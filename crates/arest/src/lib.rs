@@ -1667,13 +1667,19 @@ pub(crate) fn metamodel_parsed_state_seeded() -> &'static ast::Object {
             m.insert("Noun".to_string(), ast::fetch_cell_seq("Noun", &full));
             ast::Object::map(m)
         };
-        metamodel_readings().iter().fold(noun_seed, |acc, (name, text)| {
+        let folded = metamodel_readings().iter().fold(noun_seed, |acc, (name, text)| {
             let parsed = parse_forml2::parse_to_state_from_in_domain(text, &acc, name)
                 .unwrap_or_else(|e| panic!("metamodel parse failed at readings/{}.md: {}", name, e));
             let parsed = ast::annotate_noun_domain(&parsed, name);
             let parsed = ast::merge_states(&parsed, &ast::stamp_file_domain(&parsed, name));
             ast::merge_states(&acc, &parsed)
-        })
+        });
+        // rmap-3nf-tables (iii): constraints whose clause FTs live in a
+        // LATER slice (core.md's disjunctive Status MC → state.md's
+        // Transition FTs) parse span-less; resolve them now that every
+        // slice's Role/FactType facts are folded. Idempotent —
+        // span-bearing constraints pass through untouched.
+        parse_forml2_stage2::re_enrich_constraint_spans(&folded)
     })
 }
 

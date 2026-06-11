@@ -2839,6 +2839,68 @@ fn enrich_constraints_with_spans(
             }
         }
 
+        // rmap-3nf-tables (iii): "For each {entity}, …" mandatory
+        // constraints — the inclusive-or verbalization ("For each
+        // Status, some Transition is from that Status or some
+        // Transition is to that Status") and its single-clause anaphor
+        // form ("For each Reading, some Role is used in that Reading").
+        // The whole-text resolver can never match these (the
+        // constrained entity appears in BOTH the header and each
+        // disjunct, so the found noun sequence spans every clause and
+        // matches no FT's signature), and the entity-first-match
+        // fallback below then attached the MC to an ARBITRARY fact
+        // type having a role of that entity. Live hits: the Status-
+        // participation MC landed on Verb_is_performed_in_Status —
+        // status.verb_id NOT NULL killed the whole status/resource
+        // 3NF projection family — and the Reading MC on
+        // Reading_has_Text. Peel the header, split the body on " or ",
+        // resolve each disjunct clause independently, and anchor each
+        // span on the constrained ENTITY's role (the mandatory role —
+        // not the clause-first noun, which is the existential player).
+        // One span per disjunct: the true ORM inclusive-or shape. When
+        // any disjunct fails to resolve, emit NO span — a span-less MC
+        // is inert downstream; an arbitrary one poisons rmap and
+        // validation.
+        //
+        // The same header trips the per-entity UC form ("For each
+        // Stage, at most one Gate is performed in that Stage" — the
+        // entity appears in header AND anaphor, so the whole-text
+        // resolver sees a 3-noun sequence and falls back), so UCs take
+        // the single-clause path too; a UC's span on the constrained
+        // entity's role IS the per-entity functional uniqueness.
+        // Disjunctive UCs have no defined relational shape — they keep
+        // the historic path.
+        if kind == "MC" || (kind == "UC" && !text.contains(" or ")) {
+            if let Some(entity) = binding(c, "entity") {
+                if let Some(body) = text.strip_prefix(&alloc::format!("For each {}, ", entity)) {
+                    let disjuncts: Vec<&str> = body.split(" or ").collect();
+                    let spans: Vec<(String, usize)> = disjuncts.iter()
+                        .filter_map(|clause| {
+                            let (ft_id, _) = resolve_constraint_span_ft(
+                                clause, &roles_by_ft, &readings_by_ft, &declared_nouns)?;
+                            let pos = roles_by_ft.get(&ft_id)?.iter()
+                                .find(|(_, n)| n == entity)
+                                .map(|(p, _)| *p)?;
+                            Some((ft_id, pos))
+                        })
+                        .collect();
+                    if spans.len() == disjuncts.len() {
+                        let mut new_pairs = pairs;
+                        let push = |np: &mut Vec<Object>, k: &str, v: &str| {
+                            np.push(Object::seq(vec![Object::atom(k), Object::atom(v)]));
+                        };
+                        for (i, (ft_id, pos)) in spans.iter().enumerate() {
+                            push(&mut new_pairs, &alloc::format!("span{}_factTypeId", i), ft_id);
+                            push(&mut new_pairs, &alloc::format!("span{}_roleIndex", i),
+                                 &alloc::format!("{}", pos));
+                        }
+                        return Object::Seq(new_pairs.into());
+                    }
+                    return c.clone();
+                }
+            }
+        }
+
         let resolved = resolve_constraint_span_ft(text, &roles_by_ft, &readings_by_ft, &declared_nouns);
         // Preference 2: fall back to entity-based first-match.
         let fallback = || -> Option<(String, String)> {
@@ -5953,7 +6015,32 @@ fn cached_grammar_state() -> Result<&'static Object, String> {
 
 /// Public entry point: parse FORML 2 source with no external context.
 pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
-    parse_to_state_via_stage12_impl(text, &[], &[], &hashbrown::HashMap::new(), None)
+    parse_to_state_via_stage12_impl(text, &[], &[], &[], &hashbrown::HashMap::new(), None)
+}
+
+/// rmap-3nf-tables (iii): post-fold constraint-span re-enrichment.
+///
+/// Constraint facts whose spans could not resolve during their own
+/// slice's parse — cross-file clause FTs, e.g. core.md's disjunctive
+/// Status MC ("For each Status, some Transition is from that Status or
+/// …") referencing state.md's `Transition_is_from_Status` — are left
+/// SPAN-LESS by the per-slice enrich (better none than the entity
+/// first-match fallback's arbitrary attachment, which is exactly the
+/// poison that made status.verb_id NOT NULL). Once the fold completes
+/// and the FULL Role + FactType cells exist, run the same enrichment
+/// over the Constraint cell again: span-bearing facts pass through
+/// untouched (the has_span guard), span-less ones resolve against the
+/// complete universe. Idempotent.
+pub fn re_enrich_constraint_spans(state: &Object) -> Object {
+    let constraints: Vec<Object> =
+        crate::ast::cell_facts_iter(&fetch_or_phi("Constraint", state)).cloned().collect();
+    if constraints.is_empty() { return state.clone(); }
+    let roles: Vec<Object> =
+        crate::ast::cell_facts_iter(&fetch_or_phi("Role", state)).cloned().collect();
+    let fts: Vec<Object> =
+        crate::ast::cell_facts_iter(&fetch_or_phi("FactType", state)).cloned().collect();
+    let enriched = enrich_constraints_with_spans(&constraints, &roles, &fts);
+    crate::ast::store("Constraint", Object::Seq(enriched.into()), state)
 }
 
 /// Context-aware parse (#285). Used by `parse_to_state_from` and
@@ -6010,12 +6097,24 @@ pub fn parse_to_state_via_stage12_with_context_domain(
     let extra_ft_facts: Vec<Object> = crate::ast::cell_facts_iter(&ft_cell)
         .cloned()
         .collect();
+    // rmap-3nf-tables (iii): thread the context ROLE facts too —
+    // constraint-span enrichment resolves clause noun sequences
+    // against roles_by_ft, and a cross-file constraint ("For each
+    // Status, some Transition is from that Status or …" lives in
+    // core.md; Transition_is_from_Status in state.md) otherwise sees
+    // only the in-text FTs and either mis-attaches via the entity
+    // first-match fallback or stays span-less. Same rationale as the
+    // #940 pt2 FT threading directly above.
+    let role_cell = fetch_or_phi("Role", ctx);
+    let extra_role_facts: Vec<Object> = crate::ast::cell_facts_iter(&role_cell)
+        .cloned()
+        .collect();
     // ns-5: the bare-name → defining-domains map comes from the CONTEXT's
     // namespaced Noun cell (each fact's `homeDomain`). Built once here so
     // the per-reference resolver is an O(1) lookup.
     let defining = defining_domains_by_name(ctx);
     parse_to_state_via_stage12_impl(
-        text, &extra_nouns, &extra_ft_facts, &defining, local_domain)
+        text, &extra_nouns, &extra_ft_facts, &extra_role_facts, &defining, local_domain)
 }
 
 /// Strip HTML-style block comments (`<!-- ... -->`) from reading source
@@ -6064,6 +6163,10 @@ fn parse_to_state_via_stage12_impl(
     text: &str,
     extra_nouns: &[String],
     extra_ft_facts: &[Object],
+    // rmap-3nf-tables (iii): context Role facts, so constraint-span
+    // enrichment can resolve cross-file FT signatures (see the
+    // threading note in parse_to_state_via_stage12_with_context_domain).
+    extra_role_facts: &[Object],
     // ns-5: bare-name → set-of-defining-domains (from ctx homeDomain).
     defining_domains: &HashMap<String, Vec<String>>,
     // ns-5: the reference site's own/local domain (ns-3 file domain), or
@@ -6348,8 +6451,18 @@ fn parse_to_state_via_stage12_impl(
     // RMAP-attached-constraints code path all read them. Single-role
     // UC/MC/VC/FC/ring constraints get exactly ONE real span — the
     // historic span0→span1 mirror was pure duplication and is gone.
+    //
+    // rmap-3nf-tables (iii): resolution sees CONTEXT roles + FTs too
+    // (same #940 pt2 rationale as ft_facts_with_ctx below) — a
+    // cross-file constraint's clause FTs may live in a previously
+    // loaded reading. In-text facts come FIRST so same-signature
+    // ties keep preferring the local declaration.
+    let enrich_roles: Vec<Object> = role_facts.iter().cloned()
+        .chain(extra_role_facts.iter().cloned()).collect();
+    let enrich_fts: Vec<Object> = ft_facts.iter().cloned()
+        .chain(extra_ft_facts.iter().cloned()).collect();
     constraint_facts = tt!("enrich_spans",
-        enrich_constraints_with_spans(&constraint_facts, &role_facts, &ft_facts));
+        enrich_constraints_with_spans(&constraint_facts, &enrich_roles, &enrich_fts));
     // #940 pt2: consequent resolution must see CONTEXT fact types too, not
     // just the in-text ones. A rule whose consequent FT lives in the
     // caller-supplied context (e.g. the metamodel's `Resource is currently
@@ -9048,6 +9161,101 @@ mod tests {
                 binding(c, "modality"), binding(c, "span0_factTypeId"),
                 binding(c, "span0_roleIndex"),
             )).collect::<Vec<_>>());
+    }
+
+    /// rmap-3nf-tables (iii) — "For each {entity}, …" mandatory
+    /// constraints. The disjunctive (inclusive-or) verbalization must
+    /// emit ONE SPAN PER DISJUNCT, each anchored on the constrained
+    /// entity's role in the disjunct's fact type — never the entity-
+    /// first-match fallback (live bug: the Status-participation MC
+    /// attached to Verb_is_performed_in_Status, minting a spurious
+    /// NOT NULL that killed the status/resource 3NF projection).
+    #[test]
+    fn for_each_disjunctive_mc_emits_one_span_per_disjunct_on_entity_role() {
+        let state = super::parse_to_state_via_stage12("\
+            Hop(.hid) is an entity type.\n\
+            Stage(.sid) is an entity type.\n\
+            Gate(.gid) is an entity type.\n\
+            hid is a value type.\n\
+            sid is a value type.\n\
+            gid is a value type.\n\
+            \n\
+            ## Fact Types\n\
+            Hop is from Stage.\n\
+              Each Hop is from exactly one Stage.\n\
+            Hop is to Stage.\n\
+              Each Hop is to exactly one Stage.\n\
+            Gate is performed in Stage.\n\
+              For each Stage, at most one Gate is performed in that Stage.\n\
+            \n\
+            ## Constraints\n\
+            For each Stage, some Hop is from that Stage or some Hop is to that Stage.\n\
+        ").expect("parse_to_state_via_stage12");
+        let constraints = fetch_or_phi("Constraint", &state);
+        let entries: Vec<&Object> = constraints.as_seq()
+            .map(|s| s.iter().collect()).unwrap_or_default();
+
+        let mc = entries.iter().find(|c| {
+            binding(c, "kind") == Some("MC")
+                && binding(c, "text").map_or(false, |t| t.contains("some Hop is from that Stage or"))
+        }).unwrap_or_else(|| panic!(
+            "expected the disjunctive MC in the Constraint cell; got {:?}",
+            entries.iter().map(|c| (binding(c, "id"), binding(c, "kind"))).collect::<Vec<_>>()));
+
+        // One span per disjunct, each on the Stage role (position 1)
+        // of ITS OWN fact type — and emphatically not on the unrelated
+        // Gate_is_performed_in_Stage.
+        assert_eq!(binding(mc, "span0_factTypeId"), Some("Hop_is_from_Stage"),
+            "span0 must target the first disjunct's FT");
+        assert_eq!(binding(mc, "span0_roleIndex"), Some("1"),
+            "span0 must anchor the constrained entity's (Stage) role");
+        assert_eq!(binding(mc, "span1_factTypeId"), Some("Hop_is_to_Stage"),
+            "span1 must target the second disjunct's FT");
+        assert_eq!(binding(mc, "span1_roleIndex"), Some("1"),
+            "span1 must anchor the constrained entity's (Stage) role");
+    }
+
+    /// rmap-3nf-tables (iii) — the single-clause anaphor form ("For
+    /// each Reading, some Role is used in that Reading") resolves its
+    /// span through the CLAUSE (predicate-text matched), not the
+    /// entity-first-match fallback (live bug: attached to
+    /// Reading_has_Text).
+    #[test]
+    fn for_each_single_clause_mc_resolves_through_clause_not_fallback() {
+        let state = super::parse_to_state_via_stage12("\
+            Hop(.hid) is an entity type.\n\
+            Stage(.sid) is an entity type.\n\
+            hid is a value type.\n\
+            sid is a value type.\n\
+            Label is a value type.\n\
+            \n\
+            ## Fact Types\n\
+            Stage has Label.\n\
+              Each Stage has at most one Label.\n\
+            Hop is from Stage.\n\
+              Each Hop is from exactly one Stage.\n\
+            \n\
+            ## Constraints\n\
+            For each Stage, some Hop is from that Stage.\n\
+        ").expect("parse_to_state_via_stage12");
+        let constraints = fetch_or_phi("Constraint", &state);
+        let entries: Vec<&Object> = constraints.as_seq()
+            .map(|s| s.iter().collect()).unwrap_or_default();
+
+        let mc = entries.iter().find(|c| {
+            binding(c, "kind") == Some("MC")
+                && binding(c, "text").map_or(false, |t| t.contains("some Hop is from that Stage"))
+        }).unwrap_or_else(|| panic!(
+            "expected the for-each MC in the Constraint cell; got {:?}",
+            entries.iter().map(|c| (binding(c, "id"), binding(c, "kind"))).collect::<Vec<_>>()));
+
+        assert_eq!(binding(mc, "span0_factTypeId"), Some("Hop_is_from_Stage"),
+            "the span must resolve through the clause's predicate text, \
+             not fall back to the first FT with a Stage role");
+        assert_eq!(binding(mc, "span0_roleIndex"), Some("1"),
+            "the span must anchor the constrained entity's (Stage) role");
+        assert_eq!(binding(mc, "span1_factTypeId"), None,
+            "single clause -> single span");
     }
 
     /// Acceptance criterion #1 follow-up: the synthetic `Task_has_id`

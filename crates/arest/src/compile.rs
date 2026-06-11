@@ -3022,9 +3022,17 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                     "\n          <orm:UniquenessConstraint ref=\"{}\" />", nid));
             } else if c.kind == "MC" {
                 mc_n += 1;
+                // Multi-span = inclusive-or (disjunctive) mandatory —
+                // ORM renders it as a non-simple MandatoryConstraint
+                // whose RoleSequence spans the disjunct roles.
+                let (name_prefix, simple) = if c.spans.len() > 1 {
+                    ("InclusiveOrMandatoryConstraint", "false")
+                } else {
+                    ("SimpleMandatoryConstraint", "true")
+                };
                 constraints_block.push_str(&format!(
-                    "\n      <orm:MandatoryConstraint id=\"{}\" Name=\"SimpleMandatoryConstraint{}\" IsSimple=\"true\">\n        <orm:RoleSequence>{}\n        </orm:RoleSequence>\n      </orm:MandatoryConstraint>",
-                    nid, mc_n, seq));
+                    "\n      <orm:MandatoryConstraint id=\"{}\" Name=\"{}{}\" IsSimple=\"{}\">\n        <orm:RoleSequence>{}\n        </orm:RoleSequence>\n      </orm:MandatoryConstraint>",
+                    nid, name_prefix, mc_n, simple, seq));
                 per_fact.entry(ft0.clone()).or_default().push_str(&format!(
                     "\n          <orm:MandatoryConstraint ref=\"{}\" />", nid));
                 for s in &c.spans { mandatory_roles.insert(rid(ft0, s.role_index)); }
@@ -9710,18 +9718,40 @@ fn compile_mandatory_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     }
     let spans = resolve_spans(data, &def.spans);
 
-    // Build a pure Func check per span, then Concat to flatten.
-    let span_checks: Vec<Func> = spans.iter().map(|span| {
-        let noun_name = &span.noun_name;
-        let reading = &span.reading;
+    // rmap-3nf-tables (iii): a multi-span MC whose spans all anchor
+    // the SAME noun is the inclusive-or (disjunctive) mandatory —
+    // "For each Status, some Transition is from that Status or some
+    // Transition is to that Status". Participation in ANY span's fact
+    // type satisfies it, so the check is ONE not-participating pass
+    // over the UNION of the span populations, not a per-span
+    // conjunction (which would demand participation in EVERY fact
+    // type and flag e.g. a Status that only ever appears in from-
+    // roles). Mixed-noun multi-span MCs (no live producer) keep the
+    // historic per-span conjunction below.
+    let inclusive_or = spans.len() >= 2
+        && spans.iter().all(|s| s.noun_name == spans[0].noun_name);
+    let span_groups: Vec<(String, String, Func)> = if inclusive_or {
+        let facts_union = Func::compose(
+            Func::Concat,
+            Func::construction(spans.iter()
+                .map(|s| extract_facts_func(&s.fact_type_id))
+                .collect()),
+        );
+        vec![(spans[0].noun_name.clone(), def.text.clone(), facts_union)]
+    } else {
+        spans.iter()
+            .map(|s| (s.noun_name.clone(), s.reading.clone(), extract_facts_func(&s.fact_type_id)))
+            .collect()
+    };
+
+    // Build a pure Func check per group, then Concat to flatten.
+    let span_checks: Vec<Func> = span_groups.iter().map(|(noun_name, reading, ft_facts)| {
+        let ft_facts = ft_facts.clone();
 
         // instances of this noun from the eval context population
         // instances_of_noun_func(noun) : pop -> <val1, val2, ...>
         // Compose with Selector(3) to extract population from ctx.
         let instances = Func::compose(instances_of_noun_func(noun_name), Func::Selector(3));
-
-        // facts of the constrained fact type from eval context
-        let ft_facts = extract_facts_func(&span.fact_type_id);
 
         // binding_match: <instance, <noun, val>> -> T if
         //   noun (inner Sel(1).Sel(2)) = noun_name literal

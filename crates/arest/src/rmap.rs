@@ -544,7 +544,15 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
                         });
                 }
                 "MC" => {
-                    mc.extend(c.spans.iter().map(|s| format!("{}:{}", s.fact_type_id, s.role_index)));
+                    // rmap-3nf-tables (iii): a multi-span MC is the
+                    // inclusive-or (disjunctive) mandatory — satisfied
+                    // by participation in ANY span's fact type. Only a
+                    // SINGLE-span MC makes the role itself total, so
+                    // only that shape may mint NOT NULL on an absorbed
+                    // column.
+                    if c.spans.len() == 1 {
+                        mc.extend(c.spans.iter().map(|s| format!("{}:{}", s.fact_type_id, s.role_index)));
+                    }
                 }
                 "VC" => {
                     c.entity.as_ref()
@@ -1427,6 +1435,48 @@ mod tests {
             "implicit spanning UC -> PK over ALL role columns, names aligned");
         assert!(t.columns.iter().all(|c| c.source_cell.as_deref() == Some("Hop_blocks_Hop")),
             "junction provenance must point at the ring cell for projection");
+    }
+
+    /// rmap-3nf-tables (iii): a disjunctive ("For each Stage, … or …")
+    /// mandatory constraint is the inclusive-or — it makes NO single
+    /// role total, so it must not mint NOT NULL on any absorbed
+    /// column. The live bug attached the unresolvable disjunction to
+    /// an arbitrary FT sharing the entity's role
+    /// (Verb_is_performed_in_Status), and status.verb_id NOT NULL
+    /// zeroed the status/resource projection family.
+    #[test]
+    fn disjunctive_mc_does_not_mint_not_null_on_unrelated_absorption() {
+        let src = "\
+            Hop(.hid) is an entity type.\n\
+            Stage(.sid) is an entity type.\n\
+            Gate(.gid) is an entity type.\n\
+            hid is a value type.\n\
+            sid is a value type.\n\
+            gid is a value type.\n\
+            \n\
+            ## Fact Types\n\
+            Hop is from Stage.\n\
+              Each Hop is from exactly one Stage.\n\
+            Hop is to Stage.\n\
+              Each Hop is to exactly one Stage.\n\
+            Gate is performed in Stage.\n\
+              For each Stage, at most one Gate is performed in that Stage.\n\
+            \n\
+            ## Constraints\n\
+            For each Stage, some Hop is from that Stage or some Hop is to that Stage.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let tables = rmap(&state);
+        let stage = tables.iter().find(|t| t.name == "stage")
+            .expect("stage entity table must exist");
+        let gate_col = stage.columns.iter().find(|c| c.name == "gate_id")
+            .unwrap_or_else(|| panic!(
+                "per-Stage functional Gate must absorb as stage.gate_id; got {:?}",
+                stage.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()));
+        assert!(gate_col.nullable,
+            "the disjunctive MC constrains Hop-participation, not Gate \
+             absorption — gate_id must stay nullable");
     }
 
     /// RED (bug repro through the PARSER): a single-role functional

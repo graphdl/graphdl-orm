@@ -280,35 +280,50 @@ mod db {
         // materializes a row in its parent (id-only parents, entities
         // whose only appearance is being pointed at). The refscheme
         // column defaults to the id per Halpin.
-        let mut extra: std::collections::HashMap<String, std::collections::HashSet<String>> =
-            std::collections::HashMap::new();
-        for table in &tables {
-            let Some(rows) = collected.get(&table.name) else { continue };
-            for col in &table.columns {
-                let Some(parent) = &col.references else { continue };
-                if !by_name.contains_key(parent) { continue; }
-                for row in rows {
-                    if let Some(v) = row.get(&col.name) {
-                        extra.entry(parent.clone()).or_default().insert(v.clone());
+        //
+        // rmap-3nf-tables (iii): run to FIXPOINT — a parent row added
+        // here can itself carry an FK that needs ITS parent filled.
+        // Live chain: transition.from_status_id derives status rows,
+        // and each status row's subtype id (status.id REFERENCES
+        // function, the Status < Resource < Noun < Function reflexive
+        // chain) needs a function row — single-pass fill left those
+        // dangling and the whole status/resource family FK-failed.
+        // Terminates: each round only adds ids not yet present, over a
+        // finite id universe.
+        loop {
+            let mut extra: std::collections::HashMap<String, std::collections::HashSet<String>> =
+                std::collections::HashMap::new();
+            for table in &tables {
+                let Some(rows) = collected.get(&table.name) else { continue };
+                for col in &table.columns {
+                    let Some(parent) = &col.references else { continue };
+                    if !by_name.contains_key(parent) { continue; }
+                    for row in rows {
+                        if let Some(v) = row.get(&col.name) {
+                            extra.entry(parent.clone()).or_default().insert(v.clone());
+                        }
                     }
                 }
             }
-        }
-        for (parent, ids) in extra {
-            let parent_def = by_name[&parent];
-            let rows = collected.entry(parent.clone()).or_default();
-            let existing: std::collections::HashSet<String> = rows.iter()
-                .filter_map(|r| r.get("id").cloned())
-                .collect();
-            for id in ids {
-                if existing.contains(&id) { continue; }
-                let mut row: Row = Row::new();
-                if let Some(ref_col) = &parent_def.ref_value_column {
-                    row.insert(ref_col.clone(), id.clone());
+            let mut grew = false;
+            for (parent, ids) in extra {
+                let parent_def = by_name[&parent];
+                let rows = collected.entry(parent.clone()).or_default();
+                let existing: std::collections::HashSet<String> = rows.iter()
+                    .filter_map(|r| r.get("id").cloned())
+                    .collect();
+                for id in ids {
+                    if existing.contains(&id) { continue; }
+                    let mut row: Row = Row::new();
+                    if let Some(ref_col) = &parent_def.ref_value_column {
+                        row.insert(ref_col.clone(), id.clone());
+                    }
+                    row.insert("id".to_string(), id);
+                    rows.push(row);
+                    grew = true;
                 }
-                row.insert("id".to_string(), id);
-                rows.push(row);
             }
+            if !grew { break; }
         }
 
         // ── Phase 3: dependency order (parents before children) ───────
