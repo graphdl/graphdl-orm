@@ -2959,22 +2959,50 @@ fn transition_via_defs(
             // cell_put_keyed enforces it structurally. On the defensive
             // KeyConflict path (identical re-fire) keep prior state.
             let trigger_cell = event.replace(' ', "_");
-            // sm-fold-as-predicate: stamp occurred-at so the reconstruction fold
-            // orders this event chronologically. The cell stays keyed by the SM
-            // noun role (functional). upsert=true (last-write-wins) is essential:
-            // re-firing an event must UPDATE its occurred-at, letting a re-cycle
-            // (block->unblock->block) fold to the LATEST event's target. Plain
-            // cell_put_keyed treats the new-timestamp fact as a KeyConflict and
-            // keeps the STALE timestamp, so the re-block would never out-sort the
-            // intervening unblock. cell_put_keyed_batch(upsert) overwrites by key.
-            let occurred = next_occurred_at();
-            let (s, _conflicts) = ast::cell_put_keyed_batch(
-                &trigger_cell,
-                &[noun.as_str()],
-                vec![ast::fact_from_pairs(&[(noun.as_str(), entity_id), ("Timestamp", occurred.as_str())])],
-                true,
-                &new_state);
-            new_state = s;
+            // m:n-trigger-stamp guard (arc-agi-3 engine-issue 13,
+            // observation 3): the entity-keyed `{noun, Timestamp}` write
+            // below is shaped for a UNARY trigger FT on the SM noun
+            // (`Task is finished` → one row per Task). A transition may
+            // legitimately be triggered by an n-ary fact type
+            // (`Case proposes Hypothesis`, AREST.tex "a transition that
+            // declares its trigger as a fact type fires automatically
+            // when that fact enters P") — stamping THAT cell would file a
+            // bare-entity-keyed `<Case, Timestamp>` pseudo-fact inside an
+            // m:n cell (the corrupted row arc-agi-3 reported). For n-ary
+            // triggers the asserted fact itself is the durable event: the
+            // reconstruction fold reads the trigger cell, projects the SM
+            // noun role, and orders timestamp-less events by synthetic
+            // transition rank — so skipping the stamp loses nothing but
+            // the corruption.
+            let mut trigger_role_nouns: Vec<String> =
+                ast::fetch_cell_seq("Role", d).as_seq()
+                    .map(|roles| roles.iter()
+                        .filter(|r| ast::binding_matches(r, "factType", &trigger_cell))
+                        .filter_map(|r| ast::binding(r, "nounName").map(String::from))
+                        .collect())
+                    .unwrap_or_default();
+            trigger_role_nouns.sort();
+            trigger_role_nouns.dedup();
+            let unary_on_sm_noun =
+                trigger_role_nouns.len() == 1 && trigger_role_nouns[0] == noun;
+            if unary_on_sm_noun {
+                // sm-fold-as-predicate: stamp occurred-at so the reconstruction fold
+                // orders this event chronologically. The cell stays keyed by the SM
+                // noun role (functional). upsert=true (last-write-wins) is essential:
+                // re-firing an event must UPDATE its occurred-at, letting a re-cycle
+                // (block->unblock->block) fold to the LATEST event's target. Plain
+                // cell_put_keyed treats the new-timestamp fact as a KeyConflict and
+                // keeps the STALE timestamp, so the re-block would never out-sort the
+                // intervening unblock. cell_put_keyed_batch(upsert) overwrites by key.
+                let occurred = next_occurred_at();
+                let (s, _conflicts) = ast::cell_put_keyed_batch(
+                    &trigger_cell,
+                    &[noun.as_str()],
+                    vec![ast::fact_from_pairs(&[(noun.as_str(), entity_id), ("Timestamp", occurred.as_str())])],
+                    true,
+                    &new_state);
+                new_state = s;
+            }
         }
     }
 
@@ -3052,8 +3080,14 @@ fn transition_via_defs(
         seed.insert(sm.cell_name.to_string());
         seed.insert("Resource_is_currently_in_Status".to_string());
         {
-            // Same FT-trigger test as the durable-event write above: only
-            // then was `event.replace(' ', "_")` actually written.
+            // Same FT-trigger test as the durable-event write above. NOTE:
+            // deliberately LOOSER than the write site — the write also
+            // requires the trigger FT to be unary on the SM noun (the
+            // m:n-trigger-stamp guard), so for an n-ary trigger this seeds
+            // a cell the stamp didn't touch. Harmless: seeding only makes
+            // the chainer re-run that cell's readers (the LFP is
+            // idempotent), and for n-ary triggers the triggering fact DID
+            // recently enter that cell via the apply that fired us.
             let is_ft_trigger = ast::fetch_cell_seq("Transition_is_triggered_by_Event_Type", d)
                 .as_seq()
                 .map(|facts| facts.iter().any(|f| ast::binding(f, "Event Type") == Some(event)))
@@ -11273,6 +11307,83 @@ Transition 'start' is triggered by Event Type 'Job is started'.
         assert!(stamped,
             "the `Job is started` event for A must carry an occurred-at Timestamp; got {:?}",
             started);
+    }
+
+    // m:n-trigger-stamp guard (arc-agi-3 engine-issue 13, observation 3):
+    // a transition triggered by an N-ARY fact type must NOT receive the
+    // unary-shaped occurred-at stamp — pre-guard, firing `form-hypotheses`
+    // (triggered by `Case proposes Hypothesis`) wrote a bare-entity-keyed
+    // `<<Case, ls20-goal>, <Timestamp, …>>` pseudo-fact INTO the m:n cell,
+    // corrupting it (the exact row arc-agi-3 found in its population). The
+    // transition itself must still fire: the asserted m:n fact is the
+    // durable event the reconstruction fold replays.
+    #[test]
+    fn nary_ft_trigger_transition_does_not_stamp_pseudo_fact_into_mn_cell() {
+        const READINGS: &str = r#"
+# Hypothesis-formation SM (arc-agi-3 issue-13 shape)
+
+## Entity Types
+
+Case(.id) is an entity type.
+Hypothesis(.id) is an entity type.
+
+## Fact Types
+
+Case proposes Hypothesis.
+
+## State Machine
+
+State Machine Definition 'Case SM' is for Noun 'Case'.
+Status 'observing' is initial in State Machine Definition 'Case SM'.
+
+Transition 'form-hypotheses' is defined in State Machine Definition 'Case SM'.
+Transition 'form-hypotheses' is from Status 'observing'.
+Transition 'form-hypotheses' is to Status 'hypothesizing'.
+Transition 'form-hypotheses' is triggered by Event Type 'Case proposes Hypothesis'.
+"#;
+        let meta = crate::parse_forml2::parse_to_state(&crate::metamodel_corpus())
+            .expect("metamodel parse");
+        let cases = crate::parse_forml2::parse_to_state_with_nouns(READINGS, &meta)
+            .expect("case readings parse");
+        let state = ast::merge_states(&meta, &cases);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        // Seed the Case at 'observing' with one asserted proposal — the
+        // m:n fact whose entry into P is what fires the transition.
+        let st = ast::cell_push("State_Machine_is_currently_in_Status",
+            ast::fact_from_pairs(&[("State Machine", "ls20-goal"), ("Status", "observing")]), &state);
+        let st = ast::cell_push("Case_proposes_Hypothesis",
+            ast::fact_from_pairs(&[("Case", "ls20-goal"), ("Hypothesis", "h-c11-count-driven")]), &st);
+
+        let res = transition_via_defs(&d, "ls20-goal", "Case proposes Hypothesis", "", None, &st);
+        assert!(!res.rejected, "form-hypotheses rejected: {:?}", res.violations);
+        let after = ast::merge_delta(&st, &res.state, None);
+
+        // The transition must have fired…
+        let sm_cell = ast::fetch_cell_seq("State_Machine_is_currently_in_Status", &after);
+        let status = sm_cell.as_seq().and_then(|fs| fs.iter()
+            .find(|f| ast::binding(f, "State Machine") == Some("ls20-goal"))
+            .and_then(|f| ast::binding(f, "Status").map(String::from)));
+        assert_eq!(status.as_deref(), Some("hypothesizing"),
+            "the m:n-FT-triggered transition must still fire");
+
+        // …and the m:n cell must hold ONLY the legit proposal — no
+        // Timestamp-carrying pseudo-fact keyed by the bare entity.
+        let proposals = ast::fetch_cell_seq("Case_proposes_Hypothesis", &after);
+        let corrupted: Vec<String> = proposals.as_seq()
+            .map(|fs| fs.iter()
+                .filter(|f| ast::binding(f, "Timestamp").is_some())
+                .map(|f| format!("{f:?}"))
+                .collect())
+            .unwrap_or_default();
+        assert!(corrupted.is_empty(),
+            "no occurred-at stamp may land inside an m:n trigger cell; got {corrupted:?}");
+        let legit_survives = proposals.as_seq().map(|fs| fs.iter().any(|f|
+            ast::binding(f, "Case") == Some("ls20-goal")
+                && ast::binding(f, "Hypothesis") == Some("h-c11-count-driven")
+        )).unwrap_or(false);
+        assert!(legit_survives, "the asserted proposal must survive; got {proposals:?}");
     }
 
     // sm-fold-as-predicate (occurred-at): re-firing an event must UPDATE its
