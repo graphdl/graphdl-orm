@@ -4608,6 +4608,31 @@ pub fn reflect_schema_cells(state: &crate::ast::Object) -> Vec<(String, crate::a
             })
             .collect())
         .unwrap_or_default();
+    // task-987 onion: `Reading is used by Verb` ("Each Reading is used
+    // by exactly one Verb") — extract each reading's verb with the SAME
+    // helper the SchemaCatalog ρ-lookup uses (parse_forml2::reading_verb,
+    // text between the first and second noun occurrence), so the
+    // reflection and the resolver agree on what the Verb IS. Verb id =
+    // the verb text (its natural key). Readings whose verb extracts
+    // empty (no noun prefix — malformed legacy shapes) emit nothing.
+    let reading_verbs: Vec<Object> = {
+        let mut noun_names: Vec<String> = fetch_cell_seq("Noun", state).as_seq()
+            .map(|rows| rows.iter()
+                .filter_map(|n| binding(n, "name").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
+        let mut sorted_fts: Vec<(&String, &String)> = reading_by_ft.iter().collect();
+        sorted_fts.sort();
+        sorted_fts.into_iter()
+            .filter_map(|(ft, reading)| {
+                if reading.is_empty() { return None; }
+                let verb = crate::parse_forml2::reading_verb(reading, &noun_names);
+                if verb.is_empty() { return None; }
+                Some(fact_from_pairs(&[("Reading", ft.as_str()), ("Verb", verb)]))
+            })
+            .collect()
+    };
     alloc::vec![
         ("Fact_Type_has_Role".to_string(),   Object::Seq(ft_has_role.into())),
         ("Noun_plays_Role".to_string(),      Object::Seq(role_played.into())),
@@ -4617,6 +4642,7 @@ pub fn reflect_schema_cells(state: &crate::ast::Object) -> Vec<(String, crate::a
         ("Fact_Type_has_Reading".to_string(), Object::Seq(ft_readings.into())),
         ("Reading_has_Text".to_string(), Object::Seq(reading_texts.into())),
         ("Role_is_used_in_Reading".to_string(), Object::Seq(role_used.into())),
+        ("Reading_is_used_by_Verb".to_string(), Object::Seq(reading_verbs.into())),
     ]
 }
 
@@ -4754,6 +4780,16 @@ mod reflect_schema_cells_tests {
                 "expected role {} used in Reading entity Widget_has_Label; got {:?}",
                 role_id, urows);
         }
+
+        // task-987 onion: `Reading is used by Verb` — the verb extracted
+        // by the same helper the ρ-lookup catalog uses ('has' for
+        // 'Widget has Label').
+        let verbs = get("Reading_is_used_by_Verb");
+        let vrows = verbs.as_seq().expect("Reading_is_used_by_Verb seq");
+        assert!(vrows.iter().any(|r|
+            ast::binding(r, "Reading") == Some("Widget_has_Label")
+                && ast::binding(r, "Verb") == Some("has")),
+            "expected Reading Widget_has_Label used by Verb 'has'; got {:?}", vrows);
     }
 }
 

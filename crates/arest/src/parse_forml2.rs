@@ -1052,20 +1052,7 @@ pub(crate) fn re_resolve_rules(
     let mut catalog = SchemaCatalog::new();
     fact_types.iter().for_each(|(ft_id, ft)| {
         let role_nouns: Vec<&str> = ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
-        // Verb extraction: text after the first noun up to the second
-        // (binary+), or everything after the single noun (unary — #274
-        // Category A). Without the unary branch the catalog would
-        // register `Customer is in EEA` with an empty verb, which
-        // collides with every other unary keyed on [customer].
-        let verb = noun_names.iter()
-            .find(|n| ft.reading.starts_with(n.as_str()))
-            .map(|first| {
-                let after = &ft.reading[first.len()..];
-                noun_names.iter()
-                    .find_map(|second| after.find(second.as_str()).map(|pos| after[..pos].trim()))
-                    .unwrap_or_else(|| after.trim())
-            })
-            .unwrap_or("");
+        let verb = reading_verb(&ft.reading, &noun_names);
         catalog.register(ft_id, &role_nouns, verb, &ft.reading);
     });
 
@@ -3508,6 +3495,27 @@ pub(crate) fn constraint_to_fact_test(c: &ConstraintDef) -> crate::ast::Object {
 
 
 
+
+/// The engine's working definition of a reading's VERB: the text after
+/// the first noun occurrence up to the second (binary+), or everything
+/// after the single noun (unary — #274 Category A; without the unary
+/// branch `Customer is in EEA` would carry an empty verb and collide
+/// with every other unary keyed on [customer]). `noun_names` must be
+/// sorted longest-first so multi-word nouns match before their
+/// prefixes. Shared by the SchemaCatalog register site (ρ-lookup
+/// disambiguation) and the `Reading_is_used_by_Verb` schema reflection
+/// (task-987 onion) so both surfaces agree on what the Verb IS.
+pub(crate) fn reading_verb<'a>(reading: &'a str, noun_names_longest_first: &[String]) -> &'a str {
+    noun_names_longest_first.iter()
+        .find(|n| reading.starts_with(n.as_str()))
+        .map(|first| {
+            let after = &reading[first.len()..];
+            noun_names_longest_first.iter()
+                .find_map(|second| after.find(second.as_str()).map(|pos| after[..pos].trim()))
+                .unwrap_or_else(|| after.trim())
+        })
+        .unwrap_or("")
+}
 
 /// Collapse a fact type's role list when re-declaration concatenated it into an
 /// exact k≥2 repetition of a period-p tile (`[A, B, A, B] → [A, B]`). Only tiles
