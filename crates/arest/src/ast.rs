@@ -5357,6 +5357,51 @@ pub fn cell_put_keyed_batch(
     (store(name, Object::Map(map.into()), state), conflicts)
 }
 
+/// task-984 part B (arc-agi-3 issue 10): reconcile keyed cells after
+/// the cor:closure merge — a corrected single-valued fact from
+/// readings must DISPLACE its stale carried-forward prior, not coexist
+/// with it. Pre-984 the load path merged with identity-dedup only, so
+/// `Run 'X' has Action Count '0'.` corrected to `'25'` left BOTH rows
+/// in the cell despite `Each Run has at most one Action Count.`
+///
+/// For every cell named in `key_roles` whose contents are still
+/// Seq-shaped (Map cells are same-key-dup-free by construction):
+/// rebuild via the keyed upsert in Seq order — later rows win, and the
+/// merge appends freshly-parsed rows AFTER carried-forward priors, so
+/// corrected readings beat stale values. Conservative gate: a cell
+/// where any row fails to extract its key (dirty legacy shapes) is
+/// left untouched — dropping unkeyable rows is not this pass's job.
+/// Returns the reconciled state plus `(cell, displaced_count)` for the
+/// caller's `[load]` report.
+pub(crate) fn reconcile_keyed_cells(
+    state: &Object,
+    key_roles: &hashbrown::HashMap<String, alloc::vec::Vec<String>>,
+) -> (Object, alloc::vec::Vec<(String, usize)>) {
+    let mut out = state.clone();
+    let mut displaced: alloc::vec::Vec<(String, usize)> = alloc::vec::Vec::new();
+    let mut cells: alloc::vec::Vec<&String> = key_roles.keys().collect();
+    cells.sort();
+    for cell in cells {
+        let contents = fetch_or_phi(cell, &out);
+        let Some(items) = contents.as_seq() else { continue };
+        if items.len() < 2 { continue; }
+        let names: alloc::vec::Vec<&str> =
+            key_roles[cell].iter().map(|s| s.as_str()).collect();
+        if !items.iter().all(|f| extract_key_from_fact(f, &names).is_some()) {
+            continue;
+        }
+        let before = items.len();
+        let facts: alloc::vec::Vec<Object> = items.to_vec();
+        let (next, _conflicts) = cell_put_keyed_batch(cell, &names, facts, true, &out);
+        let after = cell_facts_iter(&fetch_or_phi(cell, &next)).count();
+        if after < before {
+            displaced.push((cell.clone(), before - after));
+        }
+        out = next;
+    }
+    (out, displaced)
+}
+
 /// Iterate over the facts in a cell regardless of storage shape.
 /// Seq cells iterate their items; Map cells iterate their values.
 /// Returns an empty iterator for any other shape (Bottom, Atom, …).
@@ -7298,6 +7343,49 @@ mod tests {
         assert_eq!(twice_len, 2,
             "recompile must be idempotent on the preserved-population — a second \
              pass through preserve_prior_population must NOT grow the cell");
+    }
+
+    /// task-984 part B (arc-agi-3 issue 10): the load-path keyed-cell
+    /// reconcile. A single-valued fact corrected in readings ('0' →
+    /// '25') must displace its stale carried-forward prior — later Seq
+    /// rows win at the same key; unrelated keys survive; and a cell
+    /// containing a row that cannot extract its key is left UNTOUCHED
+    /// (the conservative gate — dropping dirty rows is not this pass's
+    /// job).
+    #[test]
+    fn reconcile_keyed_cells_displaces_stale_single_valued_rows() {
+        let mut kr: hashbrown::HashMap<String, Vec<String>> = hashbrown::HashMap::new();
+        kr.insert("Run_has_Action_Count".to_string(), vec!["Run".to_string()]);
+
+        let cell = Object::seq(vec![
+            fact_from_pairs(&[("Run", "X"), ("Action Count", "0")]),  // stale prior
+            fact_from_pairs(&[("Run", "Y"), ("Action Count", "7")]),  // unrelated key
+            fact_from_pairs(&[("Run", "X"), ("Action Count", "25")]), // corrected (later)
+        ]);
+        let state = store("Run_has_Action_Count", cell, &Object::phi());
+        let (out, displaced) = reconcile_keyed_cells(&state, &kr);
+        assert_eq!(displaced, alloc::vec![("Run_has_Action_Count".to_string(), 1usize)],
+            "exactly the stale X row is displaced");
+        let c = fetch_or_phi("Run_has_Action_Count", &out);
+        let x_vals: Vec<&str> = cell_facts_iter(&c)
+            .filter(|f| binding(f, "Run") == Some("X"))
+            .filter_map(|f| binding(f, "Action Count"))
+            .collect();
+        assert_eq!(x_vals, alloc::vec!["25"],
+            "the corrected reading value must win at key X");
+        assert_eq!(cell_facts_iter(&c).filter(|f| binding(f, "Run") == Some("Y")).count(), 1,
+            "unrelated key Y must survive");
+
+        // Conservative gate: any unkeyable row → cell untouched.
+        let dirty = Object::seq(vec![
+            fact_from_pairs(&[("Run", "X"), ("Action Count", "0")]),
+            fact_from_pairs(&[("Action Count", "9")]), // no Run key role
+        ]);
+        let state2 = store("Run_has_Action_Count", dirty.clone(), &Object::phi());
+        let (out2, displaced2) = reconcile_keyed_cells(&state2, &kr);
+        assert!(displaced2.is_empty(), "dirty cell must report nothing");
+        assert_eq!(fetch_or_phi("Run_has_Action_Count", &out2), dirty,
+            "dirty cell must be left byte-identical");
     }
 
     // ── Object construction ──────────────────────────────────────

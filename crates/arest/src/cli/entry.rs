@@ -1878,6 +1878,28 @@ pub fn main_entry() {
                 let compile_defs = crate::compile::compile_to_defs_state(&state);
                 let d = ast::defs_to_state(&compile_defs, &d);
 
+                // task-984 part B (arc-agi-3 issue 10): enforce alethic
+                // UCs on the LOAD path. The cor:closure merge dedupes
+                // identical tuples only, so a single-valued fact
+                // CORRECTED in readings coexisted with its stale
+                // carried-forward prior. Rebuild each keyed cell via the
+                // keyed upsert (Seq order — fresh parsed rows land after
+                // priors, so corrected readings win) and report what was
+                // displaced. _CellKeyRoles is in `d` as of the
+                // defs_to_state above; runs BEFORE the #836 wipe + chain
+                // so derivations read the reconciled population.
+                let d = {
+                    let key_roles = crate::evaluate::read_cell_key_roles(&d);
+                    let (next, displaced) = ast::reconcile_keyed_cells(&d, &key_roles);
+                    for (cell, n) in &displaced {
+                        eprintln!("[load] UC upsert: {} — {} stale row(s) displaced \
+                                   by a later value at the same key (alethic UC is \
+                                   the policy; corrected readings beat \
+                                   carried-forward priors)", cell, n);
+                    }
+                    next
+                };
+
                 // Surface deontic (non-blocking) structural findings on the
                 // dirs-compile path. `platform_compile` (the runtime `compile`
                 // SYSTEM verb / `apps.compile`) already emits these as
