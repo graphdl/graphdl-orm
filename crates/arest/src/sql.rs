@@ -76,14 +76,10 @@ pub fn sql_query(state: &Object, query: &str) -> String {
 // the same DDL (NOT NULL / REFERENCES / PK / UNIQUE / CHECK) plus
 // `PRAGMA foreign_keys=ON` makes the per-row skip set identical.
 
-/// SQLite identifier quoting WITH embedded-quote escaping. Junk
-/// prose-minted FT names can carry literal `"` (arc issue 11's
-/// `frontier_hash_seed:_…"|"…` cell) — a naive `"{name}"` breaks out
-/// of the identifier and kills the whole materialization. `""` is the
-/// SQL-standard escape; Stage 3 removes the junk FTs at the source.
-fn qid(raw: &str) -> String {
-    format!("\"{}\"", raw.replace('"', "\"\""))
-}
+/// SQLite identifier quoting — shared with the persist path (see
+/// `rmap::qid`; junk prose-minted FT names can carry literal `"`,
+/// arc issue 11).
+use crate::rmap::{create_table_sql, qid};
 
 fn materialize_3nf_tables(conn: &Connection, state: &Object) -> rusqlite::Result<()> {
     let plan = crate::rmap::projection_plan(state);
@@ -119,39 +115,6 @@ fn materialize_3nf_tables(conn: &Connection, state: &Object) -> rusqlite::Result
         }
     }
     Ok(())
-}
-
-/// CREATE TABLE from a `TableDef` — the :memory: twin of the persisted
-/// DDL: TEXT affinity everywhere (cell values are atoms), NOT NULL per
-/// column nullability, REFERENCES per FK, PRIMARY KEY / UNIQUE /
-/// CHECK groups verbatim.
-fn create_table_sql(t: &crate::rmap::TableDef) -> String {
-    let mut parts: Vec<String> = t.columns.iter().map(|c| {
-        let mut s = format!("{} TEXT", qid(&c.name));
-        if !c.nullable { s.push_str(" NOT NULL"); }
-        if let Some(parent) = &c.references {
-            s.push_str(&format!(" REFERENCES {}", qid(parent)));
-        }
-        s
-    }).collect();
-    if !t.primary_key.is_empty() {
-        let cols = t.primary_key.iter()
-            .map(|c| qid(c)).collect::<Vec<_>>().join(", ");
-        parts.push(format!("PRIMARY KEY ({})", cols));
-    }
-    if let Some(ucs) = &t.unique_constraints {
-        for uc in ucs {
-            let cols = uc.iter()
-                .map(|c| qid(c)).collect::<Vec<_>>().join(", ");
-            parts.push(format!("UNIQUE ({})", cols));
-        }
-    }
-    if let Some(checks) = &t.checks {
-        for chk in checks {
-            parts.push(format!("CHECK ({})", chk));
-        }
-    }
-    format!("CREATE TABLE IF NOT EXISTS {} ({});", qid(&t.name), parts.join(", "))
 }
 
 // ── SELECT-only gate ───────────────────────────────────────────────

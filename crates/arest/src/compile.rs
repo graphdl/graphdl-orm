@@ -4473,11 +4473,30 @@ pub fn reflect_schema_cells(state: &crate::ast::Object) -> Vec<(String, crate::a
             ]))
         }).collect())
         .unwrap_or_default();
+    // task-987 prelude: reflect the ABSORBED `worldAssumption` field as
+    // standalone `Noun_has_World_Assumption` rows — same regime as the
+    // Object Type / CDT reflections above. The parser stamps every
+    // declared noun with worldAssumption (default 'closed', types.rs
+    // WorldAssumption::default), but the FT cell itself stayed empty,
+    // so `Each Noun has exactly one World Assumption` fired on every
+    // full-scope validate for any noun the absorbed-only field covered.
+    let noun_was: Vec<Object> = fetch_cell_seq("Noun", state).as_seq()
+        .map(|rows| rows.iter().filter_map(|n| {
+            let name = binding(n, "name")?;
+            if name.is_empty() { return None; }
+            let wa = binding(n, "worldAssumption").unwrap_or("closed");
+            Some(fact_from_pairs(&[
+                ("Noun", name),
+                ("World Assumption", if wa.is_empty() { "closed" } else { wa }),
+            ]))
+        }).collect())
+        .unwrap_or_default();
     alloc::vec![
         ("Fact_Type_has_Role".to_string(),   Object::Seq(ft_has_role.into())),
         ("Noun_plays_Role".to_string(),      Object::Seq(role_played.into())),
         ("Noun_has_Object_Type".to_string(), Object::Seq(noun_types.into())),
         ("Noun_has_Conceptual_Data_Type".to_string(), Object::Seq(noun_cdts.into())),
+        ("Noun_has_World_Assumption".to_string(), Object::Seq(noun_was.into())),
     ]
 }
 

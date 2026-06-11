@@ -92,6 +92,28 @@ mod db {
                 let _ = conn.execute_batch(
                     &format!("DROP TABLE IF EXISTS \"{}\";", table.replace('"', "")));
             });
+        // rmap-3nf-tables Stage 2 (ddl-plan-drift): the PROJECTION PLAN
+        // is the authoritative table shape. The sql:sqlite: defs are
+        // baked from a mid-compile rmap pass and can lag the plan the
+        // row projection computes at persist (live hit: the plan's
+        // NORMA collision suffixes produced noun.has_object_type_3
+        // while the defs' table stopped at _2 — every noun row
+        // warn-skipped "no column named", cascading through
+        // state_machine_definition → state_machine). Drop + create
+        // every plan table from rmap::create_table_sql FIRST; the defs
+        // pass below then only creates NON-plan tables (its CREATE ...
+        // IF NOT EXISTS no-ops on plan-covered names) and the triggers
+        // attach last, after every table exists.
+        let plan_tables = crate::rmap::rmap_from_state(d);
+        for t in &plan_tables {
+            let _ = conn.execute_batch(
+                &format!("DROP TABLE IF EXISTS {};", crate::rmap::qid(&t.name)));
+        }
+        for t in &plan_tables {
+            conn.execute_batch(&crate::rmap::create_table_sql(t)).unwrap_or_else(|e| {
+                eprintln!("Warning: plan DDL failed for {}: {}", t.name, e);
+            });
+        }
         // CREATE TABLE from sql:sqlite:* cells
         ast::cells_iter(d).into_iter()
             .filter(|(name, _)| name.starts_with("sql:sqlite:"))
@@ -831,6 +853,12 @@ fn system(key: &str, input: &str, d: &ast::Object) -> (String, ast::Object) {
                 .unwrap_or_else(|| result.to_string());
             (rendered, d.clone())
         }
+        // task-985 (arc issue 12.2): induce returns a Seq of Hypothesis
+        // Candidates and the MCP shim parses JSON — the generic Display
+        // arm printed the FFP form (`<confidenceScore, >` …), which the
+        // shim flagged "malformed induce envelope". Mirror lib.rs's
+        // read-only path: JSON-encode (empty atoms become "" cleanly).
+        _ if key == "induce" => (result.to_json_string(), d.clone()),
         _ => (result.to_string(), d.clone()),
     };
 

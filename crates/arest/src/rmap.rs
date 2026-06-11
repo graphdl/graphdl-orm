@@ -1415,6 +1415,49 @@ pub fn entity_id_field_name(state: &crate::ast::Object, noun_name: &str) -> Stri
 
 // -- Population projection plan (rmap-3nf-tables Stage 2) -------------
 
+/// SQLite identifier quoting WITH embedded-quote escaping. Junk
+/// prose-minted FT names can carry literal `"` — a naive `"{name}"`
+/// breaks out of the identifier; `""` is the SQL-standard escape.
+pub fn qid(raw: &str) -> String {
+    alloc::format!("\"{}\"", raw.replace('"', "\"\""))
+}
+
+/// CREATE TABLE from a `TableDef` — the SINGLE source of the 3NF
+/// table shape, used by BOTH the persist path (cli/entry.rs apply_ddl
+/// creates plan tables from this after its DROP pass, so the persisted
+/// shape can never drift from the projection plan) and the sql verb's
+/// :memory: materialization. TEXT affinity everywhere (cell values
+/// are atoms), NOT NULL per column nullability, REFERENCES per FK,
+/// PRIMARY KEY / UNIQUE / CHECK groups verbatim.
+pub fn create_table_sql(t: &TableDef) -> String {
+    let mut parts: Vec<String> = t.columns.iter().map(|c| {
+        let mut s = alloc::format!("{} TEXT", qid(&c.name));
+        if !c.nullable { s.push_str(" NOT NULL"); }
+        if let Some(parent) = &c.references {
+            s.push_str(&alloc::format!(" REFERENCES {}", qid(parent)));
+        }
+        s
+    }).collect();
+    if !t.primary_key.is_empty() {
+        let cols = t.primary_key.iter()
+            .map(|c| qid(c)).collect::<Vec<_>>().join(", ");
+        parts.push(alloc::format!("PRIMARY KEY ({})", cols));
+    }
+    if let Some(ucs) = &t.unique_constraints {
+        for uc in ucs {
+            let cols = uc.iter()
+                .map(|c| qid(c)).collect::<Vec<_>>().join(", ");
+            parts.push(alloc::format!("UNIQUE ({})", cols));
+        }
+    }
+    if let Some(checks) = &t.checks {
+        for chk in checks {
+            parts.push(alloc::format!("CHECK ({})", chk));
+        }
+    }
+    alloc::format!("CREATE TABLE IF NOT EXISTS {} ({});", qid(&t.name), parts.join(", "))
+}
+
 /// One projected row: final column name → value.
 pub type ProjectedRow = alloc::collections::BTreeMap<String, String>;
 
