@@ -568,7 +568,15 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
         .filter(|(ft_id, ft)| !binarized_ft_ids.contains(*ft_id) && ft.roles.len() >= 2)
         .map(|(ft_id, _)| {
             let ucs = ucs_by_ft.get(ft_id).cloned().unwrap_or_default();
-            (ft_id.as_str(), ucs.iter().any(|uc| uc.len() >= 2), ucs.iter().any(|uc| uc.len() == 1))
+            // rmap-3nf-tables (iv): an FT with NO declared UC defaults
+            // to the SPANNING UC (Halpin — every FT carries at least
+            // the implicit whole-tuple uniqueness), i.e. m:n → its own
+            // junction table. Rings (`Task blocks Task`) carry ring
+            // constraints but usually no UC and previously fell through
+            // BOTH classifications, producing no table at all.
+            (ft_id.as_str(),
+             ucs.is_empty() || ucs.iter().any(|uc| uc.len() >= 2),
+             ucs.iter().any(|uc| uc.len() == 1))
         }).collect();
     let compound_facts: Vec<&str> = classified.iter().filter(|(_, c, _)| *c).map(|(id, _, _)| *id).collect();
     let functional_facts: Vec<&str> = classified.iter().filter(|(_, _, f)| *f).map(|(id, _, _)| *id).collect();
@@ -590,14 +598,31 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
 
     let compound_tables: Vec<TableDef> = compound_facts.iter().map(|ft_id| {
         let ft = &fact_types[*ft_id];
-        let ucs = ucs_by_ft.get(*ft_id).unwrap();
-        let spanning_uc = ucs.iter().max_by_key(|uc| uc.len()).unwrap();
+        // rmap-3nf-tables (iv): UC-less FTs reach here via the implicit
+        // whole-tuple uniqueness — default the spanning UC to ALL roles.
+        let all_roles_uc: Vec<usize> = ft.roles.iter().map(|r| r.role_index).collect();
+        let owned_ucs;
+        let spanning_uc: &Vec<usize> = match ucs_by_ft.get(*ft_id) {
+            Some(ucs) if !ucs.is_empty() => ucs.iter().max_by_key(|uc| uc.len()).unwrap(),
+            _ => { owned_ucs = all_roles_uc; &owned_ucs }
+        };
 
-        let columns: Vec<TableColumn> = ft.roles.iter().map(|role| {
-            let col_name = column_name_for_target(&nouns, &role.noun_name);
+        // Per-role column names, REPEATED nouns disambiguated by
+        // position (rings: `Task blocks Task` → task_id, task_id_2 —
+        // both FK the same parent). Computed once, reused for the PK so
+        // names always align.
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        let role_col_names: Vec<String> = ft.roles.iter().map(|role| {
+            let base = column_name_for_target(&nouns, &role.noun_name);
+            let n = seen.entry(base.clone()).or_insert(0);
+            *n += 1;
+            if *n == 1 { base } else { format!("{}_{}", base, n) }
+        }).collect();
+
+        let columns: Vec<TableColumn> = ft.roles.iter().zip(role_col_names.iter()).map(|(role, col_name)| {
             let is_entity = nouns.get(&role.noun_name).map_or(false, |n| n.object_type == "entity");
             TableColumn {
-                name: col_name,
+                name: col_name.clone(),
                 col_type: "TEXT".to_string(),
                 nullable: false,
                 references: if is_entity { Some(to_snake(&role.noun_name)) } else { None },
@@ -608,9 +633,9 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
                 source_value_role: Some(role.noun_name.clone()),
             }
         }).collect();
-        let pk_cols: Vec<String> = ft.roles.iter()
-            .filter(|role| spanning_uc.contains(&role.role_index))
-            .map(|role| column_name_for_target(&nouns, &role.noun_name))
+        let pk_cols: Vec<String> = ft.roles.iter().zip(role_col_names.iter())
+            .filter(|(role, _)| spanning_uc.contains(&role.role_index))
+            .map(|(_, col_name)| col_name.clone())
             .collect();
 
         let table_name = compound_table_name(&ft.reading, &ft.roles, &noun_name_set);
@@ -1372,6 +1397,36 @@ mod tests {
             "the is-to column must decorate with ITS predicate (to); got {:?}", cols);
         assert!(!cols.iter().any(|c| c.ends_with("_id_2")),
             "no numeric-suffix fallback when predicate decoration disambiguates; got {:?}", cols);
+    }
+
+    /// rmap-3nf-tables (iv), ring fact types: a UC-less m:n FT carries
+    /// Halpin's IMPLICIT whole-tuple spanning UC and must still emit a
+    /// junction table (`Hop blocks Hop` → hop_blocks_hop). Repeated
+    /// nouns disambiguate POSITIONALLY (hop_id, hop_id_2), both columns
+    /// FK the same parent, and the PK spans both under the same names.
+    #[test]
+    fn uc_less_ring_fact_type_emits_junction_with_positional_columns() {
+        let src = "\
+            Hop(.hid) is an entity type.\n\
+            hid is a value type.\n\
+            \n\
+            ## Fact Types\n\
+            Hop blocks Hop.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let tables = rmap(&state);
+        let t = tables.iter().find(|t| t.name == "hop_blocks_hop")
+            .expect("UC-less ring FT must emit a junction table (implicit spanning UC)");
+        let cols: Vec<&str> = t.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(cols, vec!["hop_id", "hop_id_2"],
+            "repeated noun must disambiguate positionally; got {:?}", cols);
+        assert!(t.columns.iter().all(|c| c.references.as_deref() == Some("hop")),
+            "both ring columns must FK the hop parent");
+        assert_eq!(t.primary_key, vec!["hop_id", "hop_id_2"],
+            "implicit spanning UC -> PK over ALL role columns, names aligned");
+        assert!(t.columns.iter().all(|c| c.source_cell.as_deref() == Some("Hop_blocks_Hop")),
+            "junction provenance must point at the ring cell for projection");
     }
 
     /// RED (bug repro through the PARSER): a single-role functional
