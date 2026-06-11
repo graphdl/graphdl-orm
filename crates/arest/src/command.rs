@@ -1492,6 +1492,19 @@ fn create_via_defs(
         // the available path.)
         let ft_id = match ft_id_obj.as_atom() {
             Some(s) if s != lower => s.to_string(),
+            // <Noun>_has_domain mint guard (arc-agi-3 forensics): the
+            // `domain` entry chained above is ENGINE-synthetic (the
+            // multi-tenancy envelope), not a caller field. When the
+            // model's resolve chain doesn't map it (echo → miss), the
+            // generic fallback minted a junk `<Noun>_has_domain` cell
+            // holding `<domain, ''>` rows on EVERY create — orphan-GC'd
+            // at each compile, re-minted by the next create, forever.
+            // Skip the synthetic entry on a miss; domain-aware models
+            // (resolve hit) and a caller-supplied literal `domain`
+            // field keep their existing behavior.
+            _ if *field_name == "domain" && !fields.contains_key("domain") => {
+                return acc;
+            }
             _ => fallback_ft_id(noun, field_name),
         };
         fact_events.push(ft_id.clone());
@@ -11307,6 +11320,56 @@ Transition 'start' is triggered by Event Type 'Job is started'.
         assert!(stamped,
             "the `Job is started` event for A must carry an occurred-at Timestamp; got {:?}",
             started);
+    }
+
+    // <Noun>_has_domain mint guard (arc-agi-3 forensics): create chains a
+    // synthetic `domain` envelope entry onto the caller's fields; for a
+    // domain-UNAWARE model the resolve chain misses and the generic
+    // fallback minted a junk `<Noun>_has_domain` cell holding
+    // `<domain, ''>` rows on EVERY create (orphan-GC'd at each compile,
+    // re-minted by the next create). The synthetic entry must skip on a
+    // resolve miss; real caller fields keep the fallback.
+    #[test]
+    fn create_does_not_mint_noun_has_domain_for_domain_unaware_models() {
+        const READINGS: &str = r#"
+# Domain-unaware model
+
+## Entity Types
+
+Gadget(.id) is an entity type.
+Label is a value type.
+
+## Fact Types
+
+Gadget has Label.
+"#;
+        let meta = crate::parse_forml2::parse_to_state(&crate::metamodel_corpus())
+            .expect("metamodel parse");
+        let gadgets = crate::parse_forml2::parse_to_state_with_nouns(READINGS, &meta)
+            .expect("gadget readings parse");
+        let state = ast::merge_states(&meta, &gadgets);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        let fields: hashbrown::HashMap<String, String> =
+            [("Label".to_string(), "shiny".to_string())].into_iter().collect();
+        let res = create_via_defs(&d, "Gadget", "", Some("g-1"), &fields, None, &state);
+        assert!(!res.rejected, "create rejected: {:?}", res.violations);
+        let after = ast::merge_delta(&state, &res.state, None);
+
+        // The caller's field lands…
+        let labels = ast::fetch_cell_seq("Gadget_has_Label", &after);
+        let label_ok = labels.as_seq().map(|fs| fs.iter().any(|f|
+            ast::binding(f, "Gadget") == Some("g-1")
+                && ast::binding(f, "Label") == Some("shiny"))).unwrap_or(false);
+        assert!(label_ok, "user field must still resolve+push; got {labels:?}");
+
+        // …and the synthetic domain entry must NOT mint a junk cell.
+        let domain_cell = ast::fetch_cell_seq("Gadget_has_domain", &after);
+        let rows = domain_cell.as_seq().map(|s| s.len()).unwrap_or(0);
+        assert_eq!(rows, 0,
+            "domain-unaware model must not grow a Gadget_has_domain cell; \
+             got {domain_cell:?}");
     }
 
     // m:n-trigger-stamp guard (arc-agi-3 engine-issue 13, observation 3):
