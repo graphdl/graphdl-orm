@@ -1491,6 +1491,79 @@ Thing has Other.
              (heads, tails); got {:?}", sides_seen);
     }
 
+    /// task-985 (arc issue 12.3): the documented `bound` param — a map
+    /// of pre-pinned role values — must constrain the returned
+    /// candidates. The MCP shim always sent it; `platform_induce`
+    /// silently dropped it, so candidates spanned the whole enumeration
+    /// regardless of the pin. Same Coin/Side fixture as the acceptance
+    /// test above, with `bound = {Side: tails}` → exactly the tails
+    /// candidate survives.
+    #[test]
+    fn bound_param_filters_candidates_to_matching_bindings() {
+        use crate::ast::{Func, apply, defs_to_state, fetch_or_phi};
+        use crate::types::{ConstraintDef, SpanDef};
+        let mut state = make_state(
+            &[("Coin", "entity"), ("Side", "value")],
+            &[("Coin_has_Side", "Coin has Side", 2)],
+            &[
+                ("Coin_has_Side", "Coin", 0),
+                ("Coin_has_Side", "Side", 1),
+            ],
+            &[("Side", &["heads", "tails"])],
+            &[vec![
+                ("subjectNoun",  "Coin"),
+                ("subjectValue", "c1"),
+                ("fieldName",    "Coin_exists"),
+                ("objectNoun",   ""),
+                ("objectValue",  ""),
+            ]],
+        );
+        let uc = ConstraintDef {
+            id: "uc_each_coin_at_most_one_side".into(),
+            kind: "UC".into(),
+            modality: "Alethic".into(),
+            text: "Each Coin has at most one Side".into(),
+            spans: vec![SpanDef {
+                fact_type_id: "Coin_has_Side".into(),
+                role_index: 0,
+                subset_autofill: None,
+            }],
+            ..Default::default()
+        };
+        let constraint_fact = crate::parse_forml2::constraint_to_fact_test(&uc);
+        state = crate::ast::cell_push("Constraint", constraint_fact, &state);
+
+        let mut defs_vec = crate::compile::compile_to_defs_state(&state);
+        defs_vec.push(("induce".to_string(), Func::Platform("induce".to_string())));
+        let d = defs_to_state(&defs_vec, &state);
+
+        // <<ft_id, Coin_has_Side>, <bound, <<Side, tails>>>>
+        let args = Object::seq(vec![
+            Object::seq(vec![
+                Object::atom("ft_id"),
+                Object::atom("Coin_has_Side"),
+            ]),
+            Object::seq(vec![
+                Object::atom("bound"),
+                Object::seq(vec![Object::seq(vec![
+                    Object::atom("Side"),
+                    Object::atom("tails"),
+                ])]),
+            ]),
+        ]);
+
+        let result = apply(&Func::Def("induce".to_string()), &args, &d);
+        let hyps = result.as_seq().expect(
+            "platform_induce must return a Seq of Hypothesis Candidate facts");
+        assert_eq!(hyps.len(), 1,
+            "bound {{Side: tails}} must keep exactly the tails candidate; \
+             got {} → {:?}", hyps.len(), hyps);
+        let hidden = fetch_or_phi("Hypothesis_Candidate_has_hidden__Fact", &hyps[0]);
+        let pointer = &hidden.as_seq().expect("hidden seq")[0];
+        assert_eq!(binding(pointer, "Side"), Some("tails"),
+            "the surviving candidate must carry the bound Side value");
+    }
+
     // ─── #852 Scoring Rules — rank Hypothesis Candidates by Confidence Score ──
 
     /// Acceptance test for the platform_induce scoring + ranking layer (#852).

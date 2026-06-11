@@ -548,6 +548,21 @@ async function systemCall(key: string, input: string, scope?: CallScope): Promis
 }
 
 function runArestCli(args: string[], stdinPayload?: string): Promise<string> {
+  return runArestCliCapture(args, stdinPayload).then(r => r.stdout)
+}
+
+/**
+ * mcp-surface-compile-diagnostics (task 986 / arc issue 2): the CLI
+ * emits compile diagnostics — layer-7 check warnings, model warnings,
+ * projection warn-skips — on STDERR, and the success path used to
+ * discard them entirely (debug-log only), so `apps.compile` returned
+ * `{ok:true, raw:""}` even when the engine warned loudly. This variant
+ * returns stderr alongside stdout so callers can surface it.
+ */
+function runArestCliCapture(
+  args: string[],
+  stdinPayload?: string,
+): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(AREST_CLI, args, {
       cwd: REPO_ROOT,
@@ -570,7 +585,7 @@ function runArestCli(args: string[], stdinPayload?: string): Promise<string> {
     child.on('close', code => {
       if (AREST_DEBUG && stderr.trim()) console.error(stderr.trim())
       if (code === 0) {
-        resolvePromise(stdout.trim())
+        resolvePromise({ stdout: stdout.trim(), stderr })
       } else {
         reject(new Error(stderr.trim() || `arest-cli exited with code ${code}`))
       }
@@ -624,20 +639,42 @@ function readHeadSha(): string {
   }
 }
 
-function compileAppReadings(app: ArestApp): Promise<string> {
-  return runArestCli(buildAppCompileArgs(app, appRegistryOptions()))
+function compileAppReadings(app: ArestApp): Promise<{ stdout: string; stderr: string }> {
+  return runArestCliCapture(buildAppCompileArgs(app, appRegistryOptions()))
 }
 
-function compileResult(raw: string) {
+/**
+ * mcp-surface-compile-diagnostics (task 986 / arc issue 2): pull the
+ * diagnostic lines out of the CLI's stderr so the caller sees what the
+ * engine warned about — layer-7 check warnings (`[check] ...`), model
+ * warnings (`[model warning] ...`), DDL/trigger/projection warn-skips
+ * (`Warning: ...`). Capped: projection skips alone can run to
+ * thousands of lines on a dirty population; the caller gets the first
+ * DIAGNOSTICS_CAP plus the true total.
+ */
+const DIAGNOSTICS_CAP = 100
+function extractDiagnostics(stderr: string): { lines: string[]; total: number } {
+  const lines = stderr
+    .split(/\r?\n/)
+    .filter(l => /warning|violation|\[check\]|\[model/i.test(l))
+    .map(l => l.trim())
+  return { lines: lines.slice(0, DIAGNOSTICS_CAP), total: lines.length }
+}
+
+function compileResult(raw: string, stderr?: string) {
   let parsed: unknown
   try { parsed = JSON.parse(raw) } catch {}
   const rejected = raw.trim().startsWith('⊥')
+  const diag = stderr !== undefined ? extractDiagnostics(stderr) : undefined
   return {
     ok: !rejected,
     rejected,
     bytes: raw.length,
     raw,
     ...(parsed !== undefined ? { parsed } : {}),
+    ...(diag && diag.total > 0
+      ? { diagnostics: diag.lines, diagnostics_total: diag.total }
+      : {}),
   }
 }
 
@@ -1080,8 +1117,8 @@ server.registerTool(
       if (before.health.readings.count === 0) {
         result = { ok: false, skipped: true, error: 'app has no .md readings to compile' }
       } else {
-        const raw = await compileAppReadings(app)
-        result = compileResult(raw)
+        const { stdout, stderr } = await compileAppReadings(app)
+        result = compileResult(stdout, stderr)
         app = resolveArestApp(app.name, appRegistryOptions())
       }
     }
@@ -1124,14 +1161,14 @@ server.registerTool(
         app: appSummary(target, 'full'),
       })
     }
-    const raw = await compileAppReadings(target)
+    const { stdout, stderr } = await compileAppReadings(target)
     const refreshed = resolveArestApp(target.name, appRegistryOptions())
     const shouldActivate = name ? activate !== false : activate === true
     if (shouldActivate) activateApp(refreshed.name)
 
     return textResult({
       app: appSummary(refreshed, 'full'),
-      compile_result: compileResult(raw),
+      compile_result: compileResult(stdout, stderr),
       active_app: appSummary(activeApp, 'summary'),
       context: refreshed.name === activeApp.name ? currentMutationContext() : undefined,
     })

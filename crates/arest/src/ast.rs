@@ -3500,7 +3500,39 @@ fn platform_induce(x: &Object, d: &Object) -> Object {
         }))
         .unwrap_or_default();
     let hyps = crate::induce::run_search(d, d, ft_id, &to_explain);
-    Object::Seq(hyps.into())
+    // task-985 (arc issue 12.3): honor the documented `bound` param —
+    // a map of pre-pinned role values. The MCP shim always sent it;
+    // this parser silently dropped it, so candidates spanned the whole
+    // enumeration regardless. Post-filter the ranked candidates to
+    // those whose hidden fact carries EVERY bound pair (a candidate's
+    // hidden cell is `Hypothesis_Candidate_has_hidden__Fact` →
+    // per-FT-projected fact whose bindings include the role). Filtering
+    // preserves the Confidence-Score-descending order.
+    let bound_pairs: Vec<(String, String)> = x.as_seq()
+        .and_then(|items| items.iter().find_map(|p| {
+            let pair = p.as_seq()?;
+            if pair.len() != 2 { return None; }
+            if pair[0].as_atom() != Some("bound") { return None; }
+            pair[1].as_seq().map(|entries| entries.iter().filter_map(|e| {
+                let kv = e.as_seq()?;
+                if kv.len() != 2 { return None; }
+                Some((kv[0].as_atom()?.to_string(), kv[1].as_atom()?.to_string()))
+            }).collect::<Vec<_>>())
+        }))
+        .unwrap_or_default();
+    if bound_pairs.is_empty() {
+        return Object::Seq(hyps.into());
+    }
+    let kept: Vec<Object> = hyps.into_iter().filter(|hyp| {
+        let hidden = fetch_or_phi("Hypothesis_Candidate_has_hidden__Fact", hyp);
+        let facts: Vec<Object> = cell_facts_iter(&hidden).cloned().collect();
+        facts.iter().any(|fact| {
+            bound_pairs.iter().all(|(role, want)| {
+                binding(fact, role) == Some(want.as_str())
+            })
+        })
+    }).collect();
+    Object::Seq(kept.into())
 }
 
 /// compile ∘ parse: readings text → new defs merged into D.
@@ -3645,7 +3677,8 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
         .map(|v| v.message.as_str())
         .collect();
     if !model_alethic.is_empty() {
-        return Object::atom(&format!("⊥ model violation: {}", model_alethic.join("; ")));
+        return Object::atom(&format!("⊥ model violation: {}",
+            dedup_violations_with_counts(model_alethic.into_iter())));
     }
 
     // Compile defs from merged state + re-register platform primitives
@@ -3686,9 +3719,32 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
     };
     match decoded.iter().any(|v| v.alethic) {
         true => Object::atom(&format!("⊥ constraint violation: {}",
-            decoded.iter().filter(|v| v.alethic).map(|v| v.constraint_text.as_str()).collect::<Vec<_>>().join("; "))),
+            dedup_violations_with_counts(
+                decoded.iter().filter(|v| v.alethic).map(|v| v.constraint_text.as_str())))),
         false => record_compile_event(&new_d, "compiled"),
     }
+}
+
+/// arc-agi-3 round-3 NIT: the live-compile reject envelope used to
+/// repeat every per-instance violation line verbatim — a one-fact
+/// fragment against a dirty population produced a 235 KB error of
+/// thousands of identical constraint texts. Aggregate: first-seen
+/// order, each distinct message once, `(xN)` appended for repeats.
+fn dedup_violations_with_counts<'a>(msgs: impl Iterator<Item = &'a str>) -> String {
+    let mut order: Vec<&str> = Vec::new();
+    let mut counts: hashbrown::HashMap<&str, usize> = hashbrown::HashMap::new();
+    for m in msgs {
+        let n = counts.entry(m).or_insert(0);
+        if *n == 0 { order.push(m); }
+        *n += 1;
+    }
+    order.into_iter()
+        .map(|m| match counts[m] {
+            1 => m.to_string(),
+            n => alloc::format!("{} (x{})", m, n),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Security #22 — Evolution state machine trace.
