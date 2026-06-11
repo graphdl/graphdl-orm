@@ -13662,16 +13662,19 @@ mod schema_tests {
         cell_pairs.sort();
 
         // (Item, C Val) pairs from the SQL projection over the same state.
-        // Column names are sanitized (space → underscore): C Val → C_Val.
-        let env = crate::sql::sql_query(&new_d, r#"SELECT "Item", "C_Val" FROM ft_Item_has_C_Val"#);
+        // rmap-3nf-tables Stage 2: the functional `Item has C Val`
+        // absorbs as item.c_val — query the 3NF entity table (the
+        // ft_* layer is gone).
+        let env = crate::sql::sql_query(&new_d,
+            "SELECT id, c_val FROM item WHERE c_val IS NOT NULL");
         let parsed: serde_json::Value = serde_json::from_str(&env)
             .unwrap_or_else(|_| panic!("sql envelope must be JSON; got: {}", env));
         let mut sql_pairs: Vec<(String, String)> = parsed.get("rows")
             .and_then(|r| r.as_array())
             .map(|rows| rows.iter().filter_map(|r| {
                 Some((
-                    r.get("Item")?.as_str()?.to_string(),
-                    r.get("C_Val")?.as_str()?.to_string(),
+                    r.get("id")?.as_str()?.to_string(),
+                    r.get("c_val")?.as_str()?.to_string(),
                 ))
             }).collect())
             .unwrap_or_else(|| panic!("sql envelope must carry rows; got: {}", env));

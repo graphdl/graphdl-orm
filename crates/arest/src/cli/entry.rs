@@ -202,171 +202,28 @@ mod db {
     }
 
     fn project_population_rows_inner(conn: &Connection, d: &ast::Object) -> bool {
-        type Row = std::collections::BTreeMap<String, String>;
-        let tables = crate::rmap::rmap_from_state(d);
-        let by_name: std::collections::HashMap<String, &crate::rmap::TableDef> =
-            tables.iter().map(|t| (t.name.clone(), t)).collect();
+        // rmap-3nf-tables Stage 2: Phases 1–3 (collect, parent-fill
+        // fixpoint, Kahn order) live in `rmap::projection_plan` — the
+        // SAME plan the `sql` verb materializes into :memory:. This fn
+        // is Phase 4 only: delete children-first, insert parents-first,
+        // warn-skip per row.
+        let plan = crate::rmap::projection_plan(d);
 
-        // ── Phase 1: collect every table's rows IN MEMORY ──────────────
-        let mut collected: std::collections::HashMap<String, Vec<Row>> =
-            std::collections::HashMap::new();
-        for table in &tables {
-            let is_entity_table = table.primary_key == ["id".to_string()];
-            let mut out: Vec<Row> = Vec::new();
-            if is_entity_table {
-                let mut rows: std::collections::HashMap<String, Row> =
-                    std::collections::HashMap::new();
-                for col in &table.columns {
-                    let (Some(cell), Some(subj), Some(val)) =
-                        (&col.source_cell, &col.source_subject_role, &col.source_value_role)
-                    else { continue };
-                    let contents = ast::fetch_cell_seq(cell, d);
-                    for fact in ast::cell_facts_iter(&contents) {
-                        if let (Some(id), Some(v)) = (ast::binding(fact, subj), ast::binding(fact, val)) {
-                            rows.entry(id.to_string()).or_default()
-                                .insert(col.name.clone(), v.to_string());
-                        }
-                    }
-                }
-                for (id, mut cols) in rows {
-                    // Refscheme defaulting: the synthetic id IS the
-                    // reference-mode value when no explicit fact
-                    // carries it (resource.reference = the task id).
-                    if let Some(ref_col) = &table.ref_value_column {
-                        cols.entry(ref_col.clone()).or_insert_with(|| id.clone());
-                    }
-                    cols.insert("id".to_string(), id);
-                    out.push(cols);
-                }
-            } else {
-                // Junction/compound: one row per fact, positional
-                // extraction (same-noun rings land both roles), by-name
-                // fallback on arity mismatch.
-                let Some(cell) = table.columns.iter()
-                    .find_map(|c| c.source_cell.clone()) else { continue };
-                let proj_cols: Vec<&crate::rmap::TableColumn> = table.columns.iter()
-                    .filter(|c| c.source_cell.is_some())
-                    .collect();
-                let contents = ast::fetch_cell_seq(&cell, d);
-                for fact in ast::cell_facts_iter(&contents) {
-                    let pairs: Vec<(String, String)> = fact.as_seq()
-                        .map(|items| items.iter().filter_map(|p| {
-                            let kv = p.as_seq()?;
-                            if kv.len() != 2 { return None; }
-                            Some((kv[0].as_atom()?.to_string(), kv[1].as_atom()?.to_string()))
-                        }).collect())
-                        .unwrap_or_default();
-                    let mut row: Row = Row::new();
-                    if pairs.len() == proj_cols.len() {
-                        for (col, (_, v)) in proj_cols.iter().zip(pairs.iter()) {
-                            row.insert(col.name.clone(), v.clone());
-                        }
-                    } else {
-                        for col in proj_cols.iter() {
-                            let Some(role) = &col.source_value_role else { continue };
-                            if let Some((_, v)) = pairs.iter().find(|(k, _)| k == role) {
-                                row.insert(col.name.clone(), v.clone());
-                            }
-                        }
-                    }
-                    if !row.is_empty() { out.push(row); }
-                }
-            }
-            collected.insert(table.name.clone(), out);
-        }
-
-        // ── Phase 2: derive PARENT rows from FK values in memory ───────
-        // Every distinct id referenced by a collected FK column
-        // materializes a row in its parent (id-only parents, entities
-        // whose only appearance is being pointed at). The refscheme
-        // column defaults to the id per Halpin.
-        //
-        // rmap-3nf-tables (iii): run to FIXPOINT — a parent row added
-        // here can itself carry an FK that needs ITS parent filled.
-        // Live chain: transition.from_status_id derives status rows,
-        // and each status row's subtype id (status.id REFERENCES
-        // function, the Status < Resource < Noun < Function reflexive
-        // chain) needs a function row — single-pass fill left those
-        // dangling and the whole status/resource family FK-failed.
-        // Terminates: each round only adds ids not yet present, over a
-        // finite id universe.
-        loop {
-            let mut extra: std::collections::HashMap<String, std::collections::HashSet<String>> =
-                std::collections::HashMap::new();
-            for table in &tables {
-                let Some(rows) = collected.get(&table.name) else { continue };
-                for col in &table.columns {
-                    let Some(parent) = &col.references else { continue };
-                    if !by_name.contains_key(parent) { continue; }
-                    for row in rows {
-                        if let Some(v) = row.get(&col.name) {
-                            extra.entry(parent.clone()).or_default().insert(v.clone());
-                        }
-                    }
-                }
-            }
-            let mut grew = false;
-            for (parent, ids) in extra {
-                let parent_def = by_name[&parent];
-                let rows = collected.entry(parent.clone()).or_default();
-                let existing: std::collections::HashSet<String> = rows.iter()
-                    .filter_map(|r| r.get("id").cloned())
-                    .collect();
-                for id in ids {
-                    if existing.contains(&id) { continue; }
-                    let mut row: Row = Row::new();
-                    if let Some(ref_col) = &parent_def.ref_value_column {
-                        row.insert(ref_col.clone(), id.clone());
-                    }
-                    row.insert("id".to_string(), id);
-                    rows.push(row);
-                    grew = true;
-                }
-            }
-            if !grew { break; }
-        }
-
-        // ── Phase 3: dependency order (parents before children) ───────
-        // Kahn over the references graph; self-references and cycles
-        // fall out at the end (their FK misses warn-and-skip per row).
-        let mut order: Vec<&crate::rmap::TableDef> = Vec::new();
-        let mut placed: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut remaining: Vec<&crate::rmap::TableDef> = tables.iter().collect();
-        while !remaining.is_empty() {
-            let before = remaining.len();
-            let (ready, rest): (Vec<_>, Vec<_>) = remaining.into_iter().partition(|t| {
-                t.columns.iter()
-                    .filter_map(|c| c.references.as_ref())
-                    .all(|p| p == &t.name || placed.contains(p) || !by_name.contains_key(p))
-            });
-            for t in &ready { placed.insert(t.name.clone()); }
-            order.extend(ready);
-            remaining = rest;
-            if remaining.len() == before {
-                // Cycle: append the rest in name order (deterministic).
-                let mut rest_sorted = remaining;
-                rest_sorted.sort_by(|a, b| a.name.cmp(&b.name));
-                order.extend(rest_sorted);
-                break;
-            }
-        }
-
-        // ── Phase 4: execute — delete children-first, insert parents-first.
-        for table in order.iter().rev() {
+        for name in plan.order.iter().rev() {
             let exists: bool = conn.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                params![table.name], |r| r.get::<_, i64>(0)).map(|n| n > 0).unwrap_or(false);
+                params![name], |r| r.get::<_, i64>(0)).map(|n| n > 0).unwrap_or(false);
             if !exists { continue; }
-            if let Err(e) = conn.execute(&format!("DELETE FROM \"{}\"", table.name), []) {
-                eprintln!("Warning: projection clear failed for {}: {}", table.name, e);
+            if let Err(e) = conn.execute(&format!("DELETE FROM \"{}\"", name), []) {
+                eprintln!("Warning: projection clear failed for {}: {}", name, e);
             }
         }
-        for table in &order {
-            let Some(rows) = collected.get(&table.name) else { continue };
+        for name in &plan.order {
+            let Some(rows) = plan.rows.get(name) else { continue };
             if rows.is_empty() { continue; }
             let exists: bool = conn.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                params![table.name], |r| r.get::<_, i64>(0)).map(|n| n > 0).unwrap_or(false);
+                params![name], |r| r.get::<_, i64>(0)).map(|n| n > 0).unwrap_or(false);
             if !exists { continue; }
             for row in rows {
                 let mut names: Vec<String> = Vec::new();
@@ -379,9 +236,9 @@ mod db {
                     (1..=values.len()).map(|i| format!("?{}", i)).collect();
                 let sql = format!(
                     "INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
-                    table.name, names.join(", "), placeholders.join(", "));
+                    name, names.join(", "), placeholders.join(", "));
                 if let Err(e) = conn.execute(&sql, rusqlite::params_from_iter(values.iter())) {
-                    eprintln!("Warning: row projection failed for {}: {}", table.name, e);
+                    eprintln!("Warning: row projection failed for {}: {}", name, e);
                 }
             }
         }
@@ -2181,6 +2038,29 @@ pub fn main_entry() {
                 // persist paths -- single source of truth (task-958 schema-
                 // arity GC + ':' meta/view pass-through + identity dedup).
                 let d = super::dedup_state_for_persist(&d);
+
+                // compile-reflect-schema-as-facts, LOAD-PATH parity (arc
+                // issue 9): regenerate the schema-as-facts population
+                // (Fact_Type_has_Role / Noun_plays_Role /
+                // Noun_has_Object_Type / Noun_has_Conceptual_Data_Type)
+                // here too. platform_compile (ast.rs) reflects on live
+                // compiles, but apps.compile'd dbs lacked
+                // Noun_has_Conceptual_Data_Type entirely — so any
+                // FULL-scope validate (the assertFact path) tripped the
+                // Format→CDT subset constraint on nouns whose CDT lives
+                // only in the absorbed Noun-row field (csdp's
+                // `The data type of Design Note is text.`), rejecting
+                // every assertFact in every app. Set-replace, idempotent.
+                let d = {
+                    let mut map: hashbrown::HashMap<String, ast::Object> =
+                        ast::cells_iter(&d).into_iter()
+                            .map(|(name, contents)| (name.to_string(), contents.clone()))
+                            .collect();
+                    for (name, contents) in crate::compile::reflect_schema_cells(&d) {
+                        map.insert(name, contents);
+                    }
+                    ast::Object::map(map)
+                };
 
                 // Persist state to SQLite (tables + triggers).
                 db::apply_ddl(&conn, &d);

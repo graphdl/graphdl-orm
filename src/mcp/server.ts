@@ -1367,11 +1367,18 @@ server.registerTool(
 
 // ── 2b. sql: read-only SELECT over the relational substrate (#864) ──
 //
-// Cells ARE relations (RMAP / whitepaper §3). Each FactType cell maps
-// to a SQL table named `ft_<sanitize(ft_id)>` whose columns are the
-// role names (spaces → underscores). For example, the cell
-// `Task_has_Task_Priority` becomes the table `ft_Task_has_Task_Priority`
-// with columns `Task` and `Task_Priority`.
+// Cells ARE relations (RMAP / whitepaper §3) — and the relations the
+// verb exposes are the 3NF schema RMAP derives (rmap-3nf-tables
+// Stage 2 HARD CUT; the per-FT `ft_<id>` virtual layer is gone):
+//   - ENTITY tables (snake-case noun: task, resource, status, …) with
+//     synthetic `id` PK and functional absorptions as columns
+//     (task.task_subject, resource.status_id, verb.status_id, …);
+//     FK columns end `_id` and REFERENCE the parent table.
+//   - JUNCTION tables for m:n / UC-less fact types, named from the
+//     reading (task_blocks_task with task_id + task_id_2,
+//     task_touches_source_file, …).
+//   - UNARY occurrence tables for event fact types
+//     (task_is_started: task_id + nullable timestamp).
 //
 // `query fact_type=X filter={k:v}` is a degenerate single-table SELECT
 // with one WHERE clause; `sql` lifts that to the full SQLite SELECT
@@ -1397,9 +1404,9 @@ server.registerTool(
   'sql',
   {
     description:
-      'Read-only SQL SELECT over the relational substrate (#864). Each FactType cell is exposed as table ft_<FactType_id> with columns = role names (spaces→underscores). Example: `SELECT t.Task FROM ft_Task_has_Task_Priority t WHERE t.Task_Priority = \'p0\'`. WHEN: cross-FT JOINs, aggregates (COUNT/GROUP BY), NOT EXISTS / EXISTS subqueries, or any projection more expressive than one-FT-plus-one-equality-filter. ALTERNATIVE: query when one FT with simple role-equality filters is enough (cheaper, no SQL string to build); cells mode=get when you only want the raw contents of a single cell. GOTCHA: SELECT-only — INSERT / UPDATE / DELETE are refused on purpose so derivation + validation always run through `apply`. Returns `{rows:[...]}` on success or `{error:"..."}` envelope on parse / exec failure (no thrown exceptions). Local-mode only — without the std-deps engine feature the verb returns `{error:"engine returned ⊥"}`. Quote identifiers per SQL standard. NEXT: pipe rows into `get noun=<X> id=<row-value>` for per-entity context, or apply for mutations.',
+      'Read-only SQL SELECT over the 3NF relational substrate (#864; rmap-3nf-tables Stage 2 HARD CUT — the per-FT ft_<id> layer is GONE). The schema is the SAME one the persisted app db carries: ENTITY tables (snake-case noun — task, resource, status) with synthetic `id` PK and functional absorptions as columns (FK columns end `_id`); JUNCTION tables for m:n fact types named from the reading (task_blocks_task: task_id, task_id_2); UNARY occurrence tables for events (task_is_started: task_id, nullable timestamp). Examples: `SELECT id FROM task WHERE task_priority = \'p0\'`; board status via `SELECT r.id, r.status_id FROM resource r WHERE r.status_id = \'pending\'` or `SELECT id, status_id FROM state_machine`. WHEN: cross-table JOINs, aggregates (COUNT/GROUP BY), NOT EXISTS subqueries, or any projection more expressive than one-FT-plus-one-equality-filter. ALTERNATIVE: query when one FT with simple role-equality filters is enough (it reads the CELL, not the tables); cells mode=get for raw cell contents. GOTCHA: SELECT-only — INSERT / UPDATE / DELETE are refused on purpose so derivation + validation always run through `apply`. Rows that violate alethic constraints (NOT NULL / FK) are absent — same skip set as the persisted db. Returns `{rows:[...]}` on success or `{error:"..."}` envelope. Local-mode only. NEXT: pipe rows into `get noun=<X> id=<row-value>` for per-entity context, or apply for mutations.',
     inputSchema: {
-      query: z.string().describe('A SQL SELECT statement. Tables are ft_<FactType_id> (e.g. ft_Task_has_Task_Priority); columns are role names with spaces replaced by underscores. Quote both identifiers and string values per SQL standard.'),
+      query: z.string().describe('A SQL SELECT statement over the 3NF schema: entity tables (task, resource, …; columns = snake-case absorptions, FKs end _id), junction tables (task_blocks_task), unary event tables (task_is_started + timestamp). Quote identifiers per SQL standard.'),
       app: z.string().optional().describe(APP_OVERRIDE_FIELD_DESCRIPTION),
     },
   },

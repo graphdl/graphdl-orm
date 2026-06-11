@@ -397,44 +397,44 @@ pub fn decode_rmap_result(obj: &crate::ast::Object) -> Vec<TableDef> {
 }
 
 pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
-    use crate::ast::{fetch_cell_seq, binding};
+    use crate::ast::binding;
     use crate::types::*;
 
     // Build typed lookups from cells â€” same data state_to_domain
-    // produced, without the Domain struct.
-    let noun_cell = fetch_cell_seq("Noun", state);
+    // produced, without the Domain struct. Reads via cell_facts_iter
+    // (NOT as_seq) so Map-keyed metamodel cells (#744 / #932 storage
+    // duality) drive the projection identically to Seq cells.
+    let noun_cell = crate::ast::fetch_or_phi("Noun", state);
     let mut nouns: HashMap<String, NounDef> = HashMap::new();
     let mut subtypes: HashMap<String, String> = HashMap::new();
     let mut ref_schemes: HashMap<String, Vec<String>> = HashMap::new();
     let mut enum_values: HashMap<String, Vec<String>> = HashMap::new();
-    if let Some(ns) = noun_cell.as_seq() {
-        for f in ns.iter() {
-            let name = binding(f, "name").unwrap_or("").to_string();
-            let obj_type = binding(f, "objectType").unwrap_or("entity").to_string();
-            nouns.insert(name.clone(), NounDef { object_type: obj_type, world_assumption: WorldAssumption::default() });
-            if let Some(st) = binding(f, "superType") { subtypes.insert(name.clone(), st.to_string()); }
-            if let Some(v) = binding(f, "referenceScheme") { ref_schemes.insert(name.clone(), v.split(',').map(|s| s.to_string()).collect()); }
-            if let Some(v) = binding(f, "enumValues") { enum_values.insert(name.clone(), v.split(',').map(|s| s.to_string()).collect()); }
-        }
+    for f in crate::ast::cell_facts_iter(&noun_cell) {
+        let name = binding(f, "name").unwrap_or("").to_string();
+        let obj_type = binding(f, "objectType").unwrap_or("entity").to_string();
+        nouns.insert(name.clone(), NounDef { object_type: obj_type, world_assumption: WorldAssumption::default() });
+        if let Some(st) = binding(f, "superType") { subtypes.insert(name.clone(), st.to_string()); }
+        if let Some(v) = binding(f, "referenceScheme") { ref_schemes.insert(name.clone(), v.split(',').map(|s| s.to_string()).collect()); }
+        if let Some(v) = binding(f, "enumValues") { enum_values.insert(name.clone(), v.split(',').map(|s| s.to_string()).collect()); }
     }
-    let role_cell = fetch_cell_seq("Role", state);
-    let fact_types: HashMap<String, FactTypeDef> = fetch_cell_seq("FactType", state).as_seq()
-        .map(|facts| facts.iter().filter_map(|f| {
+    let role_cell = crate::ast::fetch_or_phi("Role", state);
+    let role_facts: Vec<&crate::ast::Object> = crate::ast::cell_facts_iter(&role_cell).collect();
+    let ft_cell = crate::ast::fetch_or_phi("FactType", state);
+    let fact_types: HashMap<String, FactTypeDef> = crate::ast::cell_facts_iter(&ft_cell)
+        .filter_map(|f| {
             let id = binding(f, "id")?.to_string();
             let reading = binding(f, "reading").unwrap_or("").to_string();
-            let roles: Vec<RoleDef> = role_cell.as_seq()
-                .map(|rs| rs.iter()
-                    .filter(|r| binding(r, "factType") == Some(&id))
-                    .map(|r| RoleDef {
-                        noun_name: binding(r, "nounName").unwrap_or("").to_string(),
-                        role_index: binding(r, "position").and_then(|v| v.parse().ok()).unwrap_or(0),
-                    }).collect())
-                .unwrap_or_default();
+            let roles: Vec<RoleDef> = role_facts.iter()
+                .filter(|r| binding(r, "factType") == Some(&id))
+                .map(|r| RoleDef {
+                    noun_name: binding(r, "nounName").unwrap_or("").to_string(),
+                    role_index: binding(r, "position").and_then(|v| v.parse().ok()).unwrap_or(0),
+                }).collect();
             Some((id, FactTypeDef { schema_id: String::new(), reading, readings: vec![], roles }))
-        }).collect())
-        .unwrap_or_default();
-    let constraints: Vec<ConstraintDef> = fetch_cell_seq("Constraint", state).as_seq()
-        .map(|facts| facts.iter().map(|f| {
+        }).collect();
+    let constraint_cell = crate::ast::fetch_or_phi("Constraint", state);
+    let constraints: Vec<ConstraintDef> = crate::ast::cell_facts_iter(&constraint_cell)
+        .map(|f| {
             let get = |key: &str| binding(f, key).map(|s| s.to_string());
             let spans = crate::compile::decode_constraint_spans(&get);
             ConstraintDef {
@@ -447,8 +447,7 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
                 min_occurrence: None, max_occurrence: None,
                 predicate: None,
             }
-        }).collect())
-        .unwrap_or_default();
+        }).collect();
 
     let mut tables: Vec<TableDef> = Vec::new();
     let mut emitted: HashSet<String> = HashSet::new();
@@ -651,6 +650,53 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
     }).collect();
     emitted.extend(compound_tables.iter().map(|t| t.name.clone()));
     tables.extend(compound_tables);
+
+    // -- Step 1b: Unary fact types -> occurrence tables ----------------
+    // rmap-3nf-tables Stage 2: Halpin §10.3 open-world unaries map to
+    // their OWN table (the population set), not a boolean column —
+    // AREST unary cells (`Task is started`) are open-world event
+    // occurrences. Columns: the entity role + the SM occurred-at stamp
+    // (`transition_via_defs` appends an UNDECLARED trailing
+    // <Timestamp, …> pair to trigger-event facts; nullable — pre-stamp
+    // historical facts project NULL). No PK: the cell is the log, the
+    // projection wipes-and-reinserts, and bag semantics stay faithful.
+    let unary_tables: Vec<TableDef> = fact_types.iter()
+        .filter(|(ft_id, ft)| !binarized_ft_ids.contains(*ft_id) && ft.roles.len() == 1)
+        .filter(|(_, ft)| nouns.get(&ft.roles[0].noun_name)
+            .map_or(false, |n| n.object_type == "entity"))
+        .map(|(ft_id, ft)| {
+            let role = &ft.roles[0];
+            let col_name = column_name_for_target(&nouns, &role.noun_name);
+            let columns = alloc::vec![
+                TableColumn {
+                    name: col_name,
+                    col_type: "TEXT".to_string(),
+                    nullable: false,
+                    references: Some(to_snake(&role.noun_name)),
+                    source_cell: Some(ft_id.clone()),
+                    source_subject_role: None,
+                    source_value_role: Some(role.noun_name.clone()),
+                },
+                TableColumn {
+                    name: "timestamp".to_string(),
+                    col_type: "TEXT".to_string(),
+                    nullable: true,
+                    references: None,
+                    source_cell: Some(ft_id.clone()),
+                    source_subject_role: None,
+                    source_value_role: Some("Timestamp".to_string()),
+                },
+            ];
+            let table_name = compound_table_name(&ft.reading, &ft.roles, &noun_name_set);
+            TableDef { name: table_name, columns, primary_key: Vec::new(),
+                checks: None, unique_constraints: None, ref_value_column: None }
+        })
+        .filter(|t| !emitted.contains(&t.name))
+        .collect();
+    let mut unary_tables = unary_tables;
+    unary_tables.sort_by(|a, b| a.name.cmp(&b.name));
+    emitted.extend(unary_tables.iter().map(|t| t.name.clone()));
+    tables.extend(unary_tables);
 
     // -- Step 2/3: Functional, 1:1 absorption, XO injection ----------
     //
@@ -1365,6 +1411,191 @@ pub fn entity_cell_for_fact(
 /// `EntityCellRouter` and use `id_field_for` instead.
 pub fn entity_id_field_name(state: &crate::ast::Object, noun_name: &str) -> String {
     EntityCellRouter::new(state).id_field_for(noun_name).to_string()
+}
+
+// -- Population projection plan (rmap-3nf-tables Stage 2) -------------
+
+/// One projected row: final column name → value.
+pub type ProjectedRow = alloc::collections::BTreeMap<String, String>;
+
+/// The PURE population-projection plan — Phases 1–3 of the 3NF row
+/// projection (collect from cells via column provenance, derive
+/// missing FK parents to fixpoint, Kahn-order parents-first). Shared
+/// by the persist path (cli/entry.rs Phase 4 executes DELETE+INSERT
+/// on the app db) and the `sql` verb (which materializes the plan
+/// into a per-call `:memory:` database). One plan = "query the 3NF
+/// substrate" means the same thing everywhere.
+pub struct ProjectionPlan {
+    pub tables: Vec<TableDef>,
+    /// table name → insertion-ready rows.
+    pub rows: HashMap<String, Vec<ProjectedRow>>,
+    /// Table names parents-before-children (Kahn over the references
+    /// graph; self-references pass; cycles append name-sorted).
+    pub order: Vec<String>,
+}
+
+pub fn projection_plan(state: &crate::ast::Object) -> ProjectionPlan {
+    use crate::ast;
+    let tables = rmap(state);
+    // Borrow-free lookups so `tables` can move into the returned plan:
+    // name membership + the refscheme column per table.
+    let table_names: HashSet<String> = tables.iter().map(|t| t.name.clone()).collect();
+    let ref_value_by_name: HashMap<String, Option<String>> =
+        tables.iter().map(|t| (t.name.clone(), t.ref_value_column.clone())).collect();
+
+    // task-924 parity: a view (derived) fact type's population IS its
+    // derivation's output, not the stored cell — but ONLY when the
+    // stored cell is EMPTY (eagerly-materialized Stored cells that
+    // also carry a `view:` def keep their stored truth).
+    let effective_cell = |cell: &str| -> crate::ast::Object {
+        let stored = ast::fetch_or_phi(cell, state);
+        if ast::cell_fact_count(&stored) == 0 {
+            if let Some(resolved) = ast::resolve_view(cell, state, state) {
+                return resolved;
+            }
+        }
+        stored
+    };
+
+    // ── Phase 1: collect every table's rows ────────────────────────
+    let mut collected: HashMap<String, Vec<ProjectedRow>> = HashMap::new();
+    for table in &tables {
+        let is_entity_table = table.primary_key == ["id".to_string()];
+        let mut out: Vec<ProjectedRow> = Vec::new();
+        if is_entity_table {
+            let mut rows: HashMap<String, ProjectedRow> = HashMap::new();
+            for col in &table.columns {
+                let (Some(cell), Some(subj), Some(val)) =
+                    (&col.source_cell, &col.source_subject_role, &col.source_value_role)
+                else { continue };
+                let contents = effective_cell(cell);
+                for fact in ast::cell_facts_iter(&contents) {
+                    if let (Some(id), Some(v)) = (ast::binding(fact, subj), ast::binding(fact, val)) {
+                        rows.entry(id.to_string()).or_default()
+                            .insert(col.name.clone(), v.to_string());
+                    }
+                }
+            }
+            // Deterministic row order (HashMap iteration is not).
+            let mut keyed: Vec<(String, ProjectedRow)> = rows.into_iter().collect();
+            keyed.sort_by(|a, b| a.0.cmp(&b.0));
+            for (id, mut cols) in keyed {
+                // Refscheme defaulting: the synthetic id IS the
+                // reference-mode value when no explicit fact carries it.
+                if let Some(ref_col) = &table.ref_value_column {
+                    cols.entry(ref_col.clone()).or_insert_with(|| id.clone());
+                }
+                cols.insert("id".to_string(), id);
+                out.push(cols);
+            }
+        } else {
+            // Junction/compound: one row per fact, positional
+            // extraction (same-noun rings land both roles), by-name
+            // fallback on arity mismatch.
+            let Some(cell) = table.columns.iter()
+                .find_map(|c| c.source_cell.clone()) else { continue };
+            let proj_cols: Vec<&TableColumn> = table.columns.iter()
+                .filter(|c| c.source_cell.is_some())
+                .collect();
+            let contents = effective_cell(&cell);
+            for fact in ast::cell_facts_iter(&contents) {
+                let pairs: Vec<(String, String)> = fact.as_seq()
+                    .map(|items| items.iter().filter_map(|p| {
+                        let kv = p.as_seq()?;
+                        if kv.len() != 2 { return None; }
+                        Some((kv[0].as_atom()?.to_string(), kv[1].as_atom()?.to_string()))
+                    }).collect())
+                    .unwrap_or_default();
+                let mut row: ProjectedRow = ProjectedRow::new();
+                if pairs.len() == proj_cols.len() {
+                    for (col, (_, v)) in proj_cols.iter().zip(pairs.iter()) {
+                        row.insert(col.name.clone(), v.clone());
+                    }
+                } else {
+                    for col in proj_cols.iter() {
+                        let Some(role) = &col.source_value_role else { continue };
+                        if let Some((_, v)) = pairs.iter().find(|(k, _)| k == role) {
+                            row.insert(col.name.clone(), v.clone());
+                        }
+                    }
+                }
+                if !row.is_empty() { out.push(row); }
+            }
+        }
+        collected.insert(table.name.clone(), out);
+    }
+
+    // ── Phase 2: derive PARENT rows from FK values, to FIXPOINT ────
+    // A parent row added here can itself carry a subtype id-FK that
+    // needs ITS parent (status.id REFERENCES function via the
+    // Status < Resource < Noun < Function chain). Terminates: each
+    // round only adds ids not yet present, over a finite id universe.
+    loop {
+        let mut extra: HashMap<String, HashSet<String>> = HashMap::new();
+        for table in &tables {
+            let Some(rows) = collected.get(&table.name) else { continue };
+            for col in &table.columns {
+                let Some(parent) = &col.references else { continue };
+                if !table_names.contains(parent) { continue; }
+                for row in rows {
+                    if let Some(v) = row.get(&col.name) {
+                        extra.entry(parent.clone()).or_default().insert(v.clone());
+                    }
+                }
+            }
+        }
+        // Deterministic fill order (HashMap iteration is not).
+        let mut extra_sorted: Vec<(String, HashSet<String>)> = extra.into_iter().collect();
+        extra_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut grew = false;
+        for (parent, ids) in extra_sorted {
+            let ref_col = ref_value_by_name.get(&parent).cloned().flatten();
+            let rows = collected.entry(parent.clone()).or_default();
+            let existing: HashSet<String> = rows.iter()
+                .filter_map(|r| r.get("id").cloned())
+                .collect();
+            let mut ids_sorted: Vec<String> = ids.into_iter().collect();
+            ids_sorted.sort();
+            for id in ids_sorted {
+                if existing.contains(&id) { continue; }
+                let mut row: ProjectedRow = ProjectedRow::new();
+                if let Some(rc) = &ref_col {
+                    row.insert(rc.clone(), id.clone());
+                }
+                row.insert("id".to_string(), id);
+                rows.push(row);
+                grew = true;
+            }
+        }
+        if !grew { break; }
+    }
+
+    // ── Phase 3: dependency order (parents before children) ────────
+    let mut order: Vec<String> = Vec::new();
+    let mut placed: HashSet<String> = HashSet::new();
+    let mut remaining: Vec<&TableDef> = tables.iter().collect();
+    while !remaining.is_empty() {
+        let before = remaining.len();
+        let (ready, rest): (Vec<_>, Vec<_>) = remaining.into_iter().partition(|t| {
+            t.columns.iter()
+                .filter_map(|c| c.references.as_ref())
+                .all(|p| p == &t.name || placed.contains(p) || !table_names.contains(p))
+        });
+        let mut ready_sorted = ready;
+        ready_sorted.sort_by(|a, b| a.name.cmp(&b.name));
+        for t in &ready_sorted { placed.insert(t.name.clone()); }
+        order.extend(ready_sorted.iter().map(|t| t.name.clone()));
+        remaining = rest;
+        if remaining.len() == before {
+            // Cycle: append the rest in name order (deterministic).
+            let mut rest_sorted = remaining;
+            rest_sorted.sort_by(|a, b| a.name.cmp(&b.name));
+            order.extend(rest_sorted.iter().map(|t| t.name.clone()));
+            break;
+        }
+    }
+
+    ProjectionPlan { tables, rows: collected, order }
 }
 
 #[cfg(test)]

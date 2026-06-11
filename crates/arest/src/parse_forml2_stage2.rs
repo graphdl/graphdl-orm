@@ -2928,8 +2928,34 @@ fn enrich_constraints_with_spans(
         // multi-role constraints never reach this path — SS/EQ resolve via
         // `resolve_constraint_span_seq` and composite "Each X, Y …" UCs via
         // `parse_spanning_uc` above, both emitting their own DISTINCT spans.
+        //
+        // EXCEPT the "for each <Z>" SUFFIX form on n-ary fact types:
+        // "Each Fact uses at most one Resource for each Role" is the
+        // ORM verbalization of a UC over the (Fact, Role) PAIR — per
+        // (Fact, Role), at most one Resource. The mirror used to
+        // inflate this to spans.len()==2 by accident, which let it
+        // pass the n-1 arity-decomposition check; with the mirror gone
+        // the single span made EVERY live compile of EVERY fragment
+        // reject on the metamodel UC (arc-agi-3 issue 8). Emit the
+        // suffix noun's role as a real second span.
         push(&mut new_pairs, "span0_factTypeId", &ft_id);
         push(&mut new_pairs, "span0_roleIndex", &pos);
+        if kind == "UC" {
+            if let Some(idx) = text.rfind(" for each ") {
+                let suffix = text[idx + " for each ".len()..]
+                    .trim_end_matches('.').trim();
+                let pos_usize: Option<usize> = pos.parse().ok();
+                if let Some(roles) = roles_by_ft.get(&ft_id) {
+                    if let Some((p2, _)) = roles.iter().find(|(p, n)|
+                        n == suffix && Some(*p) != pos_usize)
+                    {
+                        push(&mut new_pairs, "span1_factTypeId", &ft_id);
+                        push(&mut new_pairs, "span1_roleIndex",
+                             &alloc::format!("{}", p2));
+                    }
+                }
+            }
+        }
         Object::Seq(new_pairs.into())
     }).collect()
 }
