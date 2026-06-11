@@ -197,10 +197,29 @@ if ($TypeLine) {
   $qemuArgs += @('-qmp', "tcp:127.0.0.1:${qmpPort},server,nowait")
 }
 $serialPort = 4448
-$qemuArgs += @(
-  '-device','virtio-keyboard-pci,id=vkbd',
-  '-device','virtio-tablet-pci'
-)
+# Input devices. QEMU's GUI frontends route focused-window input to the
+# REALIZED virtio-keyboard/tablet whether or not the guest drives them -
+# events queue in a virtqueue nobody drains and the i8042 never sees a
+# byte (kbd_total=0, irq1 never latches; user-hit in the first -Display
+# session on a non-linuxkpi build). Attach the virtio-input pair ONLY
+# when the kernel can actually consume it: a -Features build that
+# includes linuxkpi (the in-kernel virtio-input driver). Every other
+# build gets QEMU's PS/2 fallback, which the kernel's i8042 driver
+# always handles. Headless typing modes inject via serial RX, so the
+# device choice only matters for -Display interactivity.
+# Both invocation styles normalize here (direct array AND the -File
+# single "a,b" string - see the $Features param comment).
+$hasLinuxkpi = (($Features -join ',') -split ',') -contains 'linuxkpi'
+if ($hasLinuxkpi) {
+  $qemuArgs += @(
+    '-device','virtio-keyboard-pci,id=vkbd',
+    '-device','virtio-tablet-pci'
+  )
+} else {
+  if ($Display) {
+    Write-Host "Input: PS/2 fallback (build without linuxkpi - virtio-input devices omitted so GUI input reaches the i8042)." -ForegroundColor Cyan
+  }
+}
 if ($TypeLine) {
   # Typing mode: the serial console is BIDIRECTIONAL over TCP. The
   # harness pumps socket→serial.log (so every assert below reads the
