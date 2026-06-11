@@ -4438,10 +4438,33 @@ pub fn reflect_schema_cells(state: &crate::ast::Object) -> Vec<(String, crate::a
             ]))
         }).collect())
         .unwrap_or_default();
+    // audit-entity-datatype-norma-vs-view Phase 2(a): reflect the
+    // ABSORBED `conceptualDataType` Noun-cell field as standalone
+    // `Noun_has_Conceptual_Data_Type` rows. `The data type of X is
+    // <code>.` absorbs onto the Noun row (translate_nouns), and the
+    // task-962 reconstitution deliberately skips entity-entity FTs
+    // (CDT is `Conceptual Data Type(.code)`, an entity type) — so
+    // without this reflection the population is INVISIBLE to the
+    // Format-on-CDT SS constraint in core.md (every Format-bearing
+    // noun would flag as a dangling refinement) and to the Phase-2(b)
+    // most-specific-subtype resolution rules. Same set-replace,
+    // idempotent regime as the rows above.
+    let noun_cdts: Vec<Object> = fetch_cell_seq("Noun", state).as_seq()
+        .map(|rows| rows.iter().filter_map(|n| {
+            let name = binding(n, "name")?;
+            let cdt = binding(n, "conceptualDataType")?;
+            if name.is_empty() || cdt.is_empty() { return None; }
+            Some(fact_from_pairs(&[
+                ("Noun", name),
+                ("Conceptual Data Type", cdt),
+            ]))
+        }).collect())
+        .unwrap_or_default();
     alloc::vec![
         ("Fact_Type_has_Role".to_string(),   Object::Seq(ft_has_role.into())),
         ("Noun_plays_Role".to_string(),      Object::Seq(role_played.into())),
         ("Noun_has_Object_Type".to_string(), Object::Seq(noun_types.into())),
+        ("Noun_has_Conceptual_Data_Type".to_string(), Object::Seq(noun_cdts.into())),
     ]
 }
 
@@ -15880,6 +15903,87 @@ mod mandatory_role_alethic_rejection_tests {
         // (4) Alethic -> rejects (thm:complete: D' = D).
         assert!(ss_violations[0].alethic,
             "SS violation must be alethic (rejects); got {:?}", ss_violations[0]);
+    }
+
+    /// Steady-state D for the SS tests: parsed state ⊕ reflected
+    /// schema-as-facts cells (the `Noun_has_Conceptual_Data_Type` rows
+    /// the constraint's superset side reads come from
+    /// `reflect_schema_cells` — absorbed on the Noun row, invisible
+    /// otherwise), then defs folded in. Mirrors what platform_compile
+    /// persists (ast.rs reflect step) — the state every later validate
+    /// runs against.
+    fn reflect_then_defs(state: &Object) -> Object {
+        let mut map: std::collections::HashMap<String, Object> =
+            ast::cells_iter(state).into_iter()
+                .map(|(n, c)| (n.to_string(), c.clone()))
+                .collect();
+        for (name, contents) in reflect_schema_cells(state) {
+            map.insert(name, contents);
+        }
+        let reflected = Object::Map(map.into_iter()
+            .collect::<hashbrown::HashMap<_, _>>().into());
+        let defs = compile_to_defs_state(&reflected);
+        ast::defs_to_state(&defs, &reflected)
+    }
+
+    /// audit-entity-datatype-norma-vs-view Phase 2(a): the Format-on-CDT
+    /// SS constraint in core.md — `If some Noun has some Format then that
+    /// Noun has some Conceptual Data Type.` A Format is a REFINEMENT
+    /// built on a base CDT (user-ratified framing: Format-typed value
+    /// types are a SUBSET of CDT-typed ones; the override is ordinary
+    /// subtype specialization, no new operator). A dangling Format (no
+    /// base CDT) breaks the most-specific-subtype widget resolution AND
+    /// the JSON-Schema fallback chain, so it must flag.
+    ///
+    /// Drives the TEXTUAL constraint through the full production path —
+    /// metamodel corpus + app fragment → parse → compile → ρ(validate) —
+    /// over the REAL anchors (`Noun has Format` / `Noun has Conceptual
+    /// Data Type`), absorbed-population reconstitution included.
+    #[test]
+    #[cfg(not(feature = "no_std"))]
+    fn format_without_cdt_violates_core_subset_constraint() {
+        let corpus = crate::metamodel_corpus();
+
+        // VIOLATING fragment: a value type declares a Format refinement
+        // with NO base data type.
+        let violating = format!(
+            "{corpus}\n\nDangling Probe is a value type.\nNoun 'Dangling Probe' has Format 'text'.\n",
+        );
+        let state = crate::parse_forml2::parse_to_state(&violating).expect("parse violating");
+        let d = reflect_then_defs(&state);
+        let ctx = ast::encode_eval_context_state("", None, &d);
+        let violations = ast::decode_violations(
+            &ast::apply(&ast::Func::Def("validate".to_string()), &ctx, &d));
+        let hits: Vec<&crate::types::Violation> = violations.iter()
+            .filter(|v| v.constraint_text.contains(
+                "If some Noun has some Format then that Noun has some Conceptual Data Type"))
+            .collect();
+        assert!(!hits.is_empty(),
+            "a Format refinement without a base CDT must violate the Phase-2(a) \
+             SS constraint; got constraint_texts {:?}",
+            violations.iter().map(|v| v.constraint_text.as_str()).collect::<Vec<_>>());
+        assert!(hits.iter().any(|v| v.detail.contains("Dangling Probe")),
+            "the violation must name the dangling value type; details {:?}",
+            hits.iter().map(|v| v.detail.as_str()).collect::<Vec<_>>());
+
+        // CONFORMING fragment: the same Format WITH its base data type
+        // (the csdp.md / widget-opt-in shape) — no SS violation.
+        let conforming = format!(
+            "{corpus}\n\nGrounded Probe is a value type.\nThe data type of Grounded Probe is text.\nNoun 'Grounded Probe' has Format 'text'.\n",
+        );
+        let state_ok = crate::parse_forml2::parse_to_state(&conforming).expect("parse conforming");
+        let d_ok = reflect_then_defs(&state_ok);
+        let ctx_ok = ast::encode_eval_context_state("", None, &d_ok);
+        let violations_ok = ast::decode_violations(
+            &ast::apply(&ast::Func::Def("validate".to_string()), &ctx_ok, &d_ok));
+        let leftover: Vec<&crate::types::Violation> = violations_ok.iter()
+            .filter(|v| v.constraint_text.contains(
+                "If some Noun has some Format then that Noun has some Conceptual Data Type"))
+            .filter(|v| v.detail.contains("Grounded Probe"))
+            .collect();
+        assert!(leftover.is_empty(),
+            "a Format with its base CDT declared satisfies the subset; got {:?}",
+            leftover.iter().map(|v| v.detail.as_str()).collect::<Vec<_>>());
     }
 
     /// Silent-MC gap: if an MC arrives with no resolvable spans (e.g.
