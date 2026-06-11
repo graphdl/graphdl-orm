@@ -139,6 +139,7 @@ pub fn check_readings_func() -> Func {
             layer_native(check_atom_ids),
             layer_native(check_ambiguous_domain_references),
             layer_native(check_computed_bindings_in_multi_antecedent_rules),
+            layer_native(check_effective_widget_agrees_with_most_specific_type),
         ]),
     )
 }
@@ -758,6 +759,69 @@ fn check_computed_bindings_in_multi_antecedent_rules(state: &Object) -> Vec<Read
         .collect()
 }
 
+/// audit-entity-datatype Phase 2(c) — widget-agreement drift, layer 8.
+///
+/// The Phase-2(b) machinery resolves each noun's EFFECTIVE Component
+/// Role most-specific-source-first (explicit `Noun prefers Component
+/// Role` pin > the noun's Format's implication > its Conceptual Data
+/// Type's implication). This layer is the BELT: it re-derives what the
+/// hierarchy IMPLIES from the current schema cells and warns when the
+/// persisted `Noun_has_Effective_Component_Role` row DISAGREES — the
+/// stale-effective shape left behind when a Format/CDT/pin edit lands
+/// without the widget cell re-deriving (or when a cell was written by
+/// hand). Agreement is checked only for nouns that HAVE both an
+/// effective row and a derivable implication; nouns outside the widget
+/// vocabulary stay silent.
+fn check_effective_widget_agrees_with_most_specific_type(state: &Object) -> Vec<ReadingDiagnostic> {
+    use crate::ast::{binding, cell_facts_iter, fetch_or_phi};
+    let pair_map = |cell: &str, k1: &str, k2: &str| -> hashbrown::HashMap<String, String> {
+        let c = fetch_or_phi(cell, state);
+        cell_facts_iter(&c)
+            .filter_map(|f| Some((
+                binding(f, k1)?.to_string(),
+                binding(f, k2)?.to_string(),
+            )))
+            .collect()
+    };
+    let effective = pair_map("Noun_has_Effective_Component_Role", "Noun", "Component Role");
+    if effective.is_empty() { return Vec::new(); }
+    let prefers     = pair_map("Noun_prefers_Component_Role", "Noun", "Component Role");
+    let noun_format = pair_map("Noun_has_Format", "Noun", "Format");
+    let noun_cdt    = pair_map("Noun_has_Conceptual_Data_Type", "Noun", "Conceptual Data Type");
+    let fmt_implies = pair_map("Format_implies_Component_Role", "Format", "Component Role");
+    let cdt_implies = pair_map("Conceptual_Data_Type_implies_Component_Role",
+        "Conceptual Data Type", "Component Role");
+
+    let mut diags: Vec<ReadingDiagnostic> = effective.iter()
+        .filter_map(|(noun, eff)| {
+            let implied = prefers.get(noun)
+                .or_else(|| noun_format.get(noun).and_then(|f| fmt_implies.get(f)))
+                .or_else(|| noun_cdt.get(noun).and_then(|c| cdt_implies.get(c)))?;
+            if implied == eff { return None; }
+            Some(ReadingDiagnostic {
+                line: 0,
+                reading: format!("{} has effective Component Role '{}'", noun, eff),
+                level: Level::Warning,
+                source: Source::Resolve,
+                message: format!(
+                    "effective Component Role '{}' for noun `{}` disagrees with its \
+                     most-specific type's implication '{}' (pin > Format > Conceptual \
+                     Data Type) — the widget cell is stale relative to the schema",
+                    eff, noun, implied,
+                ),
+                suggestion: Some(
+                    "recompile the app so Noun_has_Effective_Component_Role re-derives, \
+                     or declare an explicit `Noun prefers Component Role` pin if the \
+                     divergence is intentional".to_string(),
+                ),
+            })
+        })
+        .collect();
+    // Deterministic order regardless of HashMap iteration.
+    diags.sort_by(|a, b| a.reading.cmp(&b.reading));
+    diags
+}
+
 /// Render the `<domain>.<Noun>` qualifier choices as a natural English
 /// list with `or` before the final item. `domains` is assumed sorted +
 /// deduped by the caller.
@@ -1363,19 +1427,72 @@ Customer wrote Review.
         // path into the violations stream.
         // computed-binding-join-silent-empty added layer 7 (computed
         // bindings in multi-antecedent rules warn loudly).
+        // audit-entity-datatype 2(c) added layer 8 (effective widget
+        // agrees with the most-specific type's implication).
         let func = check_readings_func();
         match &func {
             Func::Compose(outer, inner) => {
                 assert!(matches!(**outer, Func::Concat),
                     "top-level must compose Concat onto the construction");
                 match &**inner {
-                    Func::Construction(layers) => assert_eq!(layers.len(), 7,
-                        "check_readings_func must expose exactly 7 layer Funcs"),
+                    Func::Construction(layers) => assert_eq!(layers.len(), 8,
+                        "check_readings_func must expose exactly 8 layer Funcs"),
                     other => panic!("inner must be Construction, got {:?}", other),
                 }
             }
             other => panic!("top-level Func shape broke: {:?}", other),
         }
+    }
+
+    /// audit-entity-datatype Phase 2(c): the widget-agreement layer
+    /// warns when a noun's persisted effective Component Role disagrees
+    /// with what the pin > Format > CDT hierarchy implies — and stays
+    /// silent when they agree or when no implication is derivable.
+    #[test]
+    fn effective_widget_drift_warns_and_agreement_stays_silent() {
+        use crate::ast::{cell_push, fact_from_pairs, Object};
+        let push = |s: Object, cell: &str, pairs: &[(&str, &str)]|
+            cell_push(cell, fact_from_pairs(pairs), &s);
+
+        // Drifted: Email's Format implies text-input, but the effective
+        // cell says combo-box (stale after a schema edit).
+        let mut state = Object::phi();
+        state = push(state, "Noun_has_Effective_Component_Role",
+            &[("Noun", "Email"), ("Component Role", "combo-box")]);
+        state = push(state, "Noun_has_Format",
+            &[("Noun", "Email"), ("Format", "email")]);
+        state = push(state, "Format_implies_Component_Role",
+            &[("Format", "email"), ("Component Role", "text-input")]);
+        // Agreeing: Birthday's CDT implies date-picker and the
+        // effective row matches — no diagnostic.
+        state = push(state, "Noun_has_Effective_Component_Role",
+            &[("Noun", "Birthday"), ("Component Role", "date-picker")]);
+        state = push(state, "Noun_has_Conceptual_Data_Type",
+            &[("Noun", "Birthday"), ("Conceptual Data Type", "date")]);
+        state = push(state, "Conceptual_Data_Type_implies_Component_Role",
+            &[("Conceptual Data Type", "date"), ("Component Role", "date-picker")]);
+        // Pinned: Status prefers combo-box explicitly — the pin IS the
+        // most-specific source, so a combo-box effective row agrees
+        // even though its CDT would imply something else.
+        state = push(state, "Noun_has_Effective_Component_Role",
+            &[("Noun", "Status"), ("Component Role", "combo-box")]);
+        state = push(state, "Noun_prefers_Component_Role",
+            &[("Noun", "Status"), ("Component Role", "combo-box")]);
+        state = push(state, "Noun_has_Conceptual_Data_Type",
+            &[("Noun", "Status"), ("Conceptual Data Type", "text")]);
+        state = push(state, "Conceptual_Data_Type_implies_Component_Role",
+            &[("Conceptual Data Type", "text"), ("Component Role", "text-input")]);
+
+        let diags = super::check_effective_widget_agrees_with_most_specific_type(&state);
+        assert_eq!(diags.len(), 1,
+            "exactly the drifted noun must warn; got {:?}",
+            diags.iter().map(|d| &d.reading).collect::<Vec<_>>());
+        assert!(diags[0].reading.contains("Email"),
+            "the drifted noun is Email; got {:?}", diags[0].reading);
+        assert!(diags[0].message.contains("text-input"),
+            "the implied role must be named; got {:?}", diags[0].message);
+        assert!(matches!(diags[0].level, Level::Warning),
+            "drift is advisory (Warning), not a reject");
     }
 
     #[test]

@@ -193,6 +193,49 @@ fn openapi_from_state(state: &Object, app_name: &str) -> serde_json::Value {
     // dual-path discipline as `compile::SqlTypeMappingTable`.
     let json_type_map = JsonTypeMappingTable::from_readings_state(state);
 
+    // audit-entity-datatype Phase 2(d): the Format refinement layer.
+    // Format is an extensible refinement built ON TOP of a Conceptual
+    // Data Type (user design; the override is ordinary most-specific-
+    // subtype resolution, ratified 2026-06-04). A noun with a Format
+    // whose `Format has JSON Format` / `Format has Pattern` facts are
+    // declared refines the CDT-derived property: the Format's JSON
+    // Format WINS over the CDT catalog's, and the Pattern emits as
+    // JSON Schema `pattern`. Read via cell_facts_iter — these cells
+    // are Map-keyed (hash-keyed fold storage), so as_seq() would
+    // silently yield nothing.
+    let noun_formats: HashMap<String, String> = {
+        let cell = crate::ast::fetch_or_phi("Noun_has_Format", state);
+        crate::ast::cell_facts_iter(&cell)
+            .filter_map(|f| Some((
+                binding(f, "Noun")?.to_string(),
+                binding(f, "Format")?.to_string(),
+            )))
+            .collect()
+    };
+    let format_json_formats: HashMap<String, String> = {
+        let cell = crate::ast::fetch_or_phi("Format_has_JSON_Format", state);
+        crate::ast::cell_facts_iter(&cell)
+            .filter_map(|f| Some((
+                binding(f, "Format")?.to_string(),
+                binding(f, "JSON Format")?.to_string(),
+            )))
+            .collect()
+    };
+    let format_patterns: HashMap<String, String> = {
+        let cell = crate::ast::fetch_or_phi("Format_has_Pattern", state);
+        crate::ast::cell_facts_iter(&cell)
+            .filter_map(|f| Some((
+                binding(f, "Format")?.to_string(),
+                binding(f, "Pattern")?.to_string(),
+            )))
+            .collect()
+    };
+    let format_layer = FormatLayer {
+        noun_formats,
+        format_json_formats,
+        format_patterns,
+    };
+
     // InstanceFact cell for general_instance_facts (plural / app description)
     let inst_cell = fetch_cell_seq("InstanceFact", state);
     let inst_seq = inst_cell.as_seq().unwrap_or(&[]);
@@ -205,7 +248,8 @@ fn openapi_from_state(state: &Object, app_name: &str) -> serde_json::Value {
             if cols.is_empty() { return None; }
             Some((name.clone(), component_schema_from_state(
                 name, &cols, &noun_by_snake, &enum_values,
-                &noun_data_types, &noun_max_lengths, &json_type_map, state)))
+                &noun_data_types, &noun_max_lengths, &json_type_map,
+                &format_layer, state)))
         })
         .collect();
 
@@ -899,11 +943,13 @@ fn component_schema_from_state(
     noun_data_types: &HashMap<String, String>,
     noun_max_lengths: &HashMap<String, u64>,
     json_type_map: &JsonTypeMappingTable,
+    format_layer: &FormatLayer,
     state: &Object,
 ) -> serde_json::Value {
     let column_props = columns.iter()
         .map(|col| (col.name.clone(), column_property_from_state(
-            col, noun_by_snake, enum_values, noun_data_types, noun_max_lengths, json_type_map)));
+            col, noun_by_snake, enum_values, noun_data_types, noun_max_lengths,
+            json_type_map, format_layer)));
 
     // SM-derived "status" property, if this noun has a state machine.
     let statuses = sm_statuses(state, noun_name);
@@ -950,6 +996,26 @@ fn component_schema_from_state(
 /// State-based variant of `column_property`. Uses `enum_values` /
 /// `noun_data_types` HashMaps derived directly from the Noun cell rather
 /// than `domain.*`.
+/// audit-entity-datatype Phase 2(d): the Format refinement maps —
+/// noun → Format id, Format → JSON Format, Format → Pattern. Bundled
+/// so the property generator takes one parameter, not three.
+struct FormatLayer {
+    noun_formats: HashMap<String, String>,
+    format_json_formats: HashMap<String, String>,
+    format_patterns: HashMap<String, String>,
+}
+
+impl FormatLayer {
+    #[cfg(test)]
+    fn empty() -> Self {
+        FormatLayer {
+            noun_formats: HashMap::new(),
+            format_json_formats: HashMap::new(),
+            format_patterns: HashMap::new(),
+        }
+    }
+}
+
 fn column_property_from_state(
     col: &ColumnView,
     noun_by_snake: &HashMap<String, String>,
@@ -957,6 +1023,7 @@ fn column_property_from_state(
     noun_data_types: &HashMap<String, String>,
     noun_max_lengths: &HashMap<String, u64>,
     json_type_map: &JsonTypeMappingTable,
+    format_layer: &FormatLayer,
 ) -> serde_json::Value {
     if let Some(target) = col.references.as_ref() {
         return serde_json::json!({
@@ -977,10 +1044,31 @@ fn column_property_from_state(
         None => (sql_type_to_json(&col.col_type), None),
     };
 
+    // audit-entity-datatype Phase 2(d): the noun's FORMAT refines the
+    // CDT projection — most-specific subtype wins (the ratified
+    // framing: Format-typed value types are a SUBSET of CDT-typed
+    // ones). The Format's declared JSON Format overrides the CDT
+    // catalog's; the Format's Pattern emits as JSON Schema `pattern`.
+    let noun_format = source_noun
+        .and_then(|n| format_layer.noun_formats.get(n));
+    let format_json = noun_format
+        .and_then(|f| format_layer.format_json_formats.get(f));
+    let format_pattern = noun_format
+        .and_then(|f| format_layer.format_patterns.get(f));
+
     let mut prop = serde_json::Map::new();
     prop.insert("type".to_string(), serde_json::Value::from(json_type));
-    if let Some(fmt) = json_format {
-        prop.insert("format".to_string(), serde_json::Value::from(fmt));
+    match (format_json, json_format) {
+        (Some(refined), _) => {
+            prop.insert("format".to_string(), serde_json::Value::from(refined.as_str()));
+        }
+        (None, Some(fmt)) => {
+            prop.insert("format".to_string(), serde_json::Value::from(fmt));
+        }
+        (None, None) => {}
+    }
+    if let Some(pat) = format_pattern {
+        prop.insert("pattern".to_string(), serde_json::Value::from(pat.as_str()));
     }
     // Enum constraint layers on top of whichever base type was chosen.
     if let Some(vals) = source_noun.and_then(|n| enum_values.get(n)) {
@@ -1265,6 +1353,42 @@ mod tests {
         assert!(required.iter().any(|v| v == "id"),
             "'id' must be required (non-nullable primary key); got required: {:?}",
             required);
+    }
+
+    /// audit-entity-datatype Phase 2(d): a noun's Format refinement
+    /// reaches the JSON Schema — the Format's JSON Format OVERRIDES
+    /// the CDT catalog's (most-specific subtype wins, the ratified
+    /// framing) and its Pattern emits as `pattern`. Fixture: Email is
+    /// a text-CDT value type refined by Format 'email' carrying a
+    /// JSON Format + Pattern; the absorbed user.email property must
+    /// carry both.
+    #[test]
+    fn format_refinement_overrides_cdt_json_format_and_emits_pattern() {
+        let mut state = parse("\
+            User(.id) is an entity type.\n\
+            Email is a value type.\n\
+            The data type of Email is text.\n\
+            User has Email.\n\
+              Each User has exactly one Email.\n\
+        ");
+        // Format layer cells, the shape csdp.md's widget opt-in mints
+        // (Map-keyed in live dbs; cell_push'd Seq here — the reader
+        // walks both via cell_facts_iter).
+        state = crate::ast::cell_push("Noun_has_Format",
+            crate::ast::fact_from_pairs(&[("Noun", "Email"), ("Format", "email")]), &state);
+        state = crate::ast::cell_push("Format_has_JSON_Format",
+            crate::ast::fact_from_pairs(&[("Format", "email"), ("JSON Format", "email")]), &state);
+        state = crate::ast::cell_push("Format_has_Pattern",
+            crate::ast::fact_from_pairs(&[("Format", "email"), ("Pattern", "^[^@]+@[^@]+$")]), &state);
+
+        let doc = openapi_for_app(&state, "test-app");
+        let prop = &doc["components"]["schemas"]["User"]["properties"]["email"];
+        assert_eq!(prop["type"], "string",
+            "the CDT base type must survive the Format refinement; got {}", prop);
+        assert_eq!(prop["format"], "email",
+            "the Format's JSON Format must override the CDT catalog's; got {}", prop);
+        assert_eq!(prop["pattern"], "^[^@]+@[^@]+$",
+            "the Format's Pattern must emit as JSON Schema pattern; got {}", prop);
     }
 
     #[test]
