@@ -1501,6 +1501,28 @@ pub struct ProjectionPlan {
 }
 
 pub fn projection_plan(state: &crate::ast::Object) -> ProjectionPlan {
+    projection_plan_inner(state, None)
+}
+
+/// 987-A.3 increment 2 (canary-3 phase split: full plan assembly was
+/// ~60s of the 65s leaf persist phase at 171MB, to refresh 12
+/// tables): assemble Phase-1 rows ONLY for the named tables. Phase 2
+/// (parent id-row fill from FK values) runs unchanged over the scoped
+/// rows, so parents of scoped rows still receive their minimal
+/// id-rows — the scoped WRITER deletes only scoped tables and upserts
+/// everything the plan carries (idempotent for existing parents,
+/// required for first-referenced new ones).
+pub fn projection_plan_scoped(
+    state: &crate::ast::Object,
+    only: &HashSet<String>,
+) -> ProjectionPlan {
+    projection_plan_inner(state, Some(only))
+}
+
+fn projection_plan_inner(
+    state: &crate::ast::Object,
+    only: Option<&HashSet<String>>,
+) -> ProjectionPlan {
     use crate::ast;
     let tables = rmap(state);
     // Borrow-free lookups so `tables` can move into the returned plan:
@@ -1526,6 +1548,9 @@ pub fn projection_plan(state: &crate::ast::Object) -> ProjectionPlan {
     // ── Phase 1: collect every table's rows ────────────────────────
     let mut collected: HashMap<String, Vec<ProjectedRow>> = HashMap::new();
     for table in &tables {
+        // 987-A.3: scoped assembly — skip row assembly for tables the
+        // caller did not name (the dominant plan cost is here).
+        if only.map_or(false, |o| !o.contains(&table.name)) { continue; }
         let is_entity_table = table.primary_key == ["id".to_string()];
         let mut out: Vec<ProjectedRow> = Vec::new();
         if is_entity_table {

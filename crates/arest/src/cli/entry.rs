@@ -369,9 +369,17 @@ mod db {
         // SAME plan the `sql` verb materializes into :memory:. This fn
         // is Phase 4 only: delete children-first, insert parents-first,
         // warn-skip per row.
-        let plan = crate::rmap::projection_plan(d);
+        // 987-A.3 increment 2: the SCOPED plan assembles rows only for
+        // the named tables (plus Phase-2 parent id-rows) — the full
+        // assembly was ~60s of the 65s leaf persist phase at 171MB.
+        let plan = match only {
+            Some(o) => crate::rmap::projection_plan_scoped(d, o),
+            None => crate::rmap::projection_plan(d),
+        };
 
         for name in plan.order.iter().rev() {
+            // DELETE only the scoped tables — unscoped tables keep
+            // their rows (their cells did not change).
             if only.map_or(false, |o| !o.contains(name)) { continue; }
             let exists: bool = conn.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -382,7 +390,10 @@ mod db {
             }
         }
         for name in &plan.order {
-            if only.map_or(false, |o| !o.contains(name)) { continue; }
+            // INSERT everything the (scoped) plan carries: scoped
+            // tables fully, plus parent id-rows from Phase 2 — upsert
+            // is idempotent for existing parents and required for a
+            // first-referenced new parent id.
             let Some(rows) = plan.rows.get(name) else { continue };
             if rows.is_empty() { continue; }
             let exists: bool = conn.query_row(
@@ -1602,6 +1613,12 @@ fn try_leaf_ingest(
     // diff (Object clones are Arc bumps — shallow and cheap).
     let snapshot = loaded.clone();
     let t_load = t0.elapsed();
+    // 987-A.3 increment 2: per-phase wall clocks. Canary-2 showed
+    // ingest-2 at 773s with load 18.3s + chain 20 facts + persist 21
+    // cells — i.e. ~740s in the un-instrumented middle. This summary
+    // line is what increment 2's next kill gets chosen from.
+    let mut laps: Vec<(&str, std::time::Duration)> = Vec::new();
+    let mut t_phase = std::time::Instant::now();
     // Parse ONLY the changed files, in readings order, each against
     // the ACCUMULATED context (prior state + earlier changed files).
     // The prior state carries the complete metamodel + app schema
@@ -1631,10 +1648,23 @@ fn try_leaf_ingest(
     let mut merged = loaded;
     let schema_rows_before: Vec<usize> = LEAF_SCHEMA_CELLS.iter()
         .map(|n| cell_rows(&merged, n)).collect();
+    // 987-A.3 increment 2 (canary-3: parse+gate was 17.6s for a
+    // 14-LINE file): parse against the 3-cell resolution catalog
+    // (Noun / FactType / Role — exactly what the full path's corpus
+    // seed pass extracts, arc issues 14/14b), NOT the whole 171MB
+    // state. Parsed outputs accumulate into the catalog so
+    // cross-file references within one delta still resolve.
+    let mut parse_ctx: ast::Object = {
+        let mut m: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+        for c in ["Noun", "FactType", "Role"] {
+            m.insert(c.to_string(), ast::fetch_cell_seq(c, &merged));
+        }
+        ast::Object::map(m)
+    };
     let mut targets: hashbrown::HashSet<String> = hashbrown::HashSet::new();
     for (name, text) in readings.iter().filter(|(n, _)| changed.iter().any(|c| c == n)) {
         let this = match parse_forml2::parse_to_state_from_in_domain(
-            text.as_str(), &merged, name.as_str()) {
+            text.as_str(), &parse_ctx, name.as_str()) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("[load] leaf-ingest declined: {}: {} (the full \
@@ -1648,6 +1678,7 @@ fn try_leaf_ingest(
             .filter(|(_, c)| c.as_seq().map(|s| !s.is_empty()).unwrap_or(false)
                 || c.as_map().map(|m| !m.is_empty()).unwrap_or(false))
             .map(|(n, _)| n.to_string()));
+        parse_ctx = ast::merge_states(&parse_ctx, &this);
         merged = ast::merge_states(&merged, &this);
     }
     if targets.is_empty() {
@@ -1668,18 +1699,21 @@ fn try_leaf_ingest(
             return false;
         }
     }
+    laps.push(("parse+gate", t_phase.elapsed())); t_phase = std::time::Instant::now();
     // UC upsert (984-B parity): corrected single-valued facts in the
     // changed files displace stale priors at the same key BEFORE the
     // chain reads the population — same order as the full path.
-    let d = {
+    let (d, reconciled_cells) = {
         let key_roles = crate::evaluate::read_cell_key_roles(&merged);
         let (next, displaced) = ast::reconcile_keyed_cells(&merged, &key_roles);
         for (cell, n) in &displaced {
             eprintln!("[load] UC upsert (leaf): {} — {} stale row(s) displaced \
                        by a later value at the same key", cell, n);
         }
-        next
+        let names: Vec<String> = displaced.iter().map(|(c, _)| c.clone()).collect();
+        (next, names)
     };
+    laps.push(("reconcile", t_phase.elapsed())); t_phase = std::time::Instant::now();
     // compile-chain-before-reflect-lag, LEAF half: the full path now
     // reflects schema-as-facts BEFORE its chain; mirror that here or
     // the leaf chain cannot see membership/schema reflections for the
@@ -1702,6 +1736,7 @@ fn try_leaf_ingest(
         }
         ast::Object::map(map)
     };
+    laps.push(("reflect-pre", t_phase.elapsed())); t_phase = std::time::Instant::now();
     // Seeded chain — the apply path's exact rule pack: user rules +
     // the synthetic SM family, sidecars as stored. Seed = the cells
     // the changed files wrote PLUS the reflection cells the delta
@@ -1715,13 +1750,48 @@ fn try_leaf_ingest(
             .collect()
     };
     let mut rules = collect("derivation:rule_", &d);
-    rules.extend(collect("derivation:_sm_init_", &d));
-    rules.extend(collect("derivation:_sm_event_fold_", &d));
-    rules.extend(collect("derivation:_sm_for_resource_backfill_", &d));
-    rules.extend(collect("derivation:_sm_instance_of_def_backfill_", &d));
+    // 987-A.3 increment 2 (canary-3 phase split: chain = 299s of the
+    // 511s wall, with only 20 facts derived): the SM fold family is
+    // deliberately sidecar-less and re-folds EVERY resource of EVERY
+    // SM noun each round (compile.rs sm-retire note). On the leaf
+    // path that is provably wasted work for untouched nouns: their
+    // event/primary cells are unchanged, so the deterministic fold
+    // output is already in the state (AREST.tex Thm Derivability) —
+    // no new facts are possible, and skipping cannot change the LFP.
+    // Pack the SM family ONLY for nouns the delta touches: FT cell
+    // ids prefix their subject noun (`Run_plays_Game` → noun `Run`),
+    // and unary trigger cells share the prefix. The membership cell
+    // changing does NOT touch other nouns: its new rows belong to
+    // the delta's own (touched-noun) resources.
+    const SM_FAMILIES: [&str; 4] = [
+        "derivation:_sm_init_", "derivation:_sm_event_fold_",
+        "derivation:_sm_for_resource_backfill_",
+        "derivation:_sm_instance_of_def_backfill_",
+    ];
+    let touched_noun = |noun_suffix: &str| -> bool {
+        let prefix = alloc::format!("{}_", noun_suffix.replace(' ', "_"));
+        targets.iter().any(|t| t.starts_with(prefix.as_str()))
+    };
+    let mut n_sm_total = 0usize;
+    for family in SM_FAMILIES {
+        for (n, contents) in ast::cells_iter(&d).into_iter()
+            .filter(|(n, _)| n.starts_with(family)) {
+            n_sm_total += 1;
+            if touched_noun(&n[family.len()..]) {
+                rules.push((n.to_string(), ast::metacompose(contents, &d)));
+            }
+        }
+    }
+    let n_sm_packed = rules.len() - rules.iter()
+        .filter(|(n, _)| n.starts_with("derivation:rule_")).count();
+    if n_sm_total > n_sm_packed {
+        eprintln!("[load] leaf-ingest: SM fold pack noun-scoped — {} of {} \
+                   SM defs packed (untouched nouns' folds are deterministic \
+                   no-ops, skipped)", n_sm_packed, n_sm_total);
+    }
     let n_rules = rules.len();
-    let (d, n_derived) = if rules.is_empty() {
-        (d, 0usize)
+    let (d, n_derived, chain_written) = if rules.is_empty() {
+        (d, 0usize, hashbrown::HashSet::<String>::new())
     } else {
         let packed: Vec<(&str, &ast::Func, Option<Vec<String>>)> = rules.iter()
             .map(|(name, func)| {
@@ -1740,8 +1810,11 @@ fn try_leaf_ingest(
                        the full pipeline");
             return false;
         }
-        (new_d, derived.len())
+        let written: hashbrown::HashSet<String> =
+            derived.iter().map(|f| f.fact_type_id.clone()).collect();
+        (new_d, derived.len(), written)
     };
+    laps.push(("chain", t_phase.elapsed())); t_phase = std::time::Instant::now();
     // Tail parity with the full pipeline, same order: converged-sig
     // stores → persist-dedup → schema reflection → DDL → persist. The
     // reflection re-runs because changed files can mint NEW instances
@@ -1750,14 +1823,19 @@ fn try_leaf_ingest(
     let d = ast::store("_CompileSig", ast::Object::atom(&compile_input_sig(readings)), &d);
     let d = ast::store("_FileSigs", ast::Object::atom(&encode_file_sigs(readings)), &d);
     // 987-A.3: SCOPED dedup — GC+dedup only the cells this ingest
-    // touched so far (vs the load snapshot). The full sweep would
-    // re-encode untouched cells (φ-canonicalization) and mark the
-    // whole store dirty in the delta diff below.
-    let touched: hashbrown::HashSet<String> = {
-        let delta = ast::diff_cells(&snapshot, &d);
-        ast::cells_iter(&delta).into_iter().map(|(n, _)| n.to_string()).collect()
-    };
+    // touched. Increment 2 (canary-3: the diff computing this set
+    // cost 16.2s of full-store compares): build it from what we
+    // ALREADY KNOW wrote — parse targets (reflect-moved cells
+    // included), chain-derived consequents, reconcile-displaced
+    // cells — instead of diffing the whole store. One full diff per
+    // ingest remains (the persist delta below); equivalence is
+    // guarded by the A/B fixture.
+    let touched: hashbrown::HashSet<String> = targets.iter().cloned()
+        .chain(chain_written.iter().cloned())
+        .chain(reconciled_cells.iter().cloned())
+        .collect();
     let d = super::dedup_state_for_persist_scoped(&d, &touched);
+    laps.push(("dedup-scoped+diff1", t_phase.elapsed())); t_phase = std::time::Instant::now();
     let d = {
         let mut map: hashbrown::HashMap<String, ast::Object> =
             ast::cells_iter(&d).into_iter()
@@ -1768,6 +1846,7 @@ fn try_leaf_ingest(
         }
         ast::Object::map(map)
     };
+    laps.push(("reflect-tail", t_phase.elapsed())); t_phase = std::time::Instant::now();
     // 987-A.3 delta persist: final diff vs the load snapshot — the
     // exact cell set this ingest changed (parse + chain + reconcile +
     // dedup + reflect inclusive; reflect layers that reproduced their
@@ -1783,6 +1862,7 @@ fn try_leaf_ingest(
         .filter(|(n, _)| !final_names.contains(n))
         .map(|(n, _)| n.to_string())
         .collect();
+    laps.push(("diff-final", t_phase.elapsed())); t_phase = std::time::Instant::now();
     if !vanished.is_empty() {
         eprintln!("[load] leaf-ingest: {} cell(s) vanished {:?} — additive \
                    contract anomaly; falling back to the FULL persist",
@@ -1797,6 +1877,7 @@ fn try_leaf_ingest(
                    projection table(s) refreshed ({} cells total in store)",
             n_cells, n_tables, final_names.len());
     }
+    laps.push(("persist", t_phase.elapsed())); t_phase = std::time::Instant::now();
     // 987-A.3: refresh the loadcache sidecar IN PLACE — the leaf path
     // holds the final tree, so the NEXT reader pays a sidecar decode
     // (~13s at 171MB) instead of a full re-parse (~98s measured).
@@ -1806,6 +1887,11 @@ fn try_leaf_ingest(
             eprintln!("[load] leaf-ingest: loadcache sidecar refreshed in place");
         }
     }
+    laps.push(("sidecar", t_phase.elapsed()));
+    eprintln!("[load] leaf-ingest phases: load {:?}, {}",
+        t_load,
+        laps.iter().map(|(n, dur)| alloc::format!("{} {:?}", n, dur))
+            .collect::<Vec<_>>().join(", "));
     eprintln!("[load] leaf-ingest EXECUTED: {} changed file(s) {:?} → {} target \
                cell(s); {} rule def(s) packed (seeded), {} fact(s) derived; \
                {} cell(s) in the persist delta; load {:?}, total {:?}. \
