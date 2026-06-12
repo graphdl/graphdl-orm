@@ -154,6 +154,31 @@ pub mod entry;
 // 1160` to call this helper too, so the three sites stop drifting.
 #[cfg(all(not(feature = "no_std"), feature = "local"))]
 pub(crate) fn dedup_state_for_persist(d: &crate::ast::Object) -> crate::ast::Object {
+    dedup_state_for_persist_inner(d, None)
+}
+
+/// 987-A.3 (delta tail): scoped variant for the leaf-ingest path —
+/// GC+dedup ONLY the named cells, pass every other cell through
+/// UNTOUCHED. The full sweep re-encodes unchanged cells
+/// (φ-canonicalization, identity dedup), which would mark them
+/// changed in the leaf path's post-tail diff and defeat the delta
+/// persist (every cell would look dirty every ingest).
+#[cfg(all(not(feature = "no_std"), feature = "local"))]
+pub(crate) fn dedup_state_for_persist_scoped(
+    d: &crate::ast::Object,
+    scope: &hashbrown::HashSet<String>,
+) -> crate::ast::Object {
+    dedup_state_for_persist_inner(d, Some(scope))
+}
+
+// Shares the cfg of its callers: the body calls the local-only
+// case-collision detector (the cfg the refactor briefly dropped —
+// gate-2/default went red on E0425; this is the restore).
+#[cfg(all(not(feature = "no_std"), feature = "local"))]
+fn dedup_state_for_persist_inner(
+    d: &crate::ast::Object,
+    scope: Option<&hashbrown::HashSet<String>>,
+) -> crate::ast::Object {
     use crate::ast;
     let ft_ids: hashbrown::HashSet<String> =
         ast::fetch_cell_seq("FactType", d).as_seq()
@@ -195,7 +220,12 @@ pub(crate) fn dedup_state_for_persist(d: &crate::ast::Object) -> crate::ast::Obj
     }
     let map: hashbrown::HashMap<String, ast::Object> =
         ast::cells_iter(d).into_iter()
-            .map(|(name, contents)| if ft_ids.contains(name) {
+            .map(|(name, contents)| if scope.map_or(false, |s| !s.contains(name)) {
+                // scoped pass-through (987-A.3): untouched cells keep
+                // their exact prior encoding so the delta diff stays
+                // delta-sized.
+                (name.to_string(), contents.clone())
+            } else if ft_ids.contains(name) {
                 (name.to_string(), ast::dedup_cell_facts(
                     &ast::drop_subjectless_facts_with_arity(contents, ft_arity.get(name).copied())))
             } else if !name.contains(':') {

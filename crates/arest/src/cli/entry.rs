@@ -247,6 +247,46 @@ mod db {
             .unwrap_or_else(|e| { eprintln!("Commit failed: {}", e); std::process::exit(1); });
     }
 
+    /// 987-A.3 increment 1 — delta persist for the leaf path. The full
+    /// `persist_state` is DELETE-ALL + rewrite of every cell, every
+    /// def, and every 3NF projection table — O(population) per persist
+    /// (the dominant share of the measured ~700s leaf tail at 171MB).
+    /// The leaf path knows its exact delta, so:
+    ///   - cells: upsert ONLY the changed ones (the caller verified
+    ///     nothing vanished — it falls back to the full persist
+    ///     otherwise, loudly);
+    ///   - defs: untouched (schema unchanged ⇒ defs unchanged by
+    ///     construction on the leaf path);
+    ///   - 3NF projection: scoped to tables sourcing a changed cell.
+    /// Returns (cells upserted, projection tables refreshed).
+    #[cfg(feature = "local")]
+    pub fn persist_state_delta(
+        conn: &Connection,
+        d: &ast::Object,
+        changed: &hashbrown::HashSet<String>,
+    ) -> (usize, usize) {
+        let tx = conn.unchecked_transaction()
+            .unwrap_or_else(|e| { eprintln!("Transaction failed: {}", e); std::process::exit(1); });
+        let mut n_cells = 0usize;
+        for (name, contents) in ast::cells_iter(d).into_iter() {
+            if !changed.contains(name) { continue; }
+            if name.contains(':') || ["validate", "compile", "apply",
+                "verify_signature", "debug", "_defs_compiled"].contains(&name) {
+                continue; // def surface — unchanged by construction
+            }
+            let json = contents.to_string();
+            tx.execute(
+                "INSERT OR REPLACE INTO cells (name, contents) VALUES (?1, ?2)",
+                params![name, json],
+            ).unwrap_or_else(|e| { eprintln!("Failed to store cell {}: {}", name, e); std::process::exit(1); });
+            n_cells += 1;
+        }
+        let n_tables = project_population_rows_scoped(&tx, d, changed);
+        tx.commit()
+            .unwrap_or_else(|e| { eprintln!("Commit failed: {}", e); std::process::exit(1); });
+        (n_cells, n_tables)
+    }
+
     /// rmap-3nf-tables Stage 1b — project population cells into the
     /// 3NF RMAP tables (wholesale refresh, mirroring the cells
     /// DELETE+reINSERT above; the tables are a PROJECTION, cells are
@@ -278,7 +318,7 @@ mod db {
         // projection error rolls back to this savepoint and the persist
         // proceeds without the projection.
         if conn.execute_batch("SAVEPOINT rmap_projection;").is_err() { return; }
-        let ok = project_population_rows_inner(conn, d);
+        let ok = project_population_rows_inner(conn, d, None);
         if ok {
             let _ = conn.execute_batch("RELEASE rmap_projection;");
         } else {
@@ -287,7 +327,43 @@ mod db {
         }
     }
 
-    fn project_population_rows_inner(conn: &Connection, d: &ast::Object) -> bool {
+    /// 987-A.3 (delta tail): refresh ONLY the 3NF tables one of whose
+    /// columns sources a changed cell. Row assembly still builds the
+    /// full plan (v1 — measure before pushing the filter into
+    /// `rmap::projection_plan`); the DELETE+reINSERT is scoped, which
+    /// is where the wholesale-refresh sqlite time went. Deferred FKs
+    /// make in-transaction parent rewrites safe: the scoped tables are
+    /// fully re-assembled from the complete plan, so every key a child
+    /// row references is back before commit. Returns the number of
+    /// affected tables.
+    #[cfg(feature = "local")]
+    pub fn project_population_rows_scoped(
+        conn: &Connection,
+        d: &ast::Object,
+        changed: &hashbrown::HashSet<String>,
+    ) -> usize {
+        let affected: hashbrown::HashSet<String> = crate::rmap::rmap(d).iter()
+            .filter(|t| t.columns.iter().any(|c|
+                c.source_cell.as_deref().map_or(false, |s| changed.contains(s))))
+            .map(|t| t.name.clone())
+            .collect();
+        if affected.is_empty() { return 0; }
+        if conn.execute_batch("SAVEPOINT rmap_projection;").is_err() { return 0; }
+        let ok = project_population_rows_inner(conn, d, Some(&affected));
+        if ok {
+            let _ = conn.execute_batch("RELEASE rmap_projection;");
+        } else {
+            eprintln!("Warning: scoped 3NF row projection rolled back (cells persist unaffected)");
+            let _ = conn.execute_batch("ROLLBACK TO rmap_projection; RELEASE rmap_projection;");
+        }
+        affected.len()
+    }
+
+    fn project_population_rows_inner(
+        conn: &Connection,
+        d: &ast::Object,
+        only: Option<&hashbrown::HashSet<String>>,
+    ) -> bool {
         // rmap-3nf-tables Stage 2: Phases 1–3 (collect, parent-fill
         // fixpoint, Kahn order) live in `rmap::projection_plan` — the
         // SAME plan the `sql` verb materializes into :memory:. This fn
@@ -296,6 +372,7 @@ mod db {
         let plan = crate::rmap::projection_plan(d);
 
         for name in plan.order.iter().rev() {
+            if only.map_or(false, |o| !o.contains(name)) { continue; }
             let exists: bool = conn.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
                 params![name], |r| r.get::<_, i64>(0)).map(|n| n > 0).unwrap_or(false);
@@ -305,6 +382,7 @@ mod db {
             }
         }
         for name in &plan.order {
+            if only.map_or(false, |o| !o.contains(name)) { continue; }
             let Some(rows) = plan.rows.get(name) else { continue };
             if rows.is_empty() { continue; }
             let exists: bool = conn.query_row(
@@ -1520,6 +1598,9 @@ fn try_leaf_ingest(
     // parse context and the merge base. Rides the loadcache sidecar
     // when fresh (459b3900).
     let loaded = load_state_cached(conn, db_path);
+    // 987-A.3: keep the load-time snapshot for the end-of-tail delta
+    // diff (Object clones are Arc bumps — shallow and cheap).
+    let snapshot = loaded.clone();
     let t_load = t0.elapsed();
     // Parse ONLY the changed files, in readings order, each against
     // the ACCUMULATED context (prior state + earlier changed files).
@@ -1668,7 +1749,15 @@ fn try_leaf_ingest(
     // them); every reflection layer is set-replace idempotent.
     let d = ast::store("_CompileSig", ast::Object::atom(&compile_input_sig(readings)), &d);
     let d = ast::store("_FileSigs", ast::Object::atom(&encode_file_sigs(readings)), &d);
-    let d = super::dedup_state_for_persist(&d);
+    // 987-A.3: SCOPED dedup — GC+dedup only the cells this ingest
+    // touched so far (vs the load snapshot). The full sweep would
+    // re-encode untouched cells (φ-canonicalization) and mark the
+    // whole store dirty in the delta diff below.
+    let touched: hashbrown::HashSet<String> = {
+        let delta = ast::diff_cells(&snapshot, &d);
+        ast::cells_iter(&delta).into_iter().map(|(n, _)| n.to_string()).collect()
+    };
+    let d = super::dedup_state_for_persist_scoped(&d, &touched);
     let d = {
         let mut map: hashbrown::HashMap<String, ast::Object> =
             ast::cells_iter(&d).into_iter()
@@ -1679,15 +1768,51 @@ fn try_leaf_ingest(
         }
         ast::Object::map(map)
     };
-    db::apply_ddl(conn, &d);
-    db::persist_state(conn, &d);
+    // 987-A.3 delta persist: final diff vs the load snapshot — the
+    // exact cell set this ingest changed (parse + chain + reconcile +
+    // dedup + reflect inclusive; reflect layers that reproduced their
+    // prior bytes drop out of the diff naturally). A vanished cell
+    // would mean the additive contract broke somewhere — fall back to
+    // the full persist, loudly.
+    let final_delta = ast::diff_cells(&snapshot, &d);
+    let changed_cells: hashbrown::HashSet<String> =
+        ast::cells_iter(&final_delta).into_iter().map(|(n, _)| n.to_string()).collect();
+    let final_names: hashbrown::HashSet<&str> =
+        ast::cells_iter(&d).into_iter().map(|(n, _)| n).collect();
+    let vanished: Vec<String> = ast::cells_iter(&snapshot).into_iter()
+        .filter(|(n, _)| !final_names.contains(n))
+        .map(|(n, _)| n.to_string())
+        .collect();
+    if !vanished.is_empty() {
+        eprintln!("[load] leaf-ingest: {} cell(s) vanished {:?} — additive \
+                   contract anomaly; falling back to the FULL persist",
+            vanished.len(), vanished);
+        db::apply_ddl(conn, &d);
+        db::persist_state(conn, &d);
+    } else {
+        // Schema unchanged by construction ⇒ tables/triggers exist:
+        // skip apply_ddl (and its fossil sweep) entirely.
+        let (n_cells, n_tables) = db::persist_state_delta(conn, &d, &changed_cells);
+        eprintln!("[load] leaf-ingest delta-persist: {} cell(s) upserted, {} \
+                   projection table(s) refreshed ({} cells total in store)",
+            n_cells, n_tables, final_names.len());
+    }
+    // 987-A.3: refresh the loadcache sidecar IN PLACE — the leaf path
+    // holds the final tree, so the NEXT reader pays a sidecar decode
+    // (~13s at 171MB) instead of a full re-parse (~98s measured).
+    if let Some(path) = db_path {
+        if let Some(key) = db_load_cache_key(path) {
+            crate::loadcache::store(std::path::Path::new(path), key, &d);
+            eprintln!("[load] leaf-ingest: loadcache sidecar refreshed in place");
+        }
+    }
     eprintln!("[load] leaf-ingest EXECUTED: {} changed file(s) {:?} → {} target \
                cell(s); {} rule def(s) packed (seeded), {} fact(s) derived; \
-               load {:?}, total {:?}. Additive contract: a REMOVED instance \
-               line does not retract on this path — the next full compile \
-               reconciles.",
+               {} cell(s) in the persist delta; load {:?}, total {:?}. \
+               Additive contract: a REMOVED instance line does not retract on \
+               this path — the next full compile reconciles.",
         changed.len(), changed, targets.len(), n_rules, n_derived,
-        t_load, t0.elapsed());
+        changed_cells.len(), t_load, t0.elapsed());
     true
 }
 
