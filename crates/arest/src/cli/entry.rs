@@ -1930,6 +1930,134 @@ fn try_leaf_ingest(
     true
 }
 
+/// load-state-cache-or-warm-engine LEVER B — warm engine v1 (user
+/// 6/30 deadline escalation, 2026-06-12). Hold the decoded state
+/// RESIDENT and serve the single-SYSTEM verb protocol over TCP
+/// localhost: the per-call spawn cost (process boot + 13-25s state
+/// decode at arc scale) drops to zero for routed calls.
+///
+/// Protocol: one request per connection — a single JSON line
+/// `{"key": "...", "input": "..."}` — answered with the verb's raw
+/// output; connection closes. SINGLE-THREADED accept loop: writes
+/// serialize by construction (closes R2, the snapshot race) and an
+/// in-flight op always completes atomically even if the client
+/// vanishes (closes R1 — committed-after-abandon is logged, not
+/// lost).
+///
+/// Lifecycle: a port file `<db>.warm` (port / pid / binary hash)
+/// advertises the process; callers route to it when live, else fall
+/// back to per-call spawn — zero-config compat. The loop exits
+/// CLEANLY (sidecar refreshed, port file removed) when the on-disk
+/// binary changes (redeploy) or a FOREIGN process writes the db
+/// (spawn-path recompile) — fallback serves until `serve` restarts.
+///
+/// Persistence: mutating verbs delta-persist immediately (changed
+/// cells + scoped 3NF projection; full persist on the rare vanished
+/// cell). The loadcache sidecar refreshes on EXIT, not per write —
+/// a per-write refresh costs ~6-10s at arc scale and only benefits
+/// fallback spawns; the tradeoff (one re-parse on the first fallback
+/// call after unflushed writes) is recorded here deliberately.
+#[cfg(feature = "local")]
+fn serve_loop(conn: &rusqlite::Connection, db_path: &str) -> ! {
+    use std::io::{BufRead, BufReader, Write as IoWrite};
+    let exe_disk_sig = |p: &std::path::Path| -> u64 {
+        let md = std::fs::metadata(p).ok();
+        let len = md.as_ref().map(|m| m.len()).unwrap_or(0);
+        let mtime = md.and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|dur| dur.as_nanos() as u64).unwrap_or(0);
+        let mut h: u64 = 0xcbf29ce484222325;
+        for v in [len, mtime] {
+            for b in v.to_le_bytes() { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+        }
+        h
+    };
+    let exe_path = std::env::current_exe().ok();
+    let my_exe_sig = exe_path.as_deref().map(exe_disk_sig);
+    let t0 = std::time::Instant::now();
+    let mut d = load_and_compile(conn, Some(db_path));
+    eprintln!("[serve] state resident in {:?}", t0.elapsed());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap_or_else(|e| { eprintln!("serve: bind failed: {}", e); std::process::exit(1); });
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    let warm_path = alloc::format!("{}.warm", db_path);
+    let _ = std::fs::write(&warm_path, alloc::format!(
+        "{}\n{}\n{:016x}\n", port, std::process::id(), binary_self_hash()));
+    let db_mtime = || std::fs::metadata(db_path).ok().and_then(|m| m.modified().ok());
+    let mut last_mtime = db_mtime();
+    eprintln!("[serve] warm engine: 127.0.0.1:{} db={} pid={} (port file {})",
+        port, db_path, std::process::id(), warm_path);
+    let cleanup_exit = |state: &ast::Object, why: &str| -> ! {
+        eprintln!("[serve] exiting: {} — sidecar refresh + port-file removal", why);
+        if let Some(key) = db_load_cache_key(db_path) {
+            crate::loadcache::store(std::path::Path::new(db_path), key, state);
+        }
+        let _ = std::fs::remove_file(&warm_path);
+        std::process::exit(0);
+    };
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { continue };
+        if let (Some(p), Some(sig)) = (exe_path.as_deref(), my_exe_sig) {
+            if exe_disk_sig(p) != sig {
+                cleanup_exit(&d, "binary changed on disk (redeploy)");
+            }
+        }
+        if db_mtime() != last_mtime {
+            cleanup_exit(&d, "db written by a foreign process");
+        }
+        let mut reader = BufReader::new(&stream);
+        let mut line = String::new();
+        if reader.read_line(&mut line).is_err() || line.trim().is_empty() { continue; }
+        let (key, input) = match serde_json::from_str::<serde_json::Value>(line.trim()) {
+            Ok(v) => (
+                v.get("key").and_then(|k| k.as_str()).unwrap_or("").to_string(),
+                v.get("input").and_then(|i| i.as_str()).unwrap_or("").to_string(),
+            ),
+            Err(e) => {
+                let mut s = stream;
+                let _ = writeln!(s, "{{\"error\":\"bad request: {}\"}}", e);
+                continue;
+            }
+        };
+        if key.is_empty() {
+            let mut s = stream;
+            let _ = writeln!(s, "{{\"error\":\"missing key\"}}");
+            continue;
+        }
+        if key == "shutdown" { cleanup_exit(&d, "shutdown requested"); }
+        let t_req = std::time::Instant::now();
+        let (output, new_d) = system(&key, &input, &d);
+        if new_d != d {
+            // Delta-persist the mutation immediately (same machinery as
+            // the leaf tail); the resident tree is the source of truth.
+            let delta = ast::diff_cells(&d, &new_d);
+            let changed: hashbrown::HashSet<String> = ast::cells_iter(&delta)
+                .into_iter().map(|(n, _)| n.to_string()).collect();
+            let vanished = {
+                let new_names: hashbrown::HashSet<&str> =
+                    ast::cells_iter(&new_d).into_iter().map(|(n, _)| n).collect();
+                ast::cells_iter(&d).into_iter().any(|(n, _)| !new_names.contains(n))
+            };
+            if vanished {
+                db::apply_ddl(conn, &new_d);
+                db::persist_state(conn, &new_d);
+            } else {
+                let (_nc, _nt) = db::persist_state_delta(conn, &new_d, &changed);
+            }
+            d = new_d;
+            last_mtime = db_mtime();
+        }
+        eprintln!("[serve] {} in {:?}", key, t_req.elapsed());
+        let mut s = stream;
+        // Best-effort response: a vanished client cannot un-commit the
+        // op above (R1 — committed-after-abandon, logged not lost).
+        if writeln!(s, "{}", output).is_err() {
+            eprintln!("[serve] client vanished after {} — result committed, response dropped", key);
+        }
+    }
+    cleanup_exit(&d, "listener closed");
+}
+
 /// load-state-cache lever A: the sidecar key — a function of the
 /// engine identity (binary self-hash; a rebuilt engine must never
 /// serve a stale tree) and the db file identity (length + mtime; any
@@ -2401,6 +2529,14 @@ pub fn main_entry() {
 
         let conn = db::open(&db_path);
         db::ensure_meta_tables(&conn);
+
+        // load-state-cache-or-warm-engine LEVER B: `arest-cli serve
+        // --db <path>` — the warm engine. Never returns (exits on
+        // redeploy / foreign write / shutdown verb).
+        #[cfg(feature = "local")]
+        if non_dirs.first().map(|s| s.as_str()) == Some("serve") {
+            serve_loop(&conn, &db_path);
+        }
 
         match (dirs.is_empty(), non_dirs.len()) {
             // arest <dir1> [<dir2> ...] — compile readings via SYSTEM

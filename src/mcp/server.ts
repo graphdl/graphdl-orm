@@ -47,6 +47,7 @@ import { readFileSync, writeFileSync, readdirSync, existsSync } from 'fs'
 import { resolve, dirname, join } from 'path'
 import { fileURLToPath } from 'url'
 import { spawn, execFileSync } from 'child_process'
+import { connect as netConnect } from 'net'
 import {
   buildAppCompileArgs,
   checkArestApps,
@@ -618,8 +619,49 @@ export function cliCallPlan(
 }
 
 function cliSystemCall(key: string, input: string, scope?: CallScope): Promise<string> {
-  const plan = cliCallPlan(currentDbPath(scope), key, input)
-  return runArestCli(plan.args, plan.stdin)
+  const db = currentDbPath(scope)
+  const plan = cliCallPlan(db, key, input)
+  return tryWarmCall(db, key, input).then(warm =>
+    warm !== null ? warm : runArestCli(plan.args, plan.stdin))
+}
+
+/**
+ * load-state-cache-or-warm-engine LEVER B (warm engine v1): when an
+ * `arest-cli serve` process advertises itself via the `<db>.warm`
+ * port file, route the verb over TCP to the RESIDENT engine instead
+ * of spawning a per-call process (which pays a full state decode —
+ * 13-25s at arc scale — before any work). Falls back to the spawn
+ * path on ANY failure: missing/stale port file, refused connection,
+ * timeout, empty response — zero-config compat, nothing breaks when
+ * the warm process is absent. Binary-staleness is enforced
+ * SERVER-side (the serve loop self-exits when the on-disk exe or db
+ * changes), so a live socket implies a current engine.
+ *
+ * The connect timeout is disabled once connected: long verbs (an
+ * apply runs its full derive→validate→persist pipeline) send nothing
+ * until done, and an idle timeout would kill them mid-op.
+ */
+function tryWarmCall(dbPath: string, key: string, input: string): Promise<string | null> {
+  try {
+    const warmFile = `${dbPath}.warm`
+    if (!existsSync(warmFile)) return Promise.resolve(null)
+    const port = parseInt(readFileSync(warmFile, 'utf8').split('\n')[0] ?? '', 10)
+    if (!port || Number.isNaN(port)) return Promise.resolve(null)
+    return new Promise<string | null>(resolveWarm => {
+      const sock = netConnect({ host: '127.0.0.1', port, timeout: 2000 }, () => {
+        sock.setTimeout(0)
+        sock.write(JSON.stringify({ key, input }) + '\n')
+      })
+      let buf = ''
+      sock.setEncoding('utf8')
+      sock.on('data', chunk => { buf += chunk })
+      sock.on('end', () => resolveWarm(buf.trim().length > 0 ? buf.trim() : null))
+      sock.on('error', () => resolveWarm(null))
+      sock.on('timeout', () => { sock.destroy(); resolveWarm(null) })
+    })
+  } catch {
+    return Promise.resolve(null)
+  }
 }
 
 // Read the repo's current HEAD SHA for the engine_version staleness
