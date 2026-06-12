@@ -233,6 +233,13 @@ pub mod viewproj;
 // stdout/stderr and read process argv.
 #[cfg(not(feature = "no_std"))]
 pub mod cli;
+// load-state sidecar cache (task load-state-cache-or-warm-engine,
+// lever A): binary codec + keyed sidecar file that lets a CLI spawn
+// skip the Object::parse pass over the whole cells/defs store when the
+// db is unchanged. std-only (filesystem); consumed by cli::entry's
+// load sites.
+#[cfg(not(feature = "no_std"))]
+pub(crate) mod loadcache;
 // Engine-level Platform fn bodies (zip codec #404, MIME sniffing #402,
 // file search #408, the §5.2 reference HTML renderer). The long-noted
 // "engine-owner wires `pub mod platform;` in a follow-up" (Cargo.toml

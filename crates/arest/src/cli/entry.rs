@@ -1197,10 +1197,61 @@ fn population_only(loaded: &ast::Object) -> ast::Object {
     ast::Object::map(kept)
 }
 
+/// load-state-cache lever A: the sidecar key — a function of the
+/// engine identity (binary self-hash; a rebuilt engine must never
+/// serve a stale tree) and the db file identity (length + mtime; any
+/// SQLite commit moves them, so writes self-invalidate and the next
+/// reader re-parses once and rewrites the sidecar).
 #[cfg(feature = "local")]
-fn load_and_compile(conn: &rusqlite::Connection) -> ast::Object {
-    let t = std::time::Instant::now();
+fn db_load_cache_key(db_path: &str) -> Option<u64> {
+    let md = std::fs::metadata(db_path).ok()?;
+    let mtime = md.modified().ok()?
+        .duration_since(std::time::UNIX_EPOCH).ok()?
+        .as_nanos() as u64;
+    let mut h: u64 = 0xcbf29ce484222325;
+    for v in [binary_self_hash(), md.len(), mtime] {
+        for b in v.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    Some(h)
+}
+
+/// `db::load_state` behind the sidecar cache (task
+/// load-state-cache-or-warm-engine, lever A): a HIT decodes the binary
+/// tree (no tokenization — the ~2-minute `Object::parse` pass over a
+/// 113 MB cells store drops to the file read + decode); a MISS parses
+/// as before and writes the sidecar for every later spawn. Read-side
+/// only by design: persist is NOT hooked, so the first reader after
+/// any write pays one parse and the cache can never diverge from what
+/// `load_state` would return. `AREST_LOAD_CACHE=0` bypasses entirely.
+#[cfg(feature = "local")]
+fn load_state_cached(conn: &rusqlite::Connection, db_path: Option<&str>) -> ast::Object {
+    let cache_on = std::env::var("AREST_LOAD_CACHE").as_deref() != Ok("0");
+    let key = cache_on
+        .then(|| db_path)
+        .flatten()
+        .and_then(db_load_cache_key);
+    if let Some(k) = key {
+        if let Some(state) = crate::loadcache::load(
+            std::path::Path::new(db_path.unwrap()), k) {
+            eprintln!("[profile] load_state: sidecar cache HIT");
+            return state;
+        }
+    }
     let loaded = db::load_state(conn);
+    if let Some(k) = key {
+        crate::loadcache::store(std::path::Path::new(db_path.unwrap()), k, &loaded);
+        eprintln!("[load] load-state sidecar written (next spawn skips the parse)");
+    }
+    loaded
+}
+
+#[cfg(feature = "local")]
+fn load_and_compile(conn: &rusqlite::Connection, db_path: Option<&str>) -> ast::Object {
+    let t = std::time::Instant::now();
+    let loaded = load_state_cached(conn, db_path);
     eprintln!("[profile] load_state: {:?}", t.elapsed());
     // Strip stale persisted compiled defs — keep population cells only.
     // Recompiled below; a stale orphan must not survive into the apply D.
@@ -1281,21 +1332,24 @@ fn is_read_only_cli_key(key: &str) -> bool {
 /// a stale on-disk `defs` cache is ever suspected — a recompile then
 /// regenerates the def families from the loaded population).
 #[cfg(feature = "local")]
-fn load_for_read(conn: &rusqlite::Connection, key: &str) -> ast::Object {
+fn load_for_read(conn: &rusqlite::Connection, key: &str, db_path: Option<&str>) -> ast::Object {
     if std::env::var("AREST_READ_FASTPATH").as_deref() == Ok("0") {
-        return load_and_compile(conn);
+        return load_and_compile(conn, db_path);
     }
     let t = std::time::Instant::now();
     let d = if key == "sql" {
         // `sql`: load only the defs reachable from the `view:` +
-        // platform-singleton seed (transitively closed).
+        // platform-singleton seed (transitively closed). The def-prune
+        // already makes this load cheap relative to a sidecar decode of
+        // the FULL state, and its byte-identity contract is scoped to
+        // the closure — leave it off the sidecar path.
         db::load_state_closure(conn, |name| {
             name.starts_with("view:") || !name.contains(':')
         })
     } else {
-        // `cells` / `orient`: whole-snapshot consumers — load all defs
-        // so the enumerated / sampled output stays byte-identical.
-        db::load_state(conn)
+        // `cells` / `orient`: whole-snapshot consumers — full load,
+        // sidecar-cached (load-state-cache lever A).
+        load_state_cached(conn, db_path)
     };
     eprintln!("[profile] load_for_read ({}, compile skipped): {:?}", key, t.elapsed());
     d
@@ -2362,9 +2416,9 @@ pub fn main_entry() {
                 // serve straight off the loaded snapshot — skip the
                 // write-only recompile via the lighter `load_for_read`.
                 let d = if is_read_only_cli_key(key) {
-                    load_for_read(&conn, key)
+                    load_for_read(&conn, key, Some(&db_path))
                 } else {
-                    load_and_compile(&conn)
+                    load_and_compile(&conn, Some(&db_path))
                 };
                 // `--no-validate` only affects the compile path of a write
                 // key (a read never validates), so it's a no-op on the
@@ -2383,7 +2437,7 @@ pub fn main_entry() {
 
             // arest --db <path> — REPL mode
             _ => {
-                let mut d = load_and_compile(&conn);
+                let mut d = load_and_compile(&conn, Some(&db_path));
                 if no_validate { d = ast::install_skip_validate(&d); }
 
                 eprintln!("AREST REPL — SYSTEM is the only function.");
