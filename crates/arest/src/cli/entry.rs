@@ -1291,7 +1291,17 @@ fn load_and_compile(conn: &rusqlite::Connection, db_path: Option<&str>) -> ast::
 /// chain — cli-apply-large-tasksdb-nonterminating).
 #[cfg(feature = "local")]
 fn is_read_only_cli_key(key: &str) -> bool {
-    matches!(key, "sql" | "cells" | "orient")
+    // query-read-fastpath (2026-06-12): the `query:{fact_type}` key
+    // family joins the fast path — the MCP query tool dispatches
+    // `query:Task_has_Task_Priority`-shaped keys (server.ts
+    // systemCall), each a pure read-only projection resolving the
+    // PERSISTED `query:{ft}` def (the defs table carries them — the
+    // persist_state test fixture's own example is `query:Ticket`).
+    // Measured on arc-agi-3 (113 MB): ~8s of the 23s steady-state
+    // canary was load_and_compile's recompile, which this skip
+    // removes. `get` stays OFF the fast path: it is federation-aware
+    // (external nouns absorb fetched rows + Citations — a write).
+    matches!(key, "sql" | "cells" | "orient") || key.starts_with("query:")
 }
 
 /// read-path-fast-path: lighter load for the read-only verbs.
@@ -2538,28 +2548,34 @@ mod stale_def_tests {
     }
 
     /// read-path-fast-path guard. The single-SYSTEM dispatch routes
-    /// `sql`/`cells`/`orient` through the lighter `load_for_read` (skip
+    /// the read-only verbs through the lighter `load_for_read` (skip
     /// the write-only recompile) and EVERYTHING else through the full
-    /// `load_and_compile`. These three are the only read-only intercepts
-    /// in `system()` (entry.rs:221/231/240) — each returns D unchanged —
-    /// so they're exactly the keys safe to serve off the loaded snapshot.
-    /// Write keys (`apply`, `compile`, the `retract:`/`assert:` families)
-    /// and any unknown key MUST fall through to the full compile so the
-    /// recompile-from-population (stale-def strip) discipline still runs.
+    /// `load_and_compile`. `sql`/`cells`/`orient` are the read-only
+    /// intercepts in `system()`; `query` joined 2026-06-12
+    /// (query-read-fastpath) — it resolves the persisted `schema:{id}`
+    /// defs exactly as `sql` resolves persisted `view:` defs, the same
+    /// staleness trade. `get` stays off (federation absorb writes).
+    /// Write keys (`apply`, `compile`, the `retract:`/`assert:`
+    /// families) and any unknown key MUST fall through to the full
+    /// compile so the recompile-from-population (stale-def strip)
+    /// discipline still runs.
     #[test]
     fn is_read_only_cli_key_selects_only_pure_read_verbs() {
         // The read-only projection verbs.
         assert!(is_read_only_cli_key("sql"));
         assert!(is_read_only_cli_key("cells"));
         assert!(is_read_only_cli_key("orient"));
-        // Write / mutating keys must keep the full load_and_compile.
+        assert!(is_read_only_cli_key("query:Task_has_Task_Priority"));
+        // Write / mutating / federation-aware keys keep load_and_compile.
         assert!(!is_read_only_cli_key("apply"));
         assert!(!is_read_only_cli_key("compile"));
+        assert!(!is_read_only_cli_key("get"));
         assert!(!is_read_only_cli_key("retract:Task_blocks_Task"));
         assert!(!is_read_only_cli_key("assert:Task_is_epic"));
         // Unknown keys default to the safe (full-compile) path.
         assert!(!is_read_only_cli_key(""));
         assert!(!is_read_only_cli_key("sqlx"));
+        // Bare `query` (no fact type) is not a real dispatch — safe path.
         assert!(!is_read_only_cli_key("query"));
     }
 
