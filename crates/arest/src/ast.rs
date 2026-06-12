@@ -3860,7 +3860,20 @@ fn platform_apply_command(x: &Object, d: &Object) -> Object {
     // `platform_apply_command_*_returns_map_carrier_shape` /
     // `_state_delta_is_map_of_touched_cells` / `_classifies_as_commit_delta`
     // acceptance tests below — #797's #777 linchpin.
-    crate::command::encode_command_result(&result)
+    //
+    // arc-agi-3 engine-issue 15 (TORN BATCH): this MUST be the
+    // `_or_bottom` variant. The single-op platform primitives
+    // (platform_create / update / …) already collapse to ⊥ when the
+    // forward chain aborted on its time budget — but THIS surface (the
+    // `apply` def every MCP/HTTP call rides, including task-930
+    // batches) used the plain encoder, so an abort's half-derived
+    // partial state encoded as a normal CommitDelta carrier and the
+    // host COMMITTED it: a 30-op batch landed its m:n rows while the
+    // entity creates inside the aborted op vanished — dangling
+    // references, atomicity broken (D' != D despite the abort). ⊥ here
+    // routes the dispatcher to the traced-bottom error path: nothing
+    // commits, the batch rejects whole (D' = D).
+    encode_command_result_or_bottom(&result)
 }
 
 /// Merge a JS-side population JSON (`{"facts":[{factType, subject?,
@@ -12796,6 +12809,51 @@ mod tests {
         let facts: alloc::vec::Vec<_> = cell_facts_iter(cell).collect();
         assert_eq!(facts.len(), 2,
             "batch delta must carry both creates' facts in one cell; got {:?}", facts);
+    }
+
+    /// arc-agi-3 engine-issue 15 (TORN BATCH): when the forward chain
+    /// aborts on its time budget mid-apply, `platform_apply_command` —
+    /// the surface every MCP/HTTP apply rides, batches included — must
+    /// collapse to ⊥ so the dispatcher's traced-bottom path rejects the
+    /// whole request (D' = D). Pre-fix it used the plain encoder: the
+    /// half-derived partial state rode back as a normal CommitDelta
+    /// carrier and the host committed a torn batch (m:n rows landed,
+    /// the entity creates inside the aborted op vanished).
+    #[test]
+    fn platform_apply_command_collapses_to_bottom_on_chain_abort() {
+        // The state must carry at least one derivation rule — with an
+        // empty stratum the chain is never invoked and the deadline
+        // guard cannot fire (the original φ-state fixture proved that
+        // the hard way).
+        const READINGS: &str = "Person(.id) is an entity type.\n\
+            Tier is a value type.\n\
+            Name is a value type.\n\n\
+            ## Fact Types\n\n\
+            Person has Name.\n\
+            Person has Tier.\n\n\
+            ## Derivation Rules\n\n\
+            * Person has Tier 'basic' iff Person has Name.\n";
+        let state = crate::parse_forml2::parse_to_state(READINGS).expect("parse");
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let d = defs_to_state(&defs, &state);
+
+        let json = r#"[
+            {"type":"createEntity","noun":"Person","domain":"d","id":"t-1","fields":{"Name":"Eve"}},
+            {"type":"createEntity","noun":"Person","domain":"d","id":"t-2","fields":{"Name":"Mallory"}}
+        ]"#;
+        let input = Object::atom(json);
+        // ZERO budget: every round boundary is already past the
+        // deadline, so the first chain inside the batch aborts.
+        let result = crate::evaluate::with_chain_budget(
+            core::time::Duration::ZERO,
+            || platform_apply_command(&input, &d));
+        assert_eq!(result, Object::Bottom,
+            "an aborted chain must collapse the WHOLE apply to ⊥ — \
+             returning a Map carrier here is the torn-batch bug");
+        // The abort flag must be consumed by the collapse, not leak
+        // into the next command on this thread.
+        assert!(!crate::evaluate::take_chain_abort(),
+            "the ⊥ collapse must clear the abort flag");
     }
 
     #[test]

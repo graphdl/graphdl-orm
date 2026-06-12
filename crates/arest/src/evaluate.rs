@@ -77,7 +77,27 @@ use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 /// zero-sentinel with no clock, so the deadline guard compiles to a
 /// no-op there (those targets run small populations and never render ⊥).
 #[cfg(all(feature = "std-deps", not(target_arch = "wasm32"), not(feature = "no_std")))]
-pub(crate) const CHAIN_BUDGET: core::time::Duration = core::time::Duration::from_secs(180);
+pub(crate) const CHAIN_BUDGET: core::time::Duration = core::time::Duration::from_secs(600);
+
+/// arc-agi-3 engine-issue 15: the first legitimate very-large app
+/// (65 MB db, ~24K instance facts, 98 noun-gated rules) tripped the
+/// guard at 180s — exactly the case the CHAIN_BUDGET doc said to raise
+/// it for. Default is now 600s (still catches genuinely
+/// non-terminating cycles, which spin for hours), and
+/// `AREST_CHAIN_BUDGET_SECS` overrides it per-process for apps whose
+/// honest LFP legitimately needs longer while the 987 delta-scoped
+/// derivation design lands. Read once per process (OnceLock) — the
+/// env lookup never rides the per-round hot path.
+#[cfg(all(feature = "std-deps", not(target_arch = "wasm32"), not(feature = "no_std")))]
+fn chain_budget_default() -> core::time::Duration {
+    static BUDGET: std::sync::OnceLock<core::time::Duration> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("AREST_CHAIN_BUDGET_SECS").ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(core::time::Duration::from_secs)
+            .unwrap_or(CHAIN_BUDGET)
+    })
+}
 
 #[cfg(not(feature = "no_std"))]
 thread_local! {
@@ -126,7 +146,7 @@ pub(crate) fn with_chain_budget<T, F: FnOnce() -> T>(budget: core::time::Duratio
 #[cfg(all(feature = "std-deps", not(target_arch = "wasm32"), not(feature = "no_std")))]
 fn chain_deadline() -> crate::time_shim::Instant {
     let budget = CHAIN_BUDGET_OVERRIDE.with(|c| c.get())
-        .unwrap_or(CHAIN_BUDGET);
+        .unwrap_or_else(chain_budget_default);
     crate::time_shim::Instant::now() + budget
 }
 #[cfg(not(all(feature = "std-deps", not(target_arch = "wasm32"), not(feature = "no_std"))))]
