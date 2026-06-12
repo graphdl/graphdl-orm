@@ -1546,11 +1546,19 @@ fn leaf_only_changed_files(
     Some(changed.into_iter().map(|(n, _)| n.clone()).collect())
 }
 
-/// 987-A.2 opt-in: the leaf EXECUTION path ships dark until arc field
-/// results flip the default. Detection (A.1) always runs and prints.
+/// 987-A.2 → DEFAULT-ON (user directive 2026-06-12, after arc hit the
+/// detection-only line in production: "that shouldn't be necessary").
+/// The v1 opt-in served its purpose: equivalence proven at fixture
+/// scale (app-UoD byte-identical, divergence fully classified) and at
+/// arc scale (canary series), every decline path falls back LOUDLY to
+/// the full pipeline, and eligibility is narrow by construction
+/// (instance-only deltas, structural schema-cell gate). The env var
+/// inverts to an escape hatch: AREST_LEAF_INGEST=0 forces the full
+/// pipeline (e.g. to reconcile a removed instance line immediately
+/// rather than at the next schema-touching compile).
 #[cfg(feature = "local")]
-fn leaf_ingest_opted_in() -> bool {
-    std::env::var("AREST_LEAF_INGEST").map(|v| v == "1").unwrap_or(false)
+fn leaf_ingest_enabled() -> bool {
+    std::env::var("AREST_LEAF_INGEST").map(|v| v != "0").unwrap_or(true)
 }
 
 /// 987-A.2 — the leaf-ingest EXECUTION path (arc ask #3, percept-only
@@ -2407,9 +2415,9 @@ pub fn main_entry() {
                         if export_norma_path.is_some() {
                             eprintln!("[load] leaf-ingest declined: --export-norma \
                                        needs the full compile (Provenance rebuild)");
-                        } else if !leaf_ingest_opted_in() {
-                            eprintln!("[load] leaf-ingest: detection-only (set \
-                                       AREST_LEAF_INGEST=1 to execute the leaf path)");
+                        } else if !leaf_ingest_enabled() {
+                            eprintln!("[load] leaf-ingest: DISABLED via \
+                                       AREST_LEAF_INGEST=0 — full pipeline");
                         } else if try_leaf_ingest(&conn, Some(db_path.as_str()), &readings, &changed) {
                             eprintln!("Compiled {} readings into {} (leaf ingest)",
                                 readings.len(), &db_path);
