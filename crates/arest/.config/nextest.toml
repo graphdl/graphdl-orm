@@ -1,0 +1,27 @@
+# test-speed-under-30s lever 1: cargo-nextest as the gate runner
+# (measured ~3x the libtest run phase: 241 tests in 10.8s vs ~270s
+# serial libtest leg). Install: cargo install cargo-nextest.
+#
+# Gate usage:
+#   inner loop : cargo nextest run --features std-deps,local -E 'test(<module>)'
+#   full gate  : cargo nextest run --features std-deps,local
+#
+# The membership perf test asserts a WALL-CLOCK ratio (Set-from-Seq
+# beats has_member after Arc<Map>) and flakes under parallel CPU
+# contention — the one observed nextest failure (241/1859, 0.177s,
+# passes isolated). `threads-required = "num-cpus"` makes the runner
+# hold every thread slot for it, so it runs ALONE at its scheduled
+# moment instead of forcing the whole suite serial.
+[[profile.default.overrides]]
+filter = 'test(membership_perf_set_from_seq_beats_has_member_after_arc_map)'
+threads-required = "num-cpus"
+
+# Slow-tail visibility: mark tests SLOW at 60s but never terminate —
+# the two mandatory_role_alethic_rejection tests legitimately run
+# ~325s today (measured 2026-06-12; they dominate the suite's wall
+# clock — everything else is done by ~90s, so they ARE the 30s
+# target's critical path). They are the shared-metamodel-parse
+# lever's primary target; once that lands, tighten this to a
+# terminate-after so regressions can't hide.
+[profile.default]
+slow-timeout = { period = "60s" }
