@@ -538,6 +538,42 @@ mod db {
             assert_eq!(def_count, 0);
         }
 
+        /// 987-A increment 1: the per-file signature registry round-trips
+        /// through a cells row, and leaf-only delta detection passes
+        /// exactly the instance-only-modification case — declining on
+        /// missing priors, file-set changes, schema-bearing edits, and
+        /// the no-change case (the delta-LFP skip owns that one).
+        #[test]
+        fn leaf_only_delta_detection_gates() {
+            let conn = Connection::open_in_memory().expect("in-memory sqlite");
+            ensure_meta_tables(&conn);
+            let v1 = vec![
+                ("app.md".to_string(), "# App\n## Fact Types\nCase observes Fact Note.\n".to_string()),
+                ("run-1.md".to_string(), "## Instance Facts\nCase 'c1' observes Fact Note 'n1'.\n".to_string()),
+            ];
+            // No priors → None (first compile is always full).
+            assert_eq!(super::super::leaf_only_changed_files(&conn, &v1), None);
+            // Store the registry the way the compile tail does.
+            conn.execute("INSERT OR REPLACE INTO cells (name, contents) VALUES ('_FileSigs', ?1)",
+                [&super::super::encode_file_sigs(&v1)]).unwrap();
+            // No change → None (delta-LFP skip's territory).
+            assert_eq!(super::super::leaf_only_changed_files(&conn, &v1), None);
+            // Instance-only change → Some([run-1.md]).
+            let mut v2 = v1.clone();
+            v2[1].1.push_str("Case 'c1' observes Fact Note 'n2'.\n");
+            assert_eq!(super::super::leaf_only_changed_files(&conn, &v2),
+                Some(vec!["run-1.md".to_string()]));
+            // Schema-bearing change → None.
+            let mut v3 = v1.clone();
+            v3[0].1.push_str("Case has Confidence.\n");
+            assert_eq!(super::super::leaf_only_changed_files(&conn, &v3), None,
+                "app.md carries ## Fact Types — schema edit must decline");
+            // Added file → None.
+            let mut v4 = v1.clone();
+            v4.push(("run-2.md".to_string(), "## Instance Facts\nCase 'c2' observes Fact Note 'n3'.\n".to_string()));
+            assert_eq!(super::super::leaf_only_changed_files(&conn, &v4), None);
+        }
+
         /// rmap-3nf-tables Stage 3 (fossil sweep): apply_ddl drops
         /// tables whose names fall outside the [A-Za-z0-9_] emission
         /// alphabet (pre-prose-leak-gate relics — arc-agi-3's backtick
@@ -1197,6 +1233,103 @@ fn population_only(loaded: &ast::Object) -> ast::Object {
     ast::Object::map(kept)
 }
 
+/// 987-A increment 1 (leaf-only ingest): per-file content signature.
+#[cfg(feature = "local")]
+fn file_sig(text: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in text.bytes() { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+    h
+}
+
+/// Encode the per-file signature registry as one atom:
+/// `name\x1f{hash:016x}\x1e…` (US/RS separators — filenames are sane).
+#[cfg(feature = "local")]
+fn encode_file_sigs(readings: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (name, text) in readings {
+        out.push_str(name);
+        out.push('\u{1f}');
+        out.push_str(&format!("{:016x}", file_sig(text)));
+        out.push('\u{1e}');
+    }
+    out
+}
+
+/// Read the prior `_FileSigs` registry with ONE targeted SQL read —
+/// never a full load_state (the whole point of the leaf path is to
+/// avoid whole-store costs before the mode decision).
+#[cfg(feature = "local")]
+fn read_prior_file_sigs(conn: &rusqlite::Connection) -> hashbrown::HashMap<String, String> {
+    let raw: Option<String> = conn
+        .query_row("SELECT contents FROM cells WHERE name='_FileSigs'", [], |r| r.get(0))
+        .ok();
+    let mut out = hashbrown::HashMap::new();
+    if let Some(raw) = raw {
+        for entry in raw.trim_matches(|c| c == '<' || c == '>').split('\u{1e}') {
+            if let Some((name, hash)) = entry.split_once('\u{1f}') {
+                out.insert(name.to_string(), hash.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Leaf-only delta detection (987-A increment 1, arc ask #3): when a
+/// recompile's per-file delta is confined to INSTANCE-ONLY files (no
+/// schema sections — the arc percept-file shape), the schema is
+/// provably unchanged and the full corpus re-parse + #836 wipe + full
+/// forward chain are unnecessary. Returns the changed file names when
+/// EVERY structural gate passes; None falls through to the full path.
+///
+/// Conservative by construction:
+///   - prior registry must exist (a first compile is always full);
+///   - the file SET must be identical (any add/remove → full);
+///   - every changed file must contain `## Instance Facts` and NONE of
+///     the schema section headers (Fact Types / Entity Types / Value
+///     Types / Derivation Rules / State Machine / Constraints) — the
+///     downstream rule-reads gate further requires that no
+///     `derivation:rule_*` reads the changed files' target cells.
+#[cfg(feature = "local")]
+fn leaf_only_changed_files(
+    conn: &rusqlite::Connection,
+    readings: &[(String, String)],
+) -> Option<Vec<String>> {
+    let prior = read_prior_file_sigs(conn);
+    if prior.is_empty() { return None; }
+    if prior.len() != readings.len() { return None; }
+    let mut changed: Vec<&(String, String)> = Vec::new();
+    for r in readings {
+        match prior.get(&r.0) {
+            None => return None, // added file → full path
+            Some(h) if *h == format!("{:016x}", file_sig(&r.1)) => {}
+            Some(_) => changed.push(r),
+        }
+    }
+    if changed.is_empty() {
+        // No file changed at all — the existing delta-LFP no-op skip
+        // already covers this; let the full path take it.
+        return None;
+    }
+    const SCHEMA_HEADERS: [&str; 7] = [
+        "## Fact Types", "## Entity Types", "## Value Types",
+        "## Derivation Rules", "## State Machine", "## Constraints",
+        "## Description",
+    ];
+    for (name, text) in &changed {
+        if !text.contains("## Instance Facts") {
+            eprintln!("[load] leaf-ingest declined: {} changed without an \
+                       Instance Facts section", name);
+            return None;
+        }
+        if let Some(h) = SCHEMA_HEADERS.iter().find(|h| text.contains(*h)) {
+            eprintln!("[load] leaf-ingest declined: {} carries schema section \
+                       {:?}", name, h);
+            return None;
+        }
+    }
+    Some(changed.into_iter().map(|(n, _)| n.clone()).collect())
+}
+
 /// load-state-cache lever A: the sidecar key — a function of the
 /// engine identity (binary self-hash; a rebuilt engine must never
 /// serve a stale tree) and the db file identity (length + mtime; any
@@ -1687,6 +1820,24 @@ pub fn main_entry() {
                 // can emit per-App cells. The set-of-generators view is
                 // derived from the pairs for backward-compat paths (SQL
                 // trigger emission still keys off generator names only).
+                // 987-A increment 1 (registry + detection): diff the
+                // per-file signatures against the prior compile's
+                // `_FileSigs` registry. When the delta is leaf-only
+                // (instance-fact files, no schema sections), this compile
+                // COULD skip the corpus re-parse + #836 wipe + full chain
+                // — the execution path for that lands as the next
+                // increment; this one ships the registry (priors start
+                // accumulating now) and the mode line (observability on
+                // real workloads, esp. arc-agi-3's percept ingests).
+                match leaf_only_changed_files(&conn, &readings) {
+                    Some(changed) => eprintln!(
+                        "[load] leaf-ingest ELIGIBLE: {} instance-only file(s) \
+                         changed {:?} — full pipeline still runs this build; \
+                         the leaf execution path is the next 987-A increment",
+                        changed.len(), changed),
+                    None => {}
+                }
+
                 let opt_in_re = regex::Regex::new(r"App '([^']+)' uses Generator '([^']+)'").unwrap();
                 let opt_in_pairs: Vec<(String, String)> = readings.iter()
                     .flat_map(|(_, text)| opt_in_re.captures_iter(text)
@@ -2348,6 +2499,13 @@ pub fn main_entry() {
                 // re-store it harmlessly.
                 let d = if chain_converged {
                     ast::store("_CompileSig", ast::Object::atom(&compile_sig), &d)
+                } else { d };
+                // 987-A: persist the per-file signature registry so the
+                // NEXT compile can compute the leaf-only delta. Stored on
+                // every converged compile (full or, later, leaf).
+                let d = if chain_converged {
+                    ast::store("_FileSigs",
+                        ast::Object::atom(&encode_file_sigs(&readings)), &d)
                 } else { d };
 
                 // Final subjectless-GC: extend cor:closure sanitation to the
