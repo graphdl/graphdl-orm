@@ -4510,7 +4510,7 @@ pub fn reflect_schema_cells(state: &crate::ast::Object) -> Vec<(String, crate::a
             role_played.push(fact_from_pairs(&[("Noun", noun), ("Role", role_id.as_str())]));
         }
     }
-    let noun_types: Vec<Object> = fetch_cell_seq("Noun", state).as_seq()
+    let mut noun_types: Vec<Object> = fetch_cell_seq("Noun", state).as_seq()
         .map(|rows| rows.iter().filter_map(|n| {
             let name = binding(n, "name")?;
             if name.is_empty() { return None; }
@@ -4520,6 +4520,41 @@ pub fn reflect_schema_cells(state: &crate::ast::Object) -> Vec<(String, crate::a
             ]))
         }).collect())
         .unwrap_or_default();
+    // task-987 (reflexive-noun-object-type-totality), ruling derived
+    // from the substrate: `Fact Type` is a subtype of `Noun`
+    // (core.md §Fact Type), so every fact-type instance is a Noun
+    // instance and `Each Noun has exactly one Object Type`
+    // (core.md:113, alethic) ranges over it. An objectified fact type's
+    // Object Type is 'entity' (Halpin objectification; consistent with
+    // the instantiability rule — entity + reference scheme, and FTs
+    // carry `.id`). Completing the population is the REQUIRED remedy:
+    // AREST.tex:435 makes the system "self-describing by construction"
+    // (scoping instance discovery would exempt the metamodel from its
+    // own constraints) and the 984 ruling forbids weakening a true
+    // invariant to deontic. Same set-replace regime as the rows above.
+    {
+        // Skip FT ids that already carry a Noun-cell row (objectified
+        // FTs the parser minted as nouns) — their Object Type came from
+        // the row above; emitting a second row would double-count the
+        // `exactly one` population.
+        let declared_nouns: hashbrown::HashSet<String> =
+            fetch_cell_seq("Noun", state).as_seq()
+                .map(|rows| rows.iter()
+                    .filter_map(|n| binding(n, "name").map(String::from))
+                    .collect())
+                .unwrap_or_default();
+        if let Some(rows) = fetch_cell_seq("FactType", state).as_seq() {
+            for f in rows {
+                let Some(id) = binding(f, "id") else { continue };
+                if id.is_empty() || declared_nouns.contains(id) { continue; }
+                noun_types.push(fact_from_pairs(&[
+                    ("Noun", id),
+                    ("Object Type", "entity"),
+                ]));
+            }
+        }
+    }
+    let noun_types = noun_types;
     // audit-entity-datatype-norma-vs-view Phase 2(a): reflect the
     // ABSORBED `conceptualDataType` Noun-cell field as standalone
     // `Noun_has_Conceptual_Data_Type` rows. `The data type of X is
@@ -4729,6 +4764,18 @@ mod reflect_schema_cells_tests {
                 .then(|| ast::binding(r, "Object Type").map(str::to_string))?);
         assert_eq!(ot_of("Widget").as_deref(), Some("entity"));
         assert_eq!(ot_of("Label").as_deref(), Some("value"));
+
+        // task-987 (substrate-derived ruling): Fact Type < Noun, so the
+        // FT instance carries Object Type 'entity' (objectification) —
+        // exactly once (no duplicate rows for ids that are also
+        // declared nouns).
+        assert_eq!(ot_of("Widget_has_Label").as_deref(), Some("entity"),
+            "an FT instance is a Noun instance and must carry Object Type");
+        let ft_rows = orows.iter()
+            .filter(|r| ast::binding(r, "Noun") == Some("Widget_has_Label"))
+            .count();
+        assert_eq!(ft_rows, 1,
+            "exactly one Object Type row per FT-as-Noun instance");
     }
 
     /// Idempotent set-replace: reflecting twice yields identical cells.
