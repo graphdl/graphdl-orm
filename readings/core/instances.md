@@ -152,7 +152,20 @@ State Machine is for Resource.
   Each Resource has at most one State Machine.
 State Machine is for Resource. *
 
-* State Machine is for Resource iff Resource is instance of Noun and some State Machine Definition is for that Noun.
+<!-- [REMOVED 2026-06-12, board-derived-layer poisoning] The rule
+     `* State Machine is for Resource iff Resource is instance of Noun
+     and some State Machine Definition is for that Noun.` is
+     UNDERSPECIFIED: it cannot bind WHICH State Machine, so it emitted
+     one-role partial tuples. Starved for months (its antecedent
+     `Resource is instance of Noun` was empty), it activated the moment
+     the task-987 membership reflection populated that cell — the
+     partials landed first in the Resource-keyed cell and
+     KeyConflict-displaced every real SM-for-Resource fact, emptying
+     the entire Task derived layer downstream (status bridge,
+     recommendation markers). The REAL writers are the SM seed
+     (compile.rs s0 trio) and the task-929 for-Resource backfill; the
+     chain-side arity-completeness guard is the defense-in-depth. -->
+
 
 ### State (projected from SM via State Machine is for Resource × State Machine is currently in Status)
 <!-- task-742 rename context: post-rename the canonical SM status

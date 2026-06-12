@@ -600,6 +600,16 @@ fn derive_one_round_with_keys(
     // the per-round `derived_keys` rebuild above.
     let candidates = enforce_value_constraints_on_candidates(
         candidates, &read_cell_value_constraints(d));
+    // (board-derived-layer poisoning, 2026-06-12: an arity-completeness
+    // CANDIDATE filter briefly lived here and was reverted same-night —
+    // 1-of-2-role partial rows are LOAD-BEARING for the subtype
+    // inheritance lift (test_subtype_inheritance_derivation et al.), so
+    // partials cannot be dropped wholesale. The poison signature is
+    // narrower — a partial DISPLACING a fuller fact at its key — and is
+    // handled where it happens: the keyed-conflict arm in
+    // `integrate_round_facts` now prefers the fact with MORE bindings,
+    // so a real full tuple upgrades over an earlier partial instead of
+    // being KeyConflict-dropped behind it.)
     if trace { crate::diag!("    [rnd] apply {} defs: {:?} ({} candidates)",
         derivation_defs.len(), t_ap.elapsed(), candidates.len()); }
     let t_dd = crate::time_shim::Instant::now();

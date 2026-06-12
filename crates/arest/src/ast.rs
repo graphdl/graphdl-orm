@@ -5354,12 +5354,31 @@ pub fn cell_put_keyed_batch(
         match map.get(&key).cloned() {
             Some(existing_fact) if existing_fact == fact => { /* idempotent no-op */ }
             Some(existing_fact) if !upsert => {
-                conflicts.push(KeyConflict {
-                    name: name.into(),
-                    key,
-                    existing_fact,
-                    incoming_fact: fact,
-                });
+                // partial-tuple upgrade (board-derived-layer poisoning,
+                // 2026-06-12): when the same key holds a PARTIAL tuple
+                // (fewer bound roles) and a FULLER fact arrives, the
+                // fuller fact WINS instead of conflict-dropping behind
+                // the partial. Partials are legitimate output for the
+                // subtype-inheritance lift (one-pair rows are its
+                // contract), but an underspecified rule's partial landing
+                // FIRST in a keyed cell must not displace the real fact —
+                // live hit: one-role `<<Resource, X>>` rows from the
+                // (since removed) `State Machine is for Resource iff …`
+                // core rule blocked every backfilled SM-for-Resource fact
+                // and emptied the Task derived layer. Equal-or-fewer
+                // bindings keeps today's conflict-reject.
+                let n_in = fact.as_seq().map_or(0, |s| s.len());
+                let n_ex = existing_fact.as_seq().map_or(0, |s| s.len());
+                if n_in > n_ex {
+                    map.insert(key, fact);
+                } else {
+                    conflicts.push(KeyConflict {
+                        name: name.into(),
+                        key,
+                        existing_fact,
+                        incoming_fact: fact,
+                    });
+                }
             }
             // None (fresh insert) OR upsert overwrite (last-write-wins).
             _ => {
