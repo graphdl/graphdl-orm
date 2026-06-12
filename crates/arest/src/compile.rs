@@ -4995,7 +4995,20 @@ fn compile_data_with_state(
                     crate::types::AntecedentSource::InstancesOfNoun(_) => None,
                 })
                 .collect();
-            (r.id.clone(), reads)
+            // derivation-semi-naive-delta-joins (soundness, fixture v9):
+            // a PARTIAL reads list is WORSE than none — the chainer's
+            // activation gate and the delta-join view evaluation both
+            // treat the sidecar as authoritative, so a rule with one
+            // FactType antecedent and one InstancesOfNoun antecedent
+            // was gated/viewed as if the FactType were its ONLY read,
+            // silently under-deriving when the dynamic antecedent
+            // changed (observed live: the ns-domain rules diverged
+            // delta-vs-naive; the SAME blindness can mis-gate the
+            // apply path's seeded chains). All-or-nothing: emit reads
+            // ONLY when every source is a FactType; otherwise empty →
+            // no sidecar → conservative run-every-round.
+            let complete = reads.len() == r.antecedent_sources.len();
+            (r.id.clone(), if complete { reads } else { Vec::new() })
         })
         .collect();
 

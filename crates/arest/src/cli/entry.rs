@@ -1810,8 +1810,28 @@ fn try_leaf_ingest(
         let refs: Vec<(&str, &ast::Func, Option<&[String]>)> = packed.iter()
             .map(|(name, func, reads)| (*name, *func, reads.as_deref()))
             .collect();
-        let (new_d, derived) = crate::evaluate::forward_chain_defs_state_seeded(
-            &refs, targets.iter().cloned().collect(), &d, 100);
+        // derivation-semi-naive-delta-joins stage 2: the seed cells'
+        // NEW ROWS (current minus snapshot, identity by encoding) ride
+        // along so AREST_DELTA_JOINS=1 can evaluate sidecar'd rules
+        // over per-antecedent delta views. New cells short-circuit
+        // (empty prior set → every row is delta).
+        let seed_delta: hashbrown::HashMap<String, Vec<ast::Object>> = targets.iter()
+            .map(|cell| {
+                let prior: hashbrown::HashSet<String> =
+                    ast::fetch_cell_seq(cell, &snapshot).as_seq()
+                        .map(|s| s.iter().map(|f| f.to_string()).collect())
+                        .unwrap_or_default();
+                let rows: Vec<ast::Object> = ast::fetch_cell_seq(cell, &d).as_seq()
+                    .map(|s| s.iter()
+                        .filter(|f| prior.is_empty() || !prior.contains(&f.to_string()))
+                        .cloned().collect())
+                    .unwrap_or_default();
+                (cell.clone(), rows)
+            })
+            .filter(|(_, rows)| !rows.is_empty())
+            .collect();
+        let (new_d, derived) = crate::evaluate::forward_chain_defs_state_seeded_with_delta(
+            &refs, targets.iter().cloned().collect(), seed_delta, &d, 100);
         if crate::evaluate::take_chain_abort() {
             eprintln!("[load] leaf-ingest declined: the seeded chain hit its \
                        time budget — NOTHING was persisted; falling back to \

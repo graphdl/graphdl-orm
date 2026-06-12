@@ -661,7 +661,7 @@ pub fn forward_chain_defs_state_semi_naive_with_base_keys(
     max_rounds: usize,
     base_keys: Option<HashSet<FactKey>>,
 ) -> (ast::Object, Vec<DerivedFact>) {
-    semi_naive_inner(derivation_defs, None, d, max_rounds, base_keys, None)
+    semi_naive_inner(derivation_defs, None, d, max_rounds, base_keys, None, None)
 }
 
 /// task-3-incremental: forward-chain with an explicit round-1
@@ -689,7 +689,31 @@ pub fn forward_chain_defs_state_seeded(
     d: &ast::Object,
     max_rounds: usize,
 ) -> (ast::Object, Vec<DerivedFact>) {
-    semi_naive_inner(derivation_defs, Some(seed), d, max_rounds, None, None)
+    semi_naive_inner(derivation_defs, Some(seed), d, max_rounds, None, None, None)
+}
+
+/// derivation-semi-naive-delta-joins: like
+/// [`forward_chain_defs_state_seeded`], but the caller ALSO supplies
+/// the seed cells' NEW ROWS (the delta), enabling true semi-naive
+/// delta-join evaluation behind `AREST_DELTA_JOINS=1`: each round,
+/// rules with reads sidecars are evaluated over per-antecedent state
+/// VIEWS (the antecedent cell swapped to only its delta rows) instead
+/// of the full population. Grounded in AREST.tex §exec (semi-naive
+/// evaluation [bancilhon86] as a sanctioned FP-law transformation):
+/// for monotone positive rules, any fact derivable with NO antecedent
+/// in the delta was derivable in an earlier round and is already
+/// present, so the variant union derives exactly the new facts.
+/// SM-family defs and sidecar-less rules keep full evaluation (they
+/// are not classical positive joins / have unknown reads).
+pub fn forward_chain_defs_state_seeded_with_delta(
+    derivation_defs: &[(&str, &ast::Func, Option<&[String]>)],
+    seed: HashSet<String>,
+    initial_delta: hashbrown::HashMap<String, Vec<ast::Object>>,
+    d: &ast::Object,
+    max_rounds: usize,
+) -> (ast::Object, Vec<DerivedFact>) {
+    semi_naive_inner(derivation_defs, Some(seed), d, max_rounds, None, None,
+        Some(initial_delta))
 }
 
 /// Same as [`forward_chain_defs_state_seeded`] but also reports every
@@ -709,7 +733,7 @@ pub fn forward_chain_defs_state_seeded_tracked(
     max_rounds: usize,
     activated: &mut HashSet<String>,
 ) -> (ast::Object, Vec<DerivedFact>) {
-    semi_naive_inner(derivation_defs, Some(seed), d, max_rounds, None, Some(activated))
+    semi_naive_inner(derivation_defs, Some(seed), d, max_rounds, None, Some(activated), None)
 }
 
 /// Shared body of the semi-naive variants. `initial_dirty == None`
@@ -732,6 +756,7 @@ fn semi_naive_inner(
     max_rounds: usize,
     base_keys: Option<HashSet<FactKey>>,
     mut activated_rules: Option<&mut HashSet<String>>,
+    initial_delta: Option<hashbrown::HashMap<String, Vec<ast::Object>>>,
 ) -> (ast::Object, Vec<DerivedFact>) {
     use hashbrown::HashMap;
     // Same gate as `derive_one_round_with_keys`: trace knob is host-only.
@@ -739,6 +764,61 @@ fn semi_naive_inner(
     let trace = std::env::var("AREST_STAGE12_TRACE").is_ok();
     #[cfg(feature = "no_std")]
     let trace = false;
+    // 987-A.3 increment 3 probe: AREST_CHAIN_TIMINGS=1 runs each round
+    // per-def (same input state per def — round semantics preserved;
+    // identical cross-def dupes within a round are identity-deduped
+    // downstream) and prints cumulative per-def wall time at the end.
+    // Diagnostic knob only — canary-4b put the leaf chain at 82.5s for
+    // 20 derived facts; this names the defs that own it.
+    #[cfg(not(feature = "no_std"))]
+    let chain_timings = std::env::var("AREST_CHAIN_TIMINGS").map(|v| v == "1").unwrap_or(false);
+    #[cfg(feature = "no_std")]
+    let chain_timings = false;
+    let mut def_times: HashMap<alloc::string::String, core::time::Duration> = HashMap::new();
+    // derivation-semi-naive-delta-joins: delta-join mode needs BOTH the
+    // env knob and a caller-supplied initial delta (only the leaf path
+    // supplies one today; full compiles stay naive — the #836 wipe
+    // means everything is new in round 0 anyway).
+    //
+    // ⚠ SHIPPED DARK (2026-06-12): the B2 equivalence fixture is RED —
+    // delta-vs-naive diverges on the ns-domain propagation cells
+    // (Resource_belongs_to_Domain / Resource_is_of_Function) through
+    // THREE guards (sidecar count-completeness; all-or-nothing sidecar
+    // emission; self-join/recursive exclusion). The residual mechanism
+    // reads below every static metadata surface available here; sound
+    // delta evaluation for that rule class needs PER-OCCURRENCE deltas
+    // (compiled-Func parameterization), not whole-cell view swaps. Do
+    // NOT enable in production until the fixture's B2 leg passes.
+    // Measured upside when it does: chain 82.5s → 8.0s at 171MB.
+    #[cfg(not(feature = "no_std"))]
+    let delta_joins = std::env::var("AREST_DELTA_JOINS").map(|v| v == "1").unwrap_or(false)
+        && initial_delta.is_some();
+    #[cfg(feature = "no_std")]
+    let delta_joins = false;
+    #[cfg(feature = "no_std")]
+    let _ = &initial_delta;
+    let mut delta_by_cell: Option<hashbrown::HashMap<String, Vec<ast::Object>>> = initial_delta;
+    // derivation-semi-naive-delta-joins COMPLETENESS GUARD (fixture v8
+    // caught it live): a rule whose reads sidecar lists FEWER cells
+    // than its declared antecedents — the aggregate-IR sidecar
+    // blindness class (compile.rs:1497) — cannot use delta views: a
+    // missed antecedent's delta would silently UNDER-derive (observed:
+    // the ns-domain rules diverged delta-vs-naive on exactly this).
+    // Such rules full-evaluate. Unknown rules (absent from the
+    // DerivationRule cell) are conservatively full-eval too.
+    let antecedent_meta: hashbrown::HashMap<alloc::string::String, (usize, alloc::string::String)> =
+        if delta_joins {
+            ast::fetch_cell_seq("DerivationRule", d).as_seq()
+                .map(|rows| rows.iter().filter_map(|r| {
+                    let id = ast::binding(r, "id")?;
+                    let n = ast::binding(r, "antecedentFactTypeIds").unwrap_or("")
+                        .split(',').filter(|s| !s.trim().is_empty()).count();
+                    let consequent = ast::binding(r, "consequentFactTypeId")
+                        .unwrap_or("").to_string();
+                    Some((alloc::format!("derivation:{}", id), (n, consequent)))
+                }).collect())
+                .unwrap_or_default()
+        } else { HashMap::new() };
     let mut current_state = d.clone();
     let mut all_derived: Vec<DerivedFact> = Vec::new();
     // task-744 phase 4: per-FT key-roles for routing Map-backed cell
@@ -806,8 +886,128 @@ fn semi_naive_inner(
             }
         }
         if active.is_empty() { break; }
-        let new_facts = derive_one_round_with_keys(
-            active.as_slice(), &current_state, &all_derived, d, &existing_keys);
+        let new_facts = if delta_joins {
+            // derivation-semi-naive-delta-joins: split the active defs.
+            // Sidecar'd non-SM rules evaluate over per-antecedent VIEWS
+            // (the antecedent cell swapped to only its delta rows —
+            // |ΔA|×|B| instead of |A|×|B|); the SM family (ordered
+            // folds, not positive joins) and sidecar-less rules keep
+            // the full-population batch path.
+            let delta = delta_by_cell.as_ref().expect("delta_joins implies delta");
+            let mut full_defs: Vec<(&str, &ast::Func)> = Vec::new();
+            let mut view_defs: Vec<(&str, &ast::Func, &[String])> = Vec::new();
+            for (name, func, reads) in derivation_defs.iter() {
+                let is_active = match (&dirty_cells, reads) {
+                    (None, _) => true,
+                    (Some(_), None) => true,
+                    (Some(dirty), Some(r)) => r.iter().any(|c| dirty.contains(c)),
+                };
+                if !is_active { continue; }
+                // View eligibility (each clause fixture-driven): sidecar
+                // present AND count-complete AND no duplicate reads AND
+                // not self-recursive — a SELF-JOIN (same cell read twice)
+                // or a rule reading its own consequent gets the whole
+                // cell swapped at EVERY occurrence under a view, yielding
+                // ΔA×ΔA and missing ΔA×A_full (fixture v10: the
+                // ns-domain propagation rules diverged on exactly this).
+                // Classical semi-naive needs per-OCCURRENCE deltas; the
+                // whole-cell swap cannot express that — full-eval them.
+                let view_ok = |r: &[String], name: &str| -> bool {
+                    let Some((n, consequent)) = antecedent_meta.get(name) else { return false };
+                    if r.len() < *n { return false; }
+                    let uniq: hashbrown::HashSet<&str> =
+                        r.iter().map(|s| s.as_str()).collect();
+                    uniq.len() == r.len() && !r.iter().any(|c| c == consequent)
+                };
+                match reads {
+                    Some(r) if !name.starts_with("derivation:_sm_")
+                        && view_ok(r, name) =>
+                        view_defs.push((*name, *func, r)),
+                    _ => full_defs.push((*name, *func)),
+                }
+            }
+            let mut round_facts = if full_defs.is_empty() { Vec::new() } else {
+                derive_one_round_with_keys(
+                    full_defs.as_slice(), &current_state, &all_derived, d, &existing_keys)
+            };
+            if !view_defs.is_empty() {
+                // Encode the population ONCE per round; each rule
+                // variant is an Arc-shallow rebuild of the encoded Seq
+                // with one cell's facts swapped to the delta rows.
+                let encoded = ast::encode_state(&current_state);
+                let encode_rows = |rows: &[ast::Object]| -> ast::Object {
+                    ast::Object::Seq(rows.iter().map(|fact| {
+                        let bindings: Vec<ast::Object> = fact.as_seq()
+                            .map(|pairs| pairs.iter().cloned().collect())
+                            .unwrap_or_default();
+                        ast::Object::Seq(bindings.into())
+                    }).collect::<Vec<_>>().into())
+                };
+                let derived_keys: HashSet<FactKey> =
+                    all_derived.iter().map(fact_key).collect();
+                let mut round_keys: HashSet<FactKey> =
+                    round_facts.iter().map(fact_key).collect();
+                let vcs = read_cell_value_constraints(d);
+                for (name, func, reads) in view_defs {
+                    let name_s = name.to_string();
+                    for cell in reads.iter().filter(|c| delta.contains_key(c.as_str())) {
+                        let t_def = crate::time_shim::Instant::now();
+                        let delta_rows = encode_rows(delta.get(cell.as_str())
+                            .expect("filtered on contains_key"));
+                        let view: ast::Object = match &encoded {
+                            ast::Object::Seq(entries) => ast::Object::Seq(
+                                entries.iter().map(|e| {
+                                    let is_target = e.as_seq()
+                                        .and_then(|p| p.first()
+                                            .and_then(|a| a.as_atom()))
+                                        .map(|s| s == cell.as_str())
+                                        .unwrap_or(false);
+                                    if is_target {
+                                        ast::Object::seq(vec![
+                                            ast::Object::atom(cell),
+                                            delta_rows.clone(),
+                                        ])
+                                    } else { e.clone() }
+                                }).collect::<Vec<_>>().into()),
+                            other => other.clone(),
+                        };
+                        let result = ast::apply(func, &view, d);
+                        let cands: Vec<DerivedFact> = result.as_seq().into_iter()
+                            .flat_map(|items| items.iter().cloned().collect::<Vec<_>>())
+                            .filter_map(|item| parse_derived_fact(&item, &name_s))
+                            .collect();
+                        let cands = enforce_value_constraints_on_candidates(cands, &vcs);
+                        for cand in cands {
+                            let key = fact_key(&cand);
+                            if !existing_keys.contains(&key)
+                                && !derived_keys.contains(&key)
+                                && round_keys.insert(key)
+                            {
+                                round_facts.push(cand);
+                            }
+                        }
+                        if chain_timings {
+                            *def_times.entry(name_s.clone().into()).or_default() +=
+                                t_def.elapsed();
+                        }
+                    }
+                }
+            }
+            round_facts
+        } else if chain_timings {
+            let mut acc: Vec<DerivedFact> = Vec::new();
+            for entry in active.as_slice() {
+                let t_def = crate::time_shim::Instant::now();
+                let one = derive_one_round_with_keys(
+                    core::slice::from_ref(entry), &current_state, &all_derived, d, &existing_keys);
+                *def_times.entry(entry.0.into()).or_default() += t_def.elapsed();
+                acc.extend(one);
+            }
+            acc
+        } else {
+            derive_one_round_with_keys(
+                active.as_slice(), &current_state, &all_derived, d, &existing_keys)
+        };
         if new_facts.is_empty() { break; }
 
         let mut by_cell: HashMap<String, Vec<ast::Object>> =
@@ -822,9 +1022,27 @@ fn semi_naive_inner(
             existing_keys.insert(fact_key(fact));
         }
         let next_dirty: HashSet<String> = by_cell.keys().cloned().collect();
+        // derivation-semi-naive-delta-joins: the round's new rows ARE the
+        // next round's delta (Arc-shallow row clones, captured before
+        // integrate consumes by_cell).
+        if delta_joins {
+            delta_by_cell = Some(by_cell.iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect());
+        }
         current_state = integrate_round_facts(current_state, by_cell, &key_roles, &upsert_safe);
         all_derived.extend(new_facts);
         dirty_cells = Some(next_dirty);
+    }
+    if chain_timings && !def_times.is_empty() {
+        let mut by_cost: Vec<(&alloc::string::String, &core::time::Duration)> =
+            def_times.iter().collect();
+        by_cost.sort_by(|a, b| b.1.cmp(a.1));
+        let total: core::time::Duration = def_times.values().sum();
+        crate::diag!("[chain-timings] total {:?} across {} defs; top:", total, def_times.len());
+        for (name, dur) in by_cost.iter().take(12) {
+            crate::diag!("[chain-timings]   {:?}  {}", dur, name);
+        }
     }
     (current_state, all_derived)
 }
