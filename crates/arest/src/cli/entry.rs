@@ -135,6 +135,48 @@ mod db {
                 eprintln!("Warning: plan DDL failed for {}: {}", t.name, e);
             });
         }
+        // rmap-3nf-tables Stage 3 (fossil sweep): drop tables whose NAMES
+        // cannot be the output of any current emission convention —
+        // prose-leak relics from the pre-gate era (backticks, pipes,
+        // dots, commas, spaces, '>' …; arc-agi-3's db carried dozens,
+        // and one broke the sql verb's materialize wholesale, issue 11).
+        // rmap names and sql:sqlite: def names are [A-Za-z0-9_] by
+        // construction, so anything outside that alphabet is provably
+        // junk WE minted historically — never a user scratch table worth
+        // preserving. Sane-named non-plan tables are LEFT ALONE (they
+        // may be user scratch); engine storage (cells/defs), sqlite
+        // internals, plan tables, and this compile's def tables are
+        // excluded by name. Loud per-drop report.
+        {
+            let def_tables: hashbrown::HashSet<String> = ast::cells_iter(d)
+                .into_iter()
+                .filter_map(|(name, _)| name.strip_prefix("sql:sqlite:"))
+                .map(|s| s.to_string())
+                .collect();
+            let fossil_names: Vec<String> = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+                .and_then(|mut stmt| {
+                    let names = stmt.query_map([], |row| row.get::<_, String>(0))?
+                        .filter_map(|r| r.ok())
+                        .collect::<Vec<String>>();
+                    Ok(names)
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|n| n != "cells" && n != "defs" && !n.starts_with("sqlite_"))
+                .filter(|n| !plan_by_name.contains_key(n.as_str()))
+                .filter(|n| !def_tables.contains(n.as_str()))
+                .filter(|n| n.chars().any(|c| !(c.is_ascii_alphanumeric() || c == '_')))
+                .collect();
+            for name in &fossil_names {
+                match conn.execute_batch(
+                    &format!("DROP TABLE IF EXISTS {};", crate::rmap::qid(name))) {
+                    Ok(()) => eprintln!("[ddl] fossil table dropped (impossible name, \
+                                         pre-gate relic): {}", name),
+                    Err(e) => eprintln!("Warning: fossil DROP failed for {}: {}", name, e),
+                }
+            }
+        }
         let _ = conn.execute_batch("PRAGMA foreign_keys=ON;");
         // CREATE TABLE from sql:sqlite:* cells
         ast::cells_iter(d).into_iter()
@@ -494,6 +536,40 @@ mod db {
             ).expect("def count after replacement");
             assert_eq!(cell_count, 0);
             assert_eq!(def_count, 0);
+        }
+
+        /// rmap-3nf-tables Stage 3 (fossil sweep): apply_ddl drops
+        /// tables whose names fall outside the [A-Za-z0-9_] emission
+        /// alphabet (pre-prose-leak-gate relics — arc-agi-3's backtick
+        /// junk, one of which broke the sql verb wholesale, issue 11)
+        /// while leaving engine storage AND sane-named non-plan tables
+        /// (potential user scratch) untouched.
+        #[test]
+        fn apply_ddl_drops_impossible_name_fossils_keeps_sane_scratch() {
+            let conn = Connection::open_in_memory().expect("in-memory sqlite");
+            ensure_meta_tables(&conn);
+            conn.execute_batch(
+                r#"CREATE TABLE "0..63,_color_over_0..15" (x TEXT);"#).unwrap();
+            conn.execute_batch(
+                r#"CREATE TABLE ">_`fact_type_has_role`_(:164)" (x TEXT);"#).unwrap();
+            conn.execute_batch("CREATE TABLE my_scratch (x TEXT);").unwrap();
+
+            apply_ddl(&conn, &ast::Object::phi());
+
+            let names: Vec<String> = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0)).unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            assert!(names.contains(&"cells".to_string())
+                && names.contains(&"defs".to_string()),
+                "engine storage tables must survive the sweep; got {names:?}");
+            assert!(names.contains(&"my_scratch".to_string()),
+                "sane-named non-plan tables are potential user scratch and \
+                 must survive; got {names:?}");
+            assert!(!names.iter().any(|n| n.contains('`') || n.contains(',') || n.contains('>')),
+                "impossible-alphabet fossils must be dropped; got {names:?}");
         }
     }
 }
