@@ -1599,11 +1599,34 @@ fn try_leaf_ingest(
         }
         next
     };
+    // compile-chain-before-reflect-lag, LEAF half: the full path now
+    // reflects schema-as-facts BEFORE its chain; mirror that here or
+    // the leaf chain cannot see membership/schema reflections for the
+    // delta's OWN new instances. (Fixture v2 caught it: the
+    // inherited-instance rows `<<Resource, j2>, <Noun, Resource>>`
+    // for the delta's new resources existed in the full-recompile db
+    // but lagged on the leaf db — the prior db's reflection cells
+    // cover PRIOR resources only.) Reflection cells whose content
+    // actually changed join the chain seed so the rules reading them
+    // (inherited-instance, ns-domain) re-fire for the new resources.
+    let d = {
+        let mut map: hashbrown::HashMap<String, ast::Object> =
+            ast::cells_iter(&d).into_iter()
+                .map(|(name, contents)| (name.to_string(), contents.clone()))
+                .collect();
+        for (name, contents) in crate::compile::reflect_schema_cells(&d) {
+            let changed = map.get(&name).map_or(true, |prior| *prior != contents);
+            if changed { targets.insert(name.clone()); }
+            map.insert(name, contents);
+        }
+        ast::Object::map(map)
+    };
     // Seeded chain — the apply path's exact rule pack: user rules +
     // the synthetic SM family, sidecars as stored. Seed = the cells
-    // the changed files wrote; only rules (transitively) touching the
-    // new facts fire. A pure-percept delta read by no rule derives
-    // nothing and the chain is effectively free.
+    // the changed files wrote PLUS the reflection cells the delta
+    // moved; only rules (transitively) touching those fire. A
+    // pure-percept delta read by no rule derives nothing and the
+    // chain is effectively free.
     let collect = |prefix: &str, state: &ast::Object| -> Vec<(String, ast::Func)> {
         ast::cells_iter(state).into_iter()
             .filter(|(n, _)| n.starts_with(prefix))
@@ -2575,6 +2598,31 @@ pub fn main_entry() {
                                    carried-forward priors)", cell, n);
                     }
                     next
+                };
+
+                // compile-chain-before-reflect-lag: reflect schema-as-facts
+                // BEFORE the #836 wipe + forward chain, so metamodel rules
+                // whose antecedents are reflection cells (Fact_Type_has_Role,
+                // Noun_has_Object_Type, …) fire on the FIRST compile instead
+                // of materializing one compile late. Observed class (987-A.2
+                // equivalence fixture): the eager Format/Enum projections —
+                // compile-1's chain found the reflection cells empty (reflect
+                // ran post-chain), derived nothing; compile-2 loaded the
+                // persisted reflection cells via cor:closure and fired —
+                // i.e. compile(compile(x)) != compile(x), masked on no-change
+                // recompiles by the delta-LFP skip. The post-chain reflect
+                // below STAYS: it re-canonicalizes the set-replace layers
+                // over whatever the chain added; both calls are idempotent
+                // pure functions of (schema, population).
+                let d = {
+                    let mut map: hashbrown::HashMap<String, ast::Object> =
+                        ast::cells_iter(&d).into_iter()
+                            .map(|(name, contents)| (name.to_string(), contents.clone()))
+                            .collect();
+                    for (name, contents) in crate::compile::reflect_schema_cells(&d) {
+                        map.insert(name, contents);
+                    }
+                    ast::Object::map(map)
                 };
 
                 // Surface deontic (non-blocking) structural findings on the

@@ -4318,6 +4318,35 @@ fn translate_instance_facts_with_ft_ids(
         }
         let roles = role_refs_with_literals(idx,stmt_id);
         if roles.is_empty() { continue; }
+        // parser-unquoted-numeric-object-literal (987-B census): the
+        // grammar captures only QUOTED tokens as role literals, so a
+        // bare numeric object (`X 'x1' has D 48.`) left the object
+        // role literal-less and the VALUE WAS SILENTLY LOST
+        // downstream: objectValue=φ → canonical mismatch (the bare
+        // token stays in the reading) → verb-fallback fieldName → no
+        // FT-cell fan-out. Live class: the bundled ifactr Material Dp
+        // layer (~175 facts), found by the 987-B census. Scoped
+        // recovery: when the LAST role of an instance fact lacks a
+        // literal and the statement text ends in a bare NUMERIC
+        // token, that token is the literal. Word tails stay
+        // unrecovered on purpose — they are reading text, not values.
+        let mut roles = roles;
+        if roles.len() >= 2 && roles.last().map_or(false, |r| r.1.is_none()) {
+            if let Some(text) = statement_text(idx, stmt_id) {
+                let t = text.trim_end().trim_end_matches('.').trim_end();
+                if let Some(tail) = t.rsplit(char::is_whitespace).next() {
+                    let numeric = !tail.is_empty()
+                        && tail.chars().all(|c| c.is_ascii_digit() || c == '.')
+                        && tail.chars().any(|c| c.is_ascii_digit());
+                    if numeric {
+                        if let Some(last) = roles.last_mut() {
+                            last.1 = Some(tail.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        let roles = roles;
         let verb = statement_verb(idx,stmt_id).unwrap_or_default();
         let subject_noun = &roles[0].0;
         let subject_value = roles[0].1.as_deref().unwrap_or("");
@@ -4403,7 +4432,7 @@ fn strip_role_literals(text: &str, roles: &[(String, Option<String>)]) -> String
         // close-quote scan through QuoteEscapeTable so doubled-quote
         // escapes inside the literal don't terminate the literal early
         // — same fix as extract_following_literal_span in stage1.
-        if let Some(_lit_str) = lit {
+        if let Some(lit_str) = lit {
             let tail = &text[cursor..];
             let after_ws = tail.trim_start();
             let ws_len = tail.len() - after_ws.len();
@@ -4411,6 +4440,13 @@ fn strip_role_literals(text: &str, roles: &[(String, Option<String>)]) -> String
                 if let Some(end) = escapes.find_close(&after_ws[1..]) {
                     cursor += ws_len + 1 + end + 1;
                 }
+            } else if !lit_str.is_empty() && after_ws.starts_with(lit_str.as_str()) {
+                // parser-unquoted-numeric-object-literal: a RECOVERED
+                // bare literal (numeric tail — see the recovery in
+                // translate_instance_facts_with_ft_ids) has no quotes
+                // to scan; strip the exact token so the canonical
+                // reading matches the declared FT.
+                cursor += ws_len + lit_str.len();
             }
         }
     }

@@ -10446,3 +10446,33 @@ fn sm_trigger_consequent_collision_flags_marker_not_backfill() {
         "only the marker (trigger consequent + non-event antecedent) is flagged; the \
          event->event backfill, the SM fold, and the renamed dependency marker are not");
 }
+
+/// 987-B census → parser-unquoted-numeric-object-literal: an instance
+/// fact whose object literal is a BARE NUMERIC (`X 'x1' has D 48.`)
+/// half-records today — the role-1 literal is dropped at parse
+/// (InstanceFact lands with `objectValue = φ`), the canonical reading
+/// then mismatches the declared FT, `fieldName` falls back to the raw
+/// verb (`has`), and the fan-out never materializes the FT cell: the
+/// VALUE IS SILENTLY LOST. Observed live in the bundled ifactr
+/// Material Dp layer (`Material Spacing Token 'ifactr-cell-height'
+/// has Dp 48.` → fieldName=has, objectValue=φ, no
+/// Material_Spacing_Token_has_Dp cell in any app db — the probe-era
+/// "Material Dp x175 backfill" was THIS bug, not missing data).
+/// Quoted numerics fan out correctly (control below); bare must too.
+#[test]
+#[cfg(not(feature = "no_std"))]
+fn bare_numeric_object_literal_fans_out_to_ft_cell() {
+    let src = "# t\n\n## Entity Types\n\nX(.id) is an entity type.\n\n\
+        ## Value Types\n\nD is a value type.\n\n## Fact Types\n\nX has D.\n\n\
+        ## Instance Facts\n\nX 'x1' has D 48.\nX 'x2' has D '49'.\n";
+    let state = crate::parse_forml2::parse_to_state(src).expect("parses");
+    let cell = crate::ast::fetch_cell_seq("X_has_D", &state);
+    let rows = cell.as_seq().map(|s| s.to_vec()).unwrap_or_default();
+    let has = |id: &str, v: &str| rows.iter().any(|f|
+        crate::ast::binding(f, "X") == Some(id)
+            && crate::ast::binding(f, "D") == Some(v));
+    assert!(has("x2", "49"), "quoted numeric object must fan out (control); rows: {:?}", rows);
+    assert!(has("x1", "48"),
+        "BARE numeric object literal must fan out to the FT cell — currently \
+         dropped (objectValue=φ, fieldName falls back to the raw verb)");
+}
