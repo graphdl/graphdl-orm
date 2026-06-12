@@ -1713,7 +1713,30 @@ pub fn main_entry() {
                     if corpus.trim().is_empty() {
                         ast::Object::phi()
                     } else {
-                        let full = parse_forml2::parse_to_state_from(&corpus, &ast::Object::phi())
+                        // arc-agi-3 engine-issue 14b: the pre-parse runs
+                        // against the METAMODEL noun catalog, not φ. An app
+                        // FT declaration referencing a metamodel noun
+                        // (`Case observes Fact` — `Fact` is core
+                        // vocabulary) failed to parse in the φ-context
+                        // corpus pass, so the FactType seed lacked it and
+                        // the per-file fold still mis-filed those instance
+                        // facts (arc's round-8 residual: case-*.md
+                        // warnings survived the 14a fix). The fold below
+                        // already parses every file against mm_parsed +
+                        // this seed; giving the seed pass the same noun
+                        // context closes the gap. The seed extraction
+                        // keeps only Noun/FactType/Role cells, and
+                        // fold_base re-merges mm_parsed anyway, so the
+                        // metamodel rows the context contributes dedupe
+                        // by identity.
+                        let mm_noun_ctx: ast::Object = {
+                            let mut m: hashbrown::HashMap<String, ast::Object> =
+                                hashbrown::HashMap::new();
+                            m.insert("Noun".to_string(),
+                                ast::fetch_cell_seq("Noun", mm_parsed));
+                            ast::Object::map(m)
+                        };
+                        let full = parse_forml2::parse_to_state_from(&corpus, &mm_noun_ctx)
                             .unwrap_or_else(|e| { eprintln!("app corpus parse: {}", e); std::process::exit(1); });
                         let mut m: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
                         m.insert("Noun".to_string(), ast::fetch_cell_seq("Noun", &full));

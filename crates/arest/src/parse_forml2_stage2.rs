@@ -9002,6 +9002,75 @@ mod tests {
              mis-file (otherwise this test cannot detect the regression)");
     }
 
+    /// arc-agi-3 engine-issue 14b (round-8 residual): an app FT
+    /// declaration referencing a noun that lives ONLY in the outer
+    /// context (`Case observes Fact` — `Fact` is metamodel
+    /// vocabulary) must still reach the corpus seed, or the early
+    /// file's instance facts keep mis-filing even after the 14a fix.
+    /// The seed pre-parse therefore runs WITH the context noun
+    /// catalog; this pins both directions.
+    #[test]
+    fn seed_carries_fact_types_that_reference_context_only_nouns() {
+        let decls = "Case(.id) is an entity type.\n\n\
+                     ## Fact Types\n\n\
+                     Case observes Fact.\n";
+        let facts = "## Instance Facts\n\n\
+                     Case 'c1' observes Fact 'f1'.\n";
+        let corpus = alloc::format!("{facts}\n\n{decls}");
+
+        // Outer noun catalog carrying `Fact` (the metamodel noun the
+        // app corpus never declares).
+        let ctx_nouns = {
+            let mut m: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+            m.insert("Noun".to_string(), Object::seq(vec![
+                fact_from_pairs(&[("name", "Fact"), ("objectType", "entity")]),
+            ]));
+            Object::map(m)
+        };
+
+        // 14b: corpus pre-parse WITH the context → the FT reaches the
+        // seed.
+        let full = crate::parse_forml2::parse_to_state_from(&corpus, &ctx_nouns)
+            .expect("corpus parses with context nouns");
+        let seeded_fts: alloc::vec::Vec<String> =
+            crate::ast::fetch_cell_seq("FactType", &full).as_seq()
+                .map(|rows| rows.iter()
+                    .filter_map(|f| binding(f, "id").map(String::from))
+                    .collect())
+                .unwrap_or_default();
+        assert!(seeded_fts.iter().any(|id| id == "Case_observes_Fact"),
+            "the context-noun FT must reach the seed; got {seeded_fts:?}");
+
+        // Negative control: the φ-context pre-parse (the 14a behavior)
+        // misses it — proving the context is load-bearing.
+        let bare = crate::parse_forml2::parse_to_state_from(&corpus, &Object::phi())
+            .expect("corpus parses bare");
+        let bare_fts: alloc::vec::Vec<String> =
+            crate::ast::fetch_cell_seq("FactType", &bare).as_seq()
+                .map(|rows| rows.iter()
+                    .filter_map(|f| binding(f, "id").map(String::from))
+                    .collect())
+                .unwrap_or_default();
+        assert!(!bare_fts.iter().any(|id| id == "Case_observes_Fact"),
+            "negative control: without context the FT must be missing \
+             (otherwise this test cannot detect the regression); got {bare_fts:?}");
+
+        // End-to-end: the facts-only file, parsed against a seed built
+        // from the context-aware corpus parse + the context nouns,
+        // resolves cleanly.
+        let mut seed_map: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        for cell in ["Noun", "FactType", "Role"] {
+            seed_map.insert(cell.to_string(), crate::ast::fetch_cell_seq(cell, &full));
+        }
+        let seed = crate::ast::merge_states(&ctx_nouns, &Object::map(seed_map));
+        let parsed = crate::parse_forml2::parse_to_state_from_in_domain(
+            facts, &seed, "a-cases.md").expect("facts file parses");
+        let unresolved = crate::ast::fetch_cell_seq("UnresolvedInstanceFact", &parsed);
+        assert_eq!(unresolved.as_seq().map(|s| s.len()).unwrap_or(0), 0,
+            "the context-noun FT must resolve the early file's instance \
+             facts; got {unresolved:?}");
+    }
+
     /// The "for each <Z>" / "per <Z>" SUFFIX UC on an n-ary fact type
     /// is the ORM pair-UC verbalization: "Each Fact uses at most one
     /// Resource for each Role" = per (Fact, Role), at most one
