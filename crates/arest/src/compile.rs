@@ -4668,6 +4668,58 @@ pub fn reflect_schema_cells(state: &crate::ast::Object) -> Vec<(String, crate::a
             })
             .collect()
     };
+    // task-987 (substrate-derived ruling, increment ii): the
+    // `Resource is instance of Noun` membership sweep. The metamodel
+    // declares the FT (instances.md) and the totality probe showed its
+    // population ×1914 short — readings-loaded and historical entities
+    // never received membership rows (the apply path writes them only
+    // at create time). Sweep every DECLARED FT cell's population: each
+    // binding whose role noun is ENTITY-typed contributes
+    // (Resource=value, Noun=role noun). DIRECT membership only —
+    // subtype closure is the metamodel's own rule
+    // (`Resource is inherited instance of Noun iff …`, core.md:423),
+    // not this reflection's job. Deduped and sorted (set-replace,
+    // deterministic). The schema-as-facts cells participate naturally:
+    // `Noun_has_Object_Type` rows make every declared noun an instance
+    // of the noun `Noun` — exactly the reflexive memberships the 987
+    // totality gate ranges over.
+    let memberships: Vec<Object> = {
+        let entity_nouns: hashbrown::HashSet<String> =
+            fetch_cell_seq("Noun", state).as_seq()
+                .map(|rows| rows.iter()
+                    .filter_map(|n| {
+                        let name = binding(n, "name")?;
+                        (binding(n, "objectType").unwrap_or("entity") == "entity")
+                            .then(|| name.to_string())
+                    })
+                    .collect())
+                .unwrap_or_default();
+        let ft_ids: Vec<String> = reading_by_ft.keys().cloned().collect();
+        let mut pairs: hashbrown::HashSet<(String, String)> = hashbrown::HashSet::new();
+        for ft in &ft_ids {
+            let cell = crate::ast::fetch_or_phi(ft, state);
+            for fact in crate::ast::cell_facts_iter(&cell) {
+                let Some(items) = fact.as_seq() else { continue };
+                for pair in items.iter() {
+                    let Some(kv) = pair.as_seq() else { continue };
+                    if kv.len() != 2 { continue; }
+                    let (Some(role), Some(value)) = (kv[0].as_atom(), kv[1].as_atom())
+                    else { continue };
+                    if value.is_empty() || value == "φ" { continue; }
+                    if !entity_nouns.contains(role) { continue; }
+                    pairs.insert((value.to_string(), role.to_string()));
+                }
+            }
+        }
+        let mut sorted: Vec<(String, String)> = pairs.into_iter().collect();
+        sorted.sort();
+        sorted.into_iter()
+            .map(|(resource, noun)| fact_from_pairs(&[
+                ("Resource", resource.as_str()),
+                ("Noun", noun.as_str()),
+            ]))
+            .collect()
+    };
     alloc::vec![
         ("Fact_Type_has_Role".to_string(),   Object::Seq(ft_has_role.into())),
         ("Noun_plays_Role".to_string(),      Object::Seq(role_played.into())),
@@ -4678,6 +4730,7 @@ pub fn reflect_schema_cells(state: &crate::ast::Object) -> Vec<(String, crate::a
         ("Reading_has_Text".to_string(), Object::Seq(reading_texts.into())),
         ("Role_is_used_in_Reading".to_string(), Object::Seq(role_used.into())),
         ("Reading_is_used_by_Verb".to_string(), Object::Seq(reading_verbs.into())),
+        ("Resource_is_instance_of_Noun".to_string(), Object::Seq(memberships.into())),
     ]
 }
 
@@ -4776,6 +4829,37 @@ mod reflect_schema_cells_tests {
             .count();
         assert_eq!(ft_rows, 1,
             "exactly one Object Type row per FT-as-Noun instance");
+    }
+
+    /// task-987 increment ii: the membership sweep — every binding in
+    /// a declared FT cell whose role noun is ENTITY-typed contributes
+    /// a (Resource, Noun) membership row; value-typed roles are
+    /// excluded; duplicates collapse; output is sorted-deterministic.
+    #[test]
+    fn reflects_resource_membership_from_population() {
+        let src = "Widget(.id) is an entity type.\nLabel is a value type.\n\nWidget has Label.\n";
+        let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+        // Population: two facts for w-1 (dedup must collapse the
+        // membership), one for w-2; Label values must NOT mint rows.
+        let state = ast::cell_push("Widget_has_Label",
+            ast::fact_from_pairs(&[("Widget", "w-1"), ("Label", "alpha")]), &state);
+        let state = ast::cell_push("Widget_has_Label",
+            ast::fact_from_pairs(&[("Widget", "w-1"), ("Label", "beta")]), &state);
+        let state = ast::cell_push("Widget_has_Label",
+            ast::fact_from_pairs(&[("Widget", "w-2"), ("Label", "gamma")]), &state);
+
+        let cells = reflect_schema_cells(&state);
+        let members = cells.iter().find(|(n, _)| n == "Resource_is_instance_of_Noun")
+            .map(|(_, c)| c.clone()).expect("membership cell emitted");
+        let rows = members.as_seq().expect("seq");
+        let widget_members: Vec<&str> = rows.iter()
+            .filter(|r| ast::binding(r, "Noun") == Some("Widget"))
+            .filter_map(|r| ast::binding(r, "Resource"))
+            .collect();
+        assert_eq!(widget_members, vec!["w-1", "w-2"],
+            "entity-role bindings mint deduped, sorted memberships; got {rows:?}");
+        assert!(!rows.iter().any(|r| ast::binding(r, "Noun") == Some("Label")),
+            "value-typed roles must not mint memberships; got {rows:?}");
     }
 
     /// Idempotent set-replace: reflecting twice yields identical cells.
