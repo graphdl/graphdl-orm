@@ -137,6 +137,17 @@ This association with Fact, Resource, Role provides the preferred identification
 ### State Machine (runtime instance of State Machine Definition)
 State Machine is instance of State Machine Definition.
   Each State Machine is instance of exactly one State Machine Definition.
+State Machine is instance of Noun.
+  Each State Machine is instance of exactly one Noun.
+<!-- task-987 / junk-writer-3: the SM seed has ALWAYS written this
+     triple at runtime (compile.rs sm seed: instance_of_Noun +
+     for_Resource + currently_in_Status), but the fact type was never
+     DECLARED — so cor:closure's orphan GC dropped the population at
+     every compile and the next SM init re-minted it, forever
+     (arc-agi-3 issue-13 forensics). Declaring the engine's own
+     vocabulary makes the population legal, persistent, queryable
+     (a 3NF table), and subject to validate — the substrate-derived
+     987 ruling: complete the self-description, never scope it. -->
 State Machine is for Resource.
   Each Resource has at most one State Machine.
 State Machine is for Resource. *
