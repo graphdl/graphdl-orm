@@ -568,10 +568,98 @@ mod db {
             v3[0].1.push_str("Case has Confidence.\n");
             assert_eq!(super::super::leaf_only_changed_files(&conn, &v3), None,
                 "app.md carries ## Fact Types — schema edit must decline");
-            // Added file → None.
+            // Added instance-only file → eligible (987-A.2 relaxation:
+            // a brand-new instance file is the safest delta — every row
+            // is new; this is the arc one-file-per-run percept shape).
             let mut v4 = v1.clone();
             v4.push(("run-2.md".to_string(), "## Instance Facts\nCase 'c2' observes Fact Note 'n3'.\n".to_string()));
-            assert_eq!(super::super::leaf_only_changed_files(&conn, &v4), None);
+            assert_eq!(super::super::leaf_only_changed_files(&conn, &v4),
+                Some(vec!["run-2.md".to_string()]));
+            // Added SCHEMA-bearing file → None (section gate catches it).
+            let mut v5 = v1.clone();
+            v5.push(("more.md".to_string(), "## Fact Types\nCase has Confidence.\n".to_string()));
+            assert_eq!(super::super::leaf_only_changed_files(&conn, &v5), None);
+            // Removed file → None (removal can retract schema or facts).
+            let v6 = vec![v1[0].clone()];
+            assert_eq!(super::super::leaf_only_changed_files(&conn, &v6), None);
+            // `## Description` + `## Instance Facts` → eligible (the arc
+            // run-file shape; prose-leak safety is the STRUCTURAL gate in
+            // try_leaf_ingest, not a textual section decline).
+            let mut v7 = v1.clone();
+            v7[1].1 = format!("## Description\n\nPercept log prose.\n\n{}", v7[1].1);
+            assert_eq!(super::super::leaf_only_changed_files(&conn, &v7),
+                Some(vec!["run-1.md".to_string()]));
+        }
+
+        /// 987-A.2: the leaf EXECUTION path ingests an instance-only
+        /// delta into a real (mini) prior db — the new fact lands in
+        /// its FT cell, prior facts and the def surface survive, and
+        /// the sig registries advance so the NEXT no-change recompile
+        /// can take the delta-LFP skip. Decline paths persist nothing.
+        #[test]
+        fn leaf_ingest_executes_instance_only_delta() {
+            let conn = Connection::open_in_memory().expect("in-memory sqlite");
+            ensure_meta_tables(&conn);
+            let v1 = vec![
+                ("app.md".to_string(),
+                 "# App\n\n## Entity Types\n\nWidget(.id) is an entity type.\n\n\
+                  ## Value Types\n\nColor is a value type.\n\n\
+                  ## Fact Types\n\nWidget has Color.\n".to_string()),
+                // The arc run-file shape: a Description (prose) section
+                // alongside the Instance Facts — the leaf path must take
+                // it (textual gate allows it; the structural schema gate
+                // verifies the prose emitted no schema rows).
+                ("data.md".to_string(),
+                 "## Description\n\nPercept log for the widget run.\n\n\
+                  ## Instance Facts\n\nWidget 'w1' has Color 'blue'.\n".to_string()),
+            ];
+            // Prior db = a real mini full compile: corpus parse → compile
+            // defs → registry stores → persist (the dirs arm distilled).
+            let corpus: String = v1.iter().map(|(_, t)| t.as_str())
+                .collect::<Vec<_>>().join("\n\n");
+            let parsed = crate::parse_forml2::parse_to_state_from(
+                &corpus, &crate::ast::Object::phi()).expect("v1 corpus parses");
+            let compile_defs = crate::compile::compile_to_defs_state(&parsed);
+            let d = crate::ast::defs_to_state(&compile_defs, &parsed);
+            let d = crate::ast::store("_FileSigs",
+                crate::ast::Object::atom(&super::super::encode_file_sigs(&v1)), &d);
+            persist_state(&conn, &d);
+            let prior_def_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM defs", [], |r| r.get(0)).expect("defs count");
+            // The delta: one ADDITIVE instance edit.
+            let mut v2 = v1.clone();
+            v2[1].1.push_str("Widget 'w2' has Color 'red'.\n");
+            let changed = super::super::leaf_only_changed_files(&conn, &v2)
+                .expect("instance-only edit is eligible");
+            assert_eq!(changed, vec!["data.md".to_string()]);
+            // Decline path: a generator opt-in in the changed file falls
+            // back loudly and persists nothing.
+            let mut v2_gen = v2.clone();
+            v2_gen[1].1.push_str("App 'x' uses Generator 'sqlite'.\n");
+            assert!(!super::super::try_leaf_ingest(&conn, None, &v2_gen, &changed),
+                "generator opt-in must decline the leaf path");
+            // Execute the leaf ingest.
+            assert!(super::super::try_leaf_ingest(&conn, None, &v2, &changed),
+                "leaf ingest should run to completion on an additive delta");
+            // The new fact landed; the prior fact survived.
+            let reloaded = super::super::db::load_state(&conn);
+            let cell = crate::ast::fetch_cell_seq("Widget_has_Color", &reloaded);
+            let rows = cell.as_seq().expect("Widget_has_Color is a populated cell");
+            let has = |id: &str, color: &str| rows.iter().any(|f|
+                crate::ast::binding(f, "Widget") == Some(id)
+                    && crate::ast::binding(f, "Color") == Some(color));
+            assert!(has("w1", "blue"), "prior fact must survive the leaf ingest");
+            assert!(has("w2", "red"), "the appended fact must land");
+            // The def surface survived (compile_to_defs_state was skipped,
+            // so the prior defs must carry over verbatim).
+            let post_def_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM defs", [], |r| r.get(0)).expect("defs count");
+            assert_eq!(post_def_count, prior_def_count,
+                "leaf ingest must not lose (or re-mint) the def surface");
+            // The registries advanced: the next no-change recompile of v2
+            // sees current sigs (None = nothing changed → delta-LFP skip).
+            assert_eq!(super::super::leaf_only_changed_files(&conn, &v2), None,
+                "_FileSigs must reflect v2 after the leaf ingest");
         }
 
         /// rmap-3nf-tables Stage 3 (fossil sweep): apply_ddl drops
@@ -1241,6 +1329,30 @@ fn file_sig(text: &str) -> u64 {
     h
 }
 
+/// The delta-LFP compile signature — fnv over every reading (name +
+/// text) folded with the binary self-hash. ONE definition shared by
+/// the full pipeline and the leaf-ingest path (987-A.2) so the two
+/// can never drift: a leaf ingest stores the SAME sig a full compile
+/// of the same inputs would, which is what lets the next no-change
+/// recompile take the delta-LFP no-op skip regardless of which path
+/// produced the db.
+///
+/// Stage-3 cache-key hardening note (carried from the inline
+/// original): the BINARY SELF-HASH, not AREST_GIT_SHA — the SHA only
+/// moves on commit, so working-tree rebuilds (new derivations, parser
+/// fixes) skipped the re-derive and served stale state until a commit
+/// landed (bit twice live).
+#[cfg(feature = "local")]
+fn compile_input_sig(readings: &[(String, String)]) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for r in readings {
+        for b in r.0.bytes().chain(r.1.bytes()) { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+        h ^= 0x1e; h = h.wrapping_mul(0x100000001b3);
+    }
+    h ^= binary_self_hash();
+    alloc::format!("{:016x}", h)
+}
+
 /// Encode the per-file signature registry as one atom:
 /// `name\x1f{hash:016x}\x1e…` (US/RS separators — filenames are sane).
 #[cfg(feature = "local")]
@@ -1283,12 +1395,15 @@ fn read_prior_file_sigs(conn: &rusqlite::Connection) -> hashbrown::HashMap<Strin
 ///
 /// Conservative by construction:
 ///   - prior registry must exist (a first compile is always full);
-///   - the file SET must be identical (any add/remove → full);
-///   - every changed file must contain `## Instance Facts` and NONE of
-///     the schema section headers (Fact Types / Entity Types / Value
-///     Types / Derivation Rules / State Machine / Constraints) — the
-///     downstream rule-reads gate further requires that no
-///     `derivation:rule_*` reads the changed files' target cells.
+///   - a REMOVED file declines (removal can retract schema or facts —
+///     only a full recompile proves which);
+///   - an ADDED file is eligible when it is itself instance-only
+///     (987-A.2 relaxation: a brand-new instance file is the SAFEST
+///     delta of all — every row it contributes is new, so there is no
+///     stale-row risk; this is the arc one-file-per-run percept shape);
+///   - every changed/added file must contain `## Instance Facts` and
+///     NONE of the schema section headers (Fact Types / Entity Types /
+///     Value Types / Derivation Rules / State Machine / Constraints).
 #[cfg(feature = "local")]
 fn leaf_only_changed_files(
     conn: &rusqlite::Connection,
@@ -1296,11 +1411,15 @@ fn leaf_only_changed_files(
 ) -> Option<Vec<String>> {
     let prior = read_prior_file_sigs(conn);
     if prior.is_empty() { return None; }
-    if prior.len() != readings.len() { return None; }
+    // Removed file → full path (readings carries every current file,
+    // so a prior name missing from it is a deletion).
+    let current: hashbrown::HashSet<&str> =
+        readings.iter().map(|(n, _)| n.as_str()).collect();
+    if prior.keys().any(|n| !current.contains(n.as_str())) { return None; }
     let mut changed: Vec<&(String, String)> = Vec::new();
     for r in readings {
         match prior.get(&r.0) {
-            None => return None, // added file → full path
+            None => changed.push(r), // added file — section-gated below
             Some(h) if *h == format!("{:016x}", file_sig(&r.1)) => {}
             Some(_) => changed.push(r),
         }
@@ -1310,10 +1429,18 @@ fn leaf_only_changed_files(
         // already covers this; let the full path take it.
         return None;
     }
-    const SCHEMA_HEADERS: [&str; 7] = [
+    // `## Description` is deliberately NOT here (987-A.2): every arc
+    // run file carries one (prose + `## Instance Facts`), so declining
+    // on it would exclude the exact percept workload this path exists
+    // for. The risk a Description section poses is PROSE LEAKING INTO
+    // SCHEMA CELLS (the junk-DerivationRule class) — and that is gated
+    // STRUCTURALLY in `try_leaf_ingest`: the partial parse must emit
+    // ZERO new rows into any schema-critical cell or the leaf path
+    // declines loudly. Gating on what the parse EMITS subsumes gating
+    // on what sections the file declares.
+    const SCHEMA_HEADERS: [&str; 6] = [
         "## Fact Types", "## Entity Types", "## Value Types",
         "## Derivation Rules", "## State Machine", "## Constraints",
-        "## Description",
     ];
     for (name, text) in &changed {
         if !text.contains("## Instance Facts") {
@@ -1328,6 +1455,217 @@ fn leaf_only_changed_files(
         }
     }
     Some(changed.into_iter().map(|(n, _)| n.clone()).collect())
+}
+
+/// 987-A.2 opt-in: the leaf EXECUTION path ships dark until arc field
+/// results flip the default. Detection (A.1) always runs and prints.
+#[cfg(feature = "local")]
+fn leaf_ingest_opted_in() -> bool {
+    std::env::var("AREST_LEAF_INGEST").map(|v| v == "1").unwrap_or(false)
+}
+
+/// 987-A.2 — the leaf-ingest EXECUTION path (arc ask #3, percept-only
+/// bulk load). For an ELIGIBLE delta (instance-only files, schema
+/// provably unchanged — `leaf_only_changed_files`), ingest the changed
+/// files as ONE BIG APPLY instead of a full recompile:
+///
+///   - skip the corpus pre-parse: the prior db's schema cells (Noun /
+///     FactType / Role and everything else) ARE the parse context —
+///     the prior compile already paid for them;
+///   - parse + fold ONLY the changed files (same in-domain parse and
+///     ns-3/ns-4 stamping as the full path's per-file fold);
+///   - skip `compile_to_defs_state`: schema unchanged ⇒ defs unchanged
+///     (the Generator-opt-in guard declines the one counterexample);
+///   - skip the #836 wipe: the wipe exists for support REMOVAL; this
+///     path's contract is ADDITIVE (a removed instance line does not
+///     retract until the next full compile — printed loudly), and
+///     aggregate/superlative supersession rides the keyed upsert
+///     (`_UpsertSafeCells` / `_CellKeyRoles`) exactly as it does on
+///     every `apply` mutation;
+///   - run the SAME seeded semi-naive chain the apply path runs — all
+///     rule defs, sidecar-gated, seeded with the cells the changed
+///     files wrote; sidecar-less rules (aggregates, the SM fold
+///     family) run every round, conservatively — NOT an SM-only
+///     stratum, so a percept that triggers an SM event still updates
+///     every downstream bridge exactly as an apply would;
+///   - tail parity: converged-sig stores → persist-dedup → schema
+///     reflection (new instances need their membership sweep) → DDL →
+///     persist.
+///
+/// Returns true when the leaf path ran to completion and persisted;
+/// false declines LOUDLY with nothing persisted (caller falls through
+/// to the full pipeline). Known v1 staleness (documented, full compile
+/// reconciles): the `Provenance` cell (NORMA export tabs) is not
+/// rebuilt here — `--export-norma` invocations decline at the caller.
+#[cfg(feature = "local")]
+fn try_leaf_ingest(
+    conn: &rusqlite::Connection,
+    db_path: Option<&str>,
+    readings: &[(String, String)],
+    changed: &[String],
+) -> bool {
+    let t0 = std::time::Instant::now();
+    // Generator opt-ins change the def surface (sql:sqlite DDL, norma
+    // model, openapi cells) — that's a compile_to_defs_state matter.
+    if let Some((name, _)) = readings.iter()
+        .filter(|(n, _)| changed.iter().any(|c| c == n))
+        .find(|(_, t)| t.contains("uses Generator '")) {
+        eprintln!("[load] leaf-ingest declined: {} adds or edits a Generator \
+                   opt-in (the def surface changes — full compile)", name);
+        return false;
+    }
+    // ONE load: full prior state — schema cells, def cells
+    // (`derivation:*`, `derivation_reads:*`, `_CellKeyRoles`,
+    // `_UpsertSafeCells`, …) and every population. Serves as both the
+    // parse context and the merge base. Rides the loadcache sidecar
+    // when fresh (459b3900).
+    let loaded = load_state_cached(conn, db_path);
+    let t_load = t0.elapsed();
+    // Parse ONLY the changed files, in readings order, each against
+    // the ACCUMULATED context (prior state + earlier changed files).
+    // The prior state carries the complete metamodel + app schema
+    // catalog, which is exactly what the full path's corpus pre-parse
+    // + noun/FT/Role seed exist to provide (arc issues 14/14b).
+    // Structural schema gate (987-A.2): snapshot the row counts of
+    // every schema-critical cell BEFORE the fold. The textual section
+    // gate upstream can't see prose leaking into schema cells (the
+    // junk-DerivationRule class — `## Description` sections are
+    // allowed through for exactly the arc run-file shape), so after
+    // the fold we require these cells to have grown by ZERO rows.
+    // merge_states is identity-aware: a context echo adds nothing, so
+    // any growth is a genuinely new schema row → decline. `Migration`
+    // is here because compile_migration_defs mints one def per
+    // Migration instance — a new instance changes the def surface.
+    const LEAF_SCHEMA_CELLS: [&str; 11] = [
+        "Noun", "FactType", "Role", "Subtype", "RefScheme",
+        "Constraint", "DerivationRule", "EnumValues", "StateMachine",
+        "State Machine", "Migration",
+    ];
+    let cell_rows = |state: &ast::Object, name: &str| -> usize {
+        let c = ast::fetch_cell_seq(name, state);
+        c.as_seq().map(|s| s.len())
+            .or_else(|| c.as_map().map(|m| m.len()))
+            .unwrap_or(0)
+    };
+    let mut merged = loaded;
+    let schema_rows_before: Vec<usize> = LEAF_SCHEMA_CELLS.iter()
+        .map(|n| cell_rows(&merged, n)).collect();
+    let mut targets: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+    for (name, text) in readings.iter().filter(|(n, _)| changed.iter().any(|c| c == n)) {
+        let this = match parse_forml2::parse_to_state_from_in_domain(
+            text.as_str(), &merged, name.as_str()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[load] leaf-ingest declined: {}: {} (the full \
+                           pipeline will report it properly)", name, e);
+                return false;
+            }
+        };
+        let this = ast::annotate_noun_domain(&this, name.as_str());
+        let this = ast::merge_states(&this, &ast::stamp_file_domain(&this, name.as_str()));
+        targets.extend(ast::cells_iter(&this).into_iter()
+            .filter(|(_, c)| c.as_seq().map(|s| !s.is_empty()).unwrap_or(false)
+                || c.as_map().map(|m| !m.is_empty()).unwrap_or(false))
+            .map(|(n, _)| n.to_string()));
+        merged = ast::merge_states(&merged, &this);
+    }
+    if targets.is_empty() {
+        eprintln!("[load] leaf-ingest declined: the changed files parsed to \
+                   no non-empty cells");
+        return false;
+    }
+    // Structural schema gate, post-fold half: any new schema-cell row
+    // means the changed files were NOT purely instance-level after all
+    // (prose leak or a stray declaration) — full compile owns that.
+    for (i, name) in LEAF_SCHEMA_CELLS.iter().enumerate() {
+        let after = cell_rows(&merged, name);
+        if after > schema_rows_before[i] {
+            eprintln!("[load] leaf-ingest declined: the changed files emitted \
+                       {} new row(s) into schema cell `{}` (prose leak or \
+                       stray declaration) — full compile",
+                after - schema_rows_before[i], name);
+            return false;
+        }
+    }
+    // UC upsert (984-B parity): corrected single-valued facts in the
+    // changed files displace stale priors at the same key BEFORE the
+    // chain reads the population — same order as the full path.
+    let d = {
+        let key_roles = crate::evaluate::read_cell_key_roles(&merged);
+        let (next, displaced) = ast::reconcile_keyed_cells(&merged, &key_roles);
+        for (cell, n) in &displaced {
+            eprintln!("[load] UC upsert (leaf): {} — {} stale row(s) displaced \
+                       by a later value at the same key", cell, n);
+        }
+        next
+    };
+    // Seeded chain — the apply path's exact rule pack: user rules +
+    // the synthetic SM family, sidecars as stored. Seed = the cells
+    // the changed files wrote; only rules (transitively) touching the
+    // new facts fire. A pure-percept delta read by no rule derives
+    // nothing and the chain is effectively free.
+    let collect = |prefix: &str, state: &ast::Object| -> Vec<(String, ast::Func)> {
+        ast::cells_iter(state).into_iter()
+            .filter(|(n, _)| n.starts_with(prefix))
+            .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, state)))
+            .collect()
+    };
+    let mut rules = collect("derivation:rule_", &d);
+    rules.extend(collect("derivation:_sm_init_", &d));
+    rules.extend(collect("derivation:_sm_event_fold_", &d));
+    rules.extend(collect("derivation:_sm_for_resource_backfill_", &d));
+    rules.extend(collect("derivation:_sm_instance_of_def_backfill_", &d));
+    let n_rules = rules.len();
+    let (d, n_derived) = if rules.is_empty() {
+        (d, 0usize)
+    } else {
+        let packed: Vec<(&str, &ast::Func, Option<Vec<String>>)> = rules.iter()
+            .map(|(name, func)| {
+                let id = name.split_once(':').map(|(_, id)| id).unwrap_or(name.as_str());
+                (name.as_str(), func, crate::evaluate::read_derivation_reads(&d, id))
+            })
+            .collect();
+        let refs: Vec<(&str, &ast::Func, Option<&[String]>)> = packed.iter()
+            .map(|(name, func, reads)| (*name, *func, reads.as_deref()))
+            .collect();
+        let (new_d, derived) = crate::evaluate::forward_chain_defs_state_seeded(
+            &refs, targets.iter().cloned().collect(), &d, 100);
+        if crate::evaluate::take_chain_abort() {
+            eprintln!("[load] leaf-ingest declined: the seeded chain hit its \
+                       time budget — NOTHING was persisted; falling back to \
+                       the full pipeline");
+            return false;
+        }
+        (new_d, derived.len())
+    };
+    // Tail parity with the full pipeline, same order: converged-sig
+    // stores → persist-dedup → schema reflection → DDL → persist. The
+    // reflection re-runs because changed files can mint NEW instances
+    // (the Resource_is_instance_of_Noun membership sweep must see
+    // them); every reflection layer is set-replace idempotent.
+    let d = ast::store("_CompileSig", ast::Object::atom(&compile_input_sig(readings)), &d);
+    let d = ast::store("_FileSigs", ast::Object::atom(&encode_file_sigs(readings)), &d);
+    let d = super::dedup_state_for_persist(&d);
+    let d = {
+        let mut map: hashbrown::HashMap<String, ast::Object> =
+            ast::cells_iter(&d).into_iter()
+                .map(|(name, contents)| (name.to_string(), contents.clone()))
+                .collect();
+        for (name, contents) in crate::compile::reflect_schema_cells(&d) {
+            map.insert(name, contents);
+        }
+        ast::Object::map(map)
+    };
+    db::apply_ddl(conn, &d);
+    db::persist_state(conn, &d);
+    eprintln!("[load] leaf-ingest EXECUTED: {} changed file(s) {:?} → {} target \
+               cell(s); {} rule def(s) packed (seeded), {} fact(s) derived; \
+               load {:?}, total {:?}. Additive contract: a REMOVED instance \
+               line does not retract on this path — the next full compile \
+               reconciles.",
+        changed.len(), changed, targets.len(), n_rules, n_derived,
+        t_load, t0.elapsed());
+    true
 }
 
 /// load-state-cache lever A: the sidecar key — a function of the
@@ -1820,21 +2158,32 @@ pub fn main_entry() {
                 // can emit per-App cells. The set-of-generators view is
                 // derived from the pairs for backward-compat paths (SQL
                 // trigger emission still keys off generator names only).
-                // 987-A increment 1 (registry + detection): diff the
-                // per-file signatures against the prior compile's
-                // `_FileSigs` registry. When the delta is leaf-only
-                // (instance-fact files, no schema sections), this compile
-                // COULD skip the corpus re-parse + #836 wipe + full chain
-                // — the execution path for that lands as the next
-                // increment; this one ships the registry (priors start
-                // accumulating now) and the mode line (observability on
-                // real workloads, esp. arc-agi-3's percept ingests).
+                // 987-A: per-file signature delta against the prior
+                // compile's `_FileSigs` registry (A.1). When the delta is
+                // leaf-only (instance-fact files, no schema sections) AND
+                // the operator opted in via AREST_LEAF_INGEST=1, A.2 runs
+                // the changed files as one big seeded apply — skipping the
+                // corpus re-parse, compile_to_defs_state, the #836 wipe
+                // and the full chain — then persists and EXITS. Every
+                // decline is loud and falls through to the full pipeline.
                 match leaf_only_changed_files(&conn, &readings) {
-                    Some(changed) => eprintln!(
-                        "[load] leaf-ingest ELIGIBLE: {} instance-only file(s) \
-                         changed {:?} — full pipeline still runs this build; \
-                         the leaf execution path is the next 987-A increment",
-                        changed.len(), changed),
+                    Some(changed) => {
+                        eprintln!("[load] leaf-ingest ELIGIBLE: {} instance-only \
+                                   file(s) changed {:?}", changed.len(), changed);
+                        if export_norma_path.is_some() {
+                            eprintln!("[load] leaf-ingest declined: --export-norma \
+                                       needs the full compile (Provenance rebuild)");
+                        } else if !leaf_ingest_opted_in() {
+                            eprintln!("[load] leaf-ingest: detection-only (set \
+                                       AREST_LEAF_INGEST=1 to execute the leaf path)");
+                        } else if try_leaf_ingest(&conn, Some(db_path.as_str()), &readings, &changed) {
+                            eprintln!("Compiled {} readings into {} (leaf ingest)",
+                                readings.len(), &db_path);
+                            std::process::exit(0);
+                        } else {
+                            eprintln!("[load] leaf-ingest fell back to the full pipeline");
+                        }
+                    }
                     None => {}
                 }
 
@@ -2342,20 +2691,9 @@ pub fn main_entry() {
                 // matches the one the last *converged* compile stored, skip the
                 // drop + chain (the ~14s app SM-fold). Any readings/binary change
                 // → full re-derive. Gated by warm-recompile == cold (838).
-                let compile_sig: String = {
-                    let mut h: u64 = 0xcbf29ce484222325;
-                    for r in &readings {
-                        for b in r.0.bytes().chain(r.1.bytes()) { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
-                        h ^= 0x1e; h = h.wrapping_mul(0x100000001b3);
-                    }
-                    // Stage-3 cache-key hardening: the BINARY SELF-HASH,
-                    // not AREST_GIT_SHA — the SHA only moves on commit,
-                    // so working-tree rebuilds (new derivations, parser
-                    // fixes) skipped the re-derive and served stale
-                    // state until a commit landed (bit twice live).
-                    h ^= binary_self_hash();
-                    alloc::format!("{:016x}", h)
-                };
+                // (sig computation extracted to `compile_input_sig` so the
+                // leaf-ingest path stores the identical sig — see its doc.)
+                let compile_sig: String = compile_input_sig(&readings);
                 let prior_sig = ast::fetch_or_phi("_CompileSig", &d).as_atom().map(|s| s.to_string());
                 // Only skip when prior derived state actually exists (a populated
                 // consequent cell) — never on a first/empty compile.
