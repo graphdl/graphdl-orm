@@ -50,7 +50,7 @@ All patterns from Halpin, Curland & CS445 Class, "ORM 2 Constraint Verbalization
 
 **UC on a single role where A = B (self-referential / ring binary):**
 
-When both roles are played by the same object type, the pattern is a special case of the standard patterns. No subscripting needed for the uniqueness constraint itself:
+When both roles are played by the same object type, the pattern is a special case of the standard patterns. No subscripting is needed for the uniqueness CONSTRAINT itself — the `at most one` quantifier already keeps the two roles straight. This is the ONLY place subscripts are optional on a ring: a **derivation or join** referencing two DISTINCT same-type players still REQUIRES numeric subscripts (`A1`, `A2`); `that`/`the`/`some`/`other <Noun>` are anaphora that collapse the two roles onto one binding, never a distinctness marker (see the Ring Constraints section of advanced-constraints). UC pattern:
 
 | Form | Pattern |
 |---|---|

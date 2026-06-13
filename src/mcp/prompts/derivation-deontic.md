@@ -24,6 +24,17 @@ Person has Full Name. *
 
 The `:=` form from pre-ORM 1 BNF grammar is retired.
 
+**Distinct same-type roles need numeric subscripts.** When a rule references
+two DISTINCT players of the same object type (recursive, transitive, or any
+ring self-join — e.g. `Glyph reaches Glyph` derived over `Glyph rotates to
+Glyph`), distinguish them with numeric subscripts (`Glyph1`, `Glyph2`,
+`Glyph3`). This is the only mechanism, and it is scoped to ring /
+external-constraint self-joins. The anaphora qualifiers
+`that`/`the`/`some`/`other <Noun>` are NOT distinctness markers — they bind to
+the same or context-resolved player and will collapse the two roles onto one
+binding. Subscript every same-type role (head and body); the fresh existential
+bridge appears only in the body. See **Ring Constraints** for the full pattern.
+
 Derivation rules belong in the `## Derivation Rules` section of a FORML2 document. A derived fact should never be stored as an independent field â€” it is a query over the base facts.
 
 **Common mistake**: adding a stored field for something that is derivable from existing facts or state machine history (e.g., adding `isApproved: boolean` when approval state is already in the lifecycle).

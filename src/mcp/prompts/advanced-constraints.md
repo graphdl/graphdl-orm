@@ -107,3 +107,31 @@ Compound ring constraints are expressed by conjoining the individual verbalizati
 
 (Halpin, ORM2, Fig. 9, p. 8)
 
+### Referencing two DISTINCT players of the same type — use numeric subscripts
+
+A ring (and external-constraint self-join) has both roles played by the same
+object type, so a constraint or derivation rule that must talk about TWO
+DISTINCT players of that type distinguishes them with **numeric subscripts**
+(`Glyph1`, `Glyph2`, `Glyph3`). This is the **only** mechanism for distinct
+same-type role-players, and it is scoped to ring / external-constraint
+self-joins.
+
+The anaphora qualifiers `that`, `the`, `some`, `a`/`an`, and `other` do **NOT**
+introduce a fresh distinct entity — they bind to the same or context-resolved
+player. So `Glyph rotates to that Glyph` (or `the Glyph` / `other Glyph`)
+collapses both roles onto ONE binding (a self-loop). There is no `other Noun`
+distinctness keyword; do not rely on `that`/`the`/`some`/`other` to keep two
+same-type players apart.
+
+For a recursive / transitive rule, subscript EVERY same-type role — head and
+body — and let the fresh existential bridge appear only in the body:
+
+```
+* Glyph1 reaches Glyph2 iff Glyph1 rotates to Glyph2.
+* Glyph1 reaches Glyph2 iff Glyph1 rotates to Glyph3 and Glyph3 reaches Glyph2.
+```
+
+Rule: **same subscript = same entity; different subscript = distinct entity.**
+On a 4-cycle this yields the full transitive closure (all 16 ordered pairs);
+the un-subscripted `the <Noun>` form yields only the 4 direct edges.
+
