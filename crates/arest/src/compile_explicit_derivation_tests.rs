@@ -4552,14 +4552,12 @@ Glyph has cheapest Count.
 }
 
 #[test]
-fn aggregate_composite_group_key_guarded_safe() {
-    // aggregate-composite-group-key (interim GUARD): a `min` whose CONSEQUENT
-    // needs a 2-role (src,tgt) group key (arc's shortest-cost) is not yet
-    // folded by the single-role path. The guard makes it emit NOTHING + a
-    // diagnostic rather than a malformed 2-role fact that would bottom the
-    // derivation stratum and silently empty co-resident valid rules. When full
-    // composite folding lands (the task of the same name), this flips to assert
-    // the per-pair minima.
+fn aggregate_min_composite_pair_group_key_fires() {
+    // aggregate-composite-group-key: a `min` whose CONSEQUENT needs a 2-role
+    // (src,tgt) group key (arc's shortest-cost) groups by the PAIR and emits
+    // all three consequent roles. Source ternary, consequent ternary. Before
+    // the fix this emitted a malformed 2-role fact (0 rows) and, co-resident
+    // with a valid rule, bottomed the stratum.
     let src = r#"# Composite (pair) group-key min aggregate
 Glyph(.id) is an entity type.
 Count(.id) is an entity type.
@@ -4572,20 +4570,31 @@ Glyph shortest reaches Glyph at Count.
 * Glyph1 shortest reaches Glyph2 at Count iff Count is the min of Count2 where Glyph1 reaches Glyph2 at Count2.
 "#;
     let (rule, func) = parse_and_compile(src);
-    // It still PARSES as an aggregate; the guard acts at compile/emit time.
     assert!(!rule.consequent_aggregates.is_empty(),
-        "rule still parses as an aggregate; unresolved={:#?}", rule.unresolved_clauses);
+        "composite-group `is the min of` must populate consequent_aggregates; unresolved={:#?}",
+        rule.unresolved_clauses);
 
+    // (g0,g1) reached at {1,3} -> 1; (g0,g2) at {2} -> 2; (g1,g2) at {5} -> 5.
     let out = apply_to_facts(&func, &[
         ("Glyph_reaches_Glyph_at_Count", &[("Glyph", "g0"), ("Glyph", "g1"), ("Count", "1")]),
         ("Glyph_reaches_Glyph_at_Count", &[("Glyph", "g0"), ("Glyph", "g1"), ("Count", "3")]),
+        ("Glyph_reaches_Glyph_at_Count", &[("Glyph", "g0"), ("Glyph", "g2"), ("Count", "2")]),
+        ("Glyph_reaches_Glyph_at_Count", &[("Glyph", "g1"), ("Glyph", "g2"), ("Count", "5")]),
     ]);
     let derived = decode_derived(&out);
-    // Guard fired: NO (malformed) Glyph_shortest_reaches_Glyph_at_Count facts.
-    assert!(
-        !derived.iter().any(|(id, _, _)| id == "Glyph_shortest_reaches_Glyph_at_Count"),
-        "composite-group aggregate must emit NOTHING under the guard (not a malformed \
-         fact that would bottom the stratum); got {:#?}", derived);
+    // Ordered (Glyph_src, Glyph_tgt, Count) membership — order matters because
+    // both group roles are the same noun "Glyph".
+    let has = |s: &str, t: &str, c: &str| derived.iter().any(|(id, _, b)|
+        id == "Glyph_shortest_reaches_Glyph_at_Count"
+        && b.len() == 3
+        && b[0] == ("Glyph".to_string(), s.to_string())
+        && b[1] == ("Glyph".to_string(), t.to_string())
+        && b[2] == ("Count".to_string(), c.to_string()));
+    assert!(has("g0", "g1", "1"), "(g0,g1) shortest must be 1 (not 3); got {:#?}", derived);
+    assert!(has("g0", "g2", "2"), "(g0,g2) shortest must be 2; got {:#?}", derived);
+    assert!(has("g1", "g2", "5"), "(g1,g2) shortest must be 5; got {:#?}", derived);
+    assert!(!has("g0", "g1", "3"),
+        "the longer (g0,g1)@3 path must NOT be emitted as shortest; got {:#?}", derived);
 }
 
 #[test]

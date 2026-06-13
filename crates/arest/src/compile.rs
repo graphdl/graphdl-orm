@@ -5650,26 +5650,35 @@ fn compile_aggregate_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> C
     // true and every source fact joins the single group. The extremum is
     // then the population-wide winner. The anchor value is arbitrary (it is
     // never projected — the global derived fact carries only the value).
-    // derivation-aggregate-composite-group-key (GUARD; full folding is the open
-    // task of the same name): a consequent that needs a COMPOSITE (multi-role)
-    // group key — arc's `Glyph1 shortest reaches Glyph2 at Count`, grouped by
-    // the (src,tgt) PAIR — is not yet folded by the single-role path. Emitting
-    // the single <group,value> pair into a 3+-role cell is MALFORMED and
-    // bottoms the WHOLE derivation stratum (cf. tasks tiers-3-4 note), silently
-    // emptying co-resident valid rules. Until composite folding lands, such a
-    // rule emits NOTHING + a diagnostic, degrading safely instead of poisoning.
-    // (Single-role-group aggregates over an n-ary source are unaffected — the
-    // group key is the one consequent subject role; see
-    // aggregate_min_over_ternary_source_single_group_fires.)
-    let consequent_group_role_count = data.fact_types.get(&consequent_id)
-        .map(|ft| ft.roles.iter().filter(|r| r.noun_name != agg.role).count())
-        .unwrap_or(0);
-    if !agg.enum_global && joined_source.is_none() && consequent_group_role_count > 1 {
+    // derivation-aggregate-composite-group-key: a consequent with >1 NON-VALUE
+    // role (arc's `Glyph1 shortest reaches Glyph2 at Count`, group = the
+    // (src,tgt) PAIR) groups by a COMPOSITE key. The consequent's non-value
+    // roles align positionally to the source's non-target roles; the group key
+    // is the TUPLE of those source role values (proven end-to-end by
+    // aggregate_min_composite_pair_group_key_fires). Single-role groups (incl.
+    // over an n-ary source) keep the scalar key. Plain (non-global, non-joined)
+    // aggregates only. An arity mismatch (composite needed but unmappable)
+    // emits NOTHING + a diagnostic rather than a malformed fact that bottoms
+    // the WHOLE derivation stratum (cf. tasks tiers-3-4 note).
+    let consequent_roles: Vec<(String, usize)> = data.fact_types.get(&consequent_id)
+        .map(|ft| ft.roles.iter().map(|r| (r.noun_name.clone(), r.role_index)).collect())
+        .unwrap_or_default();
+    let value_pos = consequent_roles.iter().position(|(n, _)| *n == agg.role);
+    let consequent_group_count = consequent_roles.iter().enumerate()
+        .filter(|(i, _)| Some(*i) != value_pos).count();
+    let n_source = source_ft.map(|ft| ft.roles.len()).unwrap_or(0);
+    let source_group_indices: Vec<usize> =
+        (0..n_source).filter(|i| *i != target_idx).collect();
+    let composite = !agg.enum_global && joined_source.is_none()
+        && consequent_group_count > 1
+        && consequent_group_count == source_group_indices.len();
+    if !agg.enum_global && joined_source.is_none()
+        && consequent_group_count > 1 && !composite
+    {
         crate::diag!(
-            "[aggregate] rule `{}`: consequent needs a composite ({}-role) group key, \
-             not yet supported - emitting nothing (avoids bottoming the stratum); \
-             see task aggregate-composite-group-key",
-            text, consequent_group_role_count);
+            "[aggregate] rule `{}`: consequent needs {} group roles but source has \
+             {} non-target roles - cannot map composite group key; emitting nothing",
+            text, consequent_group_count, source_group_indices.len());
         let (consequent_cell, _, _) = derivation_dep_metadata(rule);
         return CompiledDerivation {
             id, text, kind, func: Func::constant(Object::phi()),
@@ -5678,6 +5687,10 @@ fn compile_aggregate_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> C
     }
     let g_key = if agg.enum_global {
         Func::constant(Object::atom("\u{1}global"))
+    } else if composite {
+        // Tuple key over ALL source non-target roles (the group IS the tuple).
+        Func::construction(
+            source_group_indices.iter().map(|&i| role_value(i)).collect())
     } else {
         role_value(group_key_idx)
     };
@@ -5817,6 +5830,26 @@ fn compile_aggregate_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> C
     ]);
     let bindings = if agg.enum_global {
         Func::construction(vec![value_binding])
+    } else if composite {
+        // Emit one <role, value> per consequent role IN DECLARED ORDER: the
+        // value role gets the fold; the k-th non-value (group) role gets its
+        // positionally-aligned source role value. Order matters for same-noun
+        // ring consequents (both roles named "Glyph").
+        let mut parts: Vec<Func> = Vec::with_capacity(consequent_roles.len());
+        let mut k = 0usize;
+        for (i, (name, _)) in consequent_roles.iter().enumerate() {
+            if Some(i) == value_pos {
+                parts.push(value_binding.clone());
+            } else {
+                let src_idx = source_group_indices[k];
+                k += 1;
+                parts.push(Func::construction(vec![
+                    Func::constant(Object::atom(name)),
+                    Func::compose(role_value(src_idx), Func::Selector(1)),
+                ]));
+            }
+        }
+        Func::construction(parts)
     } else {
         Func::construction(vec![
             Func::construction(vec![

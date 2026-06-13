@@ -1991,7 +1991,28 @@ fn resolve_derivation_rule(
                         None => (clause.trim().to_string(), false),
                     };
                 let (clause_stripped, _) = split_antecedent_comparator(&clause_no_lit);
-                let resolved = resolve_fact_type(&clause_stripped);
+                let mut resolved = resolve_fact_type(&clause_stripped);
+                // The aggregate SOURCE is a DISTINCT fact type from the
+                // consequent. A consequent whose reading is a SUPERSTRING of the
+                // body clause (`Glyph shortest reaches Glyph at Count` vs the
+                // body's `Glyph reaches Glyph at Count`) shares its role
+                // multiset, so the role-set-only resolve fallback can pick the
+                // consequent — making the fold read its own (empty) cell. When
+                // that happens, re-resolve to the distinct same-role-multiset FT.
+                let consequent_ft_id = rule.consequent_cell.literal_id();
+                if resolved.as_deref() == Some(consequent_ft_id) {
+                    let mut want: Vec<String> = find_nouns(&clause_stripped, &noun_names)
+                        .iter().map(|(_, _, n)| parse_role_token(n).0.to_string()).collect();
+                    want.sort();
+                    resolved = fact_types_map.iter()
+                        .find(|(id, ft)| id.as_str() != consequent_ft_id && {
+                            let mut have: Vec<String> =
+                                ft.roles.iter().map(|r| r.noun_name.clone()).collect();
+                            have.sort();
+                            have == want
+                        })
+                        .map(|(id, _)| id.clone());
+                }
                 let carries_target = resolved.as_ref().and_then(|id| fact_types_map.get(id))
                     .map(|ft| ft.roles.iter().any(|r| r.noun_name == target_base))
                     .unwrap_or(false);
