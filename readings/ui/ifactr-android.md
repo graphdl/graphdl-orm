@@ -301,19 +301,19 @@ Material Spacing Token 'pane-divider' has Description '1dp divider View between 
 ### Material Design 1 list-item row heights
 ### Source: m1.material.io/layout/metrics-keylines component heights table
 
-Material List Item Size 'single-line' has Dp 48.
+Material List Item Size 'single-line' has Dp 48 as row height.
 Material List Item Size 'single-line' has Description 'Single-line list item, no icon. Matches iFactr CellHeight 48dp.'.
 
-Material List Item Size 'single-line-icon' has Dp 48.
+Material List Item Size 'single-line-icon' has Dp 48 as row height.
 Material List Item Size 'single-line-icon' has Description 'Single-line list item with an icon; same 48dp row height.'.
 
-Material List Item Size 'two-line' has Dp 64.
+Material List Item Size 'two-line' has Dp 64 as row height.
 Material List Item Size 'two-line' has Description 'Two-line list item (primary + secondary text), no avatar.'.
 
-Material List Item Size 'two-line-avatar' has Dp 72.
+Material List Item Size 'two-line-avatar' has Dp 72 as row height.
 Material List Item Size 'two-line-avatar' has Description 'Two-line list item with 40dp avatar or image tile. Most common Material list row.'.
 
-Material List Item Size 'three-line' has Dp 88.
+Material List Item Size 'three-line' has Dp 88 as row height.
 Material List Item Size 'three-line' has Description 'Three-line list item (primary + two secondary/body lines).'.
 
 ### Touch target
