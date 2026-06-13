@@ -35,6 +35,21 @@ the same or context-resolved player and will collapse the two roles onto one
 binding. Subscript every same-type role (head and body); the fresh existential
 bridge appears only in the body. See **Ring Constraints** for the full pattern.
 
+**Aggregate derivations** fold a target over a group:
+`* <Subject> has <ValueRole> iff <ValueRole> is the <op> of <Target> where <body>.`
+`<op>` ∈ count / sum / avg / min / max (also earliest / latest / first / last). The
+`where` body names the source fact type carrying the target; the group key is the
+consequent's subject role(s). A consequent with two-or-more non-value roles groups
+by the TUPLE of them (per-pair), e.g.
+`* Glyph1 shortest reaches Glyph2 at Count iff Count is the min of Count2 where Glyph1 reaches Glyph2 at Count2.`
+yields the per-(source, target) minimum; the consequent's non-value roles align
+positionally to the source's non-target roles. **min / max / sum / avg fold
+NUMERICALLY** — a non-numeric target (symbolic ids, enum atoms) yields an EMPTY
+result, so use numeric values for the folded role (`count` is exempt). Name the
+value role to match the consequent's value role; avoid a qualifier word that
+case-collides with a declared type name (`Solve has glyph Count` where `Glyph` is a
+type — prefer `move`/`hop`).
+
 Derivation rules belong in the `## Derivation Rules` section of a FORML2 document. A derived fact should never be stored as an independent field â€” it is a query over the base facts.
 
 **Common mistake**: adding a stored field for something that is derivable from existing facts or state machine history (e.g., adding `isApproved: boolean` when approval state is already in the lifecycle).
