@@ -259,6 +259,18 @@ name = "subtype_join_antecedent_supertype_ft_e2e"
 path = "tests/subtype_join_antecedent_supertype_ft_e2e.rs"
 required-features = ["test-bins"]
 
+# arc Issue 17A / L3 — transitive closure over a SAME-NOUN recursive
+# self-join. A reachability relation built as the least fixed point of
+# `Glyph reaches the Glyph iff Glyph rotates to some Glyph1 and Glyph1
+# reaches the Glyph` must, on a 4-cycle, materialise all 16 ordered
+# pairs. Guards against the join-key detector skipping the `Glyph1`
+# bridge (the noun appears with >1 subscript token), which collapses the
+# closure to the 4 direct edges.
+[[test]]
+name = "recursive_self_join_closure_e2e"
+path = "tests/recursive_self_join_closure_e2e.rs"
+required-features = ["test-bins"]
+
 [features]
 # `test-bins` (#684/#650a) — opt-in flag that lets each integration
 # `[[test]]` entry compile. Off by default so `cargo test --lib`

@@ -5243,9 +5243,12 @@ pub fn extract_key_from_fact(fact: &Object, key_role_names: &[&str]) -> Option<S
 /// there is no non-key role left to disagree on.
 ///
 /// Unlike `cell_put_keyed`'s `extract_key_from_fact` (binding-by-name),
-/// the FNV hash over all sorted (role,value) pairs is dup-role-name-safe:
-/// a ring fact type like `Task blocks Task` stores two `Task` pairs that
-/// a by-name key cannot tell apart, but the full-tuple hash can.
+/// the FNV hash over the (role,value) pairs — ordered by a name-only
+/// STABLE sort — is dup-role-name-safe AND direction-preserving: a ring
+/// fact type like `Task blocks Task` stores two `Task` pairs that a
+/// by-name key cannot tell apart, and the two directions <a,b> / <b,a>
+/// keep distinct keys (their role-index order is preserved, not sorted
+/// away by value). See `synthesize_fact_id`.
 ///
 /// A pre-existing Seq cell is migrated to the keyed Map in the same pass
 /// (each Seq fact re-keyed by its own `synthesize_fact_id`), mirroring
@@ -6432,7 +6435,17 @@ pub fn synthesize_fact_id(ft_id: &str, fact: &Object) -> String {
             Some((pair[0].as_atom()?.to_string(), pair[1].as_atom()?.to_string()))
         }).collect())
         .unwrap_or_default();
-    pairs.sort();
+    // directed-ring-dedup: sort by ROLE NAME only (stable), NOT the full
+    // (role, value) tuple. A full-tuple sort orders the two same-noun
+    // bindings of a ring fact (`Glyph reaches Glyph`) by VALUE, so the
+    // directed pair <g2,g0> hashes identically to <g0,g2> and the cell
+    // can hold only one direction per unordered pair — silently dropping
+    // half of a transitive closure. Name-only stable sort keeps the
+    // positional (role-index) order, so a→b and b→a get distinct keys,
+    // while still normalizing the order of DISTINCT-named roles (caller
+    // -order invariance). Matches `fact_identity_id` and the chain's
+    // `fact_key` / `state_keys`.
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME:  u64 = 0x100000001b3;
     let mut h: u64 = FNV_OFFSET;

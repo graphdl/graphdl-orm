@@ -1210,7 +1210,19 @@ fn fnv_mix(mut h: u64, bytes: &[u8]) -> u64 {
 
 fn fact_key(f: &DerivedFact) -> FactKey {
     let mut refs: Vec<&(String, String)> = f.bindings.iter().collect();
-    refs.sort();
+    // directed-ring-dedup: canonicalize by ROLE NAME only (stable), NOT
+    // by the full (name, value) tuple. Sorting the full tuple makes the
+    // key invariant to binding order across DISTINCT role names (good),
+    // but for a SAME-NOUN ring FT (`Glyph reaches Glyph`) both bindings
+    // carry the same role name, so a full-tuple sort orders them by
+    // VALUE — collapsing the directed pair <g2,g0> onto <g0,g2>. A
+    // stable sort keyed on the role name alone preserves the positional
+    // (role-index) order of the two same-noun bindings, so a→b and b→a
+    // hash distinctly. This is the L3 transitive-closure fix (arc 17A):
+    // without it a 4-cycle reach closure dedups its wrap-around pairs and
+    // never reaches the full 16-pair fixpoint. `state_keys` applies the
+    // identical canonicalization so candidate/existing keys still match.
+    refs.sort_by(|a, b| a.0.cmp(&b.0));
     let mut h = fnv_mix(FNV_OFFSET, f.fact_type_id.as_bytes());
     for (k, v) in refs {
         h = fnv_mix(h, b"|");
@@ -1323,7 +1335,11 @@ pub(crate) fn state_keys(state: &ast::Object) -> HashSet<FactKey> {
             }
             for combo in combos {
                 let mut sorted = combo;
-                sorted.sort();
+                // directed-ring-dedup: role-name-only stable sort, matching
+                // `fact_key` — preserves the positional order of same-noun
+                // ring bindings so <g2,g0> and <g0,g2> key distinctly. See
+                // the rationale at `fact_key`.
+                sorted.sort_by(|a, b| a.0.cmp(&b.0));
                 let mut h = fnv_mix(FNV_OFFSET, cell_name.as_bytes());
                 for (k, v) in &sorted {
                     h = fnv_mix(h, b"|");
