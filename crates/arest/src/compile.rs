@@ -306,6 +306,11 @@ pub(crate) struct CompiledModel {
     /// `evaluate::forward_chain_defs_state_seeded` consumes for round-1
     /// rule gating.
     pub(crate) derivation_positive_reads: HashMap<String, Vec<String>>,
+    /// Rule ids whose reads list is COMPLETE (every antecedent source
+    /// is a FactType — no dynamic/InstancesOfNoun sources). Emitted as
+    /// `derivation_reads_complete:<id>` markers; the delta-join view
+    /// gate requires the marker, activation gating does not.
+    pub(crate) derivation_reads_complete: Vec<String>,
 }
 
 /// When a fact is created in this schema, fire this event on the entity's state machine.
@@ -1891,6 +1896,16 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                 .collect());
             (format!("derivation_reads:{}", id), Func::constant(reads_obj))
         }));
+    // Completeness markers (delta-join view soundness): present only
+    // when the rule's reads list covers EVERY antecedent source. The
+    // chainer's view gate requires this; activation gating keys on the
+    // reads sidecar above (possibly partial — pre-ec434a1f behavior,
+    // restored after the apply-rederive regression).
+    defs.extend(model.derivation_reads_complete.iter()
+        .map(|id| (
+            format!("derivation_reads_complete:{}", id),
+            Func::constant(Object::atom("1")),
+        )));
 
     // sm-fold-as-predicate (collision guard): warn when a derivation consequent
     // cell is ALSO an SM trigger-event cell AND the rule reads a NON-event
@@ -4995,21 +5010,31 @@ fn compile_data_with_state(
                     crate::types::AntecedentSource::InstancesOfNoun(_) => None,
                 })
                 .collect();
-            // derivation-semi-naive-delta-joins (soundness, fixture v9):
-            // a PARTIAL reads list is WORSE than none — the chainer's
-            // activation gate and the delta-join view evaluation both
-            // treat the sidecar as authoritative, so a rule with one
-            // FactType antecedent and one InstancesOfNoun antecedent
-            // was gated/viewed as if the FactType were its ONLY read,
-            // silently under-deriving when the dynamic antecedent
-            // changed (observed live: the ns-domain rules diverged
-            // delta-vs-naive; the SAME blindness can mis-gate the
-            // apply path's seeded chains). All-or-nothing: emit reads
-            // ONLY when every source is a FactType; otherwise empty →
-            // no sidecar → conservative run-every-round.
-            let complete = reads.len() == r.antecedent_sources.len();
-            (r.id.clone(), if complete { reads } else { Vec::new() })
+            // apply-rederive regression (arc, 2026-06-12 18:34): the
+            // earlier all-or-nothing emission (ec434a1f) DELETED the
+            // reads for dynamic-antecedent rules, flipping them to
+            // run-every-round on EVERY apply chain — the per-apply
+            // re-derived layer jumped (derivedCount 57k→85k, 18m48s
+            // walls at 176MB). RESTORED: partial reads are emitted for
+            // ACTIVATION gating exactly as pre-ec434a1f; the delta-view
+            // soundness that motivated all-or-nothing keys on the
+            // SEPARATE completeness marker below instead — views are
+            // only sound when the reads list is COMPLETE, but
+            // activation gating on a partial list merely risks a
+            // skipped re-fire when the unlisted dynamic antecedent
+            // changes, which is the long-standing pre-ec434a1f
+            // behavior (tracked under the same task as fix 2).
+            (r.id.clone(), reads)
         })
+        .collect();
+    // Completeness markers: rules whose EVERY antecedent source is a
+    // FactType. The delta-join view gate (evaluate.rs) requires the
+    // marker; activation gating uses the (possibly partial) reads.
+    let derivation_reads_complete: Vec<String> = data.derivation_rules.iter()
+        .filter(|r| !r.id.is_empty())
+        .filter(|r| r.antecedent_sources.iter()
+            .all(|s| matches!(s, crate::types::AntecedentSource::FactType(_))))
+        .map(|r| r.id.clone())
         .collect();
 
     // sm-retire-imperative-fold: the SM fold is deliberately registered with
@@ -5052,7 +5077,7 @@ fn compile_data_with_state(
         .collect();
 
     CompiledModel { constraints, derivations, state_machines, noun_index,
-        schemas, fact_events, derivation_positive_reads }
+        schemas, fact_events, derivation_positive_reads, derivation_reads_complete }
 }
 
 /// Build the NounIndex from CellIndex.

@@ -903,18 +903,25 @@ fn semi_naive_inner(
                     (Some(dirty), Some(r)) => r.iter().any(|c| dirty.contains(c)),
                 };
                 if !is_active { continue; }
-                // View eligibility (each clause fixture-driven): sidecar
-                // present AND count-complete AND no duplicate reads AND
-                // not self-recursive — a SELF-JOIN (same cell read twice)
-                // or a rule reading its own consequent gets the whole
-                // cell swapped at EVERY occurrence under a view, yielding
-                // ΔA×ΔA and missing ΔA×A_full (fixture v10: the
-                // ns-domain propagation rules diverged on exactly this).
-                // Classical semi-naive needs per-OCCURRENCE deltas; the
-                // whole-cell swap cannot express that — full-eval them.
+                // View eligibility (each clause fixture-driven): the
+                // COMPLETENESS MARKER present (emitted only when every
+                // antecedent source is a FactType — partial sidecars
+                // now exist again for activation gating, so count
+                // arithmetic can no longer prove completeness) AND no
+                // duplicate reads AND not self-recursive — a SELF-JOIN
+                // or consequent-reader gets the whole cell swapped at
+                // EVERY occurrence under a view, yielding ΔA×ΔA and
+                // missing ΔA×A_full (fixture v10). Classical
+                // semi-naive needs per-OCCURRENCE deltas; whole-cell
+                // swaps cannot express that — full-eval them.
                 let view_ok = |r: &[String], name: &str| -> bool {
-                    let Some((n, consequent)) = antecedent_meta.get(name) else { return false };
-                    if r.len() < *n { return false; }
+                    let Some((_, consequent)) = antecedent_meta.get(name) else { return false };
+                    let id = name.split_once(':').map(|(_, i)| i).unwrap_or(name);
+                    let marker = ast::fetch_or_phi(
+                        &alloc::format!("derivation_reads_complete:{}", id), d);
+                    if matches!(marker, ast::Object::Bottom) || marker == ast::Object::phi() {
+                        return false;
+                    }
                     let uniq: hashbrown::HashSet<&str> =
                         r.iter().map(|s| s.as_str()).collect();
                     uniq.len() == r.len() && !r.iter().any(|c| c == consequent)
