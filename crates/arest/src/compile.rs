@@ -4464,6 +4464,30 @@ pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
             .filter(|gif| gif.subject_noun == "Fact Type" && gif.field_name == "Derivation Mode")
             .map(|gif| (gif.subject_value.clone(), gif.object_value.clone()))
             .collect();
+        // arc 17B (self-recursive-view-overflow): a `*` (fully-derived ->
+        // View) FT whose closure is SELF-RECURSIVE — some rule has the
+        // consequent FT in its OWN antecedents (a transitive-closure /
+        // reachability rule like `Glyph reaches Glyph iff Glyph rotates to
+        // some Glyph1 and Glyph1 reaches Glyph`) — CANNOT be a lazy View.
+        // View materialization recomputes the cell on read by evaluating
+        // the rule, which reads the same cell, which re-evaluates the rule
+        // … unbounded self-recursion → the `arest-main` worker stack
+        // overflows on a clean forward-chain (even at the 512 MiB default;
+        // it is runaway recursion, not depth). The eager Stored path
+        // forward-chains to the LEAST FIXED POINT (memoized per round) and
+        // terminates. So force the WHOLE such FT to Stored regardless of
+        // its `*` marker — lazy recompute-on-read is fundamentally
+        // incompatible with a self-referential fixpoint. Collected at the
+        // FT level so EVERY rule targeting it (incl. its non-recursive base
+        // rule) agrees on Stored; non-self-recursive `*` FTs keep View.
+        let self_recursive_consequents: hashbrown::HashSet<String> = rules.iter()
+            .filter_map(|r| {
+                let cid = r.consequent_cell.literal_id();
+                (!cid.is_empty()
+                    && r.antecedent_sources.iter().any(|s| s.fact_type_id() == cid))
+                    .then(|| cid.to_string())
+            })
+            .collect();
         for rule in rules.iter_mut() {
             let consequent_id = rule.consequent_cell.literal_id();
             if consequent_id.is_empty() { continue; }
@@ -4473,6 +4497,9 @@ pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
                     "fully-derived" => crate::types::MaterializationPolicy::View,
                     _ => crate::types::MaterializationPolicy::Stored,
                 };
+            }
+            if self_recursive_consequents.contains(consequent_id) {
+                rule.materialization = crate::types::MaterializationPolicy::Stored;
             }
         }
         rules

@@ -154,3 +154,47 @@ fn four_node_path_reach_closure_is_directed_and_acyclic() {
         got
     );
 }
+
+/// arc Issue 17B — a `*` (fully-derived) FT whose rule is SELF-RECURSIVE
+/// (its consequent FT appears in its own antecedents) must compile to
+/// `Stored` (eager least-fixed-point), NOT `View` (lazy recompute-on-read).
+/// A lazy View of a self-recursive rule recomputes the cell by evaluating
+/// the rule, which reads the same cell, which re-evaluates the rule … which
+/// overflows the `arest-main` stack on a clean forward-chain (runaway
+/// recursion, not depth — it blows the 512 MiB default). Forcing Stored
+/// routes it through the memoized forward-chain that terminates at the LFP.
+#[test]
+fn star_marked_self_recursive_ft_compiles_to_stored_not_view() {
+    let src = "\
+        Glyph(.id) is an entity type.\n\
+        Glyph rotates to Glyph.\n\
+        Glyph reaches Glyph. *\n\
+        \n\
+        ## Derivation Rules\n\
+        * Glyph1 reaches Glyph2 iff Glyph1 rotates to Glyph2.\n\
+        * Glyph1 reaches Glyph2 iff Glyph1 rotates to Glyph3 and Glyph3 reaches Glyph2.\n\
+    ";
+    let state = arest::parse_forml2_stage2::parse_to_state_via_stage12(src)
+        .expect("parse must succeed");
+    let idx = arest::compile::cell_index_from_state(&state);
+    let reach_rules: Vec<_> = idx
+        .derivation_rules
+        .iter()
+        .filter(|r| r.consequent_cell.literal_id() == "Glyph_reaches_Glyph")
+        .collect();
+    assert!(
+        !reach_rules.is_empty(),
+        "expected derivation rules targeting Glyph_reaches_Glyph; got: {:?}",
+        idx.derivation_rules.iter().map(|r| r.text.clone()).collect::<Vec<_>>()
+    );
+    for r in &reach_rules {
+        assert!(
+            matches!(r.materialization, arest::types::MaterializationPolicy::Stored),
+            "a `*`-marked SELF-RECURSIVE reach FT must compile to Stored (eager \
+             fixpoint), not View (lazy recompute-on-read overflows the stack on a \
+             self-referential rule); rule `{}` is {:?}",
+            r.text,
+            r.materialization
+        );
+    }
+}
