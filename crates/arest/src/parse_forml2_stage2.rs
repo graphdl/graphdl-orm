@@ -4792,12 +4792,21 @@ fn resolve_consequent_fact_type_id(rule_text: &str, ft_facts: &[Object]) -> Stri
     if ft_facts.is_empty() { return String::new(); }
     let consequent = derivation_rule_consequent(rule_text);
     let consequent_no_subs = strip_role_subscripts(consequent);
+    // arc Issue 17A / L2: also strip role QUALIFIERS (`the`/`that`/
+    // `some`/`other`/`a`/`an`) so a `the <Noun>`-head ring/recursive
+    // rule (`Glyph reaches the Glyph`) prefix-matches the canonical FT
+    // reading (`Glyph reaches Glyph`). Without this the article breaks
+    // the match → empty consequentFactTypeId → the rule writes nowhere
+    // and recursive closures never build. Combined with subscript
+    // stripping so `the Glyph1` also normalizes.
+    let consequent_no_qual = strip_role_qualifiers(&consequent_no_subs);
     let mut best: (usize, &str) = (0, "");
     for ft in ft_facts {
         let Some(reading) = binding(ft, "reading") else { continue };
         if reading.is_empty() { continue }
         let matched = consequent_matches_reading(consequent, reading)
-            || consequent_matches_reading(&consequent_no_subs, reading);
+            || consequent_matches_reading(&consequent_no_subs, reading)
+            || consequent_matches_reading(&consequent_no_qual, reading);
         if matched && reading.len() > best.0 {
             if let Some(id) = binding(ft, "id") {
                 best = (reading.len(), id);
@@ -4836,6 +4845,22 @@ fn strip_role_subscripts(text: &str) -> String {
             word.to_string()
         }
     }).collect::<Vec<_>>().join(" ")
+}
+
+/// arc Issue 17A / L2: drop standalone role-QUALIFIER words — the
+/// articles/demonstratives FORML2 uses to disambiguate same-type role
+/// players in a rule head/body (`the`, `that`, `some`, `other`, `a`,
+/// `an`). Canonical FT readings carry only noun + verb tokens (no
+/// articles), so removing these lets a qualified consequent
+/// (`Glyph reaches the Glyph`) prefix-match its reading
+/// (`Glyph reaches Glyph`). Lowercase verb tokens and noun tokens are
+/// untouched; only the exact qualifier words drop. Order-preserving.
+fn strip_role_qualifiers(text: &str) -> String {
+    const QUALIFIERS: [&str; 6] = ["the", "that", "some", "other", "a", "an"];
+    text.split_whitespace()
+        .filter(|word| !QUALIFIERS.contains(&word.to_ascii_lowercase().as_str()))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Extract the consequent text from a derivation rule. Strips bullet
@@ -10045,6 +10070,35 @@ Foo has Bar.
             "consequentFactTypeId must resolve to `Task_has_Task_Readiness` even when the \
              consequent's role-noun token (`Task1`) carries a numeric subscript; \
              got '{}'. Rule text: {:?}",
+            consequent_ft, binding(&rule_seq[0], "text"));
+    }
+
+    /// arc Issue 17A / L2 (2026-06-12): a recursive/ring derivation
+    /// rule whose HEAD role uses the `the <Noun>` qualifier (the
+    /// engine's own documented ring-self-join form, e.g.
+    /// `Task is blocked iff some Task1 blocks the Task`) must still
+    /// resolve its consequentFactTypeId. `Glyph reaches the Glyph`
+    /// failed to prefix-match the FT reading `Glyph reaches Glyph`
+    /// because the literal article `the` broke the match — leaving an
+    /// EMPTY consequent, so the rule wrote nowhere and the transitive
+    /// closure never built (arc's planning-as-derivation blocker).
+    #[test]
+    fn stage12_resolves_consequent_fact_type_id_for_the_noun_head_qualifier() {
+        let src = "\
+            Glyph is an entity type.\n\
+            Glyph rotates to Glyph.\n\
+            Glyph reaches Glyph.\n\
+            Glyph reaches the Glyph iff Glyph rotates to the Glyph.\n\
+        ";
+        let state = super::parse_to_state_via_stage12(src)
+            .expect("parse_to_state_via_stage12");
+        let rules = fetch_or_phi("DerivationRule", &state);
+        let rule_seq = rules.as_seq().expect("DerivationRule cell must be a Seq");
+        assert_eq!(rule_seq.len(), 1,
+            "exactly one derivation rule expected; got {}", rule_seq.len());
+        let consequent_ft = binding(&rule_seq[0], "consequentFactTypeId").unwrap_or("");
+        assert_eq!(consequent_ft, "Glyph_reaches_Glyph",
+            "the-Noun head qualifier must resolve to the ring FT id; got '{}'. Rule: {:?}",
             consequent_ft, binding(&rule_seq[0], "text"));
     }
 
