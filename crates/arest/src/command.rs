@@ -2006,14 +2006,24 @@ fn create_via_defs(
     let rejected = violations.iter().any(|v| v.alethic);
 
     // ── emit: construct representation via ρ ────────────────────────
-    let sm_derived: Vec<_> = derived.iter()
-        .filter(|d| d.fact_type_id.contains("StateMachine") || d.fact_type_id.contains("Machine"))
-        .map(|d| format!("{}:{:?}", d.fact_type_id, d.bindings))
-        .collect();
-    diag!("[debug] SM derived facts: {:?}", sm_derived);
+    // diag-ungated-eprintln-cost: these two dumps ran UNGATED on every
+    // createEntity — Debug-formatting the WHOLE SM cell (80+ entries at
+    // arc scale) plus a derived-facts Vec built even when nobody reads
+    // it. `diag!` is an unconditional eprintln! under std (lib.rs:69),
+    // so "diagnostic" sites on per-op paths are production cost +
+    // noise. Gated behind AREST_DEBUG (the MCP's own debug
+    // convention); the broader per-op diag! audit is boarded.
     let sm_shape = StateMachineCellShape::boot();
-    let sm_cell = ast::fetch_or_phi(sm_shape.cell_name, &derived_state);
-    diag!("[debug] SM cell: {:?}", sm_cell);
+    #[cfg(not(feature = "no_std"))]
+    if std::env::var("AREST_DEBUG").is_ok() {
+        let sm_derived: Vec<_> = derived.iter()
+            .filter(|d| d.fact_type_id.contains("StateMachine") || d.fact_type_id.contains("Machine"))
+            .map(|d| format!("{}:{:?}", d.fact_type_id, d.bindings))
+            .collect();
+        diag!("[debug] SM derived facts: {:?}", sm_derived);
+        let sm_cell = ast::fetch_or_phi(sm_shape.cell_name, &derived_state);
+        diag!("[debug] SM cell: {:?}", sm_cell);
+    }
     let status = extract_sm_status(&derived_state, &entity_id);
     let transitions = hateoas_via_rho(d, noun, &entity_id, status.as_deref());
     let navigation = nav_links_via_rho(d, noun, &entity_id);
