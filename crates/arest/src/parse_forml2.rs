@@ -3048,6 +3048,7 @@ fn resolve_derivation_rule(
             fact_types_map,
             &rule.consequent_role_literals,
             &rule.antecedent_role_literals,
+            &rule.antecedent_role_comparisons,
         ) {
             rule.kind = DerivationKind::Join;
             rule.ring_join = Some(plan);
@@ -3332,6 +3333,7 @@ fn compute_ring_join_plan(
     fact_types: &HashMap<String, FactTypeDef>,
     consequent_role_literals: &[crate::types::ConsequentRoleLiteral],
     antecedent_role_literals: &[crate::types::AntecedentRoleLiteral],
+    antecedent_role_comparisons: &[crate::types::AntecedentRoleComparison],
 ) -> Option<crate::types::RingJoinPlan> {
     let n = antecedent_sources.len();
     if n < 2 || antecedent_clauses.len() < n { return None; }
@@ -3411,7 +3413,23 @@ fn compute_ring_join_plan(
             })
         })
     };
+    // arc cross-antecedent-comparison (#914 forward-chain): a noun that is
+    // COMPARED across antecedents (`Task1's Task ID is less than Task2's
+    // Task ID`) must NOT also become an equi-join key. Equating it
+    // (Task1.TaskID == Task2.TaskID) directly contradicts the `<`
+    // comparison and empties the rule's forward-chain (the #907 repro). The
+    // comparison itself is enforced by compile_join_derivation's
+    // role-comparison Filter; the join must only bind the SHARED nouns
+    // (here Source File), not the compared one. A compared noun recurs
+    // across >=2 antecedents like any join var, so without this it is
+    // silently promoted to an equi-key. Mirrors the noun-name join path's
+    // `comparison_roles` exclusion.
+    let comparison_role_nouns: hashbrown::HashSet<&str> = antecedent_role_comparisons
+        .iter()
+        .flat_map(|c| [c.lhs_role.as_str(), c.rhs_role.as_str()])
+        .collect();
     let join_groups: Vec<Vec<(usize, usize)>> = token_positions.iter()
+        .filter(|(tok, _)| !comparison_role_nouns.contains(parse_role_token(tok).0))
         .map(|(_, ps)| ps.iter()
             .filter(|(i, ri)| !literal_pinned(*i, *ri))
             .cloned()
