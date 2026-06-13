@@ -5741,9 +5741,27 @@ fn compile_aggregate_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> C
     // time-unrolled nested conditional over `enum_values[value type]`
     // (first-declared = rank 0); an unlisted value ranks last
     // (`enum.len()`), so it never wins a `min` nor loses a `max` spuriously.
-    let agg_value = if agg.enum_rank {
-        let order = data.enum_values.get(&agg.target_role).cloned()
-            .unwrap_or_default();
+    // aggregate-min-max-nonnumeric-order: the enum order is keyed by the
+    // value-type noun. The superlative path's target_role IS the value type; a
+    // plain aggregate's target_role may carry a Halpin subscript (`Severity2`),
+    // so fall back to the de-subscripted base.
+    let enum_order = data.enum_values.get(&agg.target_role)
+        .or_else(|| {
+            let base = agg.target_role.trim_end_matches(|c: char| c.is_ascii_digit());
+            (base != agg.target_role.as_str())
+                .then(|| data.enum_values.get(base)).flatten()
+        })
+        .cloned().unwrap_or_default();
+    // A plain `is the min/max of` (or earliest/latest/first/last) over an
+    // ENUM-valued target folds over the declaration-order RANK, exactly like the
+    // superlative form — the numeric fold (the `else` arm) yields EMPTY on
+    // non-numeric atoms (the silent footgun). count/sum/avg keep numeric.
+    let use_enum_rank = agg.enum_rank
+        || (matches!(agg.op.as_str(),
+                "min" | "max" | "earliest" | "latest" | "first" | "last")
+            && !enum_order.is_empty());
+    let agg_value = if use_enum_rank {
+        let order = enum_order;
         let rank_of = |value_func: Func| enum_rank_lookup(&order, value_func);
         let value_of = Func::compose(t_val.clone(), Func::Selector(2));
         // α( <rank(value), value> ) . filtered

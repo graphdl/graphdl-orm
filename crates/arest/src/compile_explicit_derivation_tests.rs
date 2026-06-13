@@ -4639,6 +4639,45 @@ Solve has glyph Count.
 }
 
 #[test]
+fn aggregate_max_over_enum_target_folds_by_declaration_rank() {
+    // aggregate-min-max-nonnumeric-order: `is the max of <enum-valued target>`
+    // must fold over the enum DECLARATION-ORDER rank (low<medium<high), not
+    // numerically (numeric fold yields EMPTY on non-numeric atoms — the silent
+    // footgun). Reuses the enum_rank machinery the superlative form already uses.
+    let src = r#"# Enum-ordinal max aggregate
+Incident(.id) is an entity type.
+Severity is a value type.
+Severity enumerates 'low', 'medium', 'high'.
+
+## Fact Types
+Incident has Severity.
+Incident has worst Severity. *
+
+## Derivation Rules
+* Incident1 has worst Severity iff Severity is the max of Severity2 where Incident1 has Severity2.
+"#;
+    let (rule, func) = parse_and_compile(src);
+    assert!(!rule.consequent_aggregates.is_empty(),
+        "enum max aggregate must populate consequent_aggregates; unresolved={:#?}",
+        rule.unresolved_clauses);
+    // i1 has {low, high} -> worst high; i2 has {medium} -> worst medium.
+    let out = apply_to_facts(&func, &[
+        ("Incident_has_Severity", &[("Incident", "i1"), ("Severity", "low")]),
+        ("Incident_has_Severity", &[("Incident", "i1"), ("Severity", "high")]),
+        ("Incident_has_Severity", &[("Incident", "i2"), ("Severity", "medium")]),
+    ]);
+    let derived = decode_derived(&out);
+    let worst = |i: &str| derived.iter().find(|(id, _, b)|
+        id == "Incident_has_worst_Severity"
+        && b.iter().any(|(k, v)| k == "Incident" && v == i))
+        .and_then(|(_, _, b)| b.iter().find(|(k, _)| k == "Severity").map(|(_, v)| v.clone()));
+    assert_eq!(worst("i1").as_deref(), Some("high"),
+        "i1 worst severity = high (max declaration-rank of low/high); got {:#?}", derived);
+    assert_eq!(worst("i2").as_deref(), Some("medium"),
+        "i2 worst severity = medium; got {:#?}", derived);
+}
+
+#[test]
 fn authored_highest_among_superlative_now_lifts_to_rank_aggregate() {
     // task-953 flips the prior #814 pin. The brief's shape (`highest …
     // among`, enum-valued noun, ordering from the enumerate declaration
