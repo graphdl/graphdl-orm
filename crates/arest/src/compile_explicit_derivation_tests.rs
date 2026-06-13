@@ -4598,6 +4598,47 @@ Glyph shortest reaches Glyph at Count.
 }
 
 #[test]
+fn qualified_value_role_consequent_join_fires() {
+    // join-qualified-value-role-consequent-unresolved: a 3-antecedent
+    // projection join whose consequent head has a QUALIFIED value role
+    // (`Solve has glyph Count`, where the qualifier `glyph` collides
+    // case-insensitively with the `Glyph` entity type) now resolves its
+    // consequent FT (via the exact-reading match) and projects. Before the
+    // fix the head resolved to consequent_cell "" and the rule materialized 0.
+    let src = r#"# Qualified value-role projection join
+Solve(.id) is an entity type.
+Glyph(.id) is an entity type.
+Count(.id) is an entity type.
+
+## Fact Types
+Solve has source Glyph.
+Solve has target Glyph.
+Glyph reaches Glyph at Count.
+Solve has glyph Count.
+
+## Derivation Rules
+* Solve1 has glyph Count iff Solve1 has source Glyph1 and Solve1 has target Glyph2 and Glyph1 reaches Glyph2 at Count.
+"#;
+    let (rule, func) = parse_and_compile(src);
+    assert_eq!(rule.consequent_cell.literal_id(), "Solve_has_glyph_Count",
+        "qualified value-role head must resolve its consequent FT, not '' (got {:?})",
+        rule.consequent_cell);
+    // s1: source gA, target gB; gA reaches gB at 2 -> Solve s1 has glyph Count 2.
+    let out = apply_to_facts(&func, &[
+        ("Solve_has_source_Glyph", &[("Solve", "s1"), ("Glyph", "gA")]),
+        ("Solve_has_target_Glyph", &[("Solve", "s1"), ("Glyph", "gB")]),
+        ("Glyph_reaches_Glyph_at_Count", &[("Glyph", "gA"), ("Glyph", "gB"), ("Count", "2")]),
+    ]);
+    let derived = decode_derived(&out);
+    assert!(
+        derived.iter().any(|(id, _, b)|
+            id == "Solve_has_glyph_Count"
+            && b.iter().any(|(k, v)| k == "Solve" && v == "s1")
+            && b.iter().any(|(k, v)| k == "Count" && v == "2")),
+        "expected (Solve=s1, Count=2) projected from the 3-way join; got {:#?}", derived);
+}
+
+#[test]
 fn authored_highest_among_superlative_now_lifts_to_rank_aggregate() {
     // task-953 flips the prior #814 pin. The brief's shape (`highest …
     // among`, enum-valued noun, ordering from the enumerate declaration

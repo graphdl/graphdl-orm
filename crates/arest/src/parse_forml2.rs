@@ -1705,6 +1705,26 @@ fn resolve_derivation_rule(
         // `ViewElement (E) renders Fact Type (FT)` must extract verb
         // "renders", not "(E) renders".
         let cleaned = strip_role_variables(&strip_anaphora(fragment));
+        // Exact-reading match FIRST (join-qualified-value-role-consequent-unresolved):
+        // normalize the head's tokens (strip Halpin subscripts) and compare to
+        // each declared FT reading. This binds a head whose qualifier word
+        // collides case-insensitively with a type name — `Solve has glyph Count`,
+        // where `glyph` would otherwise be mis-read by find_nouns as the `Glyph`
+        // type and inflate the extracted role set to [Solve,Glyph,Count] vs the
+        // FT's real [Solve,Count] — directly to its FT, independent of the
+        // noun-extraction path. An exact reading match is the most specific
+        // resolution; non-matches fall through to the verb/role-set path below.
+        let norm_reading = |s: &str| s.split_whitespace()
+            .map(|t| parse_role_token(t).0.to_lowercase())
+            .collect::<Vec<_>>().join(" ");
+        let head_norm = norm_reading(&cleaned);
+        if !head_norm.is_empty() {
+            if let Some((id, _)) = fact_types_map.iter()
+                .find(|(_, ft)| norm_reading(&ft.reading) == head_norm)
+            {
+                return Some(id.clone());
+            }
+        }
         let found_nouns: Vec<(usize, usize, String)> = find_nouns(&cleaned, &noun_names);
         if found_nouns.is_empty() { return None; }
         let base_refs: Vec<String> = found_nouns.iter()
