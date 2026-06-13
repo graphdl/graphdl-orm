@@ -4503,6 +4503,92 @@ Order has Amount.
 }
 
 #[test]
+fn aggregate_min_over_ternary_source_single_group_fires() {
+    // Regression (aggregate-composite-group-key root cause): a `min` aggregate
+    // over a TERNARY source (`Glyph reaches Glyph at Count`, repeated `Glyph`
+    // noun), grouped by a SINGLE source role, into a BINARY consequent, fires
+    // correctly — the per-source minimum. This pins that the parser IR and the
+    // compiled fold handle an n-ary source fine; the OPEN gap is narrower: a
+    // ternary CONSEQUENT needing a COMPOSITE (pair) group key. Live arc-mincost
+    // emptied this single-group rule ONLY when it was co-resident with a
+    // malformed ternary-consequent aggregate (which ⊥-bottoms the stratum),
+    // not on its own.
+    let src = r#"# Ternary-source min aggregate (arc shortest-cost shape)
+Glyph(.id) is an entity type.
+Count(.id) is an entity type.
+
+## Fact Types
+Glyph reaches Glyph at Count.
+Glyph has cheapest Count.
+
+## Derivation Rules
+* Glyph1 has cheapest Count iff Count is the min of Count2 where Glyph1 reaches Glyph2 at Count2.
+"#;
+    let (rule, func) = parse_and_compile(src);
+    assert!(!rule.consequent_aggregates.is_empty(),
+        "ternary-source `is the min of` must populate consequent_aggregates; unresolved={:#?}",
+        rule.unresolved_clauses);
+    let agg = &rule.consequent_aggregates[0];
+    assert_eq!(agg.op, "min");
+    assert_eq!(agg.group_key_index, Some(0), "group key = source glyph (role 0)");
+    assert_eq!(agg.target_index, Some(2), "folded target = Count (role 2)");
+
+    // g0 reaches at {1, 3} -> min 1; the longer 3-path must NOT leak through.
+    let out = apply_to_facts(&func, &[
+        ("Glyph_reaches_Glyph_at_Count", &[("Glyph", "g0"), ("Glyph", "g1"), ("Count", "1")]),
+        ("Glyph_reaches_Glyph_at_Count", &[("Glyph", "g0"), ("Glyph", "g1"), ("Count", "3")]),
+        ("Glyph_reaches_Glyph_at_Count", &[("Glyph", "g0"), ("Glyph", "g2"), ("Count", "2")]),
+    ]);
+    let derived = decode_derived(&out);
+    assert!(
+        derived.iter().any(|(_, _, b)|
+            b.iter().any(|(k, v)| k == "Glyph" && v == "g0") &&
+            b.iter().any(|(k, v)| k == "Count" && v == "1")),
+        "expected (Glyph=g0, Count=1) per-source min; got {:#?}", derived);
+    assert!(
+        !derived.iter().any(|(_, _, b)|
+            b.iter().any(|(k, v)| k == "Count" && v == "3")),
+        "the longer 3-path must not leak as the min; got {:#?}", derived);
+}
+
+#[test]
+fn aggregate_composite_group_key_guarded_safe() {
+    // aggregate-composite-group-key (interim GUARD): a `min` whose CONSEQUENT
+    // needs a 2-role (src,tgt) group key (arc's shortest-cost) is not yet
+    // folded by the single-role path. The guard makes it emit NOTHING + a
+    // diagnostic rather than a malformed 2-role fact that would bottom the
+    // derivation stratum and silently empty co-resident valid rules. When full
+    // composite folding lands (the task of the same name), this flips to assert
+    // the per-pair minima.
+    let src = r#"# Composite (pair) group-key min aggregate
+Glyph(.id) is an entity type.
+Count(.id) is an entity type.
+
+## Fact Types
+Glyph reaches Glyph at Count.
+Glyph shortest reaches Glyph at Count.
+
+## Derivation Rules
+* Glyph1 shortest reaches Glyph2 at Count iff Count is the min of Count2 where Glyph1 reaches Glyph2 at Count2.
+"#;
+    let (rule, func) = parse_and_compile(src);
+    // It still PARSES as an aggregate; the guard acts at compile/emit time.
+    assert!(!rule.consequent_aggregates.is_empty(),
+        "rule still parses as an aggregate; unresolved={:#?}", rule.unresolved_clauses);
+
+    let out = apply_to_facts(&func, &[
+        ("Glyph_reaches_Glyph_at_Count", &[("Glyph", "g0"), ("Glyph", "g1"), ("Count", "1")]),
+        ("Glyph_reaches_Glyph_at_Count", &[("Glyph", "g0"), ("Glyph", "g1"), ("Count", "3")]),
+    ]);
+    let derived = decode_derived(&out);
+    // Guard fired: NO (malformed) Glyph_shortest_reaches_Glyph_at_Count facts.
+    assert!(
+        !derived.iter().any(|(id, _, _)| id == "Glyph_shortest_reaches_Glyph_at_Count"),
+        "composite-group aggregate must emit NOTHING under the guard (not a malformed \
+         fact that would bottom the stratum); got {:#?}", derived);
+}
+
+#[test]
 fn authored_highest_among_superlative_now_lifts_to_rank_aggregate() {
     // task-953 flips the prior #814 pin. The brief's shape (`highest …
     // among`, enum-valued noun, ordering from the enumerate declaration

@@ -5650,6 +5650,32 @@ fn compile_aggregate_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> C
     // true and every source fact joins the single group. The extremum is
     // then the population-wide winner. The anchor value is arbitrary (it is
     // never projected — the global derived fact carries only the value).
+    // derivation-aggregate-composite-group-key (GUARD; full folding is the open
+    // task of the same name): a consequent that needs a COMPOSITE (multi-role)
+    // group key — arc's `Glyph1 shortest reaches Glyph2 at Count`, grouped by
+    // the (src,tgt) PAIR — is not yet folded by the single-role path. Emitting
+    // the single <group,value> pair into a 3+-role cell is MALFORMED and
+    // bottoms the WHOLE derivation stratum (cf. tasks tiers-3-4 note), silently
+    // emptying co-resident valid rules. Until composite folding lands, such a
+    // rule emits NOTHING + a diagnostic, degrading safely instead of poisoning.
+    // (Single-role-group aggregates over an n-ary source are unaffected — the
+    // group key is the one consequent subject role; see
+    // aggregate_min_over_ternary_source_single_group_fires.)
+    let consequent_group_role_count = data.fact_types.get(&consequent_id)
+        .map(|ft| ft.roles.iter().filter(|r| r.noun_name != agg.role).count())
+        .unwrap_or(0);
+    if !agg.enum_global && joined_source.is_none() && consequent_group_role_count > 1 {
+        crate::diag!(
+            "[aggregate] rule `{}`: consequent needs a composite ({}-role) group key, \
+             not yet supported - emitting nothing (avoids bottoming the stratum); \
+             see task aggregate-composite-group-key",
+            text, consequent_group_role_count);
+        let (consequent_cell, _, _) = derivation_dep_metadata(rule);
+        return CompiledDerivation {
+            id, text, kind, func: Func::constant(Object::phi()),
+            consequent_cell, materialization: rule.materialization.clone(),
+        };
+    }
     let g_key = if agg.enum_global {
         Func::constant(Object::atom("\u{1}global"))
     } else {
