@@ -139,6 +139,7 @@ pub fn check_readings_func() -> Func {
             layer_native(check_atom_ids),
             layer_native(check_ambiguous_domain_references),
             layer_native(check_computed_bindings_in_multi_antecedent_rules),
+            layer_native(check_variable_disjoint_antecedents),
             layer_native(check_effective_widget_agrees_with_most_specific_type),
         ]),
     )
@@ -759,6 +760,67 @@ fn check_computed_bindings_in_multi_antecedent_rules(state: &Object) -> Vec<Read
         .collect()
 }
 
+/// Layer 7b: variable-disjoint antecedent (join-warn-variable-disjoint-antecedent,
+/// arc-agi-3 Q1). A positive multi-antecedent (join) rule whose body contains a
+/// clause sharing NO noun/variable with any other clause cannot equi-join — the
+/// engine forms no cross product over disjoint clauses, so the rule derives an
+/// EMPTY cell while the compile reports ok. arc hit this with a unit-cost guard
+/// (`… and Count1 is unit`) disjoint from the rotation it meant to grade, and
+/// debugged it blind. Surface it LOUDLY as a Resolve warning.
+///
+/// Conservative by design: flags only a clause whose noun TYPES are absent from
+/// EVERY other clause (a genuinely isolated antecedent — almost always a range-
+/// restriction slip). Subscripted same-type players (`Glyph1`/`Glyph3`) count as
+/// shared because the join planner can link them; a fully disconnected component
+/// of size >=2 is not flagged (rare, and avoiding false positives matters more).
+/// InstancesOfNoun sentinels and lifted guards carry empty FT ids / noun sets and
+/// are skipped. Warning, not Error — the complaint is the SILENCE, not the load.
+fn check_variable_disjoint_antecedents(state: &Object) -> Vec<ReadingDiagnostic> {
+    let data = crate::compile::cell_index_from_state(state);
+    let mut diags = Vec::new();
+    for rule in data.derivation_rules.iter() {
+        let ft_ids: Vec<&str> = rule.antecedent_sources.iter()
+            .map(|s| s.fact_type_id())
+            .filter(|id| !id.is_empty())
+            .collect();
+        if ft_ids.len() < 2 { continue; }
+        let noun_sets: Vec<Vec<String>> = ft_ids.iter()
+            .map(|id| data.fact_types.get(*id)
+                .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect::<Vec<_>>())
+                .unwrap_or_default())
+            .collect();
+        let disjoint: Vec<&str> = (0..ft_ids.len())
+            .filter(|&i| {
+                !noun_sets[i].is_empty()
+                    && !noun_sets[i].iter().any(|n|
+                        noun_sets.iter().enumerate()
+                            .any(|(j, other)| j != i && other.contains(n)))
+            })
+            .map(|i| ft_ids[i])
+            .collect();
+        if disjoint.is_empty() { continue; }
+        let names = disjoint.iter().map(|id| format!("`{id}`"))
+            .collect::<Vec<_>>().join(", ");
+        diags.push(ReadingDiagnostic {
+            line: 0,
+            reading: rule.text.clone(),
+            level: Level::Warning,
+            source: Source::Resolve,
+            message: format!(
+                "antecedent {names} shares no variable with the rest of the rule body \
+                 (variable-disjoint) — the equi-join has no key linking it, so this rule \
+                 derives an EMPTY cell (FORML2 forms no cross product over disjoint clauses)",
+            ),
+            suggestion: Some(
+                "connect it by sharing a noun/variable with another clause, or fold the \
+                 constant onto the related fact type (cost-on-the-relation) rather than a \
+                 disjoint guard".to_string(),
+            ),
+        });
+    }
+    diags
+}
+
 /// audit-entity-datatype Phase 2(c) — widget-agreement drift, layer 8.
 ///
 /// The Phase-2(b) machinery resolves each noun's EFFECTIVE Component
@@ -847,6 +909,51 @@ mod tests {
         let input = "Order(.Order Id) is an entity type.\n## Fact Types\nOrder has Amount.\n## Instance Facts\nOrder 'ord-1' has Amount '100'.";
         let diags = check_readings(input);
         assert!(diags.is_empty(), "expected no diagnostics, got {:?}", diags);
+    }
+
+    // ── variable-disjoint antecedent (join-warn-variable-disjoint-antecedent) ──
+
+    #[test]
+    fn variable_disjoint_antecedent_warns() {
+        // arc's footgun: a guard (`Count1 steps to Count2`) shares no noun with
+        // the rotation it grades, so the join can't link it -> empty cell.
+        let input = "\
+Glyph(.id) is an entity type.\n\
+Count(.id) is an entity type.\n\
+\n\
+## Fact Types\n\
+Glyph rotates to Glyph.\n\
+Count steps to Count.\n\
+Glyph reaches Glyph at Count.\n\
+\n\
+## Derivation Rules\n\
+* Glyph1 reaches Glyph2 at Count1 iff Glyph1 rotates to Glyph2 and Count1 steps to Count2.\n";
+        let diags = check_readings(input);
+        let hits: Vec<_> = diags.iter()
+            .filter(|d| d.message.contains("variable-disjoint")).collect();
+        assert_eq!(hits.len(), 1,
+            "expected exactly one variable-disjoint warning; got {:?}", diags);
+        assert_eq!(hits[0].level, Level::Warning);
+        assert!(hits[0].message.contains("Count_steps_to_Count"),
+            "warning names the disjoint antecedent; got {}", hits[0].message);
+    }
+
+    #[test]
+    fn connected_antecedents_do_not_warn() {
+        // Both antecedents share the Glyph type (joined on the intermediate),
+        // so the rule body is connected -> no variable-disjoint warning.
+        let input = "\
+Glyph(.id) is an entity type.\n\
+\n\
+## Fact Types\n\
+Glyph rotates to Glyph.\n\
+Glyph reaches Glyph.\n\
+\n\
+## Derivation Rules\n\
+* Glyph1 reaches Glyph2 iff Glyph1 rotates to Glyph3 and Glyph3 reaches Glyph2.\n";
+        let diags = check_readings(input);
+        assert!(diags.iter().all(|d| !d.message.contains("variable-disjoint")),
+            "connected antecedents must not warn; got {:?}", diags);
     }
 
     // ── computed-binding-join-silent-empty (arc-agi-3 issue 2) ──────
@@ -1468,14 +1575,16 @@ Customer wrote Review.
         // bindings in multi-antecedent rules warn loudly).
         // audit-entity-datatype 2(c) added layer 8 (effective widget
         // agrees with the most-specific type's implication).
+        // join-warn-variable-disjoint-antecedent added layer 7b (a
+        // variable-disjoint antecedent warns), making 9 total.
         let func = check_readings_func();
         match &func {
             Func::Compose(outer, inner) => {
                 assert!(matches!(**outer, Func::Concat),
                     "top-level must compose Concat onto the construction");
                 match &**inner {
-                    Func::Construction(layers) => assert_eq!(layers.len(), 8,
-                        "check_readings_func must expose exactly 8 layer Funcs"),
+                    Func::Construction(layers) => assert_eq!(layers.len(), 9,
+                        "check_readings_func must expose exactly 9 layer Funcs"),
                     other => panic!("inner must be Construction, got {:?}", other),
                 }
             }
