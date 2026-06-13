@@ -933,6 +933,11 @@ fn assert_fact_via_defs(
             .collect()
     };
     let stratum1 = collect_stratum_all("derivation");
+    // apply-rederive (Fix 2 perf half): noun-scope the SM folds to this
+    // assert's role nouns — an m:n assert produces no SM event, so
+    // every other noun's fold is a deterministic no-op (their status
+    // cells survive via the foundation's drop-exclusion).
+    let stratum1 = noun_scope_sm_folds(stratum1, &touched_nouns);
 
     // Seed the incremental chainer with the just-written cell.
     let seed: hashbrown::HashSet<String> = core::iter::once(fact_type.to_string()).collect();
@@ -1677,6 +1682,15 @@ fn create_via_defs(
             .collect()
     };
     let stratum1 = collect_stratum("derivation");
+    // apply-rederive (Fix 2 perf half): noun-scope the SM folds to this
+    // create's noun — every OTHER noun's fold is a deterministic no-op
+    // here (no event for it; its status cell survives via the
+    // foundation's drop-exclusion).
+    let stratum1 = {
+        let touched: hashbrown::HashSet<String> =
+            core::iter::once(noun.to_string()).collect();
+        noun_scope_sm_folds(stratum1, &touched)
+    };
     diag!("[profile] derivation gating: {}/{} stratum-1 rules for noun '{}'",
         stratum1.len(),
         ast::cells_iter(d).into_iter().filter(|(n, _)| n.starts_with("derivation:")).count(),
@@ -2663,6 +2677,49 @@ pub(crate) fn sm_family_consequent_cells(d: &ast::Object) -> hashbrown::HashSet<
         .collect()
 }
 
+/// apply-rederive (Fix 2, perf half): noun-scope the packed SM-fold
+/// family. The SM folds (`_sm_init_<N>` / `_sm_event_fold_<N>` /
+/// `_sm_for_resource_backfill_<N>` / `_sm_instance_of_def_backfill_<N>`)
+/// are sidecar-less BY DESIGN (compile.rs) — the seeded chainer's
+/// reads-dirty gate cannot skip them, so EVERY noun's fold re-runs
+/// over ALL its resources on EVERY apply, the dominant per-apply cost
+/// at arc scale. Keep an SM fold only when its `<N>` is a noun this op
+/// touched; drop the rest. Non-SM `rule_*` defs are always kept (the
+/// reads-dirty gate handles them).
+///
+/// SAFE ONLY in tandem with the `sm_family_consequent_cells`
+/// drop-exclusion (Fix 2 foundation): an untouched noun's status cell
+/// survives the (non-)drop, so NOT re-folding it cannot lose or stale
+/// its statuses — and the op produced no event for that noun, so its
+/// statuses cannot have changed. This is exactly why task-967 removed
+/// noun pre-filtering (the dropped shared cell needed every noun's
+/// fold to rebuild it); the foundation dissolves that hazard.
+fn noun_scope_sm_folds(
+    stratum: Vec<(String, ast::Func)>,
+    touched_nouns: &hashbrown::HashSet<String>,
+) -> Vec<(String, ast::Func)> {
+    const FAMILIES: [&str; 4] = [
+        "derivation:_sm_init_",
+        "derivation:_sm_event_fold_",
+        "derivation:_sm_for_resource_backfill_",
+        "derivation:_sm_instance_of_def_backfill_",
+    ];
+    // The fold DEF name carries the noun verbatim — `_sm_init_Schema
+    // Design` keeps the space (compile.rs `format!("_sm_init_{}",
+    // sm.noun_name)`). Compare against the raw touched noun names; a
+    // `.replace(' ', "_")` here mismatches every MULTI-WORD SM noun,
+    // dropping its init/fold so the entity never gets a status (caught
+    // by never_seen_app_renders_through_the_generic_seam on the
+    // multi-word `Schema Design` noun; the command:: suite uses only
+    // single-word Task/Job and missed it).
+    stratum.into_iter()
+        .filter(|(name, _)| match FAMILIES.iter().find_map(|f| name.strip_prefix(f)) {
+            Some(noun_suffix) => touched_nouns.contains(noun_suffix),
+            None => true,
+        })
+        .collect()
+}
+
 #[allow(unreachable_code)]
 fn reconcile_derived_transitions(
     d: &ast::Object,
@@ -3112,6 +3169,16 @@ fn transition_via_defs(
                 .collect()
         };
         let stratum1 = collect_stratum("derivation");
+        // apply-rederive (Fix 2 perf half): noun-scope the SM folds to
+        // the transitioning entity's noun — only ITS status changes;
+        // other nouns' folds are no-ops (their status cells survive via
+        // the foundation's drop-exclusion). THIS noun's _sm_event_fold
+        // is kept so the new status folds from the now-longer stream.
+        let stratum1 = {
+            let touched: hashbrown::HashSet<String> =
+                core::iter::once(noun.to_string()).collect();
+            noun_scope_sm_folds(stratum1, &touched)
+        };
 
         // seeded-transition-chain (p2): make the post-transition chain
         // SEEDED/scoped, mirroring update_via_defs (L3349+) and
@@ -3864,6 +3931,15 @@ fn update_via_defs(
             .collect()
     };
     let stratum1 = collect_stratum("derivation");
+    // apply-rederive (Fix 2 perf half): noun-scope the SM folds to this
+    // update's noun (an update changes fields, not status, but keeping
+    // its own fold is harmless and other nouns' folds are no-ops; their
+    // status cells survive via the foundation's drop-exclusion).
+    let stratum1 = {
+        let touched: hashbrown::HashSet<String> =
+            core::iter::once(noun.to_string()).collect();
+        noun_scope_sm_folds(stratum1, &touched)
+    };
 
     // task-3 phase 2 / DB-task-929: incremental forward chain via
     // `forward_chain_defs_state_seeded`. Round 1 only runs rules whose
