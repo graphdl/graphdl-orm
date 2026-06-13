@@ -1726,6 +1726,22 @@ fn create_via_defs(
         let sm_triggers = sm_trigger_cell_set(d);
         dropped_cells.into_iter().filter(|c| !sm_triggers.contains(c.as_str())).collect()
     };
+    // apply-rederive (Fix 2, arc 2026-06-12): ALSO exclude the
+    // SM-fold-family consequents (`sm_family_consequent_cells`: the
+    // SHARED `State_Machine_is_currently_in_Status` cell + the
+    // for-Resource / instance-of backfill cells) from the wipe. They
+    // are keyed PER RESOURCE and monotone-per-resource (the fold
+    // REPLACES each via keyed upsert), so they self-correct without
+    // the #836 wipe. Dropping the shared status cell forced EVERY
+    // noun's sidecar-less SM fold to re-run to repopulate it (the
+    // 57k->85k growing layer, 18m applies). NOT `_UpsertSafeCells`:
+    // that set also sweeps in shrinking aggregates (recommendation
+    // cascade) that DO need the drop — see the helper doc. The leaf
+    // path never drops these and passed full A/B equivalence.
+    let dropped_cells: hashbrown::HashSet<String> = {
+        let sm_family = sm_family_consequent_cells(d);
+        dropped_cells.into_iter().filter(|c| !sm_family.contains(c.as_str())).collect()
+    };
     // Bridge-clobber guard (mirror of update_via_defs's fix from
     // b4cfcb6f): snapshot the pre-drop value of every cell about to
     // clear, plus the rule_id -> consequent_cell map. After the chain
@@ -2617,6 +2633,36 @@ pub(crate) fn sm_trigger_cell_set(d: &ast::Object) -> hashbrown::HashSet<String>
     sm_fact_triggers(d).into_iter().map(|(_, _, cell)| cell).collect()
 }
 
+/// apply-rederive (Fix 2): the SM-fold-family consequent cells listed in
+/// the `SyntheticDerivedCells` meta cell — `State_Machine_is_currently_in_
+/// Status`, `State_Machine_is_for_Resource`, the instance-of backfill cell.
+/// Each is keyed PER RESOURCE and monotone-per-resource (every resource
+/// always has exactly one status; the fold REPLACES it via keyed upsert),
+/// so they self-correct WITHOUT the #836 pre-drop. Excluding them from the
+/// apply wipe avoids dropping the SHARED status cell — which otherwise
+/// forces every noun's sidecar-less fold to re-run to repopulate it.
+///
+/// NOT the same as `_UpsertSafeCells`: that set also sweeps in downstream
+/// AGGREGATE/cascade consequents (e.g. recommendation superlatives) whose
+/// population can SHRINK — an upsert cannot remove a stale row, so those
+/// DO need the drop+rederive. This set is only the per-resource folds.
+pub(crate) fn sm_family_consequent_cells(d: &ast::Object) -> hashbrown::HashSet<String> {
+    let cell = ast::fetch_cell_seq("SyntheticDerivedCells", d);
+    let entries: Vec<ast::Object> = cell.as_seq()
+        .and_then(|items| {
+            if items.len() == 2 && items[0].as_atom() == Some("'") {
+                items[1].as_seq().map(|s| s.to_vec())
+            } else {
+                Some(items.to_vec())
+            }
+        })
+        .unwrap_or_default();
+    entries.iter()
+        .filter_map(|f| ast::binding(f, "name").map(|s| s.to_string()))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 #[allow(unreachable_code)]
 fn reconcile_derived_transitions(
     d: &ast::Object,
@@ -3166,6 +3212,19 @@ fn transition_via_defs(
         let dropped_cells: hashbrown::HashSet<String> = {
             let sm_triggers = sm_trigger_cell_set(d);
             dropped_cells.into_iter().filter(|c| !sm_triggers.contains(c.as_str())).collect()
+        };
+        // apply-rederive (Fix 2): exclude the SM-fold-family
+        // consequents (`sm_family_consequent_cells`) — per-resource,
+        // monotone, self-correcting via keyed upsert; must not be wiped
+        // (dropping the shared status cell forced a full multi-noun
+        // re-fold). On a transition the fold re-emits
+        // the transitioned resource's status from its now-longer event
+        // stream and the keyed upsert REPLACES the prior entry, so the
+        // new status wins without a wipe (transition_changes_status +
+        // transition_refreshes_cross_noun_derived_cells are the guards).
+        let dropped_cells: hashbrown::HashSet<String> = {
+            let sm_family = sm_family_consequent_cells(d);
+            dropped_cells.into_iter().filter(|c| !sm_family.contains(c.as_str())).collect()
         };
         // Bridge-clobber guard (parity with update_via_defs L3432+):
         // snapshot the pre-drop value of every cell about to clear, plus
@@ -3870,6 +3929,14 @@ fn update_via_defs(
     let dropped_cells: hashbrown::HashSet<String> = {
         let sm_triggers = sm_trigger_cell_set(d);
         dropped_cells.into_iter().filter(|c| !sm_triggers.contains(c.as_str())).collect()
+    };
+    // apply-rederive (Fix 2): exclude the SM-fold-family consequents
+    // (`sm_family_consequent_cells`) from the wipe — per-resource,
+    // monotone, self-correcting via keyed upsert; see the matching
+    // block in create_via_defs for the full rationale.
+    let dropped_cells: hashbrown::HashSet<String> = {
+        let sm_family = sm_family_consequent_cells(d);
+        dropped_cells.into_iter().filter(|c| !sm_family.contains(c.as_str())).collect()
     };
     // Bridge-clobber guard (this session): snapshot the pre-drop value
     // of every cell we're about to clear, plus the rule_id ->
