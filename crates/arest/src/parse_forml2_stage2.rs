@@ -4327,21 +4327,31 @@ fn translate_instance_facts_with_ft_ids(
         // FT-cell fan-out. Live class: the bundled ifactr Material Dp
         // layer (~175 facts), found by the 987-B census. Scoped
         // recovery: when the LAST role of an instance fact lacks a
-        // literal and the statement text ends in a bare NUMERIC
-        // token, that token is the literal. Word tails stay
-        // unrecovered on purpose — they are reading text, not values.
+        // literal, the value is the first unquoted NUMERIC token right
+        // after that role's value-type noun — whether at the very end
+        // (`X 'x1' has D 48`) or BEFORE an `as <qualifier>` tail
+        // (`... has Dp 48 as resting elevation`, the bundled Material
+        // layer — task-989, the qualified-value-role form that a
+        // trailing-token scan misses, leaving the value in the canonical
+        // reading -> FT-id mismatch -> mis-file under raw verb -> empty
+        // material_* tables). Word tails stay unrecovered on purpose —
+        // they are reading text, not values.
         let mut roles = roles;
         if roles.len() >= 2 && roles.last().map_or(false, |r| r.1.is_none()) {
             if let Some(text) = statement_text(idx, stmt_id) {
                 let t = text.trim_end().trim_end_matches('.').trim_end();
-                if let Some(tail) = t.rsplit(char::is_whitespace).next() {
-                    let numeric = !tail.is_empty()
-                        && tail.chars().all(|c| c.is_ascii_digit() || c == '.')
-                        && tail.chars().any(|c| c.is_ascii_digit());
-                    if numeric {
-                        if let Some(last) = roles.last_mut() {
-                            last.1 = Some(tail.to_string());
-                        }
+                let is_numeric = |tok: &str| !tok.is_empty()
+                    && tok.chars().all(|c| c.is_ascii_digit() || c == '.')
+                    && tok.chars().any(|c| c.is_ascii_digit());
+                let last_noun = roles.last().unwrap().0.clone();
+                let recovered = t.rfind(last_noun.as_str())
+                    .map(|i| &t[i + last_noun.len()..])
+                    .and_then(|after| after.split_whitespace().next())
+                    .filter(|tok| is_numeric(tok))
+                    .map(|tok| tok.to_string());
+                if let Some(val) = recovered {
+                    if let Some(last) = roles.last_mut() {
+                        last.1 = Some(val);
                     }
                 }
             }
@@ -8115,6 +8125,38 @@ mod tests {
             "instance-fact FT id must match the schema-side canonical id even \
              when the reading self-references a role noun (canonical was {})",
             canonical_id);
+    }
+
+    /// task-989: instance facts of the form `<E> 'id' has <ValueType> <value>
+    /// as <qualifier>` (the substrate Material layer — `Material Elevation
+    /// Level 'flat' has Dp 0 as resting elevation`) must resolve to the
+    /// declared `<E> has <ValueType> as <qualifier>` FT. The UNQUOTED value
+    /// sits BETWEEN the value-type noun and the qualifier, so the bare-tail
+    /// numeric recovery (which only fires when the numeric is the last token)
+    /// misses it: the value stays in the canonical reading -> id mismatch ->
+    /// fieldName falls back to the raw verb -> the tuple never reaches the FT
+    /// cell (silent data loss; every material_* table projects empty).
+    #[test]
+    fn qualified_value_role_instance_fact_resolves_canonical() {
+        let decl_stmt = stage1_state(
+            "s_decl", "Widget has Dp as height.", &["Widget", "Dp"]);
+        let decl_classified = classify_statements(&decl_stmt, &grammar_state());
+        let (ft_facts, _roles) = super::translate_fact_types(
+            &decl_classified, &idx(&decl_classified));
+        assert_eq!(ft_facts.len(), 1, "expected one FactType from declaration");
+        let canonical_id = binding(&ft_facts[0], "id").unwrap().to_string();
+
+        let stmt = stage1_state(
+            "s_inst", "Widget 'a' has Dp 48 as height.", &["Widget", "Dp"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let facts = super::translate_instance_facts_with_ft_ids(
+            &classified, &idx(&classified), &[canonical_id.clone()]);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(binding(&facts[0], "fieldName"), Some(canonical_id.as_str()),
+            "qualified value-role instance fact must resolve to declared FT `{}`, \
+             not the raw verb", canonical_id);
+        assert_eq!(binding(&facts[0], "objectValue"), Some("48"),
+            "the value 48 (between value-type noun and qualifier) must be recovered, not lost");
     }
 
     /// engine-casing-skew-cell-name-regression: a reading whose TRAILING word
