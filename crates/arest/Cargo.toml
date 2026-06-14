@@ -271,6 +271,14 @@ name = "recursive_self_join_closure_e2e"
 path = "tests/recursive_self_join_closure_e2e.rs"
 required-features = ["test-bins"]
 
+# arc-min-aggregate-ivm-misfold — `min` over a cost-summing recursive
+# closure retains stale minima (aggregate heads are append-only, not
+# group-keyed). Tests #[ignore]'d until the keyed-upsert fix lands.
+[[test]]
+name = "aggregate_min_over_recursive_closure_e2e"
+path = "tests/aggregate_min_over_recursive_closure_e2e.rs"
+required-features = ["test-bins"]
+
 [features]
 # `test-bins` (#684/#650a) — opt-in flag that lets each integration
 # `[[test]]` entry compile. Off by default so `cargo test --lib`

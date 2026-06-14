@@ -1,0 +1,142 @@
+// crates/arest/tests/aggregate_min_over_recursive_closure_e2e.rs
+//
+// arc blocker (task arc-min-aggregate-ivm-misfold) — a `min` aggregate over a
+// RECURSIVE closure whose recursive step SUMS costs (3-role `Count plus Count
+// is Count`) misfolds: it does not fold to the single minimum per group.
+//
+// ROOT CAUSE (live-validated on arc-cost-gen): `min` is non-monotonic — when a
+// smaller value is derived in a LATER round it must logically RETRACT the prior
+// min. But an aggregate head has no declared uniqueness constraint, so
+// `resolve_key_roles_for_ft` returns no key roles and `integrate_round_facts`
+// stores it APPEND-ONLY (folded by the FULL tuple), with no replace-by-group.
+// With a MONOTONIC closure increment (`steps to`) the min is discovered FIRST
+// and never lowered, so append is accidentally correct (arc-gen WORKS). With
+// cost-SUMMING `plus`, a cheaper route has MORE hops and is discovered a round
+// LATER (direct a->c = 3 found first; a->b->c = 1+1 = 2 found later), so the
+// aggregate head is wrong.
+//
+// The group key is (Node1, Node2) — two DISTINCT same-noun role-players
+// (subscripted): a COMPOSITE key with DUPLICATE role names. The keyed-upsert
+// fix must form that key POSITIONALLY (by role index), not by role name, or the
+// two Node roles collapse (the same class issue17a hit).
+//
+// IGNORED until the fix lands: aggregate heads must be keyed by their group
+// roles with upsert (last-write = smallest-min wins), the SM-current-status IVM
+// idiom. Un-ignore when arc-min-aggregate-ivm-misfold is implemented.
+
+use arest::ast;
+
+/// Costs carried by a ternary `Node _ Node at Cost` cell for a (from,to) pair.
+fn costs_for(d: &ast::Object, cell: &str, from: &str, to: &str)
+    -> std::collections::BTreeSet<String>
+{
+    ast::fetch_cell_seq(cell, d)
+        .as_seq()
+        .map(|facts| {
+            facts
+                .iter()
+                .filter_map(|f| {
+                    let roles = f.as_seq()?;
+                    let subj = roles.first()?.as_seq()?.get(1)?.as_atom()?;
+                    let obj = roles.get(1)?.as_seq()?.get(1)?.as_atom()?;
+                    let cost = roles.get(2)?.as_seq()?.get(1)?.as_atom()?;
+                    (subj == from && obj == to).then(|| cost.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Forward-chain the cost-closure readings to fixed point; return the final
+/// state so a test can inspect both `reaches` (source) and `shortest` (head).
+fn chain() -> ast::Object {
+    let src = "\
+        Node(.id) is an entity type.\n\
+        Cost(.id) is an entity type.\n\
+        \n\
+        Node moves to Node at Cost.\n\
+        Node reaches Node at Cost. *\n\
+        Node shortest reaches Node at Cost. *\n\
+        Cost plus Cost is Cost.\n\
+        \n\
+        ## Derivation Rules\n\
+        * Node1 reaches Node2 at Cost1 iff Node1 moves to Node2 at Cost1.\n\
+        * Node1 reaches Node2 at Cost3 iff Node1 moves to Node3 at Cost1 and Node3 reaches Node2 at Cost2 and Cost1 plus Cost2 is Cost3.\n\
+        * Node1 shortest reaches Node2 at Cost iff Cost is the min of Cost2 where Node1 reaches Node2 at Cost2.\n\
+        \n\
+        ## Instance Facts\n\
+        Node 'a' moves to Node 'b' at Cost '1'.\n\
+        Node 'b' moves to Node 'c' at Cost '1'.\n\
+        Node 'a' moves to Node 'c' at Cost '3'.\n\
+        Cost '1' plus Cost '1' is Cost '2'.\n";
+
+    let state = arest::parse_forml2_stage2::parse_to_state_via_stage12(src)
+        .expect("parse must succeed");
+    let defs = arest::compile::compile_to_defs_state(&state);
+    let d = ast::defs_to_state(&defs, &state);
+
+    let derivation_refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d)
+        .into_iter()
+        .filter(|(n, _)| n.starts_with("derivation:"))
+        .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, &d)))
+        .collect();
+    assert!(
+        !derivation_refs_owned.is_empty(),
+        "harness: authored derivation rules must compile into `derivation:*` defs"
+    );
+    let derivation_refs: Vec<(&str, &ast::Func)> = derivation_refs_owned
+        .iter()
+        .map(|(n, f)| (n.as_str(), f))
+        .collect();
+
+    arest::evaluate::forward_chain_defs_state(&derivation_refs, &d).0
+}
+
+/// The multi-path group (a,c): direct cost 3 vs a->b->c cost 2. `reaches`
+/// (the source) must carry BOTH (precondition); `min` MUST fold to exactly {2}.
+#[test]
+#[ignore = "arc-min-aggregate-ivm-misfold: aggregate heads are append-only; min over a plus-closure does not fold to the per-group minimum. Un-ignore when keyed-upsert aggregate heads land."]
+fn min_over_cost_summing_closure_folds_to_single_minimum() {
+    let d = chain();
+
+    // Precondition: the cost-summing closure derives BOTH paths for (a,c).
+    let reaches = costs_for(&d, "Node_reaches_Node_at_Cost", "a", "c");
+    let want_reaches: std::collections::BTreeSet<String> =
+        ["2".to_string(), "3".to_string()].into_iter().collect();
+    assert_eq!(
+        reaches, want_reaches,
+        "precondition: reaches(a,c) must be {{2,3}} (direct 3 + a->b->c 1+1=2); \
+         got {:?}. If this fails the closure/`plus` join didn't derive the cheap \
+         path and the min test below would be vacuous.",
+        reaches
+    );
+
+    // The aggregate must fold to exactly the minimum.
+    let shortest = costs_for(&d, "Node_shortest_reaches_Node_at_Cost", "a", "c");
+    let want: std::collections::BTreeSet<String> = ["2".to_string()].into_iter().collect();
+    assert_eq!(
+        shortest, want,
+        "min `shortest reaches(a,c)` must fold to exactly the minimum {{2}}; \
+         got {:?} — the aggregate head did not yield the per-group minimum \
+         (append-only head, no group keying)",
+        shortest
+    );
+}
+
+/// Single-path groups already fold correctly even today — a guard so the fix
+/// is shown to preserve the working case, not just repair the broken one.
+#[test]
+#[ignore = "arc-min-aggregate-ivm-misfold: un-ignore with the fix (single-path control)."]
+fn min_over_single_path_group_is_unaffected() {
+    let d = chain();
+    assert_eq!(
+        costs_for(&d, "Node_shortest_reaches_Node_at_Cost", "a", "b"),
+        ["1".to_string()].into_iter().collect(),
+        "single-path (a,b) shortest cost must be {{1}}"
+    );
+    assert_eq!(
+        costs_for(&d, "Node_shortest_reaches_Node_at_Cost", "b", "c"),
+        ["1".to_string()].into_iter().collect(),
+        "single-path (b,c) shortest cost must be {{1}}"
+    );
+}
