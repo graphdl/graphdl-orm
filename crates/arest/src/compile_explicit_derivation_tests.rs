@@ -4684,6 +4684,106 @@ fn derivation_strata_reject_aggregate_inside_a_recursive_cycle() {
         "an aggregate inside a recursive cycle is not stratifiable");
 }
 
+// engine-2role-ring-aggregate-stratify-overflow (arc-cond, 2026-06-14): the
+// precise root-cause guard. `reading_verb` must slice the verb up to the
+// EARLIEST-POSITIONED next noun, NOT whichever noun the longest-first list
+// visits first. A 3-role reading whose 3rd-role noun is LONGER than the 2nd
+// (`Feature` 7 > `Value` 5) used to slurp the inter-noun text — `reaches Value
+// for` instead of `reaches` — so the catalog's REGISTERED verb mismatched the
+// position-based clause verb at ρ-lookup, the exact-verb match missed, and a
+// recursive antecedent fell through to a same-signature sibling.
+#[test]
+fn reading_verb_slices_to_earliest_noun_not_longest_in_list() {
+    let nouns = vec!["Feature".to_string(), "Value".to_string(), "Count".to_string()];
+    assert_eq!(
+        crate::parse_forml2::reading_verb("Value reaches Value for Feature at Count", &nouns),
+        "reaches",
+        "verb must stop at the 2nd role (Value), not slurp up to the longer \
+         later noun (Feature)");
+    assert_eq!(
+        crate::parse_forml2::reading_verb("Value moves to Value for Feature at Count", &nouns),
+        "moves to");
+    // 2-role same-noun ring (no longer-noun-after-the-2nd-role): always worked.
+    let ring = vec!["Frame".to_string(), "Count".to_string()];
+    assert_eq!(
+        crate::parse_forml2::reading_verb("Frame reaches Frame at Count", &ring),
+        "reaches");
+}
+
+// engine-2role-ring-aggregate-stratify-overflow (arc-cond): a min-over-recursion
+// aggregate on a 2-role same-noun ring (Frame × Frame) must STRATIFY with
+// `shortest reaches` STRICTLY ABOVE the positive `reaches` closure — exactly
+// like the structurally-identical 3-role `… for Feature` form. Before the
+// reading_verb fix the recursive `reaches` antecedent mis-resolved to its own
+// `shortest reaches` aggregate cell (a same-{Frame,Frame,Count}-signature
+// sibling), forming a FALSE cycle through the aggregate; compute_derivation_strata
+// returned None (unstratifiable) → the chain fell back to a single flat stratum →
+// the min-over-recursion ran away to a stack overflow on apps.compile.
+#[test]
+fn two_role_ring_aggregate_over_recursion_stratifies_like_three_role() {
+    let check = |label: &str, src: &str, reaches_cell: &str, shortest_cell: &str| {
+        let state = parse_to_state(src).expect("parse");
+        let data = compile::cell_index_from_state(&state);
+        let model = compile::compile(&state);
+        let deps: Vec<(String, Vec<String>, bool)> = data.derivation_rules.iter()
+            .filter(|r| !r.id.is_empty())
+            .filter_map(|r| {
+                let c = r.consequent_cell.literal_id().to_string();
+                (!c.is_empty()).then(|| (
+                    c,
+                    model.derivation_positive_reads.get(&r.id).cloned().unwrap_or_default(),
+                    !r.consequent_aggregates.is_empty(),
+                ))
+            })
+            .collect();
+        let strata = compile::compute_derivation_strata(&deps).unwrap_or_else(|| panic!(
+            "{label}: derivation graph must STRATIFY (Some), got None — the \
+             recursive antecedent mis-resolved to the aggregate cell, forming a \
+             false cycle through the aggregate.\ndeps: {deps:#?}"));
+        let rs = strata.get(reaches_cell).copied().unwrap_or(0);
+        let ss = strata.get(shortest_cell).copied().unwrap_or(0);
+        assert!(ss > rs,
+            "{label}: `shortest reaches` (stratum {ss}) must be STRICTLY ABOVE \
+             the positive `reaches` closure (stratum {rs}) so the aggregate folds \
+             the COMPLETED source; strata: {strata:?}");
+    };
+    check("2-role ring",
+        r#"# 2-role ring (arc-cond minimal repro)
+Frame(.id) is an entity type.
+Count(.id) is an entity type.
+
+## Fact Types
+Frame moves to Frame at Count.
+Frame reaches Frame at Count.
+Frame shortest reaches Frame at Count.
+Count steps to Count.
+
+## Derivation Rules
+* Frame1 reaches Frame2 at Count1 iff Frame1 moves to Frame2 at Count1.
+* Frame1 reaches Frame2 at Count2 iff Frame1 moves to Frame3 at Count4 and Frame3 reaches Frame2 at Count1 and Count1 steps to Count2.
+* Frame1 shortest reaches Frame2 at Count iff Count is the min of Count2 where Frame1 reaches Frame2 at Count2.
+"#,
+        "Frame_reaches_Frame_at_Count", "Frame_shortest_reaches_Frame_at_Count");
+    check("3-role",
+        r#"# 3-role (arc-gen/arc-ls20 shape)
+Value(.id) is an entity type.
+Feature(.id) is an entity type.
+Count(.id) is an entity type.
+
+## Fact Types
+Value moves to Value for Feature at Count.
+Value reaches Value for Feature at Count.
+Value shortest reaches Value for Feature at Count.
+Count steps to Count.
+
+## Derivation Rules
+* Value1 reaches Value2 for Feature1 at Count1 iff Value1 moves to Value2 for Feature1 at Count1.
+* Value1 reaches Value2 for Feature1 at Count2 iff Value1 moves to Value3 for Feature1 at Count4 and Value3 reaches Value2 for Feature1 at Count1 and Count1 steps to Count2.
+* Value1 shortest reaches Value2 for Feature1 at Count iff Count is the min of Count2 where Value1 reaches Value2 for Feature1 at Count2.
+"#,
+        "Value_reaches_Value_for_Feature_at_Count", "Value_shortest_reaches_Value_for_Feature_at_Count");
+}
+
 #[test]
 fn single_antecedent_head_projects_to_declared_roles_not_free_body_vars() {
     // engine-single-antecedent-head-free-var-leak (arc-csdp): a SINGLE-antecedent

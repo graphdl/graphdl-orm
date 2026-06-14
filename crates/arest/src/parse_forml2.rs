@@ -3596,8 +3596,25 @@ pub(crate) fn reading_verb<'a>(reading: &'a str, noun_names_longest_first: &[Str
         .find(|n| reading.starts_with(n.as_str()))
         .map(|first| {
             let after = &reading[first.len()..];
+            // engine-2role-ring-aggregate-stratify-overflow: the verb runs up to
+            // the EARLIEST-POSITIONED next noun in `after` — by TEXT POSITION, not
+            // by longest-first LIST order. The old `find_map` returned text up to
+            // whichever noun the longest-first iteration hit first, so a longer
+            // noun sitting LATER in the reading (`… reaches Value for Feature at
+            // Count`: Feature len 7 > the second Value len 5) slurped the
+            // inter-noun text into the verb (`reaches Value for` instead of
+            // `reaches`). That made the catalog's REGISTERED verb mismatch the
+            // position-based clause verb the ρ-lookup extracts, so the exact-verb
+            // match missed and a recursive antecedent (`… reaches …`) fell through
+            // to a same-signature sibling — its own `shortest reaches` aggregate —
+            // forming a FALSE cycle that broke stratification (→ single flat
+            // stratum → min-over-recursion stack overflow on a 2-role ring).
+            // Taking the minimum find() position keeps register/resolve identical.
             noun_names_longest_first.iter()
-                .find_map(|second| after.find(second.as_str()).map(|pos| after[..pos].trim()))
+                .filter(|n| !n.is_empty())
+                .filter_map(|second| after.find(second.as_str()))
+                .min()
+                .map(|pos| after[..pos].trim())
                 .unwrap_or_else(|| after.trim())
         })
         .unwrap_or("")
