@@ -4825,6 +4825,39 @@ mod reflect_schema_cells_tests {
              Fact_Type_has_Role; compiled antecedents: {:?}", ids);
     }
 
+    /// apply-fix3 / aggregate-sidecar-completeness: a pure-aggregate rule
+    /// (`Fact Type has Arity iff Arity is the count of Role where Fact Type
+    /// has Role`) carries an empty `antecedent_sources`; its real input is the
+    /// counted source FT, which lives only in the aggregate IR. Without
+    /// recovering it the positive-reads sidecar is empty, no `derivation_reads:`
+    /// cell is emitted, and the rule re-fires unconditionally every apply round
+    /// (measured 7.2s of pure schema reflection on a population op, where
+    /// `Fact_Type_has_Role` cannot change). The reads list must name
+    /// `Fact_Type_has_Role` so the activation gate (evaluate.rs) can skip it
+    /// when that schema cell is not dirty.
+    #[test]
+    fn aggregate_rule_positive_reads_recover_source_fact_type() {
+        let corpus = crate::metamodel_corpus();
+        let state = crate::parse_forml2::parse_to_state(&corpus).expect("corpus parses");
+        let data = cell_index_from_state(&state);
+        let arity = data.derivation_rules.iter()
+            .find(|r| r.consequent_cell.literal_id() == "Fact_Type_has_Arity")
+            .expect("the arity aggregate rule compiles in the metamodel corpus");
+        // Guard against a vacuous pass if the rule's shape changes.
+        assert!(!arity.consequent_aggregates.is_empty(),
+            "arity rule must carry an aggregate IR (else the recovery is moot)");
+        assert!(arity.antecedent_sources.is_empty(),
+            "arity rule's antecedent_sources are expected empty (pure aggregate); \
+             if this changes, revisit the recovery guard");
+        let model = compile(&state);
+        let reads = model.derivation_positive_reads.get(&arity.id)
+            .expect("arity rule must have a positive-reads entry");
+        assert!(reads.iter().any(|c| c == "Fact_Type_has_Role"),
+            "the aggregate's counted source FT (Fact_Type_has_Role) must be \
+             recovered into positive-reads so activation gating can skip the \
+             rule on population applies; got {:?}", reads);
+    }
+
     /// The reflection regenerates schema-as-facts rows from the parsed
     /// Role/Noun cells: one Fact_Type_has_Role + Noun_plays_Role row per
     /// role (deterministic `{ft}#{position}` role ids, the active-voice
@@ -5026,7 +5059,7 @@ fn compile_data_with_state(
     let derivation_positive_reads: HashMap<String, Vec<String>> = data.derivation_rules.iter()
         .filter(|r| !r.id.is_empty())
         .map(|r| {
-            let reads: Vec<String> = r.antecedent_sources.iter()
+            let mut reads: Vec<String> = r.antecedent_sources.iter()
                 .filter_map(|src| match src {
                     crate::types::AntecedentSource::FactType(id) => Some(id.clone()),
                     // InstancesOfNoun isn't a single cell — it's a
@@ -5037,6 +5070,41 @@ fn compile_data_with_state(
                     crate::types::AntecedentSource::InstancesOfNoun(_) => None,
                 })
                 .collect();
+            // apply-fix3 / aggregate-sidecar-completeness: a pure-aggregate
+            // rule (`Fact Type has Arity iff Arity is the count of Role where
+            // Fact Type has Role`) carries an EMPTY `antecedent_sources` — its
+            // real inputs (counted source FT, any join FT, each filter's ref
+            // FT) live only in the aggregate IR (`consequent_aggregates`).
+            // Without them the reads list is empty, no `derivation_reads:`
+            // sidecar is emitted, and the rule runs UNCONDITIONALLY every round
+            // (evaluate.rs:871 conservative fallback) — measured 7.2s of pure
+            // schema reflection re-fire on every POPULATION apply, where
+            // `Fact_Type_has_Role` cannot change. Recover those FTs (the same
+            // set `agg_ft_ids_by_rule` uses for noun-keying) so the sidecar is
+            // emitted and the existing activation gate skips the rule when none
+            // of its inputs are dirty. GUARD: only when the rule has no DYNAMIC
+            // (InstancesOfNoun) antecedent — those read a virtual noun-scan, not
+            // a single cell, so a recovered reads list would be PARTIAL and
+            // gating on it could skip a re-fire the scan needed (the
+            // all-or-nothing discipline; same predicate as the completeness
+            // marker below). For the static-aggregate class the recovered list
+            // is COMPLETE, so the skip is exact (AREST.tex §exec: a positive
+            // rule whose antecedent cells gained nothing this round derives
+            // nothing new).
+            let has_dynamic_antecedent = r.antecedent_sources.iter()
+                .any(|s| matches!(s, crate::types::AntecedentSource::InstancesOfNoun(_)));
+            if !has_dynamic_antecedent {
+                for agg in &r.consequent_aggregates {
+                    for id in core::iter::once(&agg.source_fact_type_id)
+                        .chain(core::iter::once(&agg.join_fact_type_id))
+                        .chain(agg.filters.iter().map(|f| &f.ref_fact_type_id))
+                    {
+                        if !id.is_empty() && !reads.iter().any(|c| c == id) {
+                            reads.push(id.clone());
+                        }
+                    }
+                }
+            }
             // apply-rederive regression (arc, 2026-06-12 18:34): the
             // earlier all-or-nothing emission (ec434a1f) DELETED the
             // reads for dynamic-antecedent rules, flipping them to
