@@ -4626,10 +4626,25 @@ pub fn reflect_schema_cells(state: &crate::ast::Object) -> Vec<(String, crate::a
     // WorldAssumption::default), but the FT cell itself stayed empty,
     // so `Each Noun has exactly one World Assumption` fired on every
     // full-scope validate for any noun the absorbed-only field covered.
+    // whitepaper Sec. exec (world assumption on populating functions): a
+    // noun's World Assumption follows its populating function — a federated
+    // noun (backed by an External System, whose populate_n cannot exhaustively
+    // enumerate) is OWA, declared as an explicit `... has World Assumption
+    // 'open'` fact. Respect any EXPLICIT World Assumption already in the
+    // population and skip the absorbed-default reflection for that noun, so the
+    // authored value and the 'closed' default do not both fire `Each Noun has
+    // exactly one World Assumption`. (The absorbed field is the parser default,
+    // types.rs WorldAssumption::default = 'closed'; it stays the CWA default
+    // for every noun that does NOT author its own.)
+    let noun_has_explicit_wa: hashbrown::HashSet<String> =
+        crate::ast::cell_facts_iter(&crate::ast::fetch_or_phi("Noun_has_World_Assumption", state))
+            .filter_map(|f| binding(&f, "Noun").map(String::from))
+            .collect();
     let noun_was: Vec<Object> = fetch_cell_seq("Noun", state).as_seq()
         .map(|rows| rows.iter().filter_map(|n| {
             let name = binding(n, "name")?;
             if name.is_empty() { return None; }
+            if noun_has_explicit_wa.contains(name) { return None; }
             let wa = binding(n, "worldAssumption").unwrap_or("closed");
             Some(fact_from_pairs(&[
                 ("Noun", name),

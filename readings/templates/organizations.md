@@ -153,3 +153,20 @@ Noun 'Stripe Product' is backed by External System 'stripe'.
 Noun 'Stripe Product' has URI '/products'.
 Noun 'Stripe Payment Intent' is backed by External System 'stripe'.
 Noun 'Stripe Payment Intent' has URI '/payment_intents'.
+
+<!-- whitepaper Sec. exec (world assumption on populating functions): each
+     federated noun above is populated by populate_n, which cannot exhaustively
+     enumerate its external domain, so it is Open-World (a fact not fetched is
+     unknown, not false; CWA would make deontic checks over external data
+     unsound). Declared explicitly so reflect_schema_cells respects it instead
+     of the parser's CWA 'closed' default. -->
+Noun 'User' has World Assumption 'open'.
+Noun 'API Product' has World Assumption 'open'.
+Noun 'Stripe Customer' has World Assumption 'open'.
+Noun 'Stripe Subscription' has World Assumption 'open'.
+Noun 'Stripe Invoice' has World Assumption 'open'.
+Noun 'Stripe Charge' has World Assumption 'open'.
+Noun 'Stripe Payment Method' has World Assumption 'open'.
+Noun 'Stripe Price' has World Assumption 'open'.
+Noun 'Stripe Product' has World Assumption 'open'.
+Noun 'Stripe Payment Intent' has World Assumption 'open'.
