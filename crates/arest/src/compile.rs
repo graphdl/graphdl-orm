@@ -5780,6 +5780,32 @@ fn compile_aggregate_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> C
     // Aggregate rules always have a literal consequent (Halpin §4 examples
     // tie the aggregate to a single group-key role on a named FT).
     let consequent_id = rule.consequent_cell.literal_id().to_string();
+
+    // engine-multiword-unary-consequent (part 2): REJECT an aggregate rule
+    // whose consequent fact type id did not resolve (empty). Building the
+    // aggregate anyway would write its fold into an empty-named target cell
+    // — an "empty-target aggregate" that historically ⊥-bottomed the ENTIRE
+    // noun stratum (every derived cell emptied; recommendations went
+    // board-empty). The reading_verb-by-position fix (7f61ec09) makes this
+    // unreachable for DECLARED multiword unaries, so this is the durable
+    // safety net: a genuinely unresolvable head (typo'd reading, undeclared
+    // consequent FT) is surfaced LOUDLY and compiles to a no-op (empty cell,
+    // never ⊥) so the rest of the stratum still derives. Mirrors the
+    // composite-group-key reject below (diag! + φ-constant func).
+    if consequent_id.is_empty() {
+        crate::diag!(
+            "[aggregate] rule `{}`: consequent fact type did not resolve \
+             (empty id) - REJECTING the rule and emitting nothing, so the \
+             empty-target aggregate cannot bottom the noun stratum. Declare \
+             the consequent fact type, or correct its reading to match the \
+             rule head.", text);
+        let (consequent_cell, _, _) = derivation_dep_metadata(rule);
+        return CompiledDerivation {
+            id, text, kind, func: Func::constant(Object::phi()),
+            consequent_cell, materialization: rule.materialization.clone(),
+        };
+    }
+
     let consequent_reading = data.fact_types.get(&consequent_id)
         .map(|ft| ft.reading.clone())
         .unwrap_or_default();
@@ -14981,6 +15007,77 @@ mod schema_tests {
         assert!(task_ids.contains(&"1".to_string()),
             "Task_is_parallelizable must include the matching Task '1' \
              (the only pending Task); got {:?}", task_ids);
+    }
+
+    /// engine-multiword-unary-consequent (part 2): an AGGREGATE rule whose
+    /// consequent does NOT resolve (here the multiword, undeclared head
+    /// `Task is super sparkly`) must REJECT at compile — emit nothing —
+    /// rather than write its fold into an empty-named target cell. The
+    /// historic failure was that the empty-target aggregate ⊥-bottomed the
+    /// ENTIRE noun stratum: every sibling derived cell emptied. This test
+    /// pairs the bad rule with a GOOD tier-1 recommendation and asserts the
+    /// good cell still populates (no bottoming) while the bad head stays
+    /// empty. Guard lives in `compile_aggregate_derivation`.
+    #[test]
+    fn unresolved_consequent_aggregate_rejects_without_bottoming_stratum() {
+        let src = "\
+            Task(.id) is an entity type.\n\
+            Task Priority is a value type.\n\
+            Task Status is a value type.\n\
+            Task has Task Priority.\n\
+            Task has Task Status.\n\
+            Task Priority is recommended.\n\
+            Task is recommended. **\n\
+            Task '1' has Task Priority 'p0'.\n\
+            Task '1' has Task Status 'in_progress'.\n\
+            Task '2' has Task Priority 'p2'.\n\
+            Task '2' has Task Status 'pending'.\n\
+            * Task Priority is recommended iff some Task has the highest Task Priority among Tasks that have Task Status 'in_progress'.\n\
+            * Task is recommended iff Task has Task Status 'in_progress' and Task has Task Priority and Task Priority is recommended.\n\
+            * Task is super sparkly iff some Task has the highest Task Priority among Tasks that have Task Status 'pending'.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+
+        // Precondition: the bad rule's consequent must be UNRESOLVED (empty)
+        // — that is the guard's trigger. (A declared/single-word head would
+        // resolve and route normally; the multiword undeclared head does not
+        // mint an FT, so its consequentFactTypeId is empty.)
+        let dr_cell = ast::fetch_or_phi("DerivationRule", &state);
+        let bad_consequent: Option<String> = dr_cell.as_seq().and_then(|s| s.iter()
+            .find(|f| ast::binding(f, "text").map_or(false, |t| t.contains("super sparkly")))
+            .map(|f| ast::binding(f, "consequentFactTypeId").unwrap_or("").to_string()));
+        assert_eq!(bad_consequent.as_deref(), Some(""),
+            "test precondition: the multiword undeclared head `Task is super \
+             sparkly` must resolve to an EMPTY consequent id; got {bad_consequent:?}");
+
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+        let derivation_refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d)
+            .into_iter()
+            .filter(|(n, _)| n.starts_with("derivation:rule_"))
+            .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, &d)))
+            .collect();
+        let derivation_refs: Vec<(&str, &ast::Func)> = derivation_refs_owned.iter()
+            .map(|(n, f)| (n.as_str(), f)).collect();
+        let (new_d, _derived) = crate::evaluate::forward_chain_defs_state(
+            &derivation_refs, &d);
+
+        // The GOOD sibling cell must survive (NOT bottomed by the bad rule).
+        let good = ast::fetch_cell_seq("Task_is_recommended", &new_d);
+        let good_rows = good.as_seq().map(|s| s.len()).unwrap_or(0);
+        assert!(good_rows > 0,
+            "Task_is_recommended must still populate — the empty-target \
+             aggregate must NOT bottom the stratum. All cells: {:?}",
+            ast::cells_iter(&new_d).into_iter().map(|(n, _)| n.to_string())
+                .collect::<Vec<_>>());
+
+        // The bad head produced nothing (rejected, not a bogus population).
+        let bad = ast::fetch_cell_seq("Task_is_super_sparkly", &new_d);
+        let bad_rows = bad.as_seq().map(|s| s.len()).unwrap_or(0);
+        assert_eq!(bad_rows, 0,
+            "the unresolved-consequent aggregate must emit nothing; \
+             Task_is_super_sparkly had {bad_rows} rows");
     }
 
     // ── task-821: AbsenceOf branches emit FetchOrPhi when the absence-

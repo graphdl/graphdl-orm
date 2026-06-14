@@ -10935,3 +10935,49 @@ fn bare_numeric_object_literal_fans_out_to_ft_cell() {
         "BARE numeric object literal must fan out to the FT cell — currently \
          dropped (objectValue=φ, fieldName falls back to the raw verb)");
 }
+
+// engine-multiword-unary-consequent (part 1 regression): the arc/tasks
+// tiered-recommendation shape — an enum-superlative AGGREGATE rule whose
+// consequent is a DECLARED multiword unary on the value type Task Priority.
+// Before 7f61ec09 (reading_verb sliced the verb by noun list-order rather
+// than text position) the multiword head `Task Priority is fallback
+// recommended` resolved to an EMPTY consequentFactTypeId — the rule wrote
+// nowhere and (as an aggregate) bottomed the stratum. Lock both the
+// single-word control and the multiword case to a non-empty resolution.
+#[test]
+fn multiword_unary_aggregate_consequent_resolves_via_stage12() {
+    fn resolved_consequent(predicate_decl: &str, rule_head: &str, status: &str) -> Vec<String> {
+        let src = format!(
+            "Task(.id) is an entity type.\n\
+             Task Priority is a value type.\n\
+             Task Status is a value type.\n\
+             Task has Task Priority.\n\
+             Task has Task Status.\n\
+             {predicate_decl}\n\
+             Task '1' has Task Priority 'p0'.\n\
+             Task '1' has Task Status '{status}'.\n\
+             Task '2' has Task Priority 'p2'.\n\
+             Task '2' has Task Status '{status}'.\n\
+             * {rule_head} iff some Task has the highest Task Priority among Tasks that have Task Status '{status}'.\n");
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(&src)
+            .expect("parse must succeed");
+        let dr_cell = ast::fetch_or_phi("DerivationRule", &state);
+        dr_cell.as_seq().map(|s| s.iter()
+            .filter_map(|f| ast::binding(f, "consequentFactTypeId").map(String::from))
+            .collect()).unwrap_or_default()
+    }
+    // Control: single-word predicate has always resolved.
+    let control = resolved_consequent(
+        "Task Priority is recommended.", "Task Priority is recommended", "in_progress");
+    assert!(control.iter().any(|id| id == "Task_Priority_is_recommended"),
+        "single-word unary aggregate consequent must resolve; got {control:?}");
+    // Regression: multiword predicate must resolve to a NON-EMPTY id.
+    let multiword = resolved_consequent(
+        "Task Priority is fallback recommended.", "Task Priority is fallback recommended", "pending");
+    assert!(multiword.iter().any(|id| id == "Task_Priority_is_fallback_recommended"),
+        "MULTIWORD unary aggregate consequent must resolve to \
+         `Task_Priority_is_fallback_recommended` (regression for 7f61ec09 — \
+         empty here ⊥-bottoms the stratum); got {multiword:?}");
+    assert!(!multiword.iter().any(|id| id.is_empty()),
+        "no aggregate consequent may resolve to an EMPTY id; got {multiword:?}");
+}
