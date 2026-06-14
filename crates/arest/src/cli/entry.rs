@@ -400,6 +400,14 @@ mod db {
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
                 params![name], |r| r.get::<_, i64>(0)).map(|n| n > 0).unwrap_or(false);
             if !exists { continue; }
+            // diag-ungated-eprintln-cost: aggregate per-row projection failures
+            // into ONE summary line per table. The per-row eprintln fired
+            // unconditionally O(failing rows) times — ~80-100 lines on a single
+            // metamodel-scale apps.compile (every substrate-baseline FK / NOT-NULL
+            // -violating derived row that can't land in the 3NF table). The count
+            // + first error preserve the operational signal at O(tables) cost.
+            let mut projection_failures = 0usize;
+            let mut first_projection_err: Option<String> = None;
             for row in rows {
                 let mut names: Vec<String> = Vec::new();
                 let mut values: Vec<&String> = Vec::new();
@@ -413,8 +421,16 @@ mod db {
                     "INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
                     name, names.join(", "), placeholders.join(", "));
                 if let Err(e) = conn.execute(&sql, rusqlite::params_from_iter(values.iter())) {
-                    eprintln!("Warning: row projection failed for {}: {}", name, e);
+                    projection_failures += 1;
+                    if first_projection_err.is_none() {
+                        first_projection_err = Some(e.to_string());
+                    }
                 }
+            }
+            if projection_failures > 0 {
+                eprintln!("Warning: {} row(s) failed projection for {} (first: {})",
+                    projection_failures, name,
+                    first_projection_err.as_deref().unwrap_or("?"));
             }
         }
         true
