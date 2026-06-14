@@ -132,6 +132,51 @@ fn aggregate_min_resolves_named_source_not_same_signature_sibling() {
     );
 }
 
+/// agg-min-recursive-supersede DISCRIMINATOR: a 3-role group (Node,Node,Feature)
+/// like arc-cost-gen, but NON-recursive (single round). If this folds to {2} the
+/// 3-role composite group is fine and bug #2 is the recursive/multi-round IVM;
+/// if it yields {2,3} the composite group itself is the culprit.
+#[test]
+fn aggregate_min_three_role_group_nonrecursive_folds_to_min() {
+    let src = "\
+        Node(.id) is an entity type.\n\
+        Cost(.id) is an entity type.\n\
+        Feature(.id) is an entity type.\n\
+        Node moves to Node for Feature at Cost.\n\
+        Node hops to Node for Feature at Cost.\n\
+        Node reaches Node for Feature at Cost. *\n\
+        Node shortest reaches Node for Feature at Cost. *\n\
+        \n\
+        ## Derivation Rules\n\
+        * Node1 reaches Node2 for Feature1 at Cost1 iff Node1 moves to Node2 for Feature1 at Cost1.\n\
+        * Node1 reaches Node2 for Feature1 at Cost1 iff Node1 hops to Node2 for Feature1 at Cost1.\n\
+        * Node1 shortest reaches Node2 for Feature1 at Cost iff Cost is the min of Cost2 where Node1 reaches Node2 for Feature1 at Cost2.\n\
+        \n\
+        ## Instance Facts\n\
+        Node 'a' moves to Node 'c' for Feature 'loc' at Cost '3'.\n\
+        Node 'a' hops to Node 'c' for Feature 'loc' at Cost '2'.\n";
+    let state = arest::parse_forml2_stage2::parse_to_state_via_stage12(src).expect("parse");
+    let defs = arest::compile::compile_to_defs_state(&state);
+    let d = ast::defs_to_state(&defs, &state);
+    let owned: Vec<(String, ast::Func)> = ast::cells_iter(&d).into_iter()
+        .filter(|(n, _)| n.starts_with("derivation:"))
+        .map(|(n, c)| (n.to_string(), ast::metacompose(c, &d))).collect();
+    let refs: Vec<(&str, &ast::Func)> = owned.iter().map(|(n, f)| (n.as_str(), f)).collect();
+    let (nd, _) = arest::evaluate::forward_chain_defs_state(&refs, &d);
+    let costs: std::collections::BTreeSet<String> =
+        ast::fetch_cell_seq("Node_shortest_reaches_Node_for_Feature_at_Cost", &nd)
+            .as_seq().map(|facts| facts.iter().filter_map(|f| {
+                let r = f.as_seq()?;
+                let n1 = r.first()?.as_seq()?.get(1)?.as_atom()?;
+                let n2 = r.get(1)?.as_seq()?.get(1)?.as_atom()?;
+                let cost = r.get(3)?.as_seq()?.get(1)?.as_atom()?;
+                (n1 == "a" && n2 == "c").then(|| cost.to_string())
+            }).collect()).unwrap_or_default();
+    assert_eq!(costs, ["2".to_string()].into_iter().collect(),
+        "3-role-group non-recursive min must fold to {{2}}; if {{2,3}} the composite \
+         3-role group is the bug, if {{2}} bug-#2 is the recursive/multi-round IVM");
+}
+
 /// The multi-path group (a,c): direct cost 3 vs a->b->c cost 2. `reaches`
 /// (the source) must carry BOTH (precondition); `min` MUST fold to exactly {2}.
 #[test]
