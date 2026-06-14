@@ -102,7 +102,7 @@ Derivation Mode is a value type.
 Constraint Kind Label is a value type.
 
 Constraint Kind Family is a value type.
-  The possible values of Constraint Kind Family are 'ring', 'uniqueness', 'mandatory', 'frequency', 'value', 'set-comparison', 'subset', 'equality'.
+  The possible values of Constraint Kind Family are 'ring', 'uniqueness', 'mandatory', 'frequency', 'value', 'set-comparison', 'subset', 'equality', 'deontic'.
 
 Constraint Match Keyword is a value type.
 
@@ -989,6 +989,19 @@ Constraint Kind 'SS' has Constraint Kind Label 'Subset'.
 Constraint Kind 'SS' has Constraint Kind Family 'subset'.
 Constraint Kind 'EQ' has Constraint Kind Label 'Equality'.
 Constraint Kind 'EQ' has Constraint Kind Family 'equality'.
+
+Constraint Kind 'DF_pop' has Constraint Kind Label 'Deontic Forbidden (population)'.
+Constraint Kind 'DF_pop' has Constraint Kind Family 'deontic'.
+Constraint Kind 'DF_cwa' has Constraint Kind Label 'Deontic Forbidden (closed-world)'.
+Constraint Kind 'DF_cwa' has Constraint Kind Family 'deontic'.
+Constraint Kind 'DF_owa' has Constraint Kind Label 'Deontic Forbidden (open-world)'.
+Constraint Kind 'DF_owa' has Constraint Kind Family 'deontic'.
+Constraint Kind 'DO_pop' has Constraint Kind Label 'Deontic Obligatory (population)'.
+Constraint Kind 'DO_pop' has Constraint Kind Family 'deontic'.
+Constraint Kind 'DO_obl' has Constraint Kind Label 'Deontic Obligatory'.
+Constraint Kind 'DO_obl' has Constraint Kind Family 'deontic'.
+Constraint Kind 'DO_sender' has Constraint Kind Label 'Deontic Obligatory (sender)'.
+Constraint Kind 'DO_sender' has Constraint Kind Family 'deontic'.
 
 ### Join Types (NORMA #279)
 
