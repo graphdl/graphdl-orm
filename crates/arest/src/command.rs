@@ -1065,6 +1065,45 @@ fn fallback_ft_id(noun: &str, field: &str) -> String {
     format!("{}_has_{}", noun.replace(' ', "_"), field.replace(' ', "_"))
 }
 
+/// apply-reject-unresolvable-field-keys: a deontic (warn-not-reject) violation
+/// for a field key that `resolve:{noun}` ECHOED (matched no declared
+/// value-type/role), so the fact lands in a NON-canonical fallback cell that
+/// SQL / query / 3NF-canonical readers never see — a silent data fork. Pushed
+/// into the apply result's violations alongside UC conflicts; `alethic: false`
+/// so it surfaces to the caller but does NOT reject the write (a genuinely-
+/// declared-but-unresolvable field — e.g. a missing Value Type declaration —
+/// must still fall back). The canonical readers' blind spot becomes visible
+/// instead of silent.
+fn unresolvable_field_key_violation(noun: &str, field: &str, fallback_cell: &str)
+    -> crate::types::Violation
+{
+    crate::types::Violation {
+        constraint_id: "apply:unresolvable-field-key".into(),
+        constraint_text: format!(
+            "field '{}' on {} did not resolve to a declared fact type", field, noun),
+        detail: format!(
+            "the value landed in non-canonical fallback cell '{}'; canonical-cell \
+             readers (SQL / query) will NOT see it — likely a typo or an abbreviated \
+             field key (e.g. 'Description' for the declared 'Task Description')",
+            fallback_cell),
+        alethic: false,
+    }
+}
+
+/// True iff `ft_id` is a DECLARED fact type (present in the `FactType` cell).
+/// Used to fire the unresolvable-field-key warning only on a TRUE phantom: a
+/// resolve-echo whose underscored fallback cell isn't a declared FT. An
+/// under-declared value type can echo too (the FT is declared but its Value
+/// Type has no Role rows), yet its fallback IS the canonical cell
+/// (Task_has_Task_Description) — declared, so no warning. Handles both Seq and
+/// folded-Map cell storage via `cell_facts_iter`.
+fn is_declared_ft(ft_id: &str, d: &ast::Object) -> bool {
+    let cell = ast::fetch_or_phi("FactType", d);
+    // Bind before the block end so the borrowing iterator drops before `cell`.
+    let found = ast::cell_facts_iter(&cell).any(|f| ast::binding(f, "id") == Some(ft_id));
+    found
+}
+
 fn auto_generate_entity_id(noun: &str, state: &ast::Object, d: &ast::Object) -> String {
     // Distinct entity-role values for this noun across all FT cells.
     // A fact's "entity-id" for noun N is the value of any role binding
@@ -1510,7 +1549,19 @@ fn create_via_defs(
             _ if *field_name == "domain" && !fields.contains_key("domain") => {
                 return acc;
             }
-            _ => fallback_ft_id(noun, field_name),
+            _ => {
+                // apply-reject-unresolvable-field-keys: resolve echoed the key —
+                // it maps to no declared FT, so it lands in a non-canonical
+                // fallback cell. Surface a deontic warning (write still lands).
+                let fb = fallback_ft_id(noun, field_name);
+                // Warn only on a TRUE phantom — a fallback cell that is NOT a
+                // declared fact type. (An under-declared VT echoes too but its
+                // fallback is the canonical, declared cell — no fork, no warning.)
+                if !is_declared_ft(&fb, d) {
+                    uc_violations.push(unresolvable_field_key_violation(noun, field_name, &fb));
+                }
+                fb
+            }
         };
         fact_events.push(ft_id.clone());
         let fact = ast::fact_from_pairs(&[(noun, &entity_id), (field_name, value)]);
@@ -3878,7 +3929,18 @@ fn update_via_defs(
         // as a no-mapping and fall through to `<Noun>_has_<Field>`.
         let ft_id = match resolved.and_then(|o| o.as_atom().map(|s| s.to_string())) {
             Some(s) if s != lower => s,
-            _ => fallback_ft_id(noun, field_name),
+            _ => {
+                // apply-reject-unresolvable-field-keys (update path): same
+                // resolve-echo-miss → non-canonical fallback; deontic warning.
+                let fb = fallback_ft_id(noun, field_name);
+                // Warn only on a TRUE phantom — a fallback cell that is NOT a
+                // declared fact type. (An under-declared VT echoes too but its
+                // fallback is the canonical, declared cell — no fork, no warning.)
+                if !is_declared_ft(&fb, d) {
+                    uc_violations.push(unresolvable_field_key_violation(noun, field_name, &fb));
+                }
+                fb
+            }
         };
         let fact = ast::fact_from_pairs(&[(noun, entity_id), (field_name.as_str(), value.as_str())]);
         if key_roles.contains_key(&ft_id) {
@@ -8454,6 +8516,55 @@ Task has Task Priority.
              newest value after sequential updates; got {:?}",
             rows,
         );
+    }
+
+    /// apply-reject-unresolvable-field-keys: an ABBREVIATED / typo'd field key
+    /// (`Description` for the declared value type `Task Description`) resolve-
+    /// misses and lands in a NON-canonical phantom cell (`Task_has_Description`)
+    /// that SQL/query never read. The apply result must surface a DEONTIC
+    /// warning naming that fallback cell — instead of a silent data fork — while
+    /// still LANDING the write (deontic, not a reject).
+    #[test]
+    fn unresolvable_field_key_surfaces_deontic_warning_and_still_lands() {
+        let meta_state = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let readings = r#"
+# Tasks
+
+## Entity Types
+
+Task(.id) is an entity type.
+
+## Fact Types
+
+Task has Task Description.
+"#;
+        let tasks_state = crate::parse_forml2::parse_to_state_with_nouns(readings, &meta_state).unwrap();
+        let merged = ast::merge_states(&meta_state, &tasks_state);
+        let defs = crate::compile::compile_to_defs_state(&merged);
+        let def_map = ast::defs_to_state(&defs, &merged);
+
+        // Abbreviated key 'Description' (declared value type is 'Task Description').
+        let mut fields = HashMap::new();
+        fields.insert("Description".to_string(), "leaked".to_string());
+        let create = Command::CreateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            id: Some("t-1".to_string()),
+            fields,
+            sender: None,
+            signature: None,
+        };
+        let r = apply_command_defs(&def_map, &create, &merged);
+
+        // Deontic: surfaced but NOT rejected; the write still lands.
+        assert!(!r.rejected, "deontic field-key warning must NOT reject; got {:?}", r.violations);
+        let warn = r.violations.iter()
+            .find(|v| v.constraint_id == "apply:unresolvable-field-key")
+            .unwrap_or_else(|| panic!(
+                "expected an apply:unresolvable-field-key warning; got {:?}", r.violations));
+        assert!(!warn.alethic, "the field-key fallback warning must be deontic (warn, not reject)");
+        assert!(warn.detail.contains("Task_has_Description"),
+            "warning must name the non-canonical fallback cell; got {:?}", warn.detail);
     }
 
     /// fallback_ft_id: when `resolve:{noun}` misses (here: the value
