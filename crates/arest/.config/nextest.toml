@@ -25,3 +25,19 @@ threads-required = "num-cpus"
 # terminate-after so regressions can't hide.
 [profile.default]
 slow-timeout = { period = "60s" }
+
+# test-speed-under-30s lever 1b: the `fast` edit-to-signal gate. The FULL suite's
+# wall is pinned by a handful of live-compile tests that each re-run a metamodel/
+# corpus compile+reflect+validate FROM SCRATCH (measured 2026-06-14 under nextest:
+# mandatory_role_alethic_rejection ~213s x2, effective_component_role ~36s,
+# derivation_cardinality_count ~30s, valuetype_bridge_join_star ~30s; everything
+# else finishes by ~10s). Their inherent cost is the shared-metamodel-compile
+# slowness tracked by test-speed-shared-compile-fixture + the 987 family. Until
+# that lands, `--profile fast` skips exactly those so the routine confidence gate
+# is ~30s instead of ~220s; the inner dev loop stays the filtered form above.
+#   fast gate : cargo nextest run --features std-deps,local --profile fast
+# Run the DEFAULT (full) profile before commit / in CI. Keep this list in sync
+# with the >=29s tests in a fresh `cargo nextest run` timing.
+[profile.fast]
+default-filter = "not (test(mandatory_role_alethic_rejection) | test(effective_component_role_most_specific_source_wins) | test(derivation_cardinality_count_honors_bound_via_live_compile) | test(valuetype_bridge_join_star_marked_materializes_via_live_compile))"
+slow-timeout = { period = "20s" }
