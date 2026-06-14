@@ -4,25 +4,25 @@
 // RECURSIVE closure whose recursive step SUMS costs (3-role `Count plus Count
 // is Count`) misfolds: it does not fold to the single minimum per group.
 //
-// ROOT CAUSE (live-validated on arc-cost-gen): `min` is non-monotonic — when a
-// smaller value is derived in a LATER round it must logically RETRACT the prior
-// min. But an aggregate head has no declared uniqueness constraint, so
-// `resolve_key_roles_for_ft` returns no key roles and `integrate_round_facts`
-// stores it APPEND-ONLY (folded by the FULL tuple), with no replace-by-group.
-// With a MONOTONIC closure increment (`steps to`) the min is discovered FIRST
-// and never lowered, so append is accidentally correct (arc-gen WORKS). With
-// cost-SUMMING `plus`, a cheaper route has MORE hops and is discovered a round
-// LATER (direct a->c = 3 found first; a->b->c = 1+1 = 2 found later), so the
-// aggregate head is wrong.
+// ROOT CAUSE — CORRECTED after investigation (see the task's Ticks; the earlier
+// "append-only keying" framing this header carried was WRONG). Verified via
+// diagnostics:
+//   * The min FOLD itself is CORRECT over a COMPLETE source: a STATIC/base (Seq)
+//     `reaches` of {2,3} folds to {2}.
+//   * The bug is the aggregate's GROUP-FOLD over a DERIVED (Map-stored, growing)
+//     source: fresh, BOTH the naive and the deployed semi-naive chains yield
+//     shortest(a,c)={3}; the corrected value (2) is NEVER produced. So keying the
+//     head is NOT the fix — there is nothing to replace the 3 with.
+//   * Reconciles every datum: static/base→correct; arc-gen `steps to` (monotonic,
+//     min discovered first)→correct; arc-cost-gen's persisted {2,3} is most
+//     likely accumulated stale-db rows, not the fresh symptom.
+//   * Ruled out by code-reading: source-encoding (encode_state/encode_state_indexed
+//     flatten Map→Seq correctly). The defect is a RUNTIME interaction in the
+//     aggregate's group/project/fold over a derived source — pinning the exact
+//     line needs live Func-interpreter instrumentation (a focused session).
 //
-// The group key is (Node1, Node2) — two DISTINCT same-noun role-players
-// (subscripted): a COMPOSITE key with DUPLICATE role names. The keyed-upsert
-// fix must form that key POSITIONALLY (by role index), not by role name, or the
-// two Node roles collapse (the same class issue17a hit).
-//
-// IGNORED until the fix lands: aggregate heads must be keyed by their group
-// roles with upsert (last-write = smallest-min wins), the SM-current-status IVM
-// idiom. Un-ignore when arc-min-aggregate-ivm-misfold is implemented.
+// IGNORED until the fix lands. The test asserts the CORRECT result (min folds to
+// {2}); un-ignore when arc-min-aggregate-ivm-misfold is fixed.
 
 use arest::ast;
 
