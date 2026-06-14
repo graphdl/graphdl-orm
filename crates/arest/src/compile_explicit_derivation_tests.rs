@@ -5902,6 +5902,66 @@ Item has Open Dep Count.
         count_for_a, derived);
 }
 
+// engine-aggregate-over-join-groupkey-misgroup: a numeric aggregate whose
+// `where` body is a multi-antecedent JOIN (a second non-literal clause carrying
+// its own fact type) must be REJECTED, not silently misgrouped. The single-source
+// numeric aggregate would drop the join's second antecedent and group the head by
+// the source FT's roles alone (the join's other entity role vanishes into the
+// wrong slot). The rule must therefore NOT compile to an aggregate; the blessed
+// pattern is to pre-join into one derived FT and aggregate over that (the CONTROL,
+// which MUST still compile to an aggregate — no regression to single-source).
+#[test]
+fn aggregate_over_multi_antecedent_join_where_is_rejected_not_misgrouped() {
+    let broken = r#"# join-where aggregate (must be rejected)
+Item(.id) is an entity type.
+Attribute(.id) is an entity type.
+Value(.id) is an entity type.
+Target(.id) is an entity type.
+Count is a value type.
+
+## Fact Types
+Item has Value for Attribute.
+Target wants Value for Attribute.
+Item satisfies Count for Target.
+
+## Derivation Rules
+* Item1 satisfies Count for Target1 iff Count is the count of Attribute1 where Item1 has Value1 for Attribute1 and Target1 wants Value1 for Attribute1.
+"#;
+    let state = parse_to_state(broken).expect("parse");
+    let data = compile::cell_index_from_state(&state);
+    let rule = data.derivation_rules.iter()
+        .find(|r| r.text.contains("satisfies"))
+        .expect("the `satisfies` rule must be present");
+    assert!(rule.consequent_aggregates.is_empty(),
+        "a JOIN-where aggregate must NOT compile to an aggregate (it would drop the \
+         join's 2nd antecedent and misgroup the head); got {:#?}\nrule: {}",
+        rule.consequent_aggregates, rule.text);
+
+    // CONTROL: the pre-joined single-antecedent aggregate IS accepted (no
+    // regression — only the multi-antecedent JOIN where-body is rejected).
+    let control = r#"# pre-joined single-antecedent aggregate (accepted)
+Item(.id) is an entity type.
+Attribute(.id) is an entity type.
+Target(.id) is an entity type.
+Count is a value type.
+
+## Fact Types
+Item hits Attribute for Target.
+Item meets Count for Target.
+
+## Derivation Rules
+* Item1 meets Count for Target1 iff Count is the count of Attribute1 where Item1 hits Attribute1 for Target1.
+"#;
+    let cstate = parse_to_state(control).expect("parse control");
+    let cdata = compile::cell_index_from_state(&cstate);
+    let crule = cdata.derivation_rules.iter()
+        .find(|r| r.text.contains("meets"))
+        .expect("the `meets` rule must be present");
+    assert!(!crule.consequent_aggregates.is_empty(),
+        "the pre-joined SINGLE-antecedent aggregate must still compile to an \
+         aggregate (single-source is unaffected); rule: {}", crule.text);
+}
+
 // ─── Category 6d: empty-image aggregate fold = the operator's unit ──────
 //
 // Backus §11.2.4: `/f:<>` is the right unit of `f`. The aggregate compiler

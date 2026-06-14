@@ -2089,6 +2089,40 @@ fn resolve_derivation_rule(
                 }
             }
 
+            // engine-aggregate-over-join-groupkey-misgroup: the numeric
+            // `<op> of <Role> where <body>` aggregate is SINGLE-SOURCE — it keeps
+            // ONE source FT, and the filter loop below understands only LITERAL
+            // restrictions, so a JOIN where-body (a SECOND non-literal clause that
+            // resolves to its own fact type) is SILENTLY DROPPED and the head is
+            // mis-grouped by the source FT's roles alone (the join's other entity
+            // roles vanish; e.g. `count of Attribute where Item has Value for
+            // Attribute and Target wants Value for Attribute` would group by
+            // (Item,Value) not (Item,Target), with the Value landing in the Target
+            // slot). Reject such a rule with a diagnostic rather than derive a
+            // SILENT wrong answer; the blessed pattern (issue #2 precedent) is to
+            // pre-join the where-body into ONE derived fact type, then aggregate
+            // over that single antecedent. Literal filters and plain single-source
+            // aggregates are unaffected (this fires only on a dropped FT-resolving
+            // non-literal join antecedent).
+            let has_dropped_join_antecedent = source.is_some()
+                && filter_clauses.iter().any(|clause| {
+                    match strip_trailing_quoted_literal(clause.trim()) {
+                        Some(_) => false, // a literal restriction — handled below
+                        None => resolve_fact_type(
+                            &split_antecedent_comparator(clause.trim()).0).is_some(),
+                    }
+                });
+            if has_dropped_join_antecedent {
+                diag!("[aggregate] rule `{}` folds `{} of {}` over a multi-antecedent \
+                    JOIN where-body, which the numeric aggregate does NOT support (it is \
+                    single-source; the join's extra antecedent would be dropped and the \
+                    head mis-grouped). Pre-join the where-body into ONE derived fact \
+                    type, then aggregate over that single antecedent.",
+                    rule.text, op, target.trim());
+                rule.unresolved_clauses.push(part.to_string());
+                continue;
+            }
+
             if let Some((ft_id, source_clause)) = source {
                 let src_ft = fact_types_map.get(&ft_id);
                 // Positional role resolution over the SOURCE clause so
