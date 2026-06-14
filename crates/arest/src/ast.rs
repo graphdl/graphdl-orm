@@ -5228,6 +5228,32 @@ pub fn extract_key_from_fact(fact: &Object, key_role_names: &[&str]) -> Option<S
     Some(parts.join("\u{001f}")) // ASCII unit-separator — won't collide with atom contents
 }
 
+/// Positional counterpart to [`extract_key_from_fact`]: build the key from
+/// the values at the given 0-based role POSITIONS, joined the same way.
+///
+/// Dup-role-name-safe, unlike the by-name `extract_key_from_fact`. An
+/// aggregate head like `Value shortest reaches Value for Feature at Count`
+/// stores TWO `Value` pairs that a by-name key cannot tell apart (`binding`
+/// returns the FIRST) — so name-keying both COLLIDES distinct groups (every
+/// `(rk, _)` keys to `rk\u{1f}rk\u{1f}…`) AND points at the wrong role.
+/// Positional keying reads the value at each named POSITION, so the group
+/// (Value@0, Value@1, Feature@2) keys correctly. The aggregate head is
+/// emitted in DECLARED ROLE ORDER (compile::compile_aggregate_derivation,
+/// the composite branch), so stored position i IS role i.
+///
+/// Returns None when any index is out of bounds or the pair is malformed —
+/// the caller's signal the fact isn't shaped for this key (skip it).
+pub fn extract_key_from_fact_by_index(fact: &Object, key_indices: &[usize]) -> Option<String> {
+    let seq = fact.as_seq()?;
+    let mut parts: Vec<String> = Vec::with_capacity(key_indices.len());
+    for &i in key_indices {
+        let pair = seq.get(i)?.as_seq()?;
+        if pair.len() != 2 { return None; }
+        parts.push(pair[1].as_atom()?.to_string());
+    }
+    Some(parts.join("\u{001f}")) // same US separator as extract_key_from_fact
+}
+
 /// #932 phase-2: fold a fact into a cell that has NO narrower uniqueness
 /// constraint, keyed by its full tuple via `synthesize_fact_id`. This is
 /// the keyless counterpart to [`cell_put_keyed`] and the fold μ_n
@@ -5325,6 +5351,41 @@ pub fn cell_put_keyed_batch(
     upsert: bool,
     state: &Object,
 ) -> (Object, Vec<KeyConflict>) {
+    cell_put_keyed_batch_with(
+        name, |f| extract_key_from_fact(f, key_role_names), facts, upsert, state)
+}
+
+/// derivation-aggregate-composite-key-upsert: positional counterpart to
+/// [`cell_put_keyed_batch`]. Keys each fact by the values at the given role
+/// POSITIONS (dup-role-name-safe — see [`extract_key_from_fact_by_index`])
+/// instead of by role name. Used for composite AGGREGATE HEAD cells, whose
+/// group roles can share a noun name (two `Value`). Same upsert / conflict
+/// semantics as the by-name batch; `upsert=true` (the aggregate's
+/// latest=min fold over a GROWING recursive source) makes each round's
+/// re-fold SUPERSEDE the group's prior value instead of appending a stale
+/// second tuple — the IVM fix for `min`-over-recursive-closure misfold.
+pub fn cell_put_keyed_batch_by_index(
+    name: &str,
+    key_indices: &[usize],
+    facts: Vec<Object>,
+    upsert: bool,
+    state: &Object,
+) -> (Object, Vec<KeyConflict>) {
+    cell_put_keyed_batch_with(
+        name, |f| extract_key_from_fact_by_index(f, key_indices), facts, upsert, state)
+}
+
+/// Shared core for the keyed batch puts: identical fold/upsert/conflict
+/// logic over ANY key-extraction strategy `key_of` (by-name for UC cells,
+/// by-index for composite aggregate heads). Factored so the two public
+/// entry points cannot drift in their migration / conflict handling.
+fn cell_put_keyed_batch_with<K: Fn(&Object) -> Option<String>>(
+    name: &str,
+    key_of: K,
+    facts: Vec<Object>,
+    upsert: bool,
+    state: &Object,
+) -> (Object, Vec<KeyConflict>) {
     if facts.is_empty() {
         return (state.clone(), Vec::new());
     }
@@ -5334,11 +5395,11 @@ pub fn cell_put_keyed_batch(
         Object::Seq(items) if items.is_empty() => HashMap::new(),
         Object::Seq(items) => {
             // Migration: rebuild a pre-existing Seq cell into the Map
-            // keyed by the same roles (later wins on key clash, matching
+            // keyed by the same strategy (later wins on key clash, matching
             // `cell_put_keyed`'s migration arm).
             let mut m = HashMap::new();
             for f in items.iter() {
-                if let Some(k) = extract_key_from_fact(f, key_role_names) {
+                if let Some(k) = key_of(f) {
                     m.insert(k, f.clone());
                 }
             }
@@ -5348,7 +5409,7 @@ pub fn cell_put_keyed_batch(
     };
     let mut conflicts: Vec<KeyConflict> = Vec::new();
     for fact in facts {
-        let Some(key) = extract_key_from_fact(&fact, key_role_names) else {
+        let Some(key) = key_of(&fact) else {
             continue;
         };
         // `.cloned()` releases the immutable borrow of `map` before the
@@ -10690,6 +10751,76 @@ mod tests {
         assert_eq!(m.len(), 2);
         assert!(conflicts.is_empty(),
             "re-asserting the byte-identical existing fact is NOT a conflict");
+    }
+
+    // ── derivation-aggregate-composite-key-upsert: positional keying ──
+    //
+    // An aggregate head `Value shortest reaches Value for Feature at Count`
+    // stores its group as TWO same-named `Value` roles + `Feature`, with
+    // `Count` the folded value. Name-keying collides the two `Value`s;
+    // positional keying (group = positions 0,1,2) keys correctly and
+    // UPSERTs so a later round's smaller min supersedes the stale one.
+
+    #[test]
+    fn extract_key_from_fact_by_index_distinguishes_duplicate_role_names() {
+        // The exact arc-cost-gen head shape (two `Value`, then `Feature`,
+        // then the folded `Count`).
+        let kg = fact_from_pairs(&[
+            ("Value", "rk"), ("Value", "rg"), ("Feature", "loc"), ("Count", "3")]);
+        let kh = fact_from_pairs(&[
+            ("Value", "rk"), ("Value", "rh"), ("Feature", "loc"), ("Count", "1")]);
+        // Positional group key over the THREE non-value roles tells the two
+        // groups apart (rg vs rh at position 1).
+        let key_kg = extract_key_from_fact_by_index(&kg, &[0, 1, 2]).expect("key");
+        let key_kh = extract_key_from_fact_by_index(&kh, &[0, 1, 2]).expect("key");
+        assert_ne!(key_kg, key_kh,
+            "positional key distinguishes (rk,rg,loc) from (rk,rh,loc)");
+        assert_eq!(key_kg, "rk\u{1f}rg\u{1f}loc");
+        // …whereas NAME keying collides them: binding(\"Value\") returns the
+        // FIRST `Value` for BOTH, so both key to `rk\u{1f}rk\u{1f}loc`. This
+        // is exactly why the aggregate head needs positional keying.
+        let name_kg = extract_key_from_fact(&kg, &["Value", "Value", "Feature"]).expect("k");
+        let name_kh = extract_key_from_fact(&kh, &["Value", "Value", "Feature"]).expect("k");
+        assert_eq!(name_kg, name_kh,
+            "by-name keying COLLIDES distinct groups — the bug positional keying fixes");
+    }
+
+    #[test]
+    fn extract_key_from_fact_by_index_out_of_bounds_is_none() {
+        let f = fact_from_pairs(&[("Value", "rk"), ("Count", "2")]);
+        assert!(extract_key_from_fact_by_index(&f, &[0, 5]).is_none(),
+            "an out-of-range position yields None (fact not shaped for this key)");
+    }
+
+    #[test]
+    fn cell_put_keyed_batch_by_index_upsert_supersedes_stale_group_min() {
+        // THE bug at the storage layer: the recursive cost closure folds the
+        // group (rk,rg,loc) to 3 in an EARLY round (toll, fewer hops) then to
+        // 2 in a LATER round (walk+walk, cheaper). Keyless folding kept BOTH
+        // → {2,3}. Positional keyed-UPSERT on the group (positions 0,1,2)
+        // supersedes 3 with 2. A distinct group (rk,rh,loc) coexists.
+        let early = fact_from_pairs(&[
+            ("Value", "rk"), ("Value", "rg"), ("Feature", "loc"), ("Count", "3")]);
+        let late = fact_from_pairs(&[
+            ("Value", "rk"), ("Value", "rg"), ("Feature", "loc"), ("Count", "2")]);
+        let other = fact_from_pairs(&[
+            ("Value", "rk"), ("Value", "rh"), ("Feature", "loc"), ("Count", "1")]);
+        // Two rounds: round 1 stores {3, (rk,rh)=1}; round 2 supersedes with 2.
+        let (s1, c1) = cell_put_keyed_batch_by_index(
+            "Value_shortest_reaches_Value_for_Feature_at_Count", &[0, 1, 2],
+            vec![early.clone(), other.clone()], true, &Object::phi());
+        assert!(c1.is_empty());
+        let (s2, c2) = cell_put_keyed_batch_by_index(
+            "Value_shortest_reaches_Value_for_Feature_at_Count", &[0, 1, 2],
+            vec![late.clone()], true, &s1);
+        assert!(c2.is_empty(), "upsert never conflicts");
+        let m = fetch_or_phi("Value_shortest_reaches_Value_for_Feature_at_Count", &s2)
+            .as_map().cloned().expect("Map");
+        assert_eq!(m.len(), 2, "exactly one tuple per group — no stale {{2,3}} append");
+        assert_eq!(m.get("rk\u{1f}rg\u{1f}loc"), Some(&late),
+            "the (rk,rg,loc) group folded to the LATER, smaller min (2)");
+        assert_eq!(m.get("rk\u{1f}rh\u{1f}loc"), Some(&other),
+            "the distinct (rk,rh,loc) single-path group is unaffected");
     }
 
     // ── perf-cellput-on2: O(n²) regression GUARDS ───────────────────

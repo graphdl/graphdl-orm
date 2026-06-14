@@ -1508,9 +1508,15 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // new value. Recover the per-rule aggregate FT ids from the FULL CellIndex
     // (which DOES carry the aggregate IR) so the index builder can key these
     // rules under the nouns they actually read.
-    let agg_ft_ids_by_rule: HashMap<String, Vec<String>> = {
+    // derivation-aggregate-composite-key-upsert: built alongside
+    // `agg_ft_ids_by_rule` from the same CellIndex — `consequent_cell ->
+    // group role POSITIONS` for COMPOSITE aggregate heads. See the long
+    // comment on `group_keys` below; emitted as `_CellAggKeyIndices`.
+    let (agg_ft_ids_by_rule, agg_group_key_indices_by_cell): (
+        HashMap<String, Vec<String>>, HashMap<String, Vec<usize>>,
+    ) = {
         let data = cell_index_from_state(state);
-        data.derivation_rules.iter()
+        let agg_ft_ids: HashMap<String, Vec<String>> = data.derivation_rules.iter()
             .filter(|r| !r.id.is_empty() && !r.consequent_aggregates.is_empty())
             .map(|r| {
                 let mut ids: Vec<String> = Vec::new();
@@ -1529,7 +1535,49 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                 }
                 (r.id.clone(), ids)
             })
-            .collect()
+            .collect();
+        // A COMPOSITE aggregate head (group = >1 non-value role, e.g. the
+        // (Value1,Value2,Feature) of `Value shortest reaches Value for
+        // Feature at Count`) is emitted in DECLARED ROLE ORDER by
+        // `compile_aggregate_derivation` (the `composite` branch). Over a
+        // GROWING recursive source the `min` fold re-emits a SMALLER value in
+        // a LATER round (cheaper = more hops, with a cost-summing `plus`
+        // closure: toll=3 found first, walk+walk=2 a round later); keyless
+        // full-tuple folding keeps BOTH → {2,3}. Mapping the head cell to its
+        // group role POSITIONS lets `integrate_round_facts` UPSERT by group
+        // (latest wins = the min, since the fold is non-increasing as the
+        // source grows) instead of appending the stale tuple. POSITIONS, not
+        // names: the group roles can share a noun name (two `Value`) that
+        // by-name keying cannot disambiguate. The value role is `agg.role`;
+        // the group is every OTHER consequent role — the same split
+        // `compile_aggregate_derivation` makes via `value_pos`.
+        //
+        // Scope (deliberately narrow, matching what the head emission
+        // guarantees): SINGLE-role groups stay keyless — monotonic min-first
+        // closures (`steps to`) make append-only already correct, and their
+        // head is emitted group-FIRST not in declared order, so positional
+        // keying would not match. GLOBAL aggregates are singletons; JOINED
+        // (superlative-over-join) heads use a synthesised index-0/1 source.
+        // A group-count mismatch makes the head emit NOTHING, so registering
+        // it is harmless (no facts to key).
+        let mut group_keys: HashMap<String, Vec<usize>> = HashMap::new();
+        for r in data.derivation_rules.iter()
+            .filter(|r| !r.id.is_empty() && !r.consequent_aggregates.is_empty())
+        {
+            let Some(agg) = r.consequent_aggregates.first() else { continue };
+            if agg.enum_global || !agg.join_fact_type_id.is_empty() { continue; }
+            let cons_id = r.consequent_cell.literal_id();
+            if cons_id.is_empty() { continue; }
+            let Some(ft) = data.fact_types.get(cons_id) else { continue };
+            let Some(value_pos) = ft.roles.iter()
+                .position(|role| role.noun_name == agg.role) else { continue };
+            let group: Vec<usize> = (0..ft.roles.len())
+                .filter(|i| *i != value_pos).collect();
+            if group.len() > 1 {
+                group_keys.insert(cons_id.to_string(), group);
+            }
+        }
+        (agg_ft_ids, group_keys)
     };
 
     // Domain eliminated (#211): all generators below read from cell-based
@@ -3636,6 +3684,45 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         if !entries.is_empty() {
             defs.push((
                 "_CellKeyRoles".to_string(),
+                Func::constant(crate::ast::Object::Seq(entries.into())),
+            ));
+        }
+    }
+
+    // derivation-aggregate-composite-key-upsert: emit `_CellAggKeyIndices`
+    // — composite aggregate HEAD cells keyed by their GROUP role POSITIONS
+    // (computed in `agg_group_key_indices_by_cell` above). `integrate_round_facts`
+    // reads this EXACTLY as it reads `_CellKeyRoles`, but routes matching
+    // cells through the POSITIONAL keyed-UPSERT (`cell_put_keyed_batch_by_index`,
+    // upsert=true) so each round's re-fold supersedes the group's prior min
+    // instead of appending a stale tuple — the IVM fix for the
+    // `min`-over-recursive-`plus`-closure misfold (arc-cost-gen:
+    // `Value_shortest_reaches…` (rk,rg) folded to {2,3} instead of {2}).
+    // Entry shape mirrors `_CellKeyRoles`: `<<ftId, cell_id>, <keyIndices,
+    // "0,1,2">>`. Sorted by cell id for a deterministic compile output.
+    {
+        let mut sorted: Vec<(&String, &Vec<usize>)> =
+            agg_group_key_indices_by_cell.iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        let entries: Vec<crate::ast::Object> = sorted.into_iter()
+            .map(|(cell_id, indices)| {
+                let joined = indices.iter()
+                    .map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+                crate::ast::Object::seq(vec![
+                    crate::ast::Object::seq(vec![
+                        crate::ast::Object::atom("ftId"),
+                        crate::ast::Object::atom(cell_id),
+                    ]),
+                    crate::ast::Object::seq(vec![
+                        crate::ast::Object::atom("keyIndices"),
+                        crate::ast::Object::atom(&joined),
+                    ]),
+                ])
+            })
+            .collect();
+        if !entries.is_empty() {
+            defs.push((
+                "_CellAggKeyIndices".to_string(),
                 Func::constant(crate::ast::Object::Seq(entries.into())),
             ));
         }

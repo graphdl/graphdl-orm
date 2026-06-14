@@ -319,6 +319,40 @@ pub(crate) fn read_cell_key_roles(d: &ast::Object) -> hashbrown::HashMap<String,
     out
 }
 
+/// derivation-aggregate-composite-key-upsert: read the `_CellAggKeyIndices`
+/// metadata cell (emitted by `compile_to_defs_state`) into a
+/// `ft_id → key role POSITIONS` map. `integrate_round_facts` routes a cell
+/// named here through the POSITIONAL keyed-UPSERT (`cell_put_keyed_batch_by_index`)
+/// so a composite aggregate head supersedes its group's prior (stale partial)
+/// value each round instead of appending it. Same `<atom("'"), seq>` wrapper
+/// unwrap as `read_cell_key_roles`; each entry is `<<ftId, X>, <keyIndices,
+/// "0,1,2">>` — the group role positions, comma-separated.
+pub(crate) fn read_cell_agg_key_indices(d: &ast::Object) -> hashbrown::HashMap<String, Vec<usize>> {
+    use hashbrown::HashMap;
+    let cell = ast::fetch_or_phi("_CellAggKeyIndices", d);
+    let entries: Vec<ast::Object> = cell.as_seq()
+        .and_then(|items| {
+            if items.len() == 2 && items[0].as_atom() == Some("'") {
+                items[1].as_seq().map(|s| s.to_vec())
+            } else {
+                Some(items.to_vec())
+            }
+        })
+        .unwrap_or_default();
+    let mut out: HashMap<String, Vec<usize>> = HashMap::with_capacity(entries.len());
+    for fact in entries.iter() {
+        let Some(ft_id) = ast::binding(fact, "ftId") else { continue };
+        let Some(idx_csv) = ast::binding(fact, "keyIndices") else { continue };
+        let indices: Vec<usize> = idx_csv.split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse::<usize>().ok())
+            .collect();
+        if indices.is_empty() { continue; }
+        out.insert(ft_id.to_string(), indices);
+    }
+    out
+}
+
 /// task-984 (vc-modality-on-derived-paths): one value-constraint row
 /// from the `_CellValueConstraints` metadata cell — the role it pins,
 /// the allowed value set, and whether the constraint is alethic
@@ -423,10 +457,30 @@ fn integrate_round_facts(
     by_cell: hashbrown::HashMap<String, Vec<ast::Object>>,
     key_roles: &hashbrown::HashMap<String, Vec<String>>,
     upsert_safe: &hashbrown::HashSet<String>,
+    agg_key_indices: &hashbrown::HashMap<String, Vec<usize>>,
 ) -> ast::Object {
     let mut current_state = state;
     for (cell_name, facts) in by_cell {
-        if let Some(roles) = key_roles.get(&cell_name) {
+        if let Some(indices) = agg_key_indices.get(&cell_name) {
+            // derivation-aggregate-composite-key-upsert: a composite
+            // aggregate HEAD. Key by the group role POSITIONS (dup-role-name
+            // -safe) and UPSERT — each round's re-fold of the (growing,
+            // recursive) source emits a non-increasing min, so last-write
+            // -wins keeps the true minimum per group rather than appending
+            // the stale partial. This routes BEFORE the by-name path because
+            // an aggregate head has no alethic UC and so never appears in
+            // `key_roles`; the explicit precedence is defensive.
+            let (next, conflicts) = ast::cell_put_keyed_batch_by_index(
+                &cell_name, indices, facts, /*upsert=*/true, &current_state);
+            current_state = next;
+            for conflict in conflicts {
+                // upsert never conflicts; a surfaced conflict means a
+                // malformed (out-of-shape) head fact was skipped upstream.
+                crate::diag!(
+                    "[forward-chain] aggregate-head positional key conflict \
+                     (unexpected under upsert), dropping: {:?}", conflict);
+            }
+        } else if let Some(roles) = key_roles.get(&cell_name) {
             // Map-backed cell: the round's facts are upserted by their
             // named-role key in ONE map clone (perf-cellput-on2). Multiple
             // facts in the same round at the same key collapse to the
@@ -826,6 +880,7 @@ fn semi_naive_inner(
     // `forward_chain_defs_state_bounded` — read once, consult per cell.
     let key_roles = read_cell_key_roles(d);
     let upsert_safe = read_upsert_safe_cells(d);
+    let agg_key_indices = read_cell_agg_key_indices(d);
     // Base set of fact keys in `d`. Built once here and updated
     // incrementally as rounds emit new facts — on core.md this cut
     // ~3ms per round of re-hashing the unchanged grammar portion of
@@ -1037,7 +1092,7 @@ fn semi_naive_inner(
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect());
         }
-        current_state = integrate_round_facts(current_state, by_cell, &key_roles, &upsert_safe);
+        current_state = integrate_round_facts(current_state, by_cell, &key_roles, &upsert_safe, &agg_key_indices);
         all_derived.extend(new_facts);
         dirty_cells = Some(next_dirty);
     }
@@ -1115,6 +1170,7 @@ pub fn forward_chain_defs_state_bounded(
     // keep the legacy Seq-append path.
     let key_roles = read_cell_key_roles(d);
     let upsert_safe = read_upsert_safe_cells(d);
+    let agg_key_indices = read_cell_agg_key_indices(d);
     // Cell written by the most recent round — names the consequent in the
     // traced ⊥ if the chain has to be aborted (the naive chainer has no
     // per-rule antecedent metadata, so the last-written cell is the best
@@ -1146,7 +1202,7 @@ pub fn forward_chain_defs_state_bounded(
                 .push(ast::fact_from_pairs(&pairs));
         }
         last_round_cell = by_cell.keys().next().cloned();
-        current_state = integrate_round_facts(current_state, by_cell, &key_roles, &upsert_safe);
+        current_state = integrate_round_facts(current_state, by_cell, &key_roles, &upsert_safe, &agg_key_indices);
         all_derived.extend(new_facts);
     }
     (current_state, all_derived)
@@ -3173,7 +3229,7 @@ mod tests {
         assert!(!upsert_safe.contains("Person_has_Name"),
             "Person_has_Name must NOT be upsert-safe (no fold ancestor)");
 
-        let next = integrate_round_facts(state, by_cell, &key_roles, &upsert_safe);
+        let next = integrate_round_facts(state, by_cell, &key_roles, &upsert_safe, &Default::default());
 
         let cell = ast::fetch_or_phi("Person_has_Name", &next);
         let names: Vec<String> = ast::cell_facts_iter(&cell)
@@ -3218,7 +3274,7 @@ mod tests {
         let mut upsert_safe: hashbrown::HashSet<String> = hashbrown::HashSet::new();
         upsert_safe.insert("Resource_is_currently_in_Status".to_string());
 
-        let next = integrate_round_facts(state, by_cell, &key_roles, &upsert_safe);
+        let next = integrate_round_facts(state, by_cell, &key_roles, &upsert_safe, &Default::default());
 
         let statuses: Vec<String> = ast::cell_facts_iter(
             &ast::fetch_or_phi("Resource_is_currently_in_Status", &next))
@@ -3255,7 +3311,7 @@ mod tests {
             let key_roles: HbMap<String, Vec<String>> = HbMap::new(); // keyless → folded
             let upsert_safe: hashbrown::HashSet<String> = hashbrown::HashSet::new();
             ast::reset_cell_map_clone_count();
-            let _ = integrate_round_facts(state, by_cell, &key_roles, &upsert_safe);
+            let _ = integrate_round_facts(state, by_cell, &key_roles, &upsert_safe, &Default::default());
             ast::get_cell_map_clone_count()
         };
         let small = clones_for(8);
@@ -3291,7 +3347,7 @@ mod tests {
             key_roles.insert("Task_has_Status".to_string(), vec!["Task".to_string()]);
             let upsert_safe: hashbrown::HashSet<String> = hashbrown::HashSet::new();
             ast::reset_cell_map_clone_count();
-            let _ = integrate_round_facts(seed, by_cell, &key_roles, &upsert_safe);
+            let _ = integrate_round_facts(seed, by_cell, &key_roles, &upsert_safe, &Default::default());
             ast::get_cell_map_clone_count()
         };
         let small = clones_for(8);

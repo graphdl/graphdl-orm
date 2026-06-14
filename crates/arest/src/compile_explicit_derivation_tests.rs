@@ -4598,6 +4598,48 @@ Glyph shortest reaches Glyph at Count.
 }
 
 #[test]
+fn composite_aggregate_head_registers_positional_group_key() {
+    // derivation-aggregate-composite-key-upsert: the composite (pair) min
+    // head `Glyph shortest reaches Glyph at Count` must register in
+    // `_CellAggKeyIndices` keyed by its GROUP role POSITIONS [0,1] (the two
+    // `Glyph` roles), EXCLUDING the folded Count at position 2. The forward
+    // chain then UPSERTs by group, so a later, SMALLER min supersedes the
+    // stale one instead of appending it — the IVM fix for `min` over a
+    // GROWING recursive source (arc-cost-gen `Value_shortest_reaches…`
+    // misfolded (rk,rg) to {2,3}). POSITIONS, not names: the two group roles
+    // share the noun name `Glyph`, which by-name keying cannot disambiguate.
+    let src = r#"# Composite (pair) group-key min aggregate
+Glyph(.id) is an entity type.
+Count(.id) is an entity type.
+
+## Fact Types
+Glyph reaches Glyph at Count.
+Glyph shortest reaches Glyph at Count.
+
+## Derivation Rules
+* Glyph1 shortest reaches Glyph2 at Count iff Count is the min of Count2 where Glyph1 reaches Glyph2 at Count2.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let defs = compile::compile_to_defs_state(&state);
+    let (_, func) = defs.iter()
+        .find(|(name, _)| name == "_CellAggKeyIndices")
+        .expect("a composite aggregate head must emit a _CellAggKeyIndices entry");
+    // Materialize the constant cell and read it through the SAME reader the
+    // forward chain uses, so the test validates the exact eval-time contract.
+    let obj = match func {
+        Func::Constant(o) => o.clone(),
+        other => panic!("_CellAggKeyIndices must be a constant cell, got {:?}", other),
+    };
+    let d = ast::store("_CellAggKeyIndices", obj, &Object::phi());
+    let map = crate::evaluate::read_cell_agg_key_indices(&d);
+    let got = map.get("Glyph_shortest_reaches_Glyph_at_Count")
+        .expect("the composite min head must be registered in _CellAggKeyIndices");
+    assert_eq!(got.as_slice(), &[0usize, 1usize],
+        "composite min head keyed by group positions [0,1] (Count@2 excluded); got {:?}",
+        map);
+}
+
+#[test]
 fn qualified_value_role_consequent_join_fires() {
     // join-qualified-value-role-consequent-unresolved: a 3-antecedent
     // projection join whose consequent head has a QUALIFIED value role

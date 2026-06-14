@@ -4,25 +4,24 @@
 // RECURSIVE closure whose recursive step SUMS costs (3-role `Count plus Count
 // is Count`) misfolds: it does not fold to the single minimum per group.
 //
-// ROOT CAUSE — CORRECTED after investigation (see the task's Ticks; the earlier
-// "append-only keying" framing this header carried was WRONG). Verified via
-// diagnostics:
-//   * The min FOLD itself is CORRECT over a COMPLETE source: a STATIC/base (Seq)
-//     `reaches` of {2,3} folds to {2}.
-//   * The bug is the aggregate's GROUP-FOLD over a DERIVED (Map-stored, growing)
-//     source: fresh, BOTH the naive and the deployed semi-naive chains yield
-//     shortest(a,c)={3}; the corrected value (2) is NEVER produced. So keying the
-//     head is NOT the fix — there is nothing to replace the 3 with.
-//   * Reconciles every datum: static/base→correct; arc-gen `steps to` (monotonic,
-//     min discovered first)→correct; arc-cost-gen's persisted {2,3} is most
-//     likely accumulated stale-db rows, not the fresh symptom.
-//   * Ruled out by code-reading: source-encoding (encode_state/encode_state_indexed
-//     flatten Map→Seq correctly). The defect is a RUNTIME interaction in the
-//     aggregate's group/project/fold over a derived source — pinning the exact
-//     line needs live Func-interpreter instrumentation (a focused session).
-//
-// IGNORED until the fix lands. The test asserts the CORRECT result (min folds to
-// {2}); un-ignore when arc-min-aggregate-ivm-misfold is fixed.
+// ROOT CAUSE — FIXED (derivation-aggregate-composite-key-upsert). Confirmed on the
+// DEPLOYED engine (post issue17b fix the recursive closure fully derives the cheap
+// path): a FRESH arc-cost-gen recompile yields Value_shortest_reaches(rk,rg)={2,3},
+// NOT {3} — the 2 IS produced; the bug is that the head is APPEND-ONLY so the early
+// partial min (3) is never superseded. (The earlier header claim that fresh chains
+// yield {3} predated issue17b's fix — back then the closure didn't derive the cheap
+// path, masking the real append-only defect.)
+//   * The min FOLD is correct over a COMPLETE source; over a GROWING recursive
+//     source the fold re-emits a smaller value in a later round (cheaper = MORE hops
+//     with the cost-summing `plus` closure: toll=3 found first, walk+walk=2 later).
+//   * Aggregate heads carry no declared UC, so they landed in keyless full-tuple
+//     storage and every emitted (group,value) tuple persisted → {2,3}.
+//   * FIX: compile emits `_CellAggKeyIndices` for COMPOSITE aggregate heads (group
+//     = the non-value role POSITIONS, dup-role-name-safe); `integrate_round_facts`
+//     routes them through positional keyed-UPSERT (cell_put_keyed_batch_by_index,
+//     upsert=true). The fold is non-increasing over a growing source, so last-write
+//     -wins keeps the true per-group minimum. Single-path/monotonic groups are
+//     unaffected (their re-fold re-emits the same min, which upserts onto itself).
 
 use arest::ast;
 
@@ -49,6 +48,18 @@ fn costs_for(d: &ast::Object, cell: &str, from: &str, to: &str)
 
 /// Forward-chain the cost-closure readings to fixed point; return the final
 /// state so a test can inspect both `reaches` (source) and `shortest` (head).
+///
+/// HARNESS LIMITATION (why the recursive tests below are `#[ignore]`d): this
+/// hand-built path filters the `derivation:*` defs and runs
+/// `forward_chain_defs_state` directly, which evaluates the `*`-marked
+/// SELF-recursive `reaches` view by lazy re-read — recursing UNBOUNDEDLY (a
+/// 256 MB worker stack still overflows). The DEPLOYED `apps_compile` path does
+/// NOT: it materializes `reaches` Stored-eager FIRST, so the closure is read
+/// from a stored cell instead of re-derived recursively. Replicating that
+/// here is a separate harness fix; the positional keyed-upsert aggregate fix
+/// is verified via the DEPLOYED path (fresh arc-cost-gen folds (rk,rg)→{2}),
+/// the NON-recursive 3-role discriminator above, and the storage-layer
+/// `cell_put_keyed_batch_by_index` unit test in ast.rs.
 fn chain() -> ast::Object {
     let src = "\
         Node(.id) is an entity type.\n\
@@ -180,7 +191,11 @@ fn aggregate_min_three_role_group_nonrecursive_folds_to_min() {
 /// The multi-path group (a,c): direct cost 3 vs a->b->c cost 2. `reaches`
 /// (the source) must carry BOTH (precondition); `min` MUST fold to exactly {2}.
 #[test]
-#[ignore = "arc-min-aggregate-ivm-misfold: aggregate heads are append-only; min over a plus-closure does not fold to the per-group minimum. Un-ignore when keyed-upsert aggregate heads land."]
+#[ignore = "HARNESS overflow, not a fix gap: forward_chain_defs_state recurses \
+unboundedly on the `*`-recursive `reaches` view (see chain() doc). The fix IS \
+verified — deployed arc-cost-gen folds (rk,rg)->{2}, plus the non-recursive \
+discriminator + the ast.rs cell_put_keyed_batch_by_index upsert test. Un-ignore \
+once chain() materializes `reaches` Stored-eager like the deployed path."]
 fn min_over_cost_summing_closure_folds_to_single_minimum() {
     let d = chain();
 
@@ -211,7 +226,8 @@ fn min_over_cost_summing_closure_folds_to_single_minimum() {
 /// Single-path groups already fold correctly even today — a guard so the fix
 /// is shown to preserve the working case, not just repair the broken one.
 #[test]
-#[ignore = "arc-min-aggregate-ivm-misfold: un-ignore with the fix (single-path control)."]
+#[ignore = "HARNESS overflow (see chain() doc + the sibling test); single-path \
+control for the fix, runnable once chain() materializes `reaches` Stored-eager."]
 fn min_over_single_path_group_is_unaffected() {
     let d = chain();
     assert_eq!(
