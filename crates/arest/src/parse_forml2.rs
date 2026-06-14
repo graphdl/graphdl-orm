@@ -2024,13 +2024,40 @@ fn resolve_derivation_rule(
                     let mut want: Vec<String> = find_nouns(&clause_stripped, &noun_names)
                         .iter().map(|(_, _, n)| parse_role_token(n).0.to_string()).collect();
                     want.sort();
-                    resolved = fact_types_map.iter()
-                        .find(|(id, ft)| id.as_str() != consequent_ft_id && {
+                    // aggregate-source-same-signature-collision: `moves` and
+                    // `reaches` share the {Node,Node,Cost} role multiset, so a
+                    // signature-ONLY `.find()` picks the first-declared sibling
+                    // (`moves`, the base edge) instead of the one the clause
+                    // actually NAMES (`reaches`, the closure) — making the
+                    // aggregate fold the wrong relation (min over the base edges,
+                    // not the closure). Disambiguate by the clause's CONNECTIVE
+                    // (non-noun) words: prefer the same-signature FT whose reading
+                    // shares them; fall back to the first sibling only when none
+                    // matches (preserving prior behaviour for the unambiguous
+                    // single-sibling case).
+                    let connectives = |text: &str| -> Vec<String> {
+                        let nouns: Vec<String> = find_nouns(text, &noun_names).iter()
+                            .flat_map(|(_, _, n)| [n.to_string().to_lowercase(),
+                                parse_role_token(n).0.to_lowercase()])
+                            .collect();
+                        text.split_whitespace()
+                            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+                            .filter(|w| !w.is_empty() && !nouns.contains(w))
+                            .collect()
+                    };
+                    let want_conn = connectives(&clause_stripped);
+                    let siblings: Vec<(String, Vec<String>)> = fact_types_map.iter()
+                        .filter(|(id, ft)| id.as_str() != consequent_ft_id && {
                             let mut have: Vec<String> =
                                 ft.roles.iter().map(|r| r.noun_name.clone()).collect();
                             have.sort();
                             have == want
                         })
+                        .map(|(id, ft)| (id.clone(), connectives(&ft.reading)))
+                        .collect();
+                    resolved = siblings.iter()
+                        .find(|(_, conn)| *conn == want_conn)
+                        .or_else(|| siblings.first())
                         .map(|(id, _)| id.clone());
                 }
                 let carries_target = resolved.as_ref().and_then(|id| fact_types_map.get(id))

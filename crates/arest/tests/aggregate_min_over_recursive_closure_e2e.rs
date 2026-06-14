@@ -92,6 +92,46 @@ fn chain() -> ast::Object {
     arest::evaluate::forward_chain_defs_state(&derivation_refs, &d).0
 }
 
+/// Source-FT resolution under a same-signature collision (the real root cause):
+/// the aggregate `min of Cost2 where Node1 reaches Node2 at Cost2` must fold
+/// `reaches`, not its same-{Node,Node,Cost}-signature sibling `moves`. Uses a
+/// NON-recursive `reaches` (derived from two base relations) so the recursive
+/// view-recursion (issue17b) doesn't confound — this isolates the fix.
+#[test]
+fn aggregate_min_resolves_named_source_not_same_signature_sibling() {
+    let src = "\
+        Node(.id) is an entity type.\n\
+        Cost(.id) is an entity type.\n\
+        Node moves to Node at Cost.\n\
+        Node hops to Node at Cost.\n\
+        Node reaches Node at Cost. *\n\
+        Node shortest reaches Node at Cost. *\n\
+        \n\
+        ## Derivation Rules\n\
+        * Node1 reaches Node2 at Cost1 iff Node1 moves to Node2 at Cost1.\n\
+        * Node1 reaches Node2 at Cost1 iff Node1 hops to Node2 at Cost1.\n\
+        * Node1 shortest reaches Node2 at Cost iff Cost is the min of Cost2 where Node1 reaches Node2 at Cost2.\n\
+        \n\
+        ## Instance Facts\n\
+        Node 'a' moves to Node 'c' at Cost '3'.\n\
+        Node 'a' hops to Node 'c' at Cost '2'.\n";
+    let state = arest::parse_forml2_stage2::parse_to_state_via_stage12(src).expect("parse");
+    let defs = arest::compile::compile_to_defs_state(&state);
+    let d = ast::defs_to_state(&defs, &state);
+    let owned: Vec<(String, ast::Func)> = ast::cells_iter(&d).into_iter()
+        .filter(|(n, _)| n.starts_with("derivation:"))
+        .map(|(n, c)| (n.to_string(), ast::metacompose(c, &d))).collect();
+    let refs: Vec<(&str, &ast::Func)> = owned.iter().map(|(n, f)| (n.as_str(), f)).collect();
+    let (nd, _) = arest::evaluate::forward_chain_defs_state(&refs, &d);
+    // reaches(a,c) = {2 (hops), 3 (moves)}; min MUST be {2}, not min(moves)={3}.
+    assert_eq!(
+        costs_for(&nd, "Node_shortest_reaches_Node_at_Cost", "a", "c"),
+        ["2".to_string()].into_iter().collect(),
+        "min must fold the NAMED source `reaches` ({{2,3}}->2), not its \
+         same-signature sibling `moves` ({{3}}->3)"
+    );
+}
+
 /// The multi-path group (a,c): direct cost 3 vs a->b->c cost 2. `reaches`
 /// (the source) must carry BOTH (precondition); `min` MUST fold to exactly {2}.
 #[test]
