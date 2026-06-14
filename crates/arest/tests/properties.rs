@@ -2511,19 +2511,23 @@ fn constraint_kind_inventory_landed_in_core_md() {
             "{vt} should be a value type");
     }
 
-    // The 17 codes the alethic dispatch in compile.rs covers. AT and
-    // ANS share the antisymmetric kernel (`"AT" | "ANS"` arm); ANS is
-    // an alias and is not given its own Constraint Kind here — the 17
-    // entries match the 17 distinct kinds the family taxonomy
-    // partitions, mirroring the existing Constraint Type inventory
-    // plus RF (which the original Constraint Type list omits).
-    let expected_codes: [&str; 17] = [
+    // The 17 alethic codes the alethic dispatch in compile.rs covers (AT
+    // and ANS share the antisymmetric kernel; ANS is an alias and is not
+    // given its own Constraint Kind here), PLUS the 6 deontic kinds
+    // (task-987 data-backfill, commit 1bd62d15): DF_pop/cwa/owa (Deontic
+    // Forbidden) and DO_pop/obl/sender (Deontic Obligatory), whose
+    // violation templates live in validation.md. Every Constraint Kind
+    // carries the mandatory Constraint Kind Label + Family, so the deontic
+    // ones must appear here too or their rows drop.
+    let expected_codes: [&str; 23] = [
         "IR", "AS", "SY", "AT",
         "UC", "MC",
         "FC", "VC",
         "IT", "TR", "AC", "RF",
         "XO", "XC", "OR",
         "SS", "EQ",
+        "DF_pop", "DF_cwa", "DF_owa",
+        "DO_pop", "DO_obl", "DO_sender",
     ];
 
     let inst_facts = ast::fetch_or_phi("InstanceFact", &state);
@@ -2557,12 +2561,13 @@ fn constraint_kind_inventory_landed_in_core_md() {
         }
     }
 
-    // 17 Label facts, 17 Family facts, one per expected code.
-    assert_eq!(label_by_code.len(), 17,
-        "expected 17 Constraint Kind Label facts, got {}: {:?}",
+    // 23 Label facts, 23 Family facts, one per expected code (17 alethic
+    // + 6 deontic).
+    assert_eq!(label_by_code.len(), 23,
+        "expected 23 Constraint Kind Label facts, got {}: {:?}",
         label_by_code.len(), label_by_code);
-    assert_eq!(family_by_code.len(), 17,
-        "expected 17 Constraint Kind Family facts, got {}: {:?}",
+    assert_eq!(family_by_code.len(), 23,
+        "expected 23 Constraint Kind Family facts, got {}: {:?}",
         family_by_code.len(), family_by_code);
 
     // Every expected code has both a Label and a Family.
@@ -2575,11 +2580,12 @@ fn constraint_kind_inventory_landed_in_core_md() {
              present: {:?}", family_by_code.keys().collect::<Vec<_>>());
     }
 
-    // Family values are drawn from the declared enumeration. The 8
-    // family names mirror the dispatch shapes in compile.rs.
+    // Family values are drawn from the declared enumeration. 8 names
+    // mirror the alethic dispatch shapes in compile.rs; 'deontic' groups
+    // the deontic kinds (task-987, commit 1bd62d15).
     let valid_families: std::collections::BTreeSet<&str> = [
         "ring", "uniqueness", "mandatory", "frequency",
-        "value", "set-comparison", "subset", "equality",
+        "value", "set-comparison", "subset", "equality", "deontic",
     ].into_iter().collect();
     for (code, fam) in &family_by_code {
         assert!(valid_families.contains(fam.as_str()),
