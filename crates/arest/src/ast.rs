@@ -5615,6 +5615,55 @@ fn encoded_pop_lookup(name: &str, state: &Object) -> Option<Object> {
     })
 }
 
+// engine-flat-stratum-recursion-stack-guard: re-entrancy guard for lazy view
+// resolution. A GENUINELY-unstratifiable program — an aggregate inside a
+// recursive cycle (no least fixed point) — makes `resolve_view` recurse through
+// the cycle on the CALL STACK (cell A's view reads cell B's view reads cell A's
+// view …) and STACK-OVERFLOW the host compile. Track the cells currently being
+// resolved on this thread; re-entering one already on the stack IS the cycle, so
+// `resolve_view` stops and returns None (the caller falls through to the stored
+// cell, breaking the recursion), letting the compile finish with a partial
+// fixpoint + a loud note instead of crashing. Triggers ONLY on a genuine
+// re-entrant cycle — acyclic / stratifiable views never re-enter a cell mid-
+// resolution — so it is a strict no-op for every well-formed app. cfg-gated like
+// the chain-abort / cap-stack thread-locals; no_std builds get a no-op guard.
+#[cfg(not(feature = "no_std"))]
+std::thread_local! {
+    static RESOLVING_VIEWS: core::cell::RefCell<alloc::vec::Vec<alloc::string::String>> =
+        const { core::cell::RefCell::new(alloc::vec::Vec::new()) };
+}
+
+#[cfg(not(feature = "no_std"))]
+struct ViewResolveGuard;
+
+#[cfg(not(feature = "no_std"))]
+impl Drop for ViewResolveGuard {
+    fn drop(&mut self) {
+        RESOLVING_VIEWS.with(|s| { s.borrow_mut().pop(); });
+    }
+}
+
+/// Begin resolving `cell`'s view. Returns `None` if `cell` is ALREADY being
+/// resolved on this thread (a recursive view cycle — the caller must NOT recurse
+/// into it); otherwise pushes it and returns a guard that pops on drop.
+#[cfg(not(feature = "no_std"))]
+fn enter_view_resolution(cell: &str) -> Option<ViewResolveGuard> {
+    RESOLVING_VIEWS.with(|s| {
+        let mut stack = s.borrow_mut();
+        if stack.iter().any(|c| c == cell) {
+            None
+        } else {
+            stack.push(alloc::string::String::from(cell));
+            Some(ViewResolveGuard)
+        }
+    })
+}
+
+#[cfg(feature = "no_std")]
+struct ViewResolveGuard;
+#[cfg(feature = "no_std")]
+fn enter_view_resolution(_cell: &str) -> Option<ViewResolveGuard> { Some(ViewResolveGuard) }
+
 /// task-930: read-side eval of a view rule. Returns Some(facts) when
 /// the cell has a registered view def (`view:{cell_name}`), None
 /// otherwise (so the caller falls through to the legacy stored-cell
@@ -5648,6 +5697,20 @@ pub(crate) fn resolve_view(cell_name: &str, pop: &Object, defs: &Object) -> Opti
         // own. Read from `defs` (carries the FactType / Role / Noun cells).
         return crate::rmap::reconstitute_absorbed_ft(defs, cell_name);
     }
+    // engine-flat-stratum-recursion-stack-guard: break a recursive view cycle
+    // before it overflows the call stack (an ill-defined aggregate-in-cycle).
+    // `_view_guard` pops `cell_name` off the resolving stack on every return.
+    let _view_guard = match enter_view_resolution(cell_name) {
+        Some(g) => g,
+        None => {
+            diag!("[view] recursive cycle resolving `{}` — an aggregate/view inside \
+                a recursive cycle has no least fixed point; returning empty to break \
+                the recursion. The program is ill-defined: break the cycle (e.g. add \
+                a partition role so an aggregate sits strictly ABOVE its recursive \
+                source).", cell_name);
+            return None;
+        }
+    };
     let func = metacompose(&stored, defs);
     // The view's func is a derivation func — it expects an encoded
     // population. If the caller already handed us an encoded pop
@@ -10210,6 +10273,30 @@ mod tests {
         ]);
         assert_eq!(apply(&f, &x, &d), expected);
         assert_eq!(func_to_object(&Func::OrderBy(Box::new(Func::Selector(1)))), obj);
+    }
+
+    // engine-flat-stratum-recursion-stack-guard: the view-resolution re-entrancy
+    // guard. resolve_view must detect when a cell is ALREADY being resolved on
+    // this thread (a recursive view cycle from an ill-defined aggregate-in-cycle)
+    // and refuse to recurse — that is what converts the former stack overflow into
+    // a clean "return empty + diagnose" break. Acyclic nesting (distinct cells)
+    // must NOT trip it, and dropping a guard must free the cell for re-entry.
+    #[test]
+    fn view_resolution_reentrancy_guard_detects_cycle_not_acyclic_nesting() {
+        let g_a = enter_view_resolution("A");
+        assert!(g_a.is_some(), "first entry of A must succeed");
+        // Re-entering A while it is still on the resolving stack = the cycle.
+        assert!(enter_view_resolution("A").is_none(),
+            "re-entry of A mid-resolution must be detected as a cycle (return None)");
+        // A DIFFERENT cell nested under A is legitimate acyclic nesting.
+        let g_b = enter_view_resolution("B");
+        assert!(g_b.is_some(), "a distinct cell B nested under A must be allowed");
+        drop(g_b);
+        drop(g_a);
+        // Stack clean after drops — A is enterable again (no leaked state).
+        let g_a2 = enter_view_resolution("A");
+        assert!(g_a2.is_some(), "after dropping its guard, A must be enterable again");
+        drop(g_a2);
     }
 
     // ── FFP: ρ and metacomposition (Backus 13) ──────────────────
