@@ -211,6 +211,57 @@ pub(crate) fn compute_upsert_safe_cells(
     safe
 }
 
+/// derivation-aggregate-stratify (to-spec: AREST.tex Thm 5 — derivation is the
+/// MONOTONE `lfp(F_S, P')`, "the fixed point is the specification, not the
+/// execution plan"; §exec — aggregation is the Klug fold `⟨/,f⟩`, a FUNCTION of
+/// its source relation). An aggregate's spec value is the fold over its source
+/// at the SOURCE's fixpoint — not an intermediate round. The eager round-by-round
+/// plan violates that for a min/max over a GROWING recursive source (it emits a
+/// transient partial value the monotone chain can't retract → the {2,3} / toll-
+/// in-policy bug). Stratified evaluation restores agreement: assign each DERIVED
+/// cell a stratum with an AGGREGATE rule strictly ABOVE its derived source, a
+/// positive (non-aggregate) edge at the SAME stratum (so positive recursion
+/// stays in one stratum). The chain driver runs strata bottom-up, each to LFP,
+/// so an aggregate folds its COMPLETED source and its consumers read the spec
+/// value — "Knaster-Tarski guarantees the cheaper path agrees with the spec".
+///
+/// `deps`: one entry per rule — (consequent cell, positive-read cells,
+/// is_aggregate). Returns cell -> stratum, or `None` when unstratifiable (an
+/// aggregate/negation edge inside a recursive cycle forces an unbounded strict
+/// increase) — the caller then falls back to a single (flat) stratum.
+pub(crate) fn compute_derivation_strata(
+    deps: &[(String, Vec<String>, bool)],
+) -> Option<HashMap<String, usize>> {
+    // Reads NOT in this set are base cells (stratum 0) — they impose no
+    // constraint and never take an aggregate bump.
+    let derived: alloc::collections::BTreeSet<&str> =
+        deps.iter().map(|(c, _, _)| c.as_str()).collect();
+    let mut stratum: HashMap<String, usize> =
+        derived.iter().map(|c| (c.to_string(), 0usize)).collect();
+    // A stratifiable graph of N derived cells reaches its top stratum (< N) in
+    // <= N propagation passes; one full pass with no change means converged.
+    // Past that bound the strata keep rising ⇒ a strict-increase cycle.
+    for _ in 0..=derived.len() {
+        let mut changed = false;
+        for (cons, reads, is_agg) in deps {
+            let mut req = stratum.get(cons).copied().unwrap_or(0);
+            for rc in reads {
+                let rc_s = stratum.get(rc).copied().unwrap_or(0);
+                let bump = if *is_agg && derived.contains(rc.as_str()) { 1 } else { 0 };
+                req = req.max(rc_s + bump);
+            }
+            if req > stratum.get(cons).copied().unwrap_or(0) {
+                stratum.insert(cons.clone(), req);
+                changed = true;
+            }
+        }
+        if !changed {
+            return Some(stratum);
+        }
+    }
+    None
+}
+
 /// A compiled state machine. func is the transition function: <state, event> -> state'.
 /// statuses retained for introspection (machine:{noun}:statuses could expose it).
 #[allow(dead_code)]
@@ -1512,8 +1563,9 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // `agg_ft_ids_by_rule` from the same CellIndex — `consequent_cell ->
     // group role POSITIONS` for COMPOSITE aggregate heads. See the long
     // comment on `group_keys` below; emitted as `_CellAggKeyIndices`.
-    let (agg_ft_ids_by_rule, agg_group_key_indices_by_cell): (
+    let (agg_ft_ids_by_rule, agg_group_key_indices_by_cell, derivation_strata): (
         HashMap<String, Vec<String>>, HashMap<String, Vec<usize>>,
+        HashMap<String, usize>,
     ) = {
         let data = cell_index_from_state(state);
         let agg_ft_ids: HashMap<String, Vec<String>> = data.derivation_rules.iter()
@@ -1577,7 +1629,47 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                 group_keys.insert(cons_id.to_string(), group);
             }
         }
-        (agg_ft_ids, group_keys)
+        // derivation-aggregate-stratify: rule id -> stratum, so the chain driver
+        // can evaluate strata bottom-up and an aggregate folds its COMPLETED
+        // source (the to-spec fix; see `compute_derivation_strata`). Built from
+        // the (consequent -> positive-reads) graph + each rule's aggregate flag.
+        // Unstratifiable graphs fall back to a single stratum (flat chain).
+        let derivation_strata: HashMap<String, usize> = {
+            // (rule_id, consequent cell, positive reads, is_aggregate)
+            let rule_info: Vec<(String, String, Vec<String>, bool)> = data.derivation_rules.iter()
+                .filter(|r| !r.id.is_empty())
+                .filter_map(|r| {
+                    let c = r.consequent_cell.literal_id();
+                    (!c.is_empty()).then(|| (
+                        r.id.clone(),
+                        c.to_string(),
+                        model.derivation_positive_reads.get(&r.id).cloned().unwrap_or_default(),
+                        !r.consequent_aggregates.is_empty(),
+                    ))
+                })
+                .collect();
+            let deps: Vec<(String, Vec<String>, bool)> = rule_info.iter()
+                .map(|(_, c, reads, agg)| (c.clone(), reads.clone(), *agg))
+                .collect();
+            match compute_derivation_strata(&deps) {
+                None => {
+                    crate::diag!("[stratify] derivation graph not stratifiable \
+                        (aggregate/negation in a recursive cycle) - using a single \
+                        flat stratum");
+                    HashMap::new()
+                }
+                Some(cell_stratum) => rule_info.iter()
+                    .filter_map(|(id, c, _, _)| {
+                        let s = cell_stratum.get(c).copied().unwrap_or(0);
+                        // Omit stratum-0 rules; the chain driver defaults absent
+                        // rules to 0. A single-stratum program emits nothing here,
+                        // so the driver takes the flat fast-path (no behavior change).
+                        (s > 0).then(|| (id.clone(), s))
+                    })
+                    .collect(),
+            }
+        };
+        (agg_ft_ids, group_keys, derivation_strata)
     };
 
     // Domain eliminated (#211): all generators below read from cell-based
@@ -3723,6 +3815,34 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         if !entries.is_empty() {
             defs.push((
                 "_CellAggKeyIndices".to_string(),
+                Func::constant(crate::ast::Object::Seq(entries.into())),
+            ));
+        }
+    }
+
+    // derivation-aggregate-stratify: emit `_DerivationStrata` — rule id ->
+    // stratum (stratum-0 rules omitted; the chain driver defaults absent rules
+    // to 0). `evaluate::forward_chain_defs_state_stratified` runs strata
+    // bottom-up so each aggregate folds its COMPLETED source (Thm 5 spec).
+    // Entry shape `<<rule, id>, <stratum, "1">>`; sorted for determinism.
+    {
+        let mut sorted: Vec<(&String, &usize)> = derivation_strata.iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        let entries: Vec<crate::ast::Object> = sorted.into_iter()
+            .map(|(id, stratum)| crate::ast::Object::seq(vec![
+                crate::ast::Object::seq(vec![
+                    crate::ast::Object::atom("rule"),
+                    crate::ast::Object::atom(id),
+                ]),
+                crate::ast::Object::seq(vec![
+                    crate::ast::Object::atom("stratum"),
+                    crate::ast::Object::atom(&stratum.to_string()),
+                ]),
+            ]))
+            .collect();
+        if !entries.is_empty() {
+            defs.push((
+                "_DerivationStrata".to_string(),
                 Func::constant(crate::ast::Object::Seq(entries.into())),
             ));
         }

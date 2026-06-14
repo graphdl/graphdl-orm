@@ -3233,8 +3233,13 @@ pub fn main_entry() {
                     let sn_refs: Vec<(&str, &ast::Func, Option<&[String]>)> = packed.iter()
                         .map(|(name, func, reads)| (*name, *func, reads.as_deref()))
                         .collect();
+                    // derivation-aggregate-stratify: STRATIFIED chain — runs each
+                    // stratum to LFP bottom-up so an aggregate folds its COMPLETED
+                    // source (AREST.tex Thm 5 spec). Delegates to the flat
+                    // semi-naive chain when there are no aggregate strata (every
+                    // monotone app) — see `_DerivationStrata` / forward_chain_defs_state_stratified.
                     let (new_d, derived) =
-                        crate::evaluate::forward_chain_defs_state_semi_naive(&sn_refs, &d, 100);
+                        crate::evaluate::forward_chain_defs_state_stratified(&sn_refs, &d, 100);
                     // cli-apply-large-tasksdb-nonterminating: consume the
                     // chain-abort flag so it can't leak past this compile.
                     // The chain already logged a traced ⊥ naming the

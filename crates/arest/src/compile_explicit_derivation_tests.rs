@@ -4640,6 +4640,51 @@ Glyph shortest reaches Glyph at Count.
 }
 
 #[test]
+fn derivation_strata_place_aggregate_strictly_above_its_recursive_source() {
+    // derivation-aggregate-stratify (to-spec): an aggregate sits strictly ABOVE
+    // its derived source; a positive (non-aggregate) edge keeps the SAME stratum
+    // — so positive recursion stays in one stratum, and an aggregate's positive
+    // consumers ride its stratum yet still read its FINAL fold (the source is a
+    // lower, COMPLETED stratum). `moves` is a base cell (no rule) → stratum 0.
+    let deps = vec![
+        // recursive source: reaches iff moves / iff moves+reaches (positive self-edge)
+        ("Glyph_reaches_Glyph_at_Count".to_string(),
+            vec!["Glyph_moves_to_Glyph_at_Count".to_string(),
+                 "Glyph_reaches_Glyph_at_Count".to_string()], false),
+        // the min AGGREGATE over the recursive source
+        ("Glyph_shortest_reaches_Glyph_at_Count".to_string(),
+            vec!["Glyph_reaches_Glyph_at_Count".to_string()], true),
+        // a positive consumer of the aggregate, and a transitive consumer
+        ("Glyph_leads_to_Glyph".to_string(),
+            vec!["Glyph_shortest_reaches_Glyph_at_Count".to_string()], false),
+        ("Glyph_realizes_Glyph".to_string(),
+            vec!["Glyph_leads_to_Glyph".to_string()], false),
+    ];
+    let strata = compile::compute_derivation_strata(&deps).expect("stratifiable");
+    assert_eq!(strata.get("Glyph_reaches_Glyph_at_Count"), Some(&0),
+        "the recursive source (positive self-edge) stays in stratum 0; got {:?}", strata);
+    assert_eq!(strata.get("Glyph_shortest_reaches_Glyph_at_Count"), Some(&1),
+        "the min AGGREGATE is strictly above its derived source (0 -> 1); got {:?}", strata);
+    assert_eq!(strata.get("Glyph_leads_to_Glyph"), Some(&1),
+        "a positive consumer rides the aggregate's stratum (reads its FINAL fold); got {:?}", strata);
+    assert_eq!(strata.get("Glyph_realizes_Glyph"), Some(&1),
+        "the transitive positive consumer also stays at the aggregate's stratum; got {:?}", strata);
+}
+
+#[test]
+fn derivation_strata_reject_aggregate_inside_a_recursive_cycle() {
+    // An aggregate edge inside a cycle (A aggregates B, B reads A) forces an
+    // unbounded strict increase → unstratifiable → None (the caller then falls
+    // back to a single flat stratum rather than looping).
+    let deps = vec![
+        ("A".to_string(), vec!["B".to_string()], true),   // A = aggregate over B
+        ("B".to_string(), vec!["A".to_string()], false),  // B reads A → cycle through an aggregate
+    ];
+    assert!(compile::compute_derivation_strata(&deps).is_none(),
+        "an aggregate inside a recursive cycle is not stratifiable");
+}
+
+#[test]
 fn qualified_value_role_consequent_join_fires() {
     // join-qualified-value-role-consequent-unresolved: a 3-antecedent
     // projection join whose consequent head has a QUALIFIED value role

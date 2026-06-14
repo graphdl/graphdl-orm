@@ -282,6 +282,88 @@ pub(crate) fn read_upsert_safe_cells(d: &ast::Object) -> hashbrown::HashSet<Stri
     out
 }
 
+/// derivation-aggregate-stratify: read `_DerivationStrata` (emitted by
+/// `compile_to_defs_state`) into `rule-id -> stratum`. Rules absent from the
+/// cell are stratum 0. Entry shape `<<rule, id>, <stratum, "1">>`; same
+/// `<atom("'"), seq>` wrapper-unwrap as `read_upsert_safe_cells`.
+pub(crate) fn read_derivation_strata(d: &ast::Object) -> hashbrown::HashMap<String, usize> {
+    use hashbrown::HashMap;
+    let cell = ast::fetch_or_phi("_DerivationStrata", d);
+    let entries: Vec<ast::Object> = cell.as_seq()
+        .and_then(|items| {
+            if items.len() == 2 && items[0].as_atom() == Some("'") {
+                items[1].as_seq().map(|s| s.to_vec())
+            } else {
+                Some(items.to_vec())
+            }
+        })
+        .unwrap_or_default();
+    let mut out: HashMap<String, usize> = HashMap::with_capacity(entries.len());
+    for fact in entries.iter() {
+        let Some(id) = ast::binding(fact, "rule") else { continue };
+        let Some(stratum) = ast::binding(fact, "stratum").and_then(|s| s.parse::<usize>().ok())
+        else { continue };
+        out.insert(id.to_string(), stratum);
+    }
+    out
+}
+
+/// derivation-aggregate-stratify: STRATIFIED forward chain — the to-spec
+/// evaluation for aggregation over recursion (AREST.tex Thm 5: derivation is
+/// the monotone `lfp(F_S, P')`, "the fixed point is the specification, not the
+/// execution plan"; §exec: aggregation is the Klug fold, a function of its
+/// source relation). Runs each stratum (from `_DerivationStrata`) to LFP
+/// bottom-up, so an aggregate folds its COMPLETED source — never an
+/// intermediate round — and its consumers read the spec value. This is what
+/// makes the eager "cheaper path" agree with the LFP specification for a
+/// non-monotone min/max over a growing recursive source (the {2,3} / toll-in-
+/// policy bug otherwise).
+///
+/// FAST PATH / FALLBACK: when `_DerivationStrata` is absent or only names
+/// stratum 0 (every app without an aggregate-over-derived-cell edge, and any
+/// program flagged unstratifiable at compile), `max_stratum == 0` and this
+/// delegates verbatim to the flat `forward_chain_defs_state_semi_naive` — zero
+/// behavior change for the monotone common case.
+pub fn forward_chain_defs_state_stratified(
+    derivation_defs: &[(&str, &ast::Func, Option<&[String]>)],
+    d: &ast::Object,
+    max_rounds: usize,
+) -> (ast::Object, Vec<DerivedFact>) {
+    let strata = read_derivation_strata(d);
+    let max_stratum = strata.values().copied().max().unwrap_or(0);
+    if max_stratum == 0 {
+        return forward_chain_defs_state_semi_naive(derivation_defs, d, max_rounds);
+    }
+    // A def name is `derivation:<rule-id>`; its stratum is the rule's (default 0
+    // for SM-synthetic and any rule absent from the map).
+    let stratum_of = |name: &str| -> usize {
+        let id = name.strip_prefix("derivation:").unwrap_or(name);
+        strata.get(id).copied().unwrap_or(0)
+    };
+    let mut cur = d.clone();
+    let mut all_derived: Vec<DerivedFact> = Vec::new();
+    for s in 0..=max_stratum {
+        let refs_s: Vec<(&str, &ast::Func, Option<&[String]>)> = derivation_defs.iter()
+            .filter(|(name, _, _)| stratum_of(name) == s)
+            .copied()
+            .collect();
+        if refs_s.is_empty() {
+            continue;
+        }
+        let (next, derived) = forward_chain_defs_state_semi_naive(&refs_s, &cur, max_rounds);
+        cur = next;
+        all_derived.extend(derived);
+        // A non-converging stratum (deadline abort) means higher strata would
+        // read incomplete lower data — stop and re-arm the flag so the caller's
+        // post-chain `take_chain_abort()` still sees it (this take consumed it).
+        if take_chain_abort() {
+            note_chain_abort();
+            break;
+        }
+    }
+    (cur, all_derived)
+}
+
 /// Read the `_CellKeyRoles` metadata cell (emitted by
 /// `compile_to_defs_state`) into a `ft_id → role_names` map. Forward-
 /// chain emit paths consult this to route writes for keyed cells
