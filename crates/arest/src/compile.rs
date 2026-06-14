@@ -7098,11 +7098,66 @@ pub(crate) fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRul
                     }).collect();
                     Func::construction(pairs)
                 } else if rule.consequent_computed_bindings.is_empty() {
-                    // Pure inheritance: antecedent and consequent FTs
-                    // share the same role schema (subtype-membership,
-                    // CWA negation, transitivity, ring-FT positional
-                    // copy). Id flows the antecedent bindings unchanged.
-                    Func::Id
+                    // Pure inheritance: antecedent and consequent FTs share the
+                    // SAME role schema (subtype-membership, CWA negation,
+                    // transitivity, ring-FT positional copy) — Id flows the
+                    // antecedent bindings unchanged.
+                    //
+                    // engine-single-antecedent-head-free-var-leak: but a
+                    // single-antecedent PROJECTION rule whose consequent roles
+                    // DIFFER from the antecedent's (`Attribute admits Value iff
+                    // Item has Value for Attribute` — Item is a free body var,
+                    // not a head role) must NOT pass the antecedent bindings
+                    // through; Id would leak the free var into the head cell.
+                    // When the schemas differ, project to the consequent's
+                    // DECLARED roles (subscript-positional for ring FTs, name-
+                    // based otherwise) — the same projection the literal-pin
+                    // branch below builds. Schema-equal copies AND unresolved
+                    // (synthetic-cell) consequents keep Id, so subtype / CWA /
+                    // transitivity / ring derivations are byte-for-byte unchanged.
+                    // Project ONLY when the consequent has STRICTLY FEWER roles
+                    // than the antecedent — i.e. a body var is genuinely dropped
+                    // (the free-var-leak case). Same-arity copies / renames /
+                    // reorders and add-a-role shapes keep Id (the positional
+                    // pass-through), byte-for-byte unchanged — so filter / fanout
+                    // / copy / subtype / CWA / transitivity / ring derivations
+                    // are unaffected; only the strict-projection shape changes.
+                    let drops_free_var = ant_ft.map(|aft|
+                        !cons_ft_roles.is_empty() && cons_ft_roles.len() < aft.roles.len()
+                    ).unwrap_or(false);
+                    if !drops_free_var {
+                        Func::Id
+                    } else {
+                        let ant_subs = antecedent_role_subscripts(rule, data);
+                        let cons_subs = consequent_role_subscripts(rule, &consequent_id, data);
+                        let pairs: Vec<Func> = cons_ft_roles.iter().enumerate()
+                            .map(|(cons_role_idx, r)| {
+                                let key = r.noun_name.clone();
+                                // subscript-positional projection (ring FTs)
+                                let cons_sub = cons_subs.iter()
+                                    .find(|(idx, _)| *idx == cons_role_idx)
+                                    .map(|(_, s)| s.as_str())
+                                    .filter(|s| !s.is_empty());
+                                if let Some(sub) = cons_sub {
+                                    if let Some(ant0_subs) = ant_subs.first() {
+                                        if let Some((ant_role_idx, _)) = ant0_subs.iter()
+                                            .find(|(_, s)| s == sub)
+                                        {
+                                            return Func::construction(vec![
+                                                Func::constant(Object::atom(&key)),
+                                                role_value(*ant_role_idx),
+                                            ]);
+                                        }
+                                    }
+                                }
+                                // name-based fallback (distinct-named roles)
+                                Func::construction(vec![
+                                    Func::constant(Object::atom(&key)),
+                                    role_value_by_name(&r.noun_name),
+                                ])
+                            }).collect();
+                        Func::construction(pairs)
+                    }
                 } else {
                     // Defensive: consequent FT didn't resolve (synthetic
                     // cell like `_cwa_negation:<ft_id>` /

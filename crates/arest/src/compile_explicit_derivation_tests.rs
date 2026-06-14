@@ -4685,6 +4685,43 @@ fn derivation_strata_reject_aggregate_inside_a_recursive_cycle() {
 }
 
 #[test]
+fn single_antecedent_head_projects_to_declared_roles_not_free_body_vars() {
+    // engine-single-antecedent-head-free-var-leak (arc-csdp): a SINGLE-antecedent
+    // rule must PROJECT its consequent to the DECLARED head roles, dropping
+    // body-only free vars. Here Item1 is free (in the body, not the head); the
+    // derived `Attribute admits Value` must be exactly (Attribute, Value), NOT
+    // (Attribute, Value, Item). Multi-antecedent bodies already project correctly
+    // (compile_join_derivation); this guards the single-antecedent path.
+    let src = r#"# Single-antecedent head projection
+Item(.id) is an entity type.
+Attribute(.id) is an entity type.
+Value(.id) is an entity type.
+
+## Fact Types
+Item has Value for Attribute.
+Attribute admits Value.
+
+## Derivation Rules
+* Attribute1 admits Value1 iff Item1 has Value1 for Attribute1.
+"#;
+    let (_, func) = parse_and_compile(src);
+    let out = apply_to_facts(&func, &[
+        ("Item_has_Value_for_Attribute",
+            &[("Item", "i1"), ("Value", "v1"), ("Attribute", "a1")]),
+    ]);
+    let derived = decode_derived(&out);
+    let fact = derived.iter().find(|(id, _, _)| id == "Attribute_admits_Value")
+        .unwrap_or_else(|| panic!("expected an Attribute_admits_Value derivation; got {:#?}", derived));
+    let roles: Vec<&str> = fact.2.iter().map(|(r, _)| r.as_str()).collect();
+    assert!(roles.contains(&"Attribute") && roles.contains(&"Value"),
+        "head must carry its declared roles (Attribute, Value); got {:?}", fact.2);
+    assert!(!roles.contains(&"Item"),
+        "free body var Item must NOT leak into the head cell; got {:?}", fact.2);
+    assert_eq!(fact.2.len(), 2,
+        "head must project to EXACTLY (Attribute, Value); got {:?}", fact.2);
+}
+
+#[test]
 fn qualified_value_role_consequent_join_fires() {
     // join-qualified-value-role-consequent-unresolved: a 3-antecedent
     // projection join whose consequent head has a QUALIFIED value role
