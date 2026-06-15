@@ -10714,31 +10714,50 @@ fn compile_mandatory_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         // Compose with Selector(3) to extract population from ctx.
         let instances = Func::compose(instances_of_noun_func(noun_name), Func::Selector(3));
 
-        // binding_match: <instance, <noun, val>> -> T if
-        //   noun (inner Sel(1).Sel(2)) = noun_name literal
-        //   AND val (inner Sel(2).Sel(2)) = instance (outer Sel(1)).
-        // Sourced from `crate::fol::constraint::mc_binding_match` —
-        // `Raw` wraps the key/val tuple-field access (not role
-        // extraction — `binding` is a single <key, val> pair, not
-        // a fact's seq of pairs, so FactRole doesn't apply here).
-        let binding_match = crate::fol::constraint::mc_binding_match(noun_name).to_func();
-
-        // fact_mentions: <instance, fact> -> T if fact has binding <noun, instance>
-        // DistL on <instance, fact_bindings> -> <<instance, binding1>, ...>
-        // Filter(binding_match) keeps matches
-        // not . NullTest -> T if any match found
-        let fact_mentions = Func::compose(
-            Func::compose(Func::Not, Func::NullTest),
-            Func::compose(Func::filter(binding_match), Func::DistL),
+        // test-speed validate-perf: build the SET of values that DO
+        // participate (every value bound to this noun across ft_facts) ONCE,
+        // then do an O(1) Map-as-set membership test per instance — replacing
+        // the historic O(instances × facts × bindings) `null ∘ filter ∘ distl`
+        // cross-scan that the SetFromSeq/FetchOrPhi primitives (#743/#821)
+        // exist precisely to kill. On the metamodel self-description this
+        // collapses the dominant mandatory-role validators (e.g. `Each Role
+        // is used in some Reading` measured at 9.1s, `Each Fact Type has some
+        // Arity` 6.0s) to ~milliseconds, because they range over hundreds of
+        // reflected rows. Semantically identical: an instance participates
+        // iff it is one of the noun-keyed binding values.
+        //
+        // covered_set : ctx -> Map{ participating value -> "T" }. A fact is a
+        // Seq of <key,val> bindings; keep the bindings whose key is this noun
+        // (mirroring `mc_binding_match`'s key test) and project their value,
+        // flatten across facts, then SetFromSeq.
+        let key_is_noun = Func::compose(
+            Func::Eq,
+            Func::construction(vec![
+                Func::constant(Object::atom(noun_name)),
+                Func::Selector(1),
+            ]),
+        );
+        let noun_vals_of_fact = Func::compose(
+            Func::apply_to_all(Func::Selector(2)),
+            Func::filter(key_is_noun),
+        );
+        let covered_set = Func::compose(
+            Func::SetFromSeq,
+            Func::compose(
+                Func::Concat,
+                Func::compose(Func::apply_to_all(noun_vals_of_fact), ft_facts.clone()),
+            ),
         );
 
-        // not_participating: <instance, all_facts> -> T when NO fact mentions instance
-        // DistL on <instance, all_facts> -> <<instance, fact1>, <instance, fact2>, ...>
-        // Filter(fact_mentions) keeps facts that mention the instance
-        // NullTest -> T if empty (no fact mentions instance)
+        // not_participating: <instance, covered_set> -> T when the instance
+        // is NOT a key of covered_set. FetchOrPhi does the O(1) Map lookup
+        // (phi when absent), NullTest turns "absent" into the violation T.
         let not_participating = Func::compose(
             Func::NullTest,
-            Func::compose(Func::filter(fact_mentions), Func::DistL),
+            Func::compose(
+                Func::FetchOrPhi,
+                Func::construction(vec![Func::Selector(1), Func::Selector(2)]),
+            ),
         );
 
         // Violation detail (#898). Template `Mandatory violation:
@@ -10756,13 +10775,13 @@ fn compile_mandatory_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         });
         let viol = make_violation_func(&def.id, &def.text, detail);
 
-        // apply_to_all(viol) . Filter(not_participating) . DistR . [instances, ft_facts]
-        // DistR on <instances, ft_facts> -> <<inst1, ft_facts>, <inst2, ft_facts>, ...>
+        // apply_to_all(viol) . Filter(not_participating) . DistR . [instances, covered_set]
+        // DistR on <instances, covered_set> -> <<inst1, set>, <inst2, set>, ...>
         Func::compose(
             Func::apply_to_all(viol),
             Func::compose(
                 Func::filter(not_participating),
-                Func::compose(Func::DistR, Func::construction(vec![instances, ft_facts])),
+                Func::compose(Func::DistR, Func::construction(vec![instances, covered_set])),
             ),
         )
     }).collect();
@@ -10903,19 +10922,27 @@ fn compile_value_constraint_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         // All instances of this noun from eval context population
         let instances = Func::compose(instances_of_noun_func(noun_name), Func::Selector(3));
 
-        // Allowed values as a constant sequence (compile-time known)
+        // Allowed values as an O(1) Map-as-set (SetFromSeq), same idiom as
+        // the mandatory-role fix: membership becomes a FetchOrPhi Map lookup
+        // instead of an O(allowed) DistL+filter(Eq) scan per instance. The
+        // enum set is compile-time known and small, so SetFromSeq builds it
+        // once per validate.
         let allowed_atoms: Vec<Object> = valid_values.iter()
             .map(|v| Object::atom(v))
             .collect();
-        let allowed_const = Func::constant(Object::Seq(allowed_atoms.into()));
+        let allowed_const = Func::compose(
+            Func::SetFromSeq,
+            Func::constant(Object::Seq(allowed_atoms.into())),
+        );
 
-        // is_allowed: <instance, allowed_seq> -> T if instance is in allowed_seq
-        // DistL on <instance, <v1, v2, ...>> -> <<instance, v1>, <instance, v2>, ...>
-        // Filter(Eq) keeps pairs where instance == vi
-        // NullTest -> T if no match (instance NOT in allowed set)
+        // not_allowed: <instance, allowed_set> -> T when the instance is NOT a
+        // key of the allowed set (FetchOrPhi -> phi -> NullTest = T).
         let not_allowed = Func::compose(
             Func::NullTest,
-            Func::compose(Func::filter(Func::Eq), Func::DistL),
+            Func::compose(
+                Func::FetchOrPhi,
+                Func::construction(vec![Func::Selector(1), Func::Selector(2)]),
+            ),
         );
 
         // Violation detail (#898). Template `Value constraint
@@ -16993,6 +17020,7 @@ mod mandatory_role_alethic_rejection_tests {
         let defs = compile_to_defs_state(&reflected);
         ast::defs_to_state(&defs, &reflected)
     }
+
 
     /// audit-entity-datatype-norma-vs-view Phase 2(a): the Format-on-CDT
     /// SS constraint in core.md — `If some Noun has some Format then that
