@@ -74,6 +74,8 @@ form[data-view] tbody tr:last-child td{border-bottom:none}\
 form[data-view] tbody tr:hover{background:#f9fafb}\
 form[data-view] td a{color:#4f46e5;text-decoration:none;font-weight:500}\
 form[data-view] td a:hover{text-decoration:underline}\
+form[data-view] caption{caption-side:bottom;text-align:right;margin-top:.6rem;font-size:.75rem;color:#9ca3af}\
+form[data-view] td.empty{text-align:center;color:#9ca3af;padding:2.5rem 1rem;font-style:italic;white-space:normal}\
 @media(prefers-color-scheme:dark){\
 form[data-view] th{background:#111827;color:#9ca3af;border-bottom-color:#374151}\
 form[data-view] td{border-bottom-color:#1f2937}\
@@ -243,14 +245,34 @@ fn render_html_collection(view_id: &str, sections: &[Object]) -> Option<String> 
         esc(view_id)));
     html.push_str(AREST_VIEW_STYLE);
     html.push_str(&format!("<h1>{}</h1>", esc(&noun)));
-    html.push_str("<table><thead><tr><th>id</th>");
+
+    let rows = section("rows").unwrap_or_default();
+    let noun_path = noun.replace(' ', "%20");
+
+    html.push_str("<table>");
+    // Count caption — first child of <table> (HTML requires it there);
+    // `caption-side:bottom` in the scoped style renders it under the grid.
+    // Singular/plural over the fixed words 'entry'/'entries' so we never
+    // mis-pluralize an arbitrary noun.
+    let n = rows.len();
+    html.push_str(&format!("<caption>{} {}</caption>",
+        n, if n == 1 { "entry" } else { "entries" }));
+
+    html.push_str("<thead><tr><th>id</th>");
     for c in &cols {
         html.push_str(&format!("<th>{}</th>", esc(c)));
     }
     html.push_str("</tr></thead><tbody>");
 
-    let noun_path = noun.replace(' ', "%20");
-    for row in section("rows").unwrap_or_default() {
+    // Empty population: a single full-width cell instead of a headers-only
+    // table (which reads as broken). Rendered, not blank — the list page is
+    // self-describing even with nothing in it.
+    if rows.is_empty() {
+        html.push_str(&format!(
+            "<tr><td class=\"empty\" colspan=\"{}\">No {} yet</td></tr>",
+            cols.len() + 1, esc(&noun)));
+    }
+    for row in &rows {
         let Some(parts) = row.as_seq() else { continue };
         let entity_id = parts.first().and_then(|o| o.as_atom()).unwrap_or("");
         let fields: Vec<(String, String)> = parts.get(1)
@@ -273,7 +295,6 @@ fn render_html_collection(view_id: &str, sections: &[Object]) -> Option<String> 
         }
         html.push_str("</tr>");
     }
-
     html.push_str("</tbody></table></form>");
     Some(html)
 }
@@ -512,6 +533,36 @@ mod tests {
         assert!(html.contains("<td><a href=\"/api/entities/Task/t2\">t2</a></td>\
                                <td>ship it</td><td>false</td>"),
             "row t2 wrong:\n{}", html);
+        // Count caption is the table's first child (HTML requires <caption>
+        // there); 2 rows ⇒ plural 'entries'.
+        assert!(html.contains("<table><caption>2 entries</caption><thead>"),
+            "caption must lead the table with the row count:\n{}", html);
+    }
+
+    /// An empty population renders a self-describing list — a single
+    /// full-width 'No <Noun> yet' cell + a '0 entries' caption — instead of a
+    /// headers-only table that reads as broken.
+    #[test]
+    fn collection_view_renders_empty_state() {
+        let mut view = sample_view();
+        view.view = "collection-view-Task".to_string();
+        view.kind = "collection".to_string();
+        let rows: alloc::vec::Vec<(String, alloc::vec::Vec<(String, String)>)> =
+            alloc::vec![];
+        let input = command::encode_render_collection_input(&view, "Task", &rows);
+        let html = render_html(&input).expect("empty collection still renders");
+
+        assert!(html.starts_with("<form ") && html.ends_with("</form>"),
+            "empty collection keeps the <form> envelope:\n{}", html);
+        // sample_view has 2 elements ⇒ 2 columns + the id column ⇒ colspan 3.
+        assert!(html.contains("<tbody><tr><td class=\"empty\" colspan=\"3\">\
+                               No Task yet</td></tr></tbody>"),
+            "empty population must show the empty-state cell:\n{}", html);
+        assert!(html.contains("<caption>0 entries</caption>"),
+            "empty caption must read '0 entries':\n{}", html);
+        // The empty-cell style is scoped, so it can't leak.
+        assert!(html.contains("form[data-view] td.empty{"),
+            "empty-state style must be present and scoped:\n{}", html);
     }
 
     /// Build a one-combo-box instance view with the given options + current
