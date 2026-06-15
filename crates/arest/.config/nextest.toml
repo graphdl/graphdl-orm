@@ -76,6 +76,28 @@ threads-required = "num-cpus"
 # instances_of_noun_func should DEDUP — kills the dup violations (81->~47) and
 # cuts each MC's per-instance DistR ~3x; core primitive, gate carefully (shifts
 # violation counts suite-wide). NOT safe to terminate-after.
+#
+# RE-MEASURED 2026-06-15 (post-dedup 6569b93f DEPLOYED + live): the two slow corpus
+# tests are STILL ~19.5s each (40.32s for the 7 `subset_constraint`-matching tests
+# run serially; the other 5 are sub-100ms parse/eval units). So the dedup (minor
+# lever) cut dup VIOLATIONS + per-instance DistR but did NOT move the corpus-validate
+# WALL — confirming the dominant cost is resolve_view whole-aggregate re-derivation
+# per FetchOrPhi miss (ast.rs:2698-2750 -> resolve_view ast.rs:5691: metacompose +
+# whole-pop encode_state + apply, NO memo), ORTHOGONAL to instance dedup. MAJOR LEVER
+# CONFIRMED NEEDED.
+# SHARPENED FIX (supersedes the bare "per-occurrence-delta" note above): the
+# AREST.tex-sanctioned path is materialized-view-not-per-request-recomputation —
+# materialize the View-marked aggregate cells INTO the population D so
+# encoded_pop_lookup HITS and resolve_view never fires during validate. That is state
+# INSIDE the formula (forward-chain output carried in D), NOT a Rust memo cache (memo
+# cache stays OUT). The 2026-06-15 "materialize ALL View cells" probe was FALSIFIED
+# (no speedup + V 6256->6358) for TWO now-addressable reasons: (1) it eagerly derived
+# EVERY view incl. never-read ones (materialization cost ~= the per-access savings) ->
+# SCOPE to the constraints' compile-time read-set (def:scope = RMAP(factTypes(c)));
+# (2) the +102 V-inflation was dup-occurrence, which the now-deployed dedup fixes at
+# the MC/VC sites. NEXT: a TEST-ONLY probe re-running read-set-scoped materialize-once
+# on the CURRENT (deduped) engine, asserting BOTH speedup AND V-preservation, BEFORE
+# any production change (high blast radius: every aggregate x every constraint).
 [profile.default]
 slow-timeout = { period = "60s" }
 
