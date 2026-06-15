@@ -594,6 +594,26 @@ fn instances_of_noun_func(noun_name: &str) -> Func {
         Func::compose(Func::filter(non_blank), Func::compose(Func::filter(non_empty), all_vals)))
 }
 
+/// Distinct instances of `noun_name` from the eval context (instances over
+/// Selector(3), deduped). Cardinality / value constraints use THIS, not the raw
+/// scan: `instances_of_noun_func` returns ~3x DUPLICATE occurrences — an entity
+/// appears once per cell that binds it (measured 2126 total / 725 distinct for
+/// "Fact Type") — which the MC/VC checks would otherwise count per-occurrence,
+/// emitting DUPLICATE violations (e.g. "Each Fact Type has some Role" reported
+/// 81 total for 30 true-distinct). Dedup is Backus, no new primitive:
+/// `IndexBy(Id)` groups occurrences under each value, `α(Selector(1))` takes one
+/// per group. Distinct enumeration is also the correct cardinality semantics —
+/// a constraint flags each distinct violator ONCE.
+fn distinct_instances_func(noun_name: &str) -> Func {
+    Func::compose(
+        Func::compose(
+            Func::apply_to_all(Func::Selector(1)),
+            Func::IndexBy(alloc::boxed::Box::new(Func::Id)),
+        ),
+        Func::compose(instances_of_noun_func(noun_name), Func::Selector(3)),
+    )
+}
+
 /// Build a Func that extracts facts for multiple fact type IDs.
 /// Returns the concatenation of all facts from all matching fact types.
 /// Concat . [extract_ft1, extract_ft2, ...] : ctx -> <all facts>
@@ -10712,7 +10732,7 @@ fn compile_mandatory_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         // instances of this noun from the eval context population
         // instances_of_noun_func(noun) : pop -> <val1, val2, ...>
         // Compose with Selector(3) to extract population from ctx.
-        let instances = Func::compose(instances_of_noun_func(noun_name), Func::Selector(3));
+        let instances = distinct_instances_func(noun_name);
 
         // test-speed validate-perf: build the SET of values that DO
         // participate (every value bound to this noun across ft_facts) ONCE,
@@ -10920,7 +10940,7 @@ fn compile_value_constraint_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
 
     for (noun_name, valid_values) in &check_nouns {
         // All instances of this noun from eval context population
-        let instances = Func::compose(instances_of_noun_func(noun_name), Func::Selector(3));
+        let instances = distinct_instances_func(noun_name);
 
         // Allowed values as an O(1) Map-as-set (SetFromSeq), same idiom as
         // the mandatory-role fix: membership becomes a FetchOrPhi Map lookup
