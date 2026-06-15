@@ -66,7 +66,19 @@ form[data-view] input[type=checkbox]{width:auto;display:inline-block;margin:.4re
 form[data-view] nav{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:1.25rem;padding-top:1rem;border-top:1px solid #f3f4f6}\
 form[data-view] nav a{display:inline-block;padding:.45rem .9rem;font-size:.85rem;font-weight:500;text-decoration:none;color:#fff;background:#6366f1;border-radius:8px;transition:background .15s}\
 form[data-view] nav a:hover{background:#4f46e5}\
+form[data-view][data-kind=collection]{max-width:62rem}\
+form[data-view] table{width:100%;border-collapse:collapse;font-size:.88rem;margin-top:.25rem}\
+form[data-view] th{text-align:left;padding:.6rem .8rem;font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:#6b7280;background:#f9fafb;border-bottom:1px solid #e5e7eb;white-space:nowrap}\
+form[data-view] td{padding:.55rem .8rem;border-bottom:1px solid #f3f4f6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:20rem}\
+form[data-view] tbody tr:last-child td{border-bottom:none}\
+form[data-view] tbody tr:hover{background:#f9fafb}\
+form[data-view] td a{color:#4f46e5;text-decoration:none;font-weight:500}\
+form[data-view] td a:hover{text-decoration:underline}\
 @media(prefers-color-scheme:dark){\
+form[data-view] th{background:#111827;color:#9ca3af;border-bottom-color:#374151}\
+form[data-view] td{border-bottom-color:#1f2937}\
+form[data-view] tbody tr:hover{background:#172033}\
+form[data-view] td a{color:#818cf8}\
 form[data-view]{background:#1f2937;border-color:#374151;color:#f9fafb;box-shadow:0 1px 3px rgba(0,0,0,.4)}\
 form[data-view] label{color:#9ca3af}\
 form[data-view] input,form[data-view] select{background:#111827;border-color:#374151}\
@@ -88,6 +100,14 @@ fn render_html(x: &Object) -> Option<String> {
     let view = section("view")?;
     let view_id = view.first()?.as_atom()?.to_string();
     let kind = view.get(1).and_then(|o| o.as_atom()).unwrap_or("instance").to_string();
+
+    // Collection (list/table) view: a `<form data-kind="collection">` with a
+    // `<table>` inside — same envelope + form[data-view] style scope as the
+    // instance form, so the dispatch contract and the scoped-stylesheet test
+    // both hold, but rendered as a population grid instead of a detail form.
+    if kind == "collection" {
+        return render_html_collection(&view_id, sections);
+    }
 
     let entity = section("entity")?;
     let entity_id = entity.first()?.as_atom()?.to_string();
@@ -171,6 +191,87 @@ fn render_html(x: &Object) -> Option<String> {
     }
 
     html.push_str("</form>");
+    Some(html)
+}
+
+/// Collection (list) view: a `<form data-kind="collection">` whose body is a
+/// `<table>` of the noun's population — one row per entity, one column per
+/// ViewElement. Same `<form>…</form>` envelope + `form[data-view]` style scope
+/// as the instance form (so `installed_body_dispatches_via_platform_apply` and
+/// `view_carries_scoped_stylesheet` both still hold), but a population grid
+/// rather than a detail form. Each row's id cell links to that entity's
+/// instance view — the list is a page of HATEOAS links into the details.
+///
+/// Operand shape (the `kind="collection"` sibling of the instance operand):
+///
+///   < <'view',     <view_id, 'collection', source>>,
+///     <'noun',     <noun>>,
+///     <'elements', <<ve_id, fact_type, component_role>, ...>>,
+///     <'rows',     <<entity_id, <<label, value>, ...>>, ...>> >
+fn render_html_collection(view_id: &str, sections: &[Object]) -> Option<String> {
+    let section = |tag: &str| -> Option<Vec<Object>> {
+        sections.iter().find_map(|s| {
+            let pair = s.as_seq()?;
+            (pair.first()?.as_atom()? == tag).then(|| pair.get(1))??
+                .as_seq().map(|v| v.to_vec())
+        })
+    };
+
+    let noun = section("noun")
+        .and_then(|s| s.first().and_then(|o| o.as_atom()).map(String::from))
+        .unwrap_or_default();
+    let noun_prefix = format!("{}_has_", noun.replace(' ', "_"));
+
+    // Column labels, in projection order — the same fact-type → value-role
+    // join (noun prefix stripped, underscores → spaces) the instance form
+    // keys its widgets by, so a row's `fields` map lines up with the headers.
+    let cols: Vec<String> = section("elements").map(|els| {
+        els.iter().filter_map(|el| {
+            let parts = el.as_seq()?;
+            let fact_type = parts.get(1)?.as_atom()?;
+            Some(fact_type.strip_prefix(noun_prefix.as_str())
+                .unwrap_or(fact_type).replace('_', " "))
+        }).collect()
+    }).unwrap_or_default();
+
+    let mut html = String::new();
+    html.push_str(&format!(
+        "<form data-view=\"{}\" data-kind=\"collection\" data-entity=\"\">",
+        esc(view_id)));
+    html.push_str(AREST_VIEW_STYLE);
+    html.push_str(&format!("<h1>{}</h1>", esc(&noun)));
+    html.push_str("<table><thead><tr><th>id</th>");
+    for c in &cols {
+        html.push_str(&format!("<th>{}</th>", esc(c)));
+    }
+    html.push_str("</tr></thead><tbody>");
+
+    let noun_path = noun.replace(' ', "%20");
+    for row in section("rows").unwrap_or_default() {
+        let Some(parts) = row.as_seq() else { continue };
+        let entity_id = parts.first().and_then(|o| o.as_atom()).unwrap_or("");
+        let fields: Vec<(String, String)> = parts.get(1)
+            .and_then(|o| o.as_seq())
+            .map(|fs| fs.iter().filter_map(|f| {
+                let p = f.as_seq()?;
+                Some((p.first()?.as_atom()?.to_string(),
+                      p.get(1)?.as_atom()?.to_string()))
+            }).collect())
+            .unwrap_or_default();
+        let value_of = |label: &str| -> String {
+            fields.iter().find(|(k, _)| k == label)
+                .map(|(_, v)| v.clone()).unwrap_or_default()
+        };
+        html.push_str(&format!(
+            "<tr><td><a href=\"/api/entities/{}/{}\">{}</a></td>",
+            esc(&noun_path), esc(entity_id), esc(entity_id)));
+        for c in &cols {
+            html.push_str(&format!("<td>{}</td>", esc(&value_of(c))));
+        }
+        html.push_str("</tr>");
+    }
+
+    html.push_str("</tbody></table></form>");
     Some(html)
 }
 
@@ -334,5 +435,54 @@ mod tests {
                     || sel.starts_with('@'),
                 "every selector must be scoped to form[data-view] (or @media); got `{}`", sel);
         }
+    }
+
+    /// UI: the `kind="collection"` view renders the noun's population as a
+    /// `<table>` — same `<form>…</form>` envelope and scoped style as the
+    /// instance form, one column per ViewElement, one row per entity, and the
+    /// id cell links into that entity's instance view. Built through the real
+    /// `encode_render_collection_input` encoder so decoder + encoder stay in
+    /// lockstep (the `encode_render_input` discipline).
+    #[test]
+    fn collection_view_renders_a_population_table() {
+        let mut view = sample_view();
+        view.view = "collection-view-Task".to_string();
+        view.kind = "collection".to_string();
+        let rows = alloc::vec![
+            ("t1".to_string(), alloc::vec![
+                ("Task Description".to_string(), "fix <the> bug".to_string()),
+                ("Task is done".to_string(), "true".to_string()),
+            ]),
+            ("t2".to_string(), alloc::vec![
+                ("Task Description".to_string(), "ship it".to_string()),
+                ("Task is done".to_string(), "false".to_string()),
+            ]),
+        ];
+        let input = command::encode_render_collection_input(&view, "Task", &rows);
+        let html = render_html(&input).expect("well-formed collection operand renders");
+
+        // Same dispatch + scope contract as the instance form.
+        assert!(html.starts_with("<form ") && html.ends_with("</form>"),
+            "collection must keep the <form> envelope:\n{}", html);
+        assert!(html.contains("data-view=\"collection-view-Task\"")
+                && html.contains("data-kind=\"collection\""),
+            "collection markers missing:\n{}", html);
+        assert!(html.contains("<style>") && html.contains("form[data-view]"),
+            "scoped <style> must ride along:\n{}", html);
+
+        // Header columns from the ViewElements (id + one per element), in
+        // projection order; underscore-joined fact types become spaced labels.
+        assert!(html.contains("<thead><tr><th>id</th><th>Task Description</th>\
+                               <th>Task is done</th></tr></thead>"),
+            "table header columns wrong:\n{}", html);
+
+        // One row per entity; id cell links to the instance view; values
+        // land under the matching column; markup-unsafe values are escaped.
+        assert!(html.contains("<td><a href=\"/api/entities/Task/t1\">t1</a></td>\
+                               <td>fix &lt;the&gt; bug</td><td>true</td>"),
+            "row t1 wrong:\n{}", html);
+        assert!(html.contains("<td><a href=\"/api/entities/Task/t2\">t2</a></td>\
+                               <td>ship it</td><td>false</td>"),
+            "row t2 wrong:\n{}", html);
     }
 }

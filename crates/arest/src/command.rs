@@ -5560,6 +5560,45 @@ pub fn encode_render_input(
     ])
 }
 
+/// Encode the COLLECTION render operand: a noun's whole population as one
+/// Object, for the `kind="collection"` (list/table) render path. The sibling
+/// of `encode_render_input` — same `view`/`elements` sections (the elements
+/// become table columns), but `entity`/`fields`/`affordances` give way to a
+/// single `noun` tag and a `rows` table. Kept in lockstep with the reference
+/// decoder (`platform/render_html.rs::render_html_collection`) by its tests.
+///
+/// `< <'view', <id, 'collection', source>>, <'noun', <noun>>,
+///    <'elements', <<id, fact_type, component_role>, ...>>,
+///    <'rows', <<entity_id, <<label, value>, ...>>, ...>> >`
+pub fn encode_render_collection_input(
+    view: &ViewProjection, noun: &str,
+    rows: &[(String, Vec<(String, String)>)],
+) -> ast::Object {
+    let tag = |name: &str, body: ast::Object| ast::Object::seq(alloc::vec![
+        ast::Object::atom(name), body,
+    ]);
+    ast::Object::seq(alloc::vec![
+        tag("view", ast::Object::seq(alloc::vec![
+            ast::Object::atom(&view.view), ast::Object::atom(&view.kind),
+            ast::Object::atom(&view.source),
+        ])),
+        tag("noun", ast::Object::seq(alloc::vec![ast::Object::atom(noun)])),
+        tag("elements", ast::Object::Seq(view.elements.iter().map(|e|
+            ast::Object::seq(alloc::vec![
+                ast::Object::atom(&e.id), ast::Object::atom(&e.fact_type),
+                ast::Object::atom(&e.component_role),
+            ])).collect())),
+        tag("rows", ast::Object::Seq(rows.iter().map(|(id, fields)|
+            ast::Object::seq(alloc::vec![
+                ast::Object::atom(id),
+                ast::Object::Seq(fields.iter().map(|(k, v)|
+                    ast::Object::seq(alloc::vec![
+                        ast::Object::atom(k), ast::Object::atom(v),
+                    ])).collect()),
+            ])).collect())),
+    ])
+}
+
 /// pb-live-binding-reeval slice 2 (§5.2 LIVE half): deliver a freshly
 /// rendered view to every standing `Render Subscription` watching this
 /// entity. "A subscriber is a ρ-application not yet evaluated" — the
