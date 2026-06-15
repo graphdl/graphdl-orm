@@ -27,9 +27,18 @@ threads-required = "num-cpus"
 # cost is the WHOLE-CORPUS validate (~7-8s/cycle x2 cycles/test), NOT parse
 # (~1s) and NOT compile (~1.6s). The remaining validate cost is spread across
 # constraint kinds OTHER than the now-hash-joined single-key SS (the SS fix
-# moved corpus validate only ~8.6s->7.3s) — closing the last few seconds needs
-# per-constraint-kind profiling of the corpus validate to find the next O(N*M)
-# holdout. NOT yet safe to terminate-after.
+# moved corpus validate only ~8.6s->7.3s). PROFILED 2026-06-15 (per-constraint
+# `constraint:{id}` timing over 995 corpus constraints): MC 4.07s/319 + VC
+# 2.80s/41 = 99% of validate; SS now 15.8ms, UC 8.1ms/610, all else <30ms.
+# ROOT CAUSE is NOT the membership test (a62d8ce8 made it O(1) FetchOrPhi) but
+# `instances_of_noun_func` (compile.rs ~556): it scans the ENTIRE population
+# (every FT x every fact x every binding) to enumerate ONE noun's instances,
+# and is INLINED per constraint — so the 360 MC+VC constraints each re-scan the
+# full reflected corpus = 360 x O(pop). NEXT LEVER: compute each noun's instance
+# set ONCE per validate and share it across that noun's constraints (e.g.
+# precompute an instances-by-noun map into the validate context), turning
+# 360 x O(pop) into O(pop) + 360 x O(1). A careful core-validate change — do it
+# as a dedicated effort, not inline. NOT yet safe to terminate-after.
 [profile.default]
 slow-timeout = { period = "60s" }
 
@@ -45,9 +54,11 @@ slow-timeout = { period = "60s" }
 # the whole mandatory_role module (whose other 8 tests are sub-100ms). The fast
 # profile thus runs those 8 + the 3 ex-excluded tests, staying well under 30s;
 # only the 2 genuine slow tests are skipped for edit-to-signal.
-# NEXT (to converge fast==full): profile the corpus validate per constraint
-# kind to find the O(N*M) holdout the SS fix didn't cover, then this filter may
-# be deletable entirely.
+# NEXT (to converge fast==full): the 2 slow tests are dominated by MC+VC
+# instance-enumeration cost (see the per-constraint profile in the
+# [profile.default] note above) — not SS. Sharing per-noun instance enumeration
+# across constraints would cut corpus validate ~7s->~1-2s and likely retire this
+# filter entirely.
 #   fast gate : cargo nextest run --features std-deps,local --profile fast
 [profile.fast]
 default-filter = "not (test(format_without_cdt_violates_core_subset_constraint) | test(ungrounded_format_violates_totality_subset_constraint))"
