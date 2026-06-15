@@ -16,28 +16,33 @@
 filter = 'test(membership_perf_set_from_seq_beats_has_member_after_arc_map)'
 threads-required = "num-cpus"
 
-# Slow-tail visibility: mark tests SLOW at 60s but never terminate —
-# the two mandatory_role_alethic_rejection tests legitimately run
-# ~325s today (measured 2026-06-12; they dominate the suite's wall
-# clock — everything else is done by ~90s, so they ARE the 30s
-# target's critical path). They are the shared-metamodel-parse
-# lever's primary target; once that lands, tighten this to a
-# terminate-after so regressions can't hide.
+# Slow-tail visibility: mark tests SLOW at 60s but never terminate.
+# HISTORICAL: the two mandatory_role_alethic_rejection tests ran ~325s
+# (2026-06-12) and dominated the suite. As of a62d8ce8 they are ~5s —
+# the real cost was the in-memory validate doing an O(N*M) cross-scan
+# in the mandatory-role + value constraints (now O(N+M) via
+# SetFromSeq/FetchOrPhi), NOT the metamodel compile (which was already
+# ~2s). The slow tail is gone; the full libtest leg is ~35s (was 234s).
+# Now safe to tighten this to a terminate-after so regressions can't hide.
 [profile.default]
 slow-timeout = { period = "60s" }
 
-# test-speed-under-30s lever 1b: the `fast` edit-to-signal gate. The FULL suite's
-# wall is pinned by a handful of live-compile tests that each re-run a metamodel/
-# corpus compile+reflect+validate FROM SCRATCH (measured 2026-06-14 under nextest:
-# mandatory_role_alethic_rejection ~213s x2, effective_component_role ~36s,
-# derivation_cardinality_count ~30s, valuetype_bridge_join_star ~30s; everything
-# else finishes by ~10s). Their inherent cost is the shared-metamodel-compile
-# slowness tracked by test-speed-shared-compile-fixture + the 987 family. Until
-# that lands, `--profile fast` skips exactly those so the routine confidence gate
-# is ~30s instead of ~220s; the inner dev loop stays the filtered form above.
+# test-speed-under-30s lever 1b: the `fast` edit-to-signal gate.
+# LARGELY SUPERSEDED by a62d8ce8. This list excluded the live-compile tests
+# (mandatory_role x2 ~213s, effective_component_role ~36s,
+# derivation_cardinality_count ~30s, valuetype_bridge_join_star ~30s) because
+# each runs a metamodel compile+reflect+VALIDATE. The cost was the VALIDATE — an
+# O(N*M) `null∘filter∘distl` cross-scan in the mandatory-role + value
+# constraints — now O(N+M) (SetFromSeq/FetchOrPhi). They are ~5s each now and
+# the full libtest leg is ~35s (was 234s). The "shared-metamodel-compile"
+# premise was WRONG (compile was already ~2s); test-speed-shared-compile-fixture
+# is closed accordingly.
+# TODO (follow-up, needs a fresh `cargo nextest run` timing): TRIM these
+# exclusions — most/all are now <29s, so the fast and full profiles likely
+# converge and this filter may be deletable. The remaining edit-to-signal cost
+# is now the COMPILE half (the monolithic compile.rs rebuild — build-split-
+# monolith-crate), not the run.
 #   fast gate : cargo nextest run --features std-deps,local --profile fast
-# Run the DEFAULT (full) profile before commit / in CI. Keep this list in sync
-# with the >=29s tests in a fresh `cargo nextest run` timing.
 [profile.fast]
 default-filter = "not (test(mandatory_role_alethic_rejection) | test(effective_component_role_most_specific_source_wins) | test(derivation_cardinality_count_honors_bound_via_live_compile) | test(valuetype_bridge_join_star_marked_materializes_via_live_compile))"
 slow-timeout = { period = "20s" }
