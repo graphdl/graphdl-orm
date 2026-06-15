@@ -17,32 +17,38 @@ filter = 'test(membership_perf_set_from_seq_beats_has_member_after_arc_map)'
 threads-required = "num-cpus"
 
 # Slow-tail visibility: mark tests SLOW at 60s but never terminate.
-# HISTORICAL: the two mandatory_role_alethic_rejection tests ran ~325s
-# (2026-06-12) and dominated the suite. As of a62d8ce8 they are ~5s —
-# the real cost was the in-memory validate doing an O(N*M) cross-scan
-# in the mandatory-role + value constraints (now O(N+M) via
-# SetFromSeq/FetchOrPhi), NOT the metamodel compile (which was already
-# ~2s). The slow tail is gone; the full libtest leg is ~35s (was 234s).
-# Now safe to tighten this to a terminate-after so regressions can't hide.
+# HISTORICAL: the mandatory_role_alethic_rejection_tests module ran ~325s
+# (2026-06-12) and dominated the suite. a62d8ce8 (MC + value constraints
+# O(N*M)->O(N+M) via SetFromSeq/FetchOrPhi) cut the bulk; 4bdc46c8 added the
+# single-key SS hash anti-join. MEASURED 2026-06-15 (phase-split probe): of
+# that module's 10 tests, 8 are sub-100ms and TWO still dominate —
+# format_without_cdt_violates_core_subset_constraint and
+# ungrounded_format_violates_totality_subset_constraint, ~17-20s each. Their
+# cost is the WHOLE-CORPUS validate (~7-8s/cycle x2 cycles/test), NOT parse
+# (~1s) and NOT compile (~1.6s). The remaining validate cost is spread across
+# constraint kinds OTHER than the now-hash-joined single-key SS (the SS fix
+# moved corpus validate only ~8.6s->7.3s) — closing the last few seconds needs
+# per-constraint-kind profiling of the corpus validate to find the next O(N*M)
+# holdout. NOT yet safe to terminate-after.
 [profile.default]
 slow-timeout = { period = "60s" }
 
 # test-speed-under-30s lever 1b: the `fast` edit-to-signal gate.
-# LARGELY SUPERSEDED by a62d8ce8. This list excluded the live-compile tests
-# (mandatory_role x2 ~213s, effective_component_role ~36s,
-# derivation_cardinality_count ~30s, valuetype_bridge_join_star ~30s) because
-# each runs a metamodel compile+reflect+VALIDATE. The cost was the VALIDATE — an
-# O(N*M) `null∘filter∘distl` cross-scan in the mandatory-role + value
-# constraints — now O(N+M) (SetFromSeq/FetchOrPhi). They are ~5s each now and
-# the full libtest leg is ~35s (was 234s). The "shared-metamodel-compile"
-# premise was WRONG (compile was already ~2s); test-speed-shared-compile-fixture
-# is closed accordingly.
-# TODO (follow-up, needs a fresh `cargo nextest run` timing): TRIM these
-# exclusions — most/all are now <29s, so the fast and full profiles likely
-# converge and this filter may be deletable. The remaining edit-to-signal cost
-# is now the COMPILE half (the monolithic compile.rs rebuild — build-split-
-# monolith-crate), not the run.
+# MEASURED 2026-06-15 (cargo test wall, post a62d8ce8 + 4bdc46c8) — the old
+# exclusion list is now mostly stale:
+#   effective_component_role_most_specific_source_wins         5.4s  (was ~36s)
+#   derivation_cardinality_count_honors_bound_via_live_compile 4.2s  (was ~30s)
+#   valuetype_bridge_join_star_marked_materializes_via_live..  4.9s  (was ~30s)
+# — all three now run in the fast profile (REMOVED from the filter). Only the
+# two subset-constraint corpus tests remain slow (~17-20s each: whole-corpus
+# validate x2 cycles), so the filter now names EXACTLY those two rather than
+# the whole mandatory_role module (whose other 8 tests are sub-100ms). The fast
+# profile thus runs those 8 + the 3 ex-excluded tests, staying well under 30s;
+# only the 2 genuine slow tests are skipped for edit-to-signal.
+# NEXT (to converge fast==full): profile the corpus validate per constraint
+# kind to find the O(N*M) holdout the SS fix didn't cover, then this filter may
+# be deletable entirely.
 #   fast gate : cargo nextest run --features std-deps,local --profile fast
 [profile.fast]
-default-filter = "not (test(mandatory_role_alethic_rejection) | test(effective_component_role_most_specific_source_wins) | test(derivation_cardinality_count_honors_bound_via_live_compile) | test(valuetype_bridge_join_star_marked_materializes_via_live_compile))"
+default-filter = "not (test(format_without_cdt_violates_core_subset_constraint) | test(ungrounded_format_violates_totality_subset_constraint))"
 slow-timeout = { period = "20s" }
