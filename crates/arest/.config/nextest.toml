@@ -30,18 +30,29 @@ threads-required = "num-cpus"
 # moved corpus validate only ~8.6s->7.3s). PROFILED 2026-06-15 (per-constraint
 # `constraint:{id}` timing over 995 corpus constraints): MC 4.07s/319 + VC
 # 2.80s/41 = 99% of validate; SS now 15.8ms, UC 8.1ms/610, all else <30ms.
-# ROOT CAUSE is NOT the membership test (a62d8ce8 made it O(1) FetchOrPhi) but
-# `instances_of_noun_func` (compile.rs ~556): it scans the ENTIRE population
-# (every FT x every fact x every binding) to enumerate ONE noun's instances,
-# and is INLINED per constraint — so the 360 MC+VC constraints each re-scan the
-# full reflected corpus = 360 x O(pop). NEXT LEVER: compute each noun's instance
-# set ONCE per validate and share it across that noun's constraints. CHECKED:
-# a shared `instances:{noun}` Def does NOT amortize — Def is not memoized
-# per-apply (ast.rs:3058 re-fetches + re-applies each reference) — so the fix
-# must precompute an instances-by-noun map into the validate CONTEXT (or group
-# constraints by noun compile-side), not lean on def sharing. That turns
-# 360 x O(pop) into O(pop) + 360 x O(1). A careful core-validate change — do it
-# as a dedicated effort, not inline. NOT yet safe to terminate-after.
+# ROOT CAUSE (MEASURED 2026-06-15, sub-Func eval timing — RETRACTS the earlier
+# `instances_of_noun_func` claim in this file + commit 1bf3e7e7, which was
+# reasoned from the source tree, not measured, and is WRONG): the cost is
+# `FetchOrPhi` RE-DERIVING view-marked cells, not instance enumeration.
+# Decomposition of the 1.03s outlier "Each Fact Type has some Arity":
+#   instances_of_noun_func("Fact Type")            20ms  (2126 inst, 725 distinct) — 2%
+#   extract_facts_func("Fact_Type_has_Arity")     828ms  (1391 facts)
+#   extract_facts_func("Fact_Type_has_Role")      362us  (1391 facts, SAME count)
+# Identical fact count, ~2300x apart. The 81-violation Arity constraint and the
+# 81-violation "has some Role" constraint share noun + instances + violation
+# count, yet are 1030ms vs 81ms — the whole delta is that one extract. WHY:
+# FetchOrPhi (ast.rs:2701) on an index miss falls to resolve_view, which
+# EVALUATES the `view:{ft}` def — re-deriving the cell — with NO memoization, so
+# every constraint that touches a view-marked / derived cell (Arity, the
+# value-typed VC outliers Content Stretch / Pluralization / Change Type)
+# re-derives it from scratch. Directly-populated cells hit the O(1) index.
+# FIX (AREST.tex cost-model: "materialized view, not per-request recomputation";
+# a Rust memo cache is OUT — state outside the formula): MATERIALIZE the
+# view-marked cells ONCE into the validate population before the constraints run,
+# as a pure-algebra augment composed onto the bulk `validate` def (the SAME shape
+# as the reverted instances augment, retargeted from an instance index to the
+# view cells). Careful core-validate change — dedicated effort. NOT yet safe to
+# terminate-after.
 [profile.default]
 slow-timeout = { period = "60s" }
 
@@ -57,11 +68,11 @@ slow-timeout = { period = "60s" }
 # the whole mandatory_role module (whose other 8 tests are sub-100ms). The fast
 # profile thus runs those 8 + the 3 ex-excluded tests, staying well under 30s;
 # only the 2 genuine slow tests are skipped for edit-to-signal.
-# NEXT (to converge fast==full): the 2 slow tests are dominated by MC+VC
-# instance-enumeration cost (see the per-constraint profile in the
-# [profile.default] note above) — not SS. Sharing per-noun instance enumeration
-# across constraints would cut corpus validate ~7s->~1-2s and likely retire this
-# filter entirely.
+# NEXT (to converge fast==full): the 2 slow tests are dominated by FetchOrPhi
+# re-deriving view-marked cells per constraint access (see the measured root
+# cause in the [profile.default] note above) — NOT instance enumeration, NOT SS.
+# Materializing those view cells ONCE into the validate population should cut
+# corpus validate ~7s->~1-2s and likely retire this filter entirely.
 #   fast gate : cargo nextest run --features std-deps,local --profile fast
 [profile.fast]
 default-filter = "not (test(format_without_cdt_violates_core_subset_constraint) | test(ungrounded_format_violates_totality_subset_constraint))"
