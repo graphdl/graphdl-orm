@@ -46,13 +46,22 @@ threads-required = "num-cpus"
 # every constraint that touches a view-marked / derived cell (Arity, the
 # value-typed VC outliers Content Stretch / Pluralization / Change Type)
 # re-derives it from scratch. Directly-populated cells hit the O(1) index.
+# CONFIRMED 2026-06-15 production-real (not a reflect_then_defs artifact):
+# Fact_Type_has_Arity is a MaterializationPolicy::View pure-aggregate rule
+# (`Arity iff count of Role where Fact Type has Role`); compile.rs:5040 already
+# records "7.2s of pure schema reflection on a population op" for it. The
+# existing `aggregate_rule_positive_reads_recover_source_fact_type` test gates
+# the FORWARD-CHAIN re-fire (via derivation_reads activation gating) — but
+# validate's lazy resolve_view path has NO such gate and re-derives per
+# FetchOrPhi access, which is the cost measured here.
 # FIX (AREST.tex cost-model: "materialized view, not per-request recomputation";
 # a Rust memo cache is OUT — state outside the formula): MATERIALIZE the
-# view-marked cells ONCE into the validate population before the constraints run,
-# as a pure-algebra augment composed onto the bulk `validate` def (the SAME shape
-# as the reverted instances augment, retargeted from an instance index to the
-# view cells). Careful core-validate change — dedicated effort. NOT yet safe to
-# terminate-after.
+# view-marked cells ONCE before the constraints run, into the Selector(4) INDEX
+# where extract_facts_func reads (so encoded_pop_lookup hits step-1 and never
+# reaches resolve_view) — a pure-algebra augment on the bulk `validate` def,
+# same shape as the reverted instances augment, retargeted to the view cells +
+# the Selector(4) Map. Careful core-validate change — dedicated effort. NOT yet
+# safe to terminate-after.
 [profile.default]
 slow-timeout = { period = "60s" }
 
