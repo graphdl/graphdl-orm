@@ -48,6 +48,32 @@ fn render_html_apply(x: &Object, _d: &Object) -> Object {
     }
 }
 
+/// Self-contained, scoped stylesheet for the generic entity view. Emitted
+/// as the form's FIRST child so the markup envelope stays `<form>…</form>`
+/// (the dispatch contract `installed_body_dispatches_via_platform_apply`
+/// pins) and scoped to `form[data-view]` so it never leaks onto host-page
+/// chrome. Turns the zero-glue rendering from a bare form into a polished,
+/// light/dark-aware card — UI is what sells the framework, and every app
+/// that renders through the generic seam inherits this for free.
+const AREST_VIEW_STYLE: &str = "<style>\
+form[data-view]{font-family:system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;max-width:34rem;margin:1.5rem auto;padding:1.5rem 1.75rem;background:#fff;border:1px solid #e5e7eb;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.04);color:#111827;box-sizing:border-box}\
+form[data-view] h1{margin:0 0 1.25rem;font-size:1.15rem;font-weight:600;letter-spacing:-.01em;word-break:break-word}\
+form[data-view] label{display:block;margin-bottom:.85rem;font-size:.78rem;font-weight:500;color:#6b7280}\
+form[data-view] input,form[data-view] select{display:block;width:100%;margin-top:.3rem;padding:.5rem .65rem;font-size:.9rem;color:inherit;background:#fff;border:1px solid #d1d5db;border-radius:8px;box-sizing:border-box;transition:border-color .15s,box-shadow .15s}\
+form[data-view] input:focus,form[data-view] select:focus{outline:none;border-color:#6366f1;box-shadow:0 0 0 3px rgba(99,102,241,.18)}\
+form[data-view] input[readonly]{background:#f9fafb;color:#6b7280;cursor:default}\
+form[data-view] input[type=checkbox]{width:auto;display:inline-block;margin:.4rem .5rem 0 0;vertical-align:middle}\
+form[data-view] nav{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:1.25rem;padding-top:1rem;border-top:1px solid #f3f4f6}\
+form[data-view] nav a{display:inline-block;padding:.45rem .9rem;font-size:.85rem;font-weight:500;text-decoration:none;color:#fff;background:#6366f1;border-radius:8px;transition:background .15s}\
+form[data-view] nav a:hover{background:#4f46e5}\
+@media(prefers-color-scheme:dark){\
+form[data-view]{background:#1f2937;border-color:#374151;color:#f9fafb;box-shadow:0 1px 3px rgba(0,0,0,.4)}\
+form[data-view] label{color:#9ca3af}\
+form[data-view] input,form[data-view] select{background:#111827;border-color:#374151}\
+form[data-view] input[readonly]{background:#1a2231;color:#9ca3af}\
+form[data-view] nav{border-top-color:#374151}}\
+</style>";
+
 /// Pure operand → markup. None on malformed input.
 fn render_html(x: &Object) -> Option<String> {
     let sections = x.as_seq()?;
@@ -85,6 +111,7 @@ fn render_html(x: &Object) -> Option<String> {
     html.push_str(&format!(
         "<form data-view=\"{}\" data-kind=\"{}\" data-entity=\"{}\">",
         esc(&view_id), esc(&kind), esc(&entity_id)));
+    html.push_str(AREST_VIEW_STYLE);
     html.push_str(&format!("<h1>{}</h1>", esc(&entity_id)));
 
     // One labelled widget per ViewElement, in projection order. The
@@ -286,5 +313,26 @@ mod tests {
         let html = reps.get("html").expect("'html' target keyed by slug");
         assert!(html.contains("value=\"fix it\""),
             "field value missing from dispatched rendering:\n{}", html);
+    }
+
+    /// UI: the generic view ships a self-contained, scoped stylesheet as
+    /// the form's first child, so the markup envelope stays `<form>…` and
+    /// the styling can't leak onto host-page chrome.
+    #[test]
+    fn view_carries_scoped_stylesheet() {
+        let html = render_html(&sample_input()).expect("renders");
+        assert!(html.starts_with("<form "),
+            "envelope must stay a <form>: {}", &html[..html.len().min(40)]);
+        assert!(html.contains("<style>") && html.contains("form[data-view]"),
+            "scoped <style> must be emitted: {}", html);
+        // Scoped — every rule is qualified by the form[data-view] selector,
+        // so it cannot style host-page elements.
+        let css = &html[html.find("<style>").unwrap() + 7..html.find("</style>").unwrap()];
+        for rule in css.split('}').filter(|r| r.contains('{')) {
+            let sel = rule.rsplit('{').nth(1).unwrap_or("").trim();
+            assert!(sel.is_empty() || sel.starts_with("form[data-view]")
+                    || sel.starts_with('@'),
+                "every selector must be scoped to form[data-view] (or @media); got `{}`", sel);
+        }
     }
 }
