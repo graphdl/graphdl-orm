@@ -3887,6 +3887,10 @@ pub(crate) fn find_nouns(text: &str, noun_names: &[String]) -> Vec<(usize, usize
         |(mut matches, mut used), name| {
             let name_lower: String = name.chars().map(|c| c.to_ascii_lowercase()).collect();
             let mut pos = 0;
+            // Collect THIS noun's candidate occurrences first, so the
+            // verb/noun case-collision filter below can weigh them against
+            // each other before committing any to the global match set.
+            let mut cands: Vec<(usize, usize, String)> = Vec::new();
             while let Some(found) = text_lower[pos..].find(name_lower.as_str()) {
                 let start = pos + found;
                 let mut end = start + name_lower.len();
@@ -3920,11 +3924,31 @@ pub(crate) fn find_nouns(text: &str, noun_names: &[String]) -> Vec<(usize, usize
                     // name is recovered via parse_role_token at the
                     // resolve site.
                     let captured = &text[start..end];
-                    matches.push((start, end, captured.to_string()));
-                    used.push((start, end));
+                    cands.push((start, end, captured.to_string()));
                 }
                 pos = start + 1;
                 if pos >= text.len() { break; }
+            }
+            // engine-valuetyped-maxmin: verb/noun case-collision. When a
+            // declared noun occurs BOTH capitalized (the genuine role
+            // reference — `Slots1`, possibly subscripted) AND lowercased
+            // (the relating VERB — `slots` in `Item slots Slots1 for
+            // Attribute`) within ONE clause, the lowercase occurrence is the
+            // verb, not a noun. Keeping it inflated the role-set, so
+            // `resolve_fact_type` missed the source FT and the aggregate was
+            // SILENTLY DROPPED (the head compiled to nothing / an empty
+            // fold). Drop the lowercase occurrence(s) only when a capitalized
+            // sibling exists — preserving the #273 prose case (a noun
+            // mentioned ONLY in lowercase, with no capitalized sibling, still
+            // matches) and the all-capitalized ring case (`Glyph1`/`Glyph2`).
+            let any_cap = cands.iter()
+                .any(|&(s, _, _)| text.as_bytes()[s].is_ascii_uppercase());
+            for (start, end, captured) in cands {
+                if any_cap && text.as_bytes()[start].is_ascii_lowercase() {
+                    continue;
+                }
+                matches.push((start, end, captured));
+                used.push((start, end));
             }
             (matches, used)
         },

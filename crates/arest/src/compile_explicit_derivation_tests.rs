@@ -4552,6 +4552,53 @@ Glyph has cheapest Count.
 }
 
 #[test]
+fn aggregate_over_ternary_with_verb_noun_case_collision_resolves() {
+    // engine-valuetyped-maxmin: the source FT's VERB `slots` is the lowercase
+    // of the declared value-type noun `Slots`. Before the find_nouns
+    // case-collision fix, resolve_fact_type matched the verb `slots` AS the
+    // noun `Slots`, inflating the where-clause role-set so `Item slots Slots1
+    // for Attribute` did NOT resolve to `Item_slots_Slots_for_Attribute` —
+    // the aggregate was SILENTLY DROPPED (consequent_aggregates empty, head
+    // compiled to an empty fold). This was mis-diagnosed as a value-typed /
+    // ternary-role-position bug; the actual cause is the verb≡noun collision.
+    // Group by the trailing value role Attribute (entity Item dropped), max of
+    // the mid-positioned value Slots.
+    let src = r#"# verb≡noun collision aggregate
+Item(.id) is an entity type.
+Slots is a value type.
+Attribute is a value type.
+
+## Fact Types
+Item slots Slots for Attribute.
+Attribute has spread Slots.
+
+## Derivation Rules
+* Attribute has spread Slots iff Slots is the max of Slots1 where Item slots Slots1 for Attribute.
+"#;
+    let (rule, func) = parse_and_compile(src);
+    assert!(!rule.consequent_aggregates.is_empty(),
+        "the colliding-verb aggregate must EXTRACT — its source must resolve \
+         despite verb `slots` == noun `Slots`; unresolved={:#?}",
+        rule.unresolved_clauses);
+    assert_eq!(rule.consequent_aggregates[0].op, "max");
+    // i1→2/course, i2→5/course, i3→1/advisor  ⇒  course→5, advisor→1.
+    let out = apply_to_facts(&func, &[
+        ("Item_slots_Slots_for_Attribute", &[("Item","i1"),("Slots","2"),("Attribute","course")]),
+        ("Item_slots_Slots_for_Attribute", &[("Item","i2"),("Slots","5"),("Attribute","course")]),
+        ("Item_slots_Slots_for_Attribute", &[("Item","i3"),("Slots","1"),("Attribute","advisor")]),
+    ]);
+    let derived = decode_derived(&out);
+    let spread = |a: &str| derived.iter().find(|(id, _, b)|
+        id == "Attribute_has_spread_Slots"
+        && b.iter().any(|(k, v)| k == "Attribute" && v == a))
+        .and_then(|(_, _, b)| b.iter().find(|(k, _)| k == "Slots").map(|(_, v)| v.clone()));
+    assert_eq!(spread("course").as_deref(), Some("5"),
+        "course max = 5 (of 2,5); got {:#?}", derived);
+    assert_eq!(spread("advisor").as_deref(), Some("1"),
+        "advisor max = 1; got {:#?}", derived);
+}
+
+#[test]
 fn aggregate_min_composite_pair_group_key_fires() {
     // aggregate-composite-group-key: a `min` whose CONSEQUENT needs a 2-role
     // (src,tgt) group key (arc's shortest-cost) groups by the PAIR and emits
