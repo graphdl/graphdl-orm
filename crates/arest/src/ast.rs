@@ -5588,6 +5588,28 @@ fn pop_is_encoded(state: &Object) -> bool {
 /// extractor can compose Func::FetchOrPhi over the encoded pop and
 /// get the right entry without changing its shape.
 fn encoded_pop_lookup(name: &str, state: &Object) -> Option<Object> {
+    // materialized-view-precedence (validate-resolve-view perf): the INDEXED
+    // (Map) pop form — Selector(4) of the eval ctx, what extract_facts_func
+    // reads — is keyed by ft_id. A present, NON-EMPTY entry here IS the
+    // eagerly-materialized cell (the eager fold ran `derivation:{ft}` and
+    // stored it; see compile.rs eager_materializable + the compile.rs:1975
+    // note that the `view:` def is "a redundant FALLBACK for the now-
+    // materialized cell, not the sole population source"). Returning it here,
+    // BEFORE Func::Fetch/FetchOrPhi can fall through to `resolve_view`, makes
+    // the view: def behave as the intended fallback instead of re-deriving a
+    // View-marked aggregate on EVERY access (measured: Fact_Type_has_Arity
+    // re-derived 9x/validate = 91% of resolve_view cost). `pop_is_encoded`
+    // only recognizes the Seq form, so without this a materialized cell in the
+    // Map form is silently bypassed. Empty/absent → None → caller resolves the
+    // view (unchanged lazy behavior; View cells are not otherwise stored, and
+    // the eager-stored ones are maintained fresh by the same chain/apply pack).
+    if let Object::Map(m) = state {
+        return m.get(name).and_then(|entry| match entry {
+            Object::Seq(items) if !items.is_empty() => Some(entry.clone()),
+            Object::Map(mm) if !mm.is_empty() => Some(entry.clone()),
+            _ => None,
+        });
+    }
     if !pop_is_encoded(state) {
         return None;
     }
