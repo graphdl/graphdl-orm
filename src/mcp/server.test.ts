@@ -304,6 +304,25 @@ describe('mcp-get-surface-view-representations — parseGetEntityResponse', () =
     // …and the list path still goes through list:{noun} + parseGetResponse.
     expect(block).toMatch(/systemCall\(`list:\$\{noun\}`, '', scope\)/)
   })
+
+  // Source wiring: the actions verb ALSO surfaces the ui-readings `view`,
+  // fetched via the same getEntity command path the get tool uses (get:{noun}
+  // carries only the flattened 3NF row, never the view). Additive — the legacy
+  // transitions + entity_data shape is preserved.
+  it('actions handler surfaces the view via getEntity, keeping transitions + entity_data', () => {
+    const SRC = SERVER_TS.replace(/\r\n/g, '\n')
+    const head = SRC.indexOf(`server.registerTool(\n  'actions',\n`)
+    expect(head, "registerTool('actions', ...) block not found").toBeGreaterThan(0)
+    const tail = SRC.indexOf('server.registerTool(', head + 1)
+    const block = SRC.slice(head, tail)
+    // View fetched through the getEntity command + parseGetEntityResponse…
+    expect(block).toMatch(/type:\s*'getEntity'/)
+    expect(block).toMatch(/parseGetEntityResponse/)
+    expect(block).toMatch(/\bview\b/)
+    // …and the legacy actions response (transitions + entity_data) survives.
+    expect(block).toMatch(/entity_data:/)
+    expect(block).toMatch(/transitions:/)
+  })
 })
 
 describe('AREST MCP Server', () => {

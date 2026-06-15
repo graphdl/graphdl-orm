@@ -2307,6 +2307,27 @@ server.registerTool(
       const rawTransitions = await systemCall(`transitions:${noun}`, resolvedStatus, scope)
       const rawEntity = await systemCall(`get:${noun}`, id, scope)
       const parsedTransitions = parseOr(rawTransitions, null)
+      // mcp-get-surface-view-representations: the actions verb previously
+      // dropped the ui-readings `view` layer that `get` surfaces. `get:{noun}`
+      // returns ONLY the flattened 3NF row (never the view), so fetch the view
+      // via the same getEntity command path the get tool uses (line ~1256) and
+      // ride it alongside the HATEOAS transitions. Additive + non-fatal: a
+      // getEntity miss (older binary / ⊥ / rejected → parseGetEntityResponse
+      // null) just omits `view`, leaving today's transitions + entity_data shape.
+      let view: unknown
+      try {
+        const envelope = JSON.stringify({
+          command: { type: 'getEntity', noun, entityId: id },
+          population: '',
+        })
+        const enriched = parseGetEntityResponse(await systemCall('apply', envelope, scope))
+        if (enriched && enriched.view !== undefined && enriched.view !== null) {
+          view = enriched.view
+        }
+      } catch {
+        // getEntity dispatch failure is non-fatal — actions still answers
+        // with transitions + entity_data exactly as before.
+      }
       return textResult({
         entity: id,
         noun,
@@ -2315,6 +2336,7 @@ server.registerTool(
           ? parsedTransitions
           : normalizeTransitionRows(rawTransitions, noun, id),
         entity_data: parseOr(rawEntity, null),
+        ...(view !== undefined ? { view } : {}),
       })
     }
     const data = await httpRequest(`/arest/default/${encodeURIComponent(noun)}/${encodeURIComponent(id)}/actions`)
