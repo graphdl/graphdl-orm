@@ -60,23 +60,22 @@ threads-required = "num-cpus"
 # materialized all MaterializationPolicy::View cells into d before validate:
 #   lazy validate  6.65s, 6256 violations
 #   materialized   6.88s, 6358 violations
-# i.e. NO speedup AND a DIFFERENT violation set (+102). The +102 was then
-# LOCALIZED (per-constraint violation diff): exactly 3 MCs move 81->115 —
-# "Each Fact Type has some Arity / Reading / Role". Mechanism: materializing
-# Fact_Type_has_Arity (1391 facts) INTO the population means
-# instances_of_noun_func("Fact Type") — which scans EVERY cell — now finds 34
-# more "Fact Type" instances from those materialized facts, which the 3 MCs
-# flag. So the divergence is NOT context-dependent view semantics; it is that
-# view-materialization and the all-cells instance scan are ENTANGLED —
-# materializing the view pollutes instance enumeration. Two consequences: (a)
-# any perf fix that materializes views must also stop instances_of_noun_func
-# from scanning the materialized cells (scope it), and (b) OPEN CORRECTNESS
-# QUESTION — does the lazy path UNDER-report these violations (the Arity facts
-# aren't in the population when the Role/Reading MCs enumerate), i.e. is 6256
-# or 6358 the true V? The measured hotspot (resolve_view re-derivation, 828ms
-# for Arity) is SOLID; the fix is entangled with instance-enumeration scope and
-# the open V question — architect-level, not more autonomous guessing. NOT safe
-# to terminate-after.
+# i.e. NO speedup AND a DIFFERENT violation set (+102). The +102 is now RESOLVED
+# (debug_v_truth_decisive, 2026-06-15) and my first explanation ("instance-
+# enumeration pollution") was WRONG: DISTINCT Fact Type instances are IDENTICAL
+# lazy=eager=725. Real cause: instances_of_noun_func returns ~3x DUPLICATE
+# occurrences (2126 total / 725 distinct); the MCs count NON-deduped occurrences;
+# materializing Fact_Type_has_Arity adds +1391 dup "Fact Type" occurrences
+# (= the Arity fact count), inflating per-occurrence violation counts. For
+# "Each Fact Type has some Role": true distinct violations = 30, MC reports
+# 81 total / 47 distinct. So lazy does NOT under-report (catches >= all true);
+# both over-report duplicates, eager worse; NO soundness bug, V=6256 sound on
+# accept/reject. NET LEVERS: (major) the resolve_view re-derivation (828ms,
+# SOLID) — fix via per-occurrence-delta, NOT materialization (it inflates dups);
+# a Rust memo cache is OUT (state outside the formula). (minor + hygiene)
+# instances_of_noun_func should DEDUP — kills the dup violations (81->~47) and
+# cuts each MC's per-instance DistR ~3x; core primitive, gate carefully (shifts
+# violation counts suite-wide). NOT safe to terminate-after.
 [profile.default]
 slow-timeout = { period = "60s" }
 
