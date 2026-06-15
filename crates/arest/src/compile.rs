@@ -11122,26 +11122,14 @@ fn compile_subset_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     let a_facts = extract_facts_func(&a_ft_id);
     let b_facts = extract_facts_func(&b_ft_id);
 
-    // match_pred: <a_fact, b_candidate> -> common noun values all equal.
-    // Sourced from `crate::fol::constraint::ss_match_pred` —
-    // `FolTerm::And` with one Eq per common noun handles the empty /
-    // single / N-ary cases uniformly (empty And = True, single And
-    // passes through, N >= 2 becomes Insert(And) ∘ Construction).
-    let match_pred = crate::fol::constraint::ss_match_pred(&common).to_func();
-
-    // not_in_b: <a_fact, b_facts> -> T when no b_candidate matches a_fact
-    // NullTest . Filter(match_pred) . DistL
-    let not_in_b = Func::compose(
-        Func::NullTest,
-        Func::compose(Func::filter(match_pred), Func::DistL),
-    );
-
     // Violation detail (#898). Template `Subset violation: {pairs}
     // participates in {a_ft} but not in {b_ft}`. `{pairs}` is the
     // multi-segment placeholder documented in validation.md — it
     // expands to one `<noun> <value>` pair per common join column,
     // mirroring the existing flat_map shape that produced two atoms
-    // per common pair.
+    // per common pair. Detail is shared by both compile branches below:
+    // it only reads the A-fact (Selector(1)), so it is agnostic to
+    // whether the right arm carries the B-fact SEQ or the B hash index.
     let a_ft_atom = Object::atom(&a_ft_id);
     let b_ft_atom = Object::atom(&b_ft_id);
     let pairs_funcs: Vec<Func> = common.iter().flat_map(|&(ai, _)| [
@@ -11156,6 +11144,57 @@ fn compile_subset_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     });
 
     let viol = make_violation_func(&def.id, &def.text, detail);
+
+    // perf-hashjoin-ss: a SINGLE common join column → O(N+M) hash
+    // ANTI-join instead of the O(N×M) cross-scan. Build a hash index of
+    // the SUPERSET facts keyed on the shared role ONCE (`IndexBy` — the
+    // same read-only equi-join primitive the derivation joiner uses, no
+    // Store capability gate), then probe it per subset fact (`FetchOrPhi`
+    // → φ ⇒ NullTest T ⇒ the witness participates in A but not B). For a
+    // single column "common values all equal" IS "A's key ∈ B's key set",
+    // so the narrowing is exact — identical violations to the cross
+    // product, which is what dominated the validate hot path (the
+    // Format⊆CDT / Format-built-on-CDT metamodel constraints over the
+    // full corpus). Multi-column tuple joins (and the degenerate
+    // no-common-noun case) keep the proven cross product: their composite
+    // keys don't fit an atom-keyed index, and they are not a measured
+    // hotspot.
+    if common.len() == 1 {
+        let (ai, bi) = common[0];
+        // index : b_facts -> Map<b_join_value, <b_fact...>>, built once.
+        let b_index = Func::compose(
+            Func::IndexBy(Box::new(role_value(bi))), b_facts);
+        // not_in_b: <a_fact, b_index> -> T when a's join value is not a
+        // key of the index. NullTest . FetchOrPhi . [role_value(ai).sel1, sel2]
+        let not_in_b = Func::compose(
+            Func::NullTest,
+            Func::compose(Func::FetchOrPhi, Func::construction(vec![
+                Func::compose(role_value(ai), Func::Selector(1)),
+                Func::Selector(2),
+            ])),
+        );
+        return Func::compose(
+            Func::apply_to_all(viol),
+            Func::compose(
+                Func::filter(not_in_b),
+                Func::compose(Func::DistR, Func::construction(vec![a_facts, b_index])),
+            ),
+        );
+    }
+
+    // Cross-product path (common.len() == 0 or >= 2). match_pred:
+    // <a_fact, b_candidate> -> common noun values all equal. Sourced from
+    // `crate::fol::constraint::ss_match_pred` — `FolTerm::And` with one Eq
+    // per common noun handles the empty / single / N-ary cases uniformly
+    // (empty And = True, single And passes through, N >= 2 becomes
+    // Insert(And) ∘ Construction).
+    let match_pred = crate::fol::constraint::ss_match_pred(&common).to_func();
+    // not_in_b: <a_fact, b_facts> -> T when no b_candidate matches a_fact.
+    // NullTest . Filter(match_pred) . DistL
+    let not_in_b = Func::compose(
+        Func::NullTest,
+        Func::compose(Func::filter(match_pred), Func::DistL),
+    );
 
     // apply_to_all(viol) . Filter(not_in_b) . DistR . [a_facts, b_facts]
     Func::compose(
