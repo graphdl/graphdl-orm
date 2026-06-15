@@ -54,14 +54,21 @@ threads-required = "num-cpus"
 # the FORWARD-CHAIN re-fire (via derivation_reads activation gating) — but
 # validate's lazy resolve_view path has NO such gate and re-derives per
 # FetchOrPhi access, which is the cost measured here.
-# FIX (AREST.tex cost-model: "materialized view, not per-request recomputation";
-# a Rust memo cache is OUT — state outside the formula): MATERIALIZE the
-# view-marked cells ONCE before the constraints run, into the Selector(4) INDEX
-# where extract_facts_func reads (so encoded_pop_lookup hits step-1 and never
-# reaches resolve_view) — a pure-algebra augment on the bulk `validate` def,
-# same shape as the reverted instances augment, retargeted to the view cells +
-# the Selector(4) Map. Careful core-validate change — dedicated effort. NOT yet
-# safe to terminate-after.
+# FIX: UNRESOLVED. The obvious candidate — materialize the view-marked cells
+# once before the constraints (AREST.tex "materialized view, not per-request
+# recomputation") — was empirically FALSIFIED 2026-06-15 by a probe that
+# materialized all MaterializationPolicy::View cells into d before validate:
+#   lazy validate  6.65s, 6256 violations
+#   materialized   6.88s, 6358 violations
+# i.e. NO speedup AND a DIFFERENT violation set (+102). So either validate
+# resolves views context-dependently (the eager whole-d resolution is not the
+# same function the per-access lazy path computes), or the cost is not avoided
+# by pre-population — and the naive materialization is also NOT V-preserving,
+# which would break cor:consensus. The measured hotspot (resolve_view
+# re-derivation, 828ms for Arity) is SOLID, but the fix is subtler than any
+# hypothesis tried (SS hash-join, instances-index, view-materialization — all
+# wrong). This needs the view-resolution semantics understood at the architect
+# level, not more autonomous guessing. NOT safe to terminate-after.
 [profile.default]
 slow-timeout = { period = "60s" }
 
