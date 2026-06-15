@@ -35,8 +35,11 @@ threads-required = "num-cpus"
 # (every FT x every fact x every binding) to enumerate ONE noun's instances,
 # and is INLINED per constraint — so the 360 MC+VC constraints each re-scan the
 # full reflected corpus = 360 x O(pop). NEXT LEVER: compute each noun's instance
-# set ONCE per validate and share it across that noun's constraints (e.g.
-# precompute an instances-by-noun map into the validate context), turning
+# set ONCE per validate and share it across that noun's constraints. CHECKED:
+# a shared `instances:{noun}` Def does NOT amortize — Def is not memoized
+# per-apply (ast.rs:3058 re-fetches + re-applies each reference) — so the fix
+# must precompute an instances-by-noun map into the validate CONTEXT (or group
+# constraints by noun compile-side), not lean on def sharing. That turns
 # 360 x O(pop) into O(pop) + 360 x O(1). A careful core-validate change — do it
 # as a dedicated effort, not inline. NOT yet safe to terminate-after.
 [profile.default]
