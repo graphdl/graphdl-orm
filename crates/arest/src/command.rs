@@ -5547,6 +5547,10 @@ pub fn encode_render_input(
             ast::Object::seq(alloc::vec![
                 ast::Object::atom(&e.id), ast::Object::atom(&e.fact_type),
                 ast::Object::atom(&e.component_role),
+                // 4th slot: enumerated options (empty for non-combo widgets).
+                // Positional + optional — the decoder reads `.get(3)`, so the
+                // 3-slot collection element shape stays valid too.
+                ast::Object::Seq(e.options.iter().map(|o| ast::Object::atom(o)).collect()),
             ])).collect())),
         tag("fields", ast::Object::Seq(fields.iter().map(|(k, v)|
             ast::Object::seq(alloc::vec![

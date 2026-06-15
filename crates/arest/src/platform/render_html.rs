@@ -149,6 +149,11 @@ fn render_html(x: &Object) -> Option<String> {
         let label = fact_type.strip_prefix(noun_prefix.as_str())
             .unwrap_or(fact_type).replace('_', " ");
         let value = value_of(&label);
+        // 4th element slot: the enumerated options for a combo-box (empty for
+        // every other widget kind, and absent in older 3-slot operands).
+        let options: Vec<String> = parts.get(3).and_then(|o| o.as_seq())
+            .map(|s| s.iter().filter_map(|o| o.as_atom().map(String::from)).collect())
+            .unwrap_or_default();
         let widget = match role {
             "text-input" => format!(
                 "<input type=\"text\" name=\"{}\" value=\"{}\">",
@@ -160,9 +165,7 @@ fn render_html(x: &Object) -> Option<String> {
                 "<input type=\"checkbox\" name=\"{}\"{}>",
                 esc(&label),
                 if value == "true" { " checked" } else { "" }),
-            "combo-box" => format!(
-                "<select name=\"{}\"><option selected>{}</option></select>",
-                esc(&label), esc(&value)),
+            "combo-box" => render_combo(&label, &value, &options),
             // Unknown widget kinds degrade to readonly text — additive
             // vocabulary growth in components.md must not break targets.
             other => format!(
@@ -275,6 +278,29 @@ fn render_html_collection(view_id: &str, sections: &[Object]) -> Option<String> 
     Some(html)
 }
 
+/// Render a `<select>` for a combo-box: one `<option>` per enumerated value,
+/// the current value `selected`. A stored value that falls OUTSIDE the enum
+/// (stale data, or an enum the population doesn't carry) is preserved as a
+/// leading selected option so it can never silently vanish from the form. With
+/// no options and no value this degrades to a single empty selected option, so
+/// the widget is never an empty `<select>` — and the no-options/with-value case
+/// reproduces the prior single-option markup exactly (a strict superset).
+fn render_combo(label: &str, value: &str, options: &[String]) -> String {
+    let mut s = format!("<select name=\"{}\">", esc(label));
+    if !value.is_empty() && !options.iter().any(|o| o == value) {
+        s.push_str(&format!("<option selected>{}</option>", esc(value)));
+    }
+    for o in options {
+        let selected = if o == value { " selected" } else { "" };
+        s.push_str(&format!("<option{}>{}</option>", selected, esc(o)));
+    }
+    if options.is_empty() && value.is_empty() {
+        s.push_str("<option selected></option>");
+    }
+    s.push_str("</select>");
+    s
+}
+
 /// Minimal HTML escaper for text + attribute positions.
 fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -306,11 +332,13 @@ mod tests {
                     id: "ve_1".to_string(),
                     fact_type: "Task_has_Task_Description".to_string(),
                     component_role: "text-input".to_string(),
+                    options: alloc::vec![],
                 },
                 command::ViewElementProjection {
                     id: "ve_2".to_string(),
                     fact_type: "Task_is_done".to_string(),
                     component_role: "checkbox".to_string(),
+                    options: alloc::vec![],
                 },
             ],
             representations: Default::default(),
@@ -484,5 +512,66 @@ mod tests {
         assert!(html.contains("<td><a href=\"/api/entities/Task/t2\">t2</a></td>\
                                <td>ship it</td><td>false</td>"),
             "row t2 wrong:\n{}", html);
+    }
+
+    /// Build a one-combo-box instance view with the given options + current
+    /// value, render it through the real encoder, return the markup.
+    fn render_combo_input(options: &[&str], value: &str) -> String {
+        let view = command::ViewProjection {
+            view: "instance-view-Task".to_string(),
+            kind: "instance".to_string(),
+            source: "synthesized".to_string(),
+            elements: alloc::vec![command::ViewElementProjection {
+                id: "ve_s".to_string(),
+                fact_type: "Task_has_Task_Status".to_string(),
+                component_role: "combo-box".to_string(),
+                options: options.iter().map(|s| s.to_string()).collect(),
+            }],
+            representations: Default::default(),
+        };
+        let fields = [("Task Status".to_string(), value.to_string())];
+        let transitions: alloc::vec::Vec<command::TransitionAction> = alloc::vec![];
+        let input = command::encode_render_input(&view, "t1", "Task", &fields, &transitions);
+        render_html(&input).expect("well-formed combo operand renders")
+    }
+
+    /// A combo-box surfaces its value type's enum options as a real
+    /// `<select>` — every allowed value an `<option>`, the current value
+    /// `selected` — instead of the old single-option stub.
+    #[test]
+    fn combo_box_surfaces_enum_options() {
+        let html = render_combo_input(&["pending", "in_progress", "done"], "in_progress");
+        assert!(html.contains(
+            "<select name=\"Task Status\">\
+             <option>pending</option>\
+             <option selected>in_progress</option>\
+             <option>done</option></select>"),
+            "combo-box must list every enum option with the current selected:\n{}", html);
+    }
+
+    /// A current value OUTSIDE the enum is preserved as a leading selected
+    /// option, so stored data never silently vanishes from the form.
+    #[test]
+    fn combo_box_preserves_out_of_enum_value() {
+        let html = render_combo_input(&["pending", "done"], "archived");
+        assert!(html.contains(
+            "<select name=\"Task Status\">\
+             <option selected>archived</option>\
+             <option>pending</option>\
+             <option>done</option></select>"),
+            "out-of-enum value must lead as the selected option:\n{}", html);
+    }
+
+    /// No options + no value (e.g. a combo declared before any EnumValues are
+    /// present) keeps the prior single-option shape — a strict superset, so the
+    /// change can't regress an enum-less combo-box.
+    #[test]
+    fn combo_box_without_options_is_backward_compatible() {
+        assert!(render_combo_input(&[], "blocked").contains(
+            "<select name=\"Task Status\"><option selected>blocked</option></select>"),
+            "no-options + value must reproduce the prior single-option markup");
+        assert!(render_combo_input(&[], "").contains(
+            "<select name=\"Task Status\"><option selected></option></select>"),
+            "no-options + no value must stay a single empty selected option");
     }
 }

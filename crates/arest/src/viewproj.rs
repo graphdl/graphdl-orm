@@ -30,6 +30,14 @@ pub struct ViewElementProjection {
     pub fact_type: String,
     /// The widget kind ('text-input', 'date-picker', 'checkbox', 'combo-box').
     pub component_role: String,
+    /// For an enumerated widget ('combo-box'), the value type's allowed values
+    /// — the `EnumValues` cell rows for the value-role noun — so the rendered
+    /// `<select>` offers every option, not just the current value. Empty for
+    /// non-enumerated widgets (and serialized only when non-empty, so a plain
+    /// text/date/checkbox element's JSON is unchanged).
+    #[cfg_attr(feature = "std-deps",
+        serde(default, skip_serializing_if = "Vec::is_empty"))]
+    pub options: Vec<String>,
 }
 
 /// The abstract control tree projected for a fetched entity — the
@@ -126,7 +134,16 @@ pub fn view_via_rho(d: &ast::Object, noun: &str, _entity_id: &str) -> Option<Vie
             let id = ast::binding(f, "ViewElement")?.to_string();
             let fact_type = ast::binding(f, "Fact Type")?.to_string();
             let component_role = role_of.get(&id).cloned().unwrap_or_default();
-            Some(ViewElementProjection { id, fact_type, component_role })
+            // Enumerated widget → surface the value type's allowed values from
+            // the runtime population, so the rendered <select> is a real
+            // dropdown. Read from `d` (the live cells), not `pop` (which only
+            // adds the transient synth View facts).
+            let options = if component_role == "combo-box" {
+                enum_options_for_fact_type(d, noun, &fact_type)
+            } else {
+                Vec::new()
+            };
+            Some(ViewElementProjection { id, fact_type, component_role, options })
         }).collect())
         .unwrap_or_default();
 
@@ -149,4 +166,55 @@ fn view_kind_of(d: &ast::Object, view: &str) -> Option<String> {
             (ast::binding(f, "View") == Some(view))
                 .then(|| ast::binding(f, "View Kind").map(String::from)).flatten()
         }))
+}
+
+/// Allowed values for an enumerated value-type, read from the runtime
+/// `EnumValues` cell (rows keyed `noun` + `value0`, `value1`, …). The
+/// combo-box's value-role noun is recovered the same way the renderer derives
+/// the field label: strip the `{noun}_has_` prefix off the Fact Type and
+/// restore spaces (the binary `Noun has ValueNoun` shape). Empty when the Fact
+/// Type isn't that shape or the noun has no `EnumValues` row — the renderer
+/// then falls back to showing just the current value, i.e. prior behaviour.
+/// Mirrors `induce::enum_values_for_noun`, kept local so viewproj stays
+/// no_std-consumable without depending on the std-gated induce module.
+fn enum_options_for_fact_type(d: &ast::Object, noun: &str, fact_type: &str) -> Vec<String> {
+    let prefix = format!("{}_has_", noun.replace(' ', "_"));
+    let value_noun = match fact_type.strip_prefix(prefix.as_str()) {
+        Some(rest) => rest.replace('_', " "),
+        None => return Vec::new(),
+    };
+    let cell = ast::fetch_cell_seq("EnumValues", d);
+    let Some(seq) = cell.as_seq() else { return Vec::new() };
+    for f in seq.iter() {
+        if ast::binding(f, "noun") != Some(value_noun.as_str()) { continue; }
+        return (0..)
+            .map_while(|i| ast::binding(f, &format!("value{i}")).map(String::from))
+            .collect();
+    }
+    Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The enum reader recovers the value-role noun from the binary Fact Type
+    /// and returns its `EnumValues` row in declaration order; a non-binary
+    /// shape or a missing row yields no options (renderer falls back).
+    #[test]
+    fn enum_options_read_from_enumvalues_cell() {
+        let d = ast::cell_push("EnumValues", ast::fact_from_pairs(&[
+            ("noun", "Task Status"),
+            ("value0", "pending"), ("value1", "in_progress"), ("value2", "done"),
+        ]), &ast::Object::phi());
+
+        assert_eq!(
+            enum_options_for_fact_type(&d, "Task", "Task_has_Task_Status"),
+            alloc::vec!["pending", "in_progress", "done"],
+            "binary fact type resolves its value-role noun's enum row");
+        assert!(enum_options_for_fact_type(&d, "Task", "Task_is_done").is_empty(),
+            "a unary (no `{{noun}}_has_` prefix) yields no options");
+        assert!(enum_options_for_fact_type(&d, "Task", "Task_has_Unlisted").is_empty(),
+            "a noun with no EnumValues row yields no options");
+    }
 }
