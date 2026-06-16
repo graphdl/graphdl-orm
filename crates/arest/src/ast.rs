@@ -1347,6 +1347,100 @@ fn unit_of(f: &Func) -> Option<Object> {
     }
 }
 
+// ── Static cell-read analysis of a compiled Func (delta-occ-1) ───────
+//
+// derivation-semi-naive-delta-joins / per-occurrence delta. The dark
+// AREST_DELTA_JOINS view path is sound only when a rule's STATIC reads
+// sidecar covers every cell its compiled Func actually fetches. Today
+// `derivation_positive_reads` (compile.rs) is built from the declared
+// antecedent_sources alone and never inspects the Func, so a rule whose
+// Func also fetches a reflection/hidden cell is wrongly marked
+// view-complete and the view-swap leaves that cell at full population →
+// the B2 divergence (see the claude ledger lever delta-joins-per-occurrence).
+//
+// This is the foundational analyzer: walk a compiled Func and return the
+// set of cell names it fetches by a LITERAL name, plus a flag when any
+// fetch name is computed at runtime (so the read-set is NOT statically
+// complete and the soundness gate must treat the rule conservatively).
+// The compiler emits every cell read as the fixed shape
+//   Compose(FetchOrPhi|Fetch, Construction([Constant(atom(cell)), <pop>]))
+// (extract_facts_func / extract_facts_from_pop, compile.rs), so a literal
+// read is exactly that shape and anything else feeding a fetch is dynamic.
+
+/// Result of [`func_read_set`]: the statically-knowable cell reads of a Func.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FuncReadSet {
+    /// Cell names fetched by a literal (Constant-atom) name.
+    pub literal: alloc::collections::BTreeSet<alloc::string::String>,
+    /// True if any Fetch/FetchOrPhi takes a non-literal (runtime-computed)
+    /// name, or the walk reaches a Platform/Native escape hatch — i.e. the
+    /// read-set is NOT provably complete and the delta-view soundness gate
+    /// must full-evaluate this rule rather than swap views.
+    pub has_dynamic: bool,
+    /// Named defs referenced (Func::Def). Reads THROUGH a def are indirect;
+    /// resolve these against the def map for a fully-complete read-set.
+    pub def_refs: alloc::collections::BTreeSet<alloc::string::String>,
+}
+
+/// Walk a compiled Func and return its statically-knowable cell read-set
+/// (delta-occ-1). See the module comment above for the recognized fetch
+/// shape. `def_refs` are left unresolved — a caller wanting the transitive
+/// read-set resolves them against its def map.
+pub fn func_read_set(f: &Func) -> FuncReadSet {
+    let mut rs = FuncReadSet::default();
+    collect_func_reads(f, &mut rs);
+    rs
+}
+
+fn collect_func_reads(f: &Func, rs: &mut FuncReadSet) {
+    match f {
+        // The cell-read shape: a Fetch/FetchOrPhi composed over a
+        // Construction whose FIRST element builds the cell NAME.
+        Func::Compose(g, h) if matches!(**g, Func::Fetch | Func::FetchOrPhi) => {
+            match &**h {
+                Func::Construction(elems) if !elems.is_empty() => {
+                    match &elems[0] {
+                        // Literal name → a statically-known read.
+                        Func::Constant(obj) => match obj.as_atom() {
+                            Some(name) => { rs.literal.insert(name.to_string()); }
+                            None => rs.has_dynamic = true,
+                        },
+                        // Computed name → dynamic; still walk it for nested reads.
+                        other => { rs.has_dynamic = true; collect_func_reads(other, rs); }
+                    }
+                    // The pop-source (and any further args) may carry nested reads.
+                    for e in &elems[1..] { collect_func_reads(e, rs); }
+                }
+                // Fetch over a non-Construction operand: name not a leading
+                // Constant → dynamic.
+                other => { rs.has_dynamic = true; collect_func_reads(other, rs); }
+            }
+        }
+        // A bare Fetch reached outside the recognized shape: its operand is
+        // supplied by an enclosing frame, so the name is not statically known.
+        Func::Fetch | Func::FetchOrPhi => rs.has_dynamic = true,
+
+        // Sub-Func-carrying combining forms: recurse into every child.
+        Func::Compose(g, h) => { collect_func_reads(g, rs); collect_func_reads(h, rs); }
+        Func::Construction(v) => for g in v { collect_func_reads(g, rs); },
+        Func::Condition(a, b, c) => {
+            collect_func_reads(a, rs); collect_func_reads(b, rs); collect_func_reads(c, rs);
+        }
+        Func::While(a, b) => { collect_func_reads(a, rs); collect_func_reads(b, rs); }
+        Func::ApplyToAll(g) | Func::Insert(g) | Func::Filter(g) | Func::FoldL(g)
+        | Func::IndexBy(g) | Func::OrderBy(g) | Func::BinaryToUnary(g, _) =>
+            collect_func_reads(g, rs),
+
+        // Indirect / opaque surfaces.
+        Func::Def(name) => { rs.def_refs.insert(name.clone()); }
+        Func::Platform(_) | Func::Native(_) => rs.has_dynamic = true,
+
+        // All remaining variants are nullary leaves with no cell reads
+        // (Id, Selector, Tail, Eq, arithmetic/logic, Constant, Store, …).
+        _ => {}
+    }
+}
+
 fn apply_arithmetic(x: &Object, op: fn(f64, f64) -> Option<f64>) -> Object {
     match x.as_seq() {
         Some(items) if items.len() == 2 => {
@@ -7239,6 +7333,61 @@ impl fmt::Debug for Func {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // delta-occ-1: the static cell-read analyzer. Mirrors the compiler's
+    // fixed cell-read shape and pins literal vs dynamic vs indirect reads.
+    #[test]
+    fn func_read_set_extracts_literal_and_flags_dynamic_fetches() {
+        // The shape extract_facts_from_pop emits (compile.rs:544):
+        //   Compose(FetchOrPhi, Construction([Constant(atom(cell)), Id]))
+        let extract = |cell: &str| Func::compose(
+            Func::FetchOrPhi,
+            Func::construction(vec![Func::constant(Object::atom(cell)), Func::Id]),
+        );
+
+        // 1) a single literal-name fetch is a statically-known read.
+        let rs = func_read_set(&extract("resource_is_of_function"));
+        assert!(rs.literal.contains("resource_is_of_function"));
+        assert_eq!(rs.literal.len(), 1);
+        assert!(!rs.has_dynamic, "a literal-name fetch is statically complete");
+
+        // 2) a 2-cell join reads BOTH antecedent cells (BTreeSet is sorted).
+        let join = Func::construction(vec![
+            extract("resource_is_of_function"),
+            extract("function_belongs_to_domain"),
+        ]);
+        let rs = func_read_set(&join);
+        assert_eq!(
+            rs.literal.iter().cloned().collect::<Vec<_>>(),
+            vec![
+                "function_belongs_to_domain".to_string(),
+                "resource_is_of_function".to_string(),
+            ],
+        );
+        assert!(!rs.has_dynamic);
+
+        // 3) reads nested inside a combining form are still found.
+        let nested = Func::ApplyToAll(Box::new(extract("nested_cell")));
+        let rs = func_read_set(&nested);
+        assert!(rs.literal.contains("nested_cell") && !rs.has_dynamic);
+
+        // 4) a fetch whose NAME is computed at runtime (Selector, not a
+        //    Constant) is the hidden/dynamic case the soundness gate must
+        //    catch — the read-set is NOT statically complete.
+        let dynamic = Func::compose(
+            Func::FetchOrPhi,
+            Func::construction(vec![Func::Selector(1), Func::Id]),
+        );
+        let rs = func_read_set(&dynamic);
+        assert!(rs.has_dynamic, "a computed-name fetch must flag has_dynamic");
+        assert!(rs.literal.is_empty());
+
+        // 5) a Def reference is recorded as indirect (resolve via def map),
+        //    not as a literal read and not (by itself) dynamic.
+        let rs = func_read_set(&Func::Def("derivation:rbd".to_string()));
+        assert!(rs.def_refs.contains("derivation:rbd"));
+        assert!(rs.literal.is_empty() && !rs.has_dynamic);
+    }
 
     #[test]
     fn stamp_file_domain_tags_declared_functions() {
