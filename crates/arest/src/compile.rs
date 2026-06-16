@@ -5283,6 +5283,32 @@ fn compile_data_with_state(
     // them in round 1 is cheap; the cost forward_chain_defs_state_seeded
     // attacks is the long-tail user-rule cardinality (~75 user rules on
     // the live tasks.db corpus).
+    // delta-occ-2: the compiled Func's ACTUAL literal cell reads (the
+    // delta-occ-1 analyzer ast::func_read_set), keyed by rule id. Lets the
+    // sidecar below cover reflection/hidden cells the antecedent_sources
+    // list misses, and gates the delta-view completeness marker on the
+    // reads being PROVABLY COMPLETE.
+    let func_reads_by_id: HashMap<String, crate::ast::FuncReadSet> = derivations.iter()
+        .filter(|d| !d.id.is_empty())
+        .map(|d| (d.id.clone(), crate::ast::func_read_set(&d.func)))
+        .collect();
+    // A rule's compiled-Func read-set is PROVABLY COMPLETE only when every
+    // antecedent source is a FactType (excludes InstancesOfNoun whole-pop
+    // scans, which traverse the population structurally and so are NOT
+    // visible to func_read_set as named reads), the Func has NO dynamic
+    // (computed-name) fetch, and it makes NO indirect Def call. Only then
+    // is it sound to (a) union the Func reads into the activation sidecar —
+    // a partial union could flip an unconditional rule to gated and skip a
+    // re-fire (the ec434a1f regression class) — and (b) emit the delta-view
+    // completeness marker.
+    let func_complete_ids: hashbrown::HashSet<String> = data.derivation_rules.iter()
+        .filter(|r| !r.id.is_empty())
+        .filter(|r| r.antecedent_sources.iter()
+            .all(|s| matches!(s, crate::types::AntecedentSource::FactType(_))))
+        .filter(|r| func_reads_by_id.get(&r.id)
+            .map_or(false, |fr| !fr.has_dynamic && fr.def_refs.is_empty()))
+        .map(|r| r.id.clone())
+        .collect();
     let derivation_positive_reads: HashMap<String, Vec<String>> = data.derivation_rules.iter()
         .filter(|r| !r.id.is_empty())
         .map(|r| {
@@ -5346,16 +5372,38 @@ fn compile_data_with_state(
             // skipped re-fire when the unlisted dynamic antecedent
             // changes, which is the long-standing pre-ec434a1f
             // behavior (tracked under the same task as fix 2).
+            //
+            // delta-occ-2: for a provably-complete rule, union in the
+            // compiled Func's literal reads so the activation sidecar covers
+            // cells the Func fetches BEYOND the declared antecedents
+            // (reflection / anaphora). Gated to func-complete rules so the
+            // union stays COMPLETE — a partial add could flip an
+            // unconditional rule to gated and skip a re-fire (the ec434a1f
+            // regression class). Clean rules add nothing (Func reads ==
+            // declared antecedents), so the common case is unchanged.
+            if func_complete_ids.contains(&r.id) {
+                if let Some(fr) = func_reads_by_id.get(&r.id) {
+                    for cell in &fr.literal {
+                        if !reads.iter().any(|c| c == cell) {
+                            reads.push(cell.clone());
+                        }
+                    }
+                }
+            }
             (r.id.clone(), reads)
         })
         .collect();
-    // Completeness markers: rules whose EVERY antecedent source is a
-    // FactType. The delta-join view gate (evaluate.rs) requires the
-    // marker; activation gating uses the (possibly partial) reads.
+    // Completeness markers (delta-occ-2): exactly the func-complete set —
+    // all-FactType antecedents AND the compiled Func has no dynamic fetch
+    // and no indirect Def, so the STATIC read-set (now unioned with the
+    // Func's literal reads above) provably covers every cell the Func reads.
+    // A rule with a hidden reflection read keeps the marker ONLY when that
+    // read is a literal cell (captured in the sidecar); a dynamic hidden
+    // read drops the marker → the delta-view gate full-evaluates it (sound)
+    // until per-occurrence delta (delta-occ-3) lands. Order preserved from
+    // data.derivation_rules for deterministic compiles.
     let derivation_reads_complete: Vec<String> = data.derivation_rules.iter()
-        .filter(|r| !r.id.is_empty())
-        .filter(|r| r.antecedent_sources.iter()
-            .all(|s| matches!(s, crate::types::AntecedentSource::FactType(_))))
+        .filter(|r| func_complete_ids.contains(&r.id))
         .map(|r| r.id.clone())
         .collect();
 
