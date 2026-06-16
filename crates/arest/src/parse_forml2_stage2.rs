@@ -6443,6 +6443,51 @@ fn parse_to_state_via_stage12_impl(
     // line until the closing fence. The marker test is `starts_with`
     // (not `==`) so a language-tagged opener (```forml2, ```jsonc) and
     // any closing whitespace are handled.
+    // freewill-action-kind-resolver-gap: FORML 2 lets several facts share a
+    // line — `A 'x' has V 'v'. A 'x' r B 'y'.` (used throughout spd-1.md,
+    // free-will.md, etc.). The per-line tokenizer below treated one line as
+    // ONE statement, so a multi-fact line parsed into a single over-roled
+    // statement whose canonical matched no fact type and silently mis-filed
+    // under the raw verb (broad data loss — e.g. spd-1's Convergence Themes
+    // never materialized). Split each line into statements at top-level ". "
+    // boundaries (period + whitespace OUTSIDE a single-quoted literal), so
+    // decimals (`1.5`, no following space) and quoted periods don't split.
+    // A trailing ORM derivation marker (`. *` / `. **` / `. +`) is kept with
+    // its segment; derivation-rule lines (leading `*`/`+`) are never split.
+    fn split_statement_line(line: &str) -> Vec<&str> {
+        if line.starts_with('*') || line.starts_with('+') {
+            return alloc::vec![line];
+        }
+        let bytes = line.as_bytes();
+        let mut segs: Vec<&str> = Vec::new();
+        let mut in_quote = false;
+        let mut start = 0usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == b'\'' { in_quote = !in_quote; i += 1; continue; }
+            if !in_quote && bytes[i] == b'.'
+                && i + 1 < bytes.len() && bytes[i + 1].is_ascii_whitespace()
+            {
+                let next = line[i + 1..].trim_start();
+                // A trailing derivation marker (`. *`) or pure trailing space
+                // is not a statement boundary — keep it with this segment.
+                if next.is_empty() || next.starts_with('*') || next.starts_with('+') {
+                    i += 1;
+                    continue;
+                }
+                let seg = line[start..=i].trim();
+                if !seg.is_empty() { segs.push(seg); }
+                start = i + 1;
+                i += 1;
+                continue;
+            }
+            i += 1;
+        }
+        let last = line[start..].trim();
+        if !last.is_empty() { segs.push(last); }
+        if segs.is_empty() { segs.push(line); }
+        segs
+    }
     let mut in_fence = false;
     for (i, raw_line) in lines.iter().enumerate() {
         let line = raw_line.trim();
@@ -6518,11 +6563,20 @@ fn parse_to_state_via_stage12_impl(
         if line.starts_with("This association with") {
             continue;
         }
-        let statement_id = alloc::format!("s{}", i);
-        let cells = crate::parse_forml2_stage1::tokenize_statement_with_buckets_vocab(
-            &statement_id, line, &noun_buckets, &vocab);
-        for (cell_name, facts) in cells.into_iter() {
-            acc_cells.entry(cell_name).or_default().extend(facts);
+        let segments = split_statement_line(line);
+        for (j, seg) in segments.iter().enumerate() {
+            // Keep `s{i}` for the common single-statement line so existing
+            // statement ids are unchanged; multi-fact lines get `s{i}_{j}`.
+            let statement_id = if segments.len() == 1 {
+                alloc::format!("s{}", i)
+            } else {
+                alloc::format!("s{}_{}", i, j)
+            };
+            let cells = crate::parse_forml2_stage1::tokenize_statement_with_buckets_vocab(
+                &statement_id, seg, &noun_buckets, &vocab);
+            for (cell_name, facts) in cells.into_iter() {
+                acc_cells.entry(cell_name).or_default().extend(facts);
+            }
         }
     }
     let stmt_state: Object = {
@@ -9202,6 +9256,94 @@ mod tests {
         assert!(ak.as_seq().map(|s| !s.is_empty()).unwrap_or(false),
             "the `has Action Kind` instance must still resolve even though the same \
              FT appears in a literal-clause derivation rule antecedent");
+    }
+
+    /// freewill-action-kind-resolver-gap, white-box FOLD repro attempt:
+    /// replicate the cli/entry.rs app-compile per-file fold (corpus-seed
+    /// pre-parse -> parse_to_state_from_in_domain -> annotate_noun_domain ->
+    /// stamp_file_domain) for the ORIGINAL multi-FT-on-one-subject shape that
+    /// reproduces via MCP (Op with Op Kind + Op Mode, both token-sharing,
+    /// plus literal-clause derivation rules). If Op_has_Op_Kind is empty
+    /// here, the ns-domain stamping / fold is the trigger and this is the
+    /// fast repro for the fix. If it passes, the FULL bundled substrate (not
+    /// just metamodel_state) is additionally required.
+    #[test]
+    fn app_compile_fold_resolves_shared_token_multi_ft_under_domain_stamping() {
+        let corpus = "Op(.Op Name) is an entity type.\nTier(.Tier Name) is an entity type.\n\n## Value Types\n\nOp Name is a value type.\nTier Name is a value type.\nOp Kind is a value type.\n  The possible values of Op Kind are 'soft', 'hard'.\nOp Mode is a value type.\n  The possible values of Op Mode are 'auto', 'manual'.\nPlain Kind is a value type.\n  The possible values of Plain Kind are 'a', 'b'.\n\n## Fact Types\n\nOp has Op Kind.\nOp has Op Mode. *\nOp is governed by Tier.\nTier has Plain Kind.\n\n## Derivation Rules\n\n* Op has Op Mode 'auto' iff Op has Op Kind 'soft'.\n* Op has Op Mode 'manual' iff Op has Op Kind 'hard'.\n\n## Instance Facts\n\nOp 'o1' has Op Kind 'soft'. Op 'o1' is governed by Tier 't1'.\nOp 'o2' has Op Kind 'hard'. Op 'o2' is governed by Tier 't1'.\nTier 't1' has Plain Kind 'a'.\n";
+        let mm = crate::metamodel_state();
+        let mm_noun_ctx = {
+            let mut m: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+            m.insert("Noun".to_string(), crate::ast::fetch_cell_seq("Noun", &mm));
+            Object::map(m)
+        };
+        let full = crate::parse_forml2::parse_to_state_from(corpus, &mm_noun_ctx)
+            .expect("corpus pre-parse");
+        let seed = {
+            let mut m: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+            for cell in ["Noun", "FactType", "Role"] {
+                m.insert(cell.to_string(), crate::ast::fetch_cell_seq(cell, &full));
+            }
+            Object::map(m)
+        };
+        let _ = (full, seed);
+        let cnt = |s: &Object, c: &str| crate::ast::fetch_cell_seq(c, s)
+            .as_seq().map(|x| x.len()).unwrap_or(0);
+        // SIMPLE shape: one value-type FT on Op (shared token), no second FT,
+        // no derivation rule. COMPLEX = the failing original.
+        let simple = "Op(.Op Name) is an entity type.\n\n## Value Types\n\nOp Name is a value type.\nOp Kind is a value type.\n\n## Fact Types\n\nOp has Op Kind.\n\n## Instance Facts\n\nOp 'o1' has Op Kind 'soft'.\n";
+        let mm_full = crate::metamodel_state();
+        let ctxs: [(&str, Object); 3] = [
+            ("phi", Object::phi()),
+            ("mm_nouns", mm_noun_ctx),
+            ("mm_full", mm_full.clone()),
+        ];
+        // Post-fix regression: the `complex` corpus carries multi-fact
+        // instance lines (`Op 'oN' has Op Kind 'x'. Op 'oN' is governed by
+        // Tier 't1'.`); both its `has Op Kind` facts (o1, o2) must resolve in
+        // EVERY context, and the `simple` single-fact line stays at 1.
+        for (clabel, corp) in [("simple", simple), ("complex", corpus)] {
+            for (_xlabel, ctx) in ctxs.iter() {
+                let p = crate::parse_forml2::parse_to_state_from(corp, ctx)
+                    .expect("parse");
+                let want = if clabel == "complex" { 2 } else { 1 };
+                assert_eq!(cnt(&p, "Op_has_Op_Kind"), want,
+                    "Op has Op Kind must resolve for {clabel} shape");
+                assert_eq!(cnt(&p, "UnresolvedInstanceFact"), 0,
+                    "no fact must mis-file for {clabel} shape");
+            }
+        }
+    }
+
+    /// freewill-action-kind-resolver-gap SHAPE bisection: the matrix showed
+    /// the trigger is the shape, not the context (complex fails even under
+    /// phi). Build up from the passing `base` adding one element of the
+    /// failing complex at a time; the first variant with Op_has_Op_Kind=0
+    /// names the trigger.
+    #[test]
+    fn bisect_shape_trigger_for_value_type_instance_misfile() {
+        let cnt = |s: &Object, c: &str| crate::ast::fetch_cell_seq(c, s)
+            .as_seq().map(|x| x.len()).unwrap_or(0);
+        let base = "Op(.Op Name) is an entity type.\n\n## Value Types\n\nOp Name is a value type.\nOp Kind is a value type.\n  The possible values of Op Kind are 'soft', 'hard'.\n\n## Fact Types\n\nOp has Op Kind.\n\n## Instance Facts\n\nOp 'o1' has Op Kind 'soft'.\n";
+        let plus_2nd_ft = "Op(.Op Name) is an entity type.\n\n## Value Types\n\nOp Name is a value type.\nOp Kind is a value type.\n  The possible values of Op Kind are 'soft', 'hard'.\nOp Mode is a value type.\n  The possible values of Op Mode are 'auto', 'manual'.\n\n## Fact Types\n\nOp has Op Kind.\nOp has Op Mode.\n\n## Instance Facts\n\nOp 'o1' has Op Kind 'soft'.\n";
+        let plus_rule = "Op(.Op Name) is an entity type.\n\n## Value Types\n\nOp Name is a value type.\nOp Kind is a value type.\n  The possible values of Op Kind are 'soft', 'hard'.\nOp Mode is a value type.\n  The possible values of Op Mode are 'auto', 'manual'.\n\n## Fact Types\n\nOp has Op Kind.\nOp has Op Mode. *\n\n## Derivation Rules\n\n* Op has Op Mode 'auto' iff Op has Op Kind 'soft'.\n\n## Instance Facts\n\nOp 'o1' has Op Kind 'soft'.\n";
+        let plus_rule2_o2 = "Op(.Op Name) is an entity type.\n\n## Value Types\n\nOp Name is a value type.\nOp Kind is a value type.\n  The possible values of Op Kind are 'soft', 'hard'.\nOp Mode is a value type.\n  The possible values of Op Mode are 'auto', 'manual'.\n\n## Fact Types\n\nOp has Op Kind.\nOp has Op Mode. *\n\n## Derivation Rules\n\n* Op has Op Mode 'auto' iff Op has Op Kind 'soft'.\n* Op has Op Mode 'manual' iff Op has Op Kind 'hard'.\n\n## Instance Facts\n\nOp 'o1' has Op Kind 'soft'.\nOp 'o2' has Op Kind 'hard'.\n";
+        // free-will.md's actual instance shape: TWO facts on one line, the
+        // first value-type-ranged (`has Op Kind 'lit'`), the second
+        // entity-ranged (`is governed by Tier`). gov_2line = same facts split
+        // onto separate lines (the control).
+        let gov_1line = "Op(.Op Name) is an entity type.\nTier(.Tier Name) is an entity type.\n\n## Value Types\n\nOp Name is a value type.\nTier Name is a value type.\nOp Kind is a value type.\n  The possible values of Op Kind are 'soft', 'hard'.\n\n## Fact Types\n\nOp has Op Kind.\nOp is governed by Tier.\n\n## Instance Facts\n\nOp 'o1' has Op Kind 'soft'. Op 'o1' is governed by Tier 't1'.\n";
+        let gov_2line = "Op(.Op Name) is an entity type.\nTier(.Tier Name) is an entity type.\n\n## Value Types\n\nOp Name is a value type.\nTier Name is a value type.\nOp Kind is a value type.\n  The possible values of Op Kind are 'soft', 'hard'.\n\n## Fact Types\n\nOp has Op Kind.\nOp is governed by Tier.\n\n## Instance Facts\n\nOp 'o1' has Op Kind 'soft'.\nOp 'o1' is governed by Tier 't1'.\n";
+        // Every shape — including gov_1line (the two-facts-on-one-line shape
+        // that regressed) — must resolve its `Op has Op Kind` instance with
+        // nothing mis-filed. gov_1line and gov_2line (same facts, one line vs
+        // two) must agree.
+        for (label, rdg) in [("base", base), ("+2nd_ft", plus_2nd_ft), ("+rule", plus_rule), ("+rule2_o2", plus_rule2_o2), ("gov_1line", gov_1line), ("gov_2line", gov_2line)] {
+            let p = crate::parse_forml2::parse_to_state(rdg).expect("parse");
+            assert!(cnt(&p, "Op_has_Op_Kind") >= 1,
+                "{label}: the `has Op Kind` instance must resolve into its cell");
+            assert_eq!(cnt(&p, "UnresolvedInstanceFact"), 0,
+                "{label}: no fact must mis-file under the raw verb");
+        }
     }
 
     /// arc-agi-3 engine-issue 14b (round-8 residual): an app FT
