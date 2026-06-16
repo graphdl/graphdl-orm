@@ -325,6 +325,16 @@ fn recent_changes(state: &Object) -> Vec<Value> {
         if name.contains(':') {
             continue;
         }
+        // orient-reorient-snapshot: skip MIS-FILED cells whose names are not
+        // canonical FactType ids. Unresolved / multi-fact-line tuples get
+        // mis-filed under a raw-verb fragment ("maps agent-", "has auditTask
+        // 'ft-", "are for the same", "maps to 'Arousal positive'"), which then
+        // surfaced as garbage recent-activity nouns. A canonical FT id is ASCII
+        // letters, digits, and '_' only; a name with a space, quote, or other
+        // punctuation is mis-filed scaffolding, not session activity.
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
         // #932 phase-2: collect via cell_facts_iter so a folded (Map)
         // cell is counted too, not skipped as a non-Seq.
         let facts: Vec<_> = crate::ast::cell_facts_iter(contents).collect();
@@ -566,6 +576,35 @@ mod tests {
         // The genuine instance cell must still be present.
         assert!(nouns.contains(&"Task_has_Task_Status"),
             "expected Task_has_Task_Status in recent_changes; got: {:?}", nouns);
+    }
+
+    #[test]
+    fn recent_changes_skips_misfiled_non_factid_cell_names() {
+        // orient-reorient-snapshot: mis-filed cells (raw-verb fragments with
+        // spaces/quotes/punctuation from unresolved or multi-fact-line tuples)
+        // must NOT surface as recent-activity nouns -- they were the "garbage
+        // recent-activity nouns" symptom. Canonical FT-id cells still surface.
+        let mut state = Object::phi();
+        state = cell_push("maps agent-",
+            fact_from_pairs(&[("subjectValue", "x")]), &state);
+        state = cell_push("has auditTask 'ft-",
+            fact_from_pairs(&[("subjectValue", "y")]), &state);
+        state = cell_push("maps to 'Arousal positive'",
+            fact_from_pairs(&[("subjectValue", "z")]), &state);
+        state = cell_push("Task_has_Task_Status",
+            fact_from_pairs(&[("Task", "1"), ("Task Status", "ready")]), &state);
+        let env = orient(&state, r#"{"active_app":"tasks"}"#);
+        let v = parse_envelope(&env);
+        let changes = v.get("recent_changes").and_then(|c| c.as_array())
+            .unwrap_or_else(|| panic!("expected recent_changes array, got: {}", env));
+        let nouns: Vec<&str> = changes.iter()
+            .map(|c| c.get("noun").and_then(|n| n.as_str()).unwrap_or("")).collect();
+        for n in &nouns {
+            assert!(n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "mis-filed non-FactId cell leaked into recent_changes: {:?}", nouns);
+        }
+        assert!(nouns.contains(&"Task_has_Task_Status"),
+            "canonical FT cell dropped from recent_changes: {:?}", nouns);
     }
 
     // ── glob join_path / civil_from_days unit coverage ────────────
