@@ -4036,8 +4036,15 @@ fn tokenize_arith(text: &str) -> Vec<String> {
     tokens
 }
 
-/// Hand-rolled equivalent of trailing-comparator regex
+/// Peel a trailing numeric comparator off a derivation antecedent, accepting
+/// BOTH a SYMBOLIC operator —
 ///   `\s*(>=|<=|!=|<>|>|<|=)\s*(-?\d+(?:\.\d+)?)\s*$`
+/// — and a TEXT phrase (`greater than`, `less than or equal to`, `equals`,
+/// `not equal to`, `exceeds`, `more than`, …, with an optional leading `is`)
+/// mapped to the SAME canonical op symbol, so both forms feed an identical
+/// Filter primitive downstream. (`at least N` / `at most N` are deliberately
+/// NOT recognised here — those are CARDINALITY premises consumed upstream by
+/// `extract_antecedent_cardinality`.)
 ///
 /// Returns `Some((stripped, raw_op, value))` where:
 /// - `stripped` is the input with the trailing operator + numeric
@@ -4103,22 +4110,104 @@ fn peel_trailing_comparator(text: &str) -> Option<(String, &'static str, f64)> {
         while op_end > 0 && bytes[op_end - 1].is_ascii_whitespace() {
             op_end -= 1;
         }
-        // 7. Operator alternation, longest first (so `>=` beats `>`).
+        // 7. Operator — SYMBOLIC token or TEXT phrase, both mapped to the same
+        //    canonical op symbol (so the downstream Filter primitive is identical).
+        let head = &s[..op_end];
+        // 7a. Symbolic alternation, longest first (so `>=` beats `>`).
         const OPS: &[&str] = &[">=", "<=", "!=", "<>", ">", "<", "="];
-        let Some(op) = OPS.iter().find(|op| {
-            op.len() <= op_end && &s[op_end - op.len()..op_end] == **op
-        }) else {
-            continue;
-        };
-        let op_start = op_end - op.len();
-        // 8. `stripped` mirrors `text[..whole.start()].trim_end()`.
-        //    `whole.start()` is the start of the leading `\s*` run
-        //    before the operator; trim_end on the slice up to the
-        //    operator gives the same result.
-        let stripped = text[..op_start].trim_end().to_string();
-        return Some((stripped, op, value));
+        if let Some(op) = OPS.iter().copied().find(|op| {
+            op.len() <= op_end && &head[op_end - op.len()..] == *op
+        }) {
+            // 8. `stripped` mirrors `text[..whole.start()].trim_end()`.
+            let stripped = text[..op_end - op.len()].trim_end().to_string();
+            return Some((stripped, op, value));
+        }
+        // 7b. Text comparator phrases → op symbol (e.g. `greater than` → `>`).
+        //     Matched at the operator position, requiring a word boundary before
+        //     the phrase; an optional `is` connective (`... Weight is more than 5`)
+        //     is stripped so the remaining clause resolves as the bare fact type.
+        //     (`at least N` / `at most N` are intentionally absent — those are
+        //     CARDINALITY premises, handled upstream by extract_antecedent_cardinality.)
+        const TEXT_OPS: &[(&str, &str)] = &[
+            ("greater than or equal to", ">="),
+            ("less than or equal to", "<="),
+            ("no less than", ">="),
+            ("no more than", "<="),
+            ("not equal to", "!="),
+            ("does not equal", "!="),
+            ("greater than", ">"),
+            ("less than", "<"),
+            ("more than", ">"),
+            ("fewer than", "<"),
+            ("equal to", "="),
+            ("exceeds", ">"),
+            ("equals", "="),
+        ];
+        let head_lower = head.to_ascii_lowercase();
+        for (phrase, op) in TEXT_OPS.iter().copied() {
+            if head_lower.len() >= phrase.len()
+                && &head_lower[head_lower.len() - phrase.len()..] == phrase
+                && (head.len() == phrase.len()
+                    || head.as_bytes()[head.len() - phrase.len() - 1].is_ascii_whitespace())
+            {
+                let op_start = op_end - phrase.len();
+                let mut stripped = text[..op_start].trim_end().to_string();
+                if let Some(pre) = stripped.strip_suffix(" is") {
+                    stripped = pre.trim_end().to_string();
+                }
+                return Some((stripped, op, value));
+            }
+        }
+        continue;
     }
     None
+}
+
+#[cfg(test)]
+mod text_comparator_tests {
+    //! comparison-text-and-symbolic: a derivation antecedent may compare a role
+    //! VALUE against a numeric literal using EITHER a symbolic operator
+    //! (`> 5`, `>= 9`) or a TEXT phrase (`greater than 5`, `at least`-style
+    //! words excluded as those are cardinality). Both forms peel to the same
+    //! canonical op symbol + f64 so the downstream Filter primitive is identical.
+    use super::*;
+
+    fn split(t: &str) -> (String, Option<(String, f64)>) {
+        split_antecedent_comparator(t)
+    }
+
+    #[test]
+    fn symbolic_forms_unchanged() {
+        assert_eq!(split("Item has Weight > 5"), ("Item has Weight".into(), Some((">".into(), 5.0))));
+        assert_eq!(split("Item has Weight >= 9"), ("Item has Weight".into(), Some((">=".into(), 9.0))));
+        assert_eq!(split("Item has Weight != 5"), ("Item has Weight".into(), Some(("!=".into(), 5.0))));
+        assert_eq!(split("Item has Weight"), ("Item has Weight".into(), None));
+    }
+
+    #[test]
+    fn text_forms_map_to_same_op() {
+        assert_eq!(split("Item has Weight greater than 5"), ("Item has Weight".into(), Some((">".into(), 5.0))));
+        assert_eq!(split("Item has Weight less than 5"), ("Item has Weight".into(), Some(("<".into(), 5.0))));
+        assert_eq!(split("Item has Weight more than 5"), ("Item has Weight".into(), Some((">".into(), 5.0))));
+        assert_eq!(split("Item has Weight greater than or equal to 9"), ("Item has Weight".into(), Some((">=".into(), 9.0))));
+        assert_eq!(split("Item has Weight less than or equal to 9"), ("Item has Weight".into(), Some(("<=".into(), 9.0))));
+        assert_eq!(split("Item has Weight equal to 5"), ("Item has Weight".into(), Some(("=".into(), 5.0))));
+        assert_eq!(split("Item has Weight equals 5"), ("Item has Weight".into(), Some(("=".into(), 5.0))));
+        assert_eq!(split("Item has Weight not equal to 5"), ("Item has Weight".into(), Some(("!=".into(), 5.0))));
+        assert_eq!(split("Item has Weight exceeds 5"), ("Item has Weight".into(), Some((">".into(), 5.0))));
+    }
+
+    #[test]
+    fn optional_is_connective_is_stripped() {
+        assert_eq!(split("Item has Weight is greater than 5"), ("Item has Weight".into(), Some((">".into(), 5.0))));
+        assert_eq!(split("Item has Weight is more than 5"), ("Item has Weight".into(), Some((">".into(), 5.0))));
+    }
+
+    #[test]
+    fn role_named_with_is_suffix_not_corrupted() {
+        // `Axis` ends in `is` but has no preceding space-`is`, so symbolic `>` peels cleanly.
+        assert_eq!(split("Shape has Axis > 2"), ("Shape has Axis".into(), Some((">".into(), 2.0))));
+    }
 }
 
 // =========================================================================

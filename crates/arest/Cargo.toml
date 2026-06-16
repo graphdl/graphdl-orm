@@ -247,6 +247,16 @@ name = "cross_antecedent_value_comparison_e2e"
 path = "tests/cross_antecedent_value_comparison_e2e.rs"
 required-features = ["test-bins"]
 
+# Role-op-LITERAL sibling of the cross-antecedent pin above. A rule body
+# comparing a role value to a numeric literal must parse into a non-empty
+# `antecedent_filters` vec for BOTH the text phrase (`greater than 5`) and
+# the symbolic operator (`< 5`) — they canonicalise to the same op — and
+# forward-chain so the strict comparison excludes the boundary value.
+[[test]]
+name = "antecedent_literal_value_comparison_e2e"
+path = "tests/antecedent_literal_value_comparison_e2e.rs"
+required-features = ["test-bins"]
+
 # Subtype-join → supertype FT derivation-resolver gap. A derivation
 # whose join clause has a SUBTYPE subject (`that Noun belongs to Domain`)
 # but whose target FT is declared on the SUPERTYPE (`Function belongs to
