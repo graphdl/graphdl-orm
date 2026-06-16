@@ -9105,6 +9105,105 @@ mod tests {
              mis-file (otherwise this test cannot detect the regression)");
     }
 
+    /// freewill-action-kind-resolver-gap (2026-06-16): an instance fact
+    /// whose object value-type noun SHARES its leading token with the
+    /// subject entity noun ("Action Class" / "Action Kind", both lead
+    /// with "Action") must still resolve to the declared
+    /// `Action Class has Action Kind` fact type. spd-1/free-will.md hit
+    /// this — the deontic `has Action Kind` / `has Authorization Mode`
+    /// facts mis-filed under the raw verb while the no-overlap
+    /// `is governed by Layer` resolved, leaving the whole Action-Class
+    /// authorization model dark in spd-1 and every importer (claude). The
+    /// `Tier has Plain Kind` control has no token overlap and must keep
+    /// resolving — guarding the fix against a false positive.
+    #[test]
+    fn instance_fact_resolves_when_object_noun_shares_token_with_subject() {
+        let input = "Action Class(.Action Class Name) is an entity type.\n\
+                     Tier(.Tier Name) is an entity type.\n\n\
+                     ## Value Types\n\n\
+                     Action Class Name is a value type.\n\
+                     Tier Name is a value type.\n\
+                     Action Kind is a value type.\n\
+                     Plain Kind is a value type.\n\n\
+                     ## Fact Types\n\n\
+                     Action Class has Action Kind.\n\
+                     Tier has Plain Kind.\n\n\
+                     ## Instance Facts\n\n\
+                     Action Class 'build' has Action Kind 'soft'.\n\
+                     Tier 't1' has Plain Kind 'a'.\n";
+        let parsed = crate::parse_forml2::parse_to_state(input).expect("parses");
+        let unresolved = crate::ast::fetch_cell_seq("UnresolvedInstanceFact", &parsed);
+        let miss: alloc::vec::Vec<String> = unresolved.as_seq()
+            .map(|s| s.iter()
+                .filter_map(|f| binding(f, "stmtText").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        // Control: the no-overlap fact resolves into its cell.
+        let pk = crate::ast::fetch_cell_seq("Tier_has_Plain_Kind", &parsed);
+        assert!(pk.as_seq().map(|s| !s.is_empty()).unwrap_or(false),
+            "control `Tier has Plain Kind` must resolve; unresolved={miss:?}");
+        // The shared-token fact must ALSO land in its declared cell ...
+        let ak = crate::ast::fetch_cell_seq("Action_Class_has_Action_Kind", &parsed);
+        assert!(ak.as_seq().map(|s| !s.is_empty()).unwrap_or(false),
+            "`Action Class has Action Kind` instance must land in its cell, not \
+             mis-file under the raw verb; unresolved={miss:?}");
+        // ... and nothing should mis-file under the raw verb.
+        assert!(miss.is_empty(), "no instance fact should mis-file; got {miss:?}");
+    }
+
+    /// freewill-action-kind-resolver-gap, the CONTEXT-DEPENDENT leg: the
+    /// shared-token instance resolves standalone (test above) but the real
+    /// failure only bites under a large declared-noun CONTEXT — the bundled
+    /// metamodel the MCP compile threads in. spd-1/free-will.md and the
+    /// freewill-repro app both lost their `... has Action Kind` data this
+    /// way while `Tier has Plain Kind` (no overlap) survived. This pins the
+    /// faithful repro: same shape, parsed against `metamodel_state()`.
+    #[test]
+    fn instance_fact_with_shared_token_resolves_under_metamodel_context() {
+        let ctx = crate::metamodel_state();
+        let input = "Action Class(.Action Class Name) is an entity type.\n\
+                     Tier(.Tier Name) is an entity type.\n\n\
+                     ## Value Types\n\n\
+                     Action Class Name is a value type.\n\
+                     Tier Name is a value type.\n\
+                     Action Kind is a value type.\n\
+                     Plain Kind is a value type.\n\n\
+                     ## Fact Types\n\n\
+                     Action Class has Action Kind.\n\
+                     Tier has Plain Kind.\n\n\
+                     ## Instance Facts\n\n\
+                     Action Class 'build' has Action Kind 'soft'.\n\
+                     Tier 't1' has Plain Kind 'a'.\n";
+        let parsed = crate::parse_forml2::parse_to_state_from(input, &ctx)
+            .expect("parses under metamodel context");
+        let pk = crate::ast::fetch_cell_seq("Tier_has_Plain_Kind", &parsed);
+        assert!(pk.as_seq().map(|s| !s.is_empty()).unwrap_or(false),
+            "control `Tier has Plain Kind` must resolve under context too");
+        let ak = crate::ast::fetch_cell_seq("Action_Class_has_Action_Kind", &parsed);
+        assert!(ak.as_seq().map(|s| !s.is_empty()).unwrap_or(false),
+            "shared-token `Action Class has Action Kind` instance must resolve \
+             under the metamodel context, not mis-file under the raw verb");
+    }
+
+    /// freewill-action-kind-resolver-gap, ISOLATED trigger: the two tests
+    /// above pass — so the shared token was a red herring. The real
+    /// difference is that free-will.md and freewill-repro BOTH carry a
+    /// literal-clause DERIVATION RULE over the same value-type fact type
+    /// (`... has Authorization Mode 'x' iff ... has Action Kind 'y'`),
+    /// which my minimal repros omitted. This adds exactly that rule,
+    /// standalone: if the `has Action Kind` instance now mis-files, the
+    /// literal-clause derivation rule is the trigger (and the metamodel
+    /// context is NOT required).
+    #[test]
+    fn instance_fact_resolves_when_same_ft_appears_in_literal_clause_derivation_rule() {
+        let input = "Action Class(.Action Class Name) is an entity type.\n\n## Value Types\n\nAction Class Name is a value type.\nAction Kind is a value type.\n  The possible values of Action Kind are 'soft', 'hard'.\nAuthorization Mode is a value type.\n  The possible values of Authorization Mode are 'auto', 'manual'.\n\n## Fact Types\n\nAction Class has Action Kind.\nAction Class has Authorization Mode. *\n\n## Derivation Rules\n\n* Action Class has Authorization Mode 'auto' iff Action Class has Action Kind 'soft'.\n\n## Instance Facts\n\nAction Class 'build' has Action Kind 'soft'.\n";
+        let parsed = crate::parse_forml2::parse_to_state(input).expect("parses");
+        let ak = crate::ast::fetch_cell_seq("Action_Class_has_Action_Kind", &parsed);
+        assert!(ak.as_seq().map(|s| !s.is_empty()).unwrap_or(false),
+            "the `has Action Kind` instance must still resolve even though the same \
+             FT appears in a literal-clause derivation rule antecedent");
+    }
+
     /// arc-agi-3 engine-issue 14b (round-8 residual): an app FT
     /// declaration referencing a noun that lives ONLY in the outer
     /// context (`Case observes Fact` — `Fact` is metamodel
