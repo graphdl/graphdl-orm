@@ -110,30 +110,30 @@ fn role_nouns_for_ft(state: &Object, ft_id: &str) -> Vec<String> {
     with_pos.into_iter().map(|(_, n)| n).collect()
 }
 
-/// Resolve the finite domain for a noun, dispatching on its
-/// `objectType` from the Noun cell.
+/// Resolve the finite domain for a noun: its enumerated value-type
+/// values UNION its entity-instance population.
+///
+/// We UNION the two sources rather than dispatch on `objectType` because
+/// a cross-domain NAME COLLISION can mis-classify a noun. induce-no-
+/// candidates: an app declares `Color(.id)` as an ENTITY while the
+/// bundled substrate declares a VALUE type `Color` (theming — stroke /
+/// background / header Color); the merged Noun cell carries objectType
+/// "value", so the old dispatch routed the entity-populated noun to the
+/// (empty) enum lookup and yielded ZERO candidates. The bare-name
+/// collision is the real bug (proper fix: domain-aware / app-local noun
+/// resolution, the ns-domain cluster); unioning makes enumeration robust
+/// to it meanwhile. It is behaviour-preserving otherwise — a pure value
+/// type has no entity instances, a pure entity type has no enum values —
+/// and a `to_explain` coverage set filters any cross-domain
+/// over-enumeration the union admits.
 fn domain_for_noun(state: &Object, noun_name: &str) -> Vec<String> {
-    let object_type = noun_object_type(state, noun_name);
-    match object_type.as_deref() {
-        Some("value") => enum_values_for_noun(state, noun_name),
-        // Entity (or unknown — treat as entity per the conservative
-        // default in compile.rs:953). Walk cells for facts that bind
-        // that noun id.
-        _ => entity_population_for_noun(state, noun_name),
-    }
-}
-
-/// Read `objectType` for a noun from the Noun cell. Returns `None`
-/// if the noun is undeclared.
-fn noun_object_type(state: &Object, noun_name: &str) -> Option<String> {
-    let cell = fetch_cell_seq("Noun", state);
-    let seq = cell.as_seq()?;
-    for f in seq.iter() {
-        if binding(f, "name") == Some(noun_name) {
-            return binding(f, "objectType").map(String::from);
+    let mut domain = enum_values_for_noun(state, noun_name);
+    for v in entity_population_for_noun(state, noun_name) {
+        if !domain.iter().any(|d| d == &v) {
+            domain.push(v);
         }
     }
-    None
+    domain
 }
 
 /// Read enum values for a value-typed noun from the EnumValues
@@ -1080,6 +1080,65 @@ mod tests {
         for c in candidates.iter() {
             assert_eq!(binding(c, "fieldName"), Some("Coin_has_Side"));
         }
+    }
+
+    /// Regression (induce-no-candidates): a noun DECLARED an entity
+    /// type but cross-domain-misclassified as `object_type: "value"`
+    /// (the bundled-substrate noun-name collision — an app `Color`
+    /// shadowed by a substrate value-type `Color`) must STILL
+    /// enumerate from its entity population. Before the
+    /// `domain_for_noun` union, the misclassification routed the
+    /// domain to the empty enum lookup → zero candidates and `induce`
+    /// returned `[]`. Here Color has NO EnumValues row but four
+    /// instances; the self-referential `Color_maps_to_Color` must
+    /// yield 4×4 = 16 ordered pairs from the entity-side domain alone.
+    #[test]
+    fn value_misclassified_but_entity_populated_noun_still_enumerates() {
+        let state = make_state(
+            // Color carries the WRONG object_type ("value") — exactly
+            // the mis-resolution the union is robust to.
+            &[("Color", "value")],
+            &[("Color_maps_to_Color", "Color maps to Color", 2)],
+            &[
+                ("Color_maps_to_Color", "Color", 0),
+                ("Color_maps_to_Color", "Color", 1),
+            ],
+            // No enum row for Color: the empty-domain trap.
+            &[],
+            // Four Color instances supply the entity-side domain via
+            // the raw InstanceFact subjectNoun/subjectValue keying.
+            &[
+                vec![("subjectNoun", "Color"), ("subjectValue", "red"),
+                     ("fieldName", "Color_exists"),
+                     ("objectNoun", ""), ("objectValue", "")],
+                vec![("subjectNoun", "Color"), ("subjectValue", "green"),
+                     ("fieldName", "Color_exists"),
+                     ("objectNoun", ""), ("objectValue", "")],
+                vec![("subjectNoun", "Color"), ("subjectValue", "blue"),
+                     ("fieldName", "Color_exists"),
+                     ("objectNoun", ""), ("objectValue", "")],
+                vec![("subjectNoun", "Color"), ("subjectValue", "yellow"),
+                     ("fieldName", "Color_exists"),
+                     ("objectNoun", ""), ("objectValue", "")],
+            ],
+        );
+        let candidates =
+            enumerate_candidates_for_fact_type(&state, "Color_maps_to_Color");
+        assert_eq!(candidates.len(), 16,
+            "misclassified-but-populated Color must enumerate its 4 \
+             instances across both roles (4×4 ordered pairs); got {:?}",
+            candidates);
+        let pairs: Vec<(Option<&str>, Option<&str>, Option<&str>, Option<&str>)> =
+            candidates.iter().map(|c| (
+                binding(c, "subjectNoun"),
+                binding(c, "subjectValue"),
+                binding(c, "objectNoun"),
+                binding(c, "objectValue"),
+            )).collect();
+        assert!(pairs.contains(&(Some("Color"), Some("red"), Some("Color"), Some("red"))),
+            "missing diagonal <red, red>; got {:?}", pairs);
+        assert!(pairs.contains(&(Some("Color"), Some("red"), Some("Color"), Some("yellow"))),
+            "missing off-diagonal <red, yellow>; got {:?}", pairs);
     }
 
     /// Cartesian product across two roles: 2 entities × 2 enum
