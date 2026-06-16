@@ -5890,6 +5890,163 @@ Animal 'fido' has Owner 'alice'.\n\
         assert_eq!(derived_count, 0, "No match should produce no derivation");
     }
 
+    // ── derivation-semi-naive-delta-joins: in-process equivalence harness ──
+    //
+    // 987-delta-scoped-compile. The dark `AREST_DELTA_JOINS` path evaluates
+    // a sidecar'd positive rule over per-antecedent VIEWS (each antecedent
+    // cell swapped to only its delta rows, |ΔA|×B ∪ A×|ΔB|) instead of the
+    // full |A|×|B| batch. For the SOUND subset — every antecedent a
+    // FactType, the reads sidecar covers them all, no self-join, no hidden
+    // reads — this must derive EXACTLY the naive fixed point (AREST.tex
+    // §exec: semi-naive evaluation as a sanctioned FP-law transformation;
+    // a fact with no antecedent in the delta was derivable earlier and is
+    // already present).
+    //
+    // A clean 2-hop join — `Resource belongs to Domain(r,d) ⊣ Resource is
+    // of Function(r,f), Function belongs to Domain(f,d)` — is the canonical
+    // such rule and the exact shape of the ns-domain propagation cells the
+    // SHIPPED-DARK note (semi_naive_inner) names as the B2 divergence site.
+    // NOTE the synthetic fixture CANNOT reproduce the B2 *red*: that
+    // divergence needs the real reflection Funcs whose COMPILED reads
+    // exceed their static sidecar (reads "below every static metadata
+    // surface"); a hand-built join reads only its declared antecedents, so
+    // it is exactly the sound case. This test therefore pins the sound
+    // subset GREEN — the regression floor any future provably-complete-
+    // sidecar gating (which would enable the view path only for rules whose
+    // reads are statically proven ⊆ the sidecar) must preserve.
+
+    /// Cells for the clean 2-hop transitive join used by the delta-join
+    /// equivalence test: `Resource is of Function` ⋈ `Function belongs to
+    /// Domain` on Function ⊢ `Resource belongs to Domain`.
+    fn two_hop_join_cells() -> S {
+        let mut cells = empty_cells();
+        cells = with_ft(cells, "resource_is_of_function", &FactTypeDef {
+            schema_id: String::new(), reading: "Resource is of Function".to_string(), readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Resource".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Function".to_string(), role_index: 1 },
+            ],
+        });
+        cells = with_ft(cells, "function_belongs_to_domain", &FactTypeDef {
+            schema_id: String::new(), reading: "Function belongs to Domain".to_string(), readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Function".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Domain".to_string(), role_index: 1 },
+            ],
+        });
+        cells = with_ft(cells, "resource_belongs_to_domain", &FactTypeDef {
+            schema_id: String::new(), reading: "Resource belongs to Domain".to_string(), readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Resource".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Domain".to_string(), role_index: 1 },
+            ],
+        });
+        cells = with_derivation(cells, &DerivationRuleDef {
+            id: "rbd".to_string(),
+            text: "Resource belongs to Domain via Function".to_string(),
+            antecedent_sources: vec![
+                AntecedentSource::FactType("resource_is_of_function".to_string()),
+                AntecedentSource::FactType("function_belongs_to_domain".to_string()),
+            ],
+            consequent_cell: ConsequentCellSource::Literal("resource_belongs_to_domain".to_string()),
+            consequent_instance_role: String::new(),
+            kind: DerivationKind::Join,
+            join_on: vec!["Function".to_string()],
+            match_on: vec![],
+            consequent_bindings: vec!["Resource".to_string(), "Domain".to_string()],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![], antecedent_cardinalities: vec![],
+        });
+        cells
+    }
+
+    /// Project the derived `resource_belongs_to_domain` facts to a set of
+    /// (Resource, Domain) pairs for order-independent equivalence checks.
+    fn rbd_pairs(derived: &[DerivedFact]) -> alloc::collections::BTreeSet<(String, String)> {
+        derived.iter()
+            .filter(|f| f.fact_type_id == "resource_belongs_to_domain")
+            .filter_map(|f| {
+                let r = f.bindings.iter().find(|(k, _)| k == "Resource").map(|(_, v)| v.clone())?;
+                let dom = f.bindings.iter().find(|(k, _)| k == "Domain").map(|(_, v)| v.clone())?;
+                Some((r, dom))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn delta_joins_equivalence_two_hop_positive_join() {
+        let (_meta, defs, _def_map) = compile_cells(two_hop_join_cells());
+        let rule_func = defs.iter().find(|(n, _)| n == "derivation:rbd")
+            .map(|(_, f)| f.clone())
+            .expect("compiled join rule derivation:rbd must exist");
+
+        // Build the chain population `d` as the PRODUCTION leaf path
+        // presents it: base FT cells PLUS the two reflection surfaces the
+        // delta view gate reads — the `DerivationRule` cell (antecedent_meta
+        // source) and the `derivation_reads_complete:rbd` marker (view_ok's
+        // soundness gate, Func::constant(atom("1")) in compile.rs). The
+        // lightweight compile_cells/pop_state path OMITS these, which would
+        // silently force the rule down the full-eval branch and make the
+        // equivalence vacuous (the reflect_then_defs false-negative trap).
+        let mut d = ast::Object::phi();
+        // R1,R2 -> F1 ; R3 -> F2 ; R4 -> F3. F3 has NO domain, so R4 derives
+        // nothing — a negative leg guarding against over-derivation.
+        for (r, f) in [("R1", "F1"), ("R2", "F1"), ("R3", "F2"), ("R4", "F3")] {
+            d = ast::cell_push("resource_is_of_function",
+                ast::fact_from_pairs(&[("Resource", r), ("Function", f)]), &d);
+        }
+        for (f, dom) in [("F1", "D1"), ("F2", "D2")] {
+            d = ast::cell_push("function_belongs_to_domain",
+                ast::fact_from_pairs(&[("Function", f), ("Domain", dom)]), &d);
+        }
+        d = ast::cell_push("DerivationRule", ast::fact_from_pairs(&[
+            ("id", "rbd"),
+            ("antecedentFactTypeIds", "resource_is_of_function,function_belongs_to_domain"),
+            ("consequentFactTypeId", "resource_belongs_to_domain"),
+        ]), &d);
+        d = ast::store("derivation_reads_complete:rbd", ast::Object::atom("1"), &d);
+
+        let reads = ["resource_is_of_function".to_string(),
+                     "function_belongs_to_domain".to_string()];
+        let packed: Vec<(&str, &ast::Func, Option<&[String]>)> =
+            vec![("derivation:rbd", &rule_func, Some(reads.as_slice()))];
+
+        // 1) NAIVE baseline: round-1-everything over the full population,
+        //    delta off (initial_delta = None ⇒ delta_joins gate is false).
+        let (_ns, naive_derived) = forward_chain_defs_state_semi_naive(&packed, &d, 100);
+        let naive = rbd_pairs(&naive_derived);
+        assert_eq!(naive.len(), 3,
+            "sanity: the join must derive R1->D1, R2->D1, R3->D2 (R4/F3 has no \
+             domain); got {:?}", naive);
+
+        // 2) DELTA path: seed both antecedent cells, hand the chain their
+        //    rows as the round-0 delta, flip AREST_DELTA_JOINS on. The gate
+        //    needs BOTH the env knob and a non-None initial_delta, so this
+        //    is the only call in the suite that takes the view path; every
+        //    other chain entry passes initial_delta=None and is unaffected
+        //    by the process-global env var.
+        let mut seed = HashSet::new();
+        seed.insert("resource_is_of_function".to_string());
+        seed.insert("function_belongs_to_domain".to_string());
+        let mut initial_delta: hashbrown::HashMap<String, Vec<ast::Object>> =
+            hashbrown::HashMap::new();
+        for cell in ["resource_is_of_function", "function_belongs_to_domain"] {
+            let rows: Vec<ast::Object> = ast::fetch_cell_seq(cell, &d).as_seq()
+                .map(|s| s.to_vec()).unwrap_or_default();
+            initial_delta.insert(cell.to_string(), rows);
+        }
+
+        std::env::set_var("AREST_DELTA_JOINS", "1");
+        let (_ds, delta_derived) = forward_chain_defs_state_seeded_with_delta(
+            &packed, seed, initial_delta, &d, 100);
+        std::env::remove_var("AREST_DELTA_JOINS");
+
+        let delta = rbd_pairs(&delta_derived);
+        assert_eq!(delta, naive,
+            "AREST_DELTA_JOINS must derive the SAME resource_belongs_to_domain set \
+             as the naive chain for a sidecar-complete, hidden-read-free 2-hop join. \
+             naive={:?} delta={:?}", naive, delta);
+    }
+
     fn make_forbidden_text_cells(enum_vals: Vec<String>) -> S {
         let mut cells = empty_cells();
         let pt = "ProhibitedText";
