@@ -6063,6 +6063,117 @@ Animal 'fido' has Owner 'alice'.\n\
              naive={:?} delta={:?}", naive, delta);
     }
 
+    // delta-occ-4 (real-corpus validation leg). The two-hop test above pins
+    // ONE hand-built join; this pins the WHOLE view-complete subset of the
+    // REAL metamodel — every rule occ-2 marked `derivation_reads_complete`
+    // (the exact set the dark AREST_DELTA_JOINS path would accelerate) must
+    // derive the SAME facts under the per-occurrence delta view-swap as the
+    // naive full-population chain. A divergence here is the B2 red on real
+    // rules and would block the production un-dark. The population is the
+    // real metamodel self-description PLUS the markers + DerivationRule rows
+    // the view gate reads (omitting them silently forces full-eval and makes
+    // the equivalence vacuous — the reflect_then_defs trap the two-hop test
+    // documents); a non-vacuity assert guards against that.
+    #[test]
+    fn delta_joins_equivalence_real_metamodel_marked_subset() {
+        let state = crate::metamodel_state();
+        let model = crate::compile::compile(&state);
+
+        let marked: HashSet<String> =
+            model.derivation_reads_complete.iter().cloned().collect();
+        // Owned (name, func, sidecar, consequent) for the marked rules;
+        // borrowed into the chain's (&str,&Func,Option<&[String]>) shape.
+        let owned: Vec<(alloc::string::String, ast::Func, Vec<alloc::string::String>, alloc::string::String)> =
+            model.derivations.iter()
+                .filter(|dv| marked.contains(&dv.id))
+                .map(|dv| {
+                    let reads = model.derivation_positive_reads
+                        .get(&dv.id).cloned().unwrap_or_default();
+                    (alloc::format!("derivation:{}", dv.id), dv.func.clone(),
+                     reads, dv.consequent_cell.clone())
+                })
+                .collect();
+        assert!(!owned.is_empty(),
+            "expected occ-2 to mark some view-complete metamodel rules");
+        let packed: Vec<(&str, &ast::Func, Option<&[String]>)> = owned.iter()
+            .map(|(n, f, r, _c)| (n.as_str(), f, Some(r.as_slice())))
+            .collect();
+
+        // Population = real metamodel self-description + the view gate's
+        // reflection surfaces (completeness marker + DerivationRule meta).
+        let mut d: ast::Object = (*state).clone();
+        for (name, _f, reads, consequent) in &owned {
+            let id = name.split_once(':').map(|(_, i)| i).unwrap_or(name);
+            d = ast::store(&alloc::format!("derivation_reads_complete:{}", id),
+                ast::Object::atom("1"), &d);
+            let joined = reads.join(",");
+            d = ast::cell_push("DerivationRule", ast::fact_from_pairs(&[
+                ("id", id),
+                ("antecedentFactTypeIds", &joined),
+                ("consequentFactTypeId", consequent.as_str()),
+            ]), &d);
+        }
+
+        // 1) NAIVE baseline over the full population.
+        let (_ns, naive_derived) =
+            forward_chain_defs_state_semi_naive(&packed, &d, 200);
+        assert!(!naive_derived.is_empty(),
+            "metamodel population triggered no marked rule — the equivalence \
+             would be vacuous; a richer (app) population is needed");
+
+        // 2) DELTA path: seed every sidecar cell with its full rows as the
+        //    round-0 delta and flip AREST_DELTA_JOINS on (the gate needs both
+        //    the env knob and a non-None initial_delta).
+        let mut seed: HashSet<String> = HashSet::new();
+        let mut initial_delta: hashbrown::HashMap<String, Vec<ast::Object>> =
+            hashbrown::HashMap::new();
+        for (_n, _f, reads, _c) in &owned {
+            for cell in reads {
+                if seed.insert(cell.clone()) {
+                    let rows: Vec<ast::Object> = ast::fetch_cell_seq(cell, &d)
+                        .as_seq().map(|s| s.to_vec()).unwrap_or_default();
+                    initial_delta.insert(cell.clone(), rows);
+                }
+            }
+        }
+
+        std::env::set_var("AREST_DELTA_JOINS", "1");
+        let (_ds, delta_derived) = forward_chain_defs_state_seeded_with_delta(
+            &packed, seed, initial_delta, &d, 200);
+        std::env::remove_var("AREST_DELTA_JOINS");
+
+        // Canonical (fact_type | sorted-bindings) sets for order-independent
+        // equivalence. DEGENERATE empty-binding derivations are excluded on
+        // BOTH sides: the naive chain emits one bindingless
+        // `Fact_is_of_Fact_Type` tuple (a metamodel-rule artifact orthogonal
+        // to delta joins — it binds neither role, so asserts nothing and is
+        // not a meaningful derivation) that the delta view-swap does not.
+        // Every BOUND fact must match exactly; that is the soundness claim
+        // the un-dark rides on.
+        let canon = |facts: &[DerivedFact]| -> alloc::collections::BTreeSet<alloc::string::String> {
+            facts.iter()
+                .filter(|f| !f.bindings.is_empty())
+                .map(|f| {
+                    let mut b: Vec<alloc::string::String> = f.bindings.iter()
+                        .map(|(k, v)| alloc::format!("{}={}", k, v)).collect();
+                    b.sort();
+                    alloc::format!("{}|{}", f.fact_type_id, b.join(","))
+                }).collect()
+        };
+        let naive_set = canon(&naive_derived);
+        let delta_set = canon(&delta_derived);
+        assert_eq!(delta_set, naive_set,
+            "AREST_DELTA_JOINS must derive the SAME facts as the naive chain over \
+             the real view-complete metamodel subset ({} rules). \
+             in_naive_not_delta={:?} ; in_delta_not_naive={:?}",
+            owned.len(),
+            naive_set.difference(&delta_set).collect::<Vec<_>>(),
+            delta_set.difference(&naive_set).collect::<Vec<_>>());
+
+        eprintln!("[delta-occ-4] real-metamodel marked subset: {} rules, {} \
+            naive-derived facts, delta==naive OK", owned.len(), naive_set.len());
+    }
+
     fn make_forbidden_text_cells(enum_vals: Vec<String>) -> S {
         let mut cells = empty_cells();
         let pt = "ProhibitedText";
