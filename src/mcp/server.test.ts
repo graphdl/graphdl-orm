@@ -1308,6 +1308,7 @@ describe('per-call app scoping (p0 mcp-active-app-isolation, option b)', () => {
       'get', 'query', 'sql', 'cells',
       'apply', 'retract', 'schema', 'actions', 'explain',
       'orient',
+      'induce', 'ask', 'synthesize', 'validate', 'propose',
     ] as const
 
     for (const verb of SCOPED_VERBS) {

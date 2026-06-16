@@ -1636,9 +1636,11 @@ server.registerTool(
       ft_id: z.string().describe('Fact type id to search over (e.g. "Hypothesis_has_Plausibility").'),
       to_explain: z.array(z.unknown()).optional().describe('Optional seq of InstanceFact-shaped facts the candidate should forward-chain-derive. Empty (default) means open-ended search.'),
       bound: z.record(z.string(), z.string()).optional().describe('Optional pre-bound role values keyed by role name. Constrains the cartesian enumeration to candidates that match these bindings.'),
+      app: z.string().optional().describe('Route this call to the named app instead of the default (multi-agent-safe). Omit to use the current default app.'),
     },
   },
-  async ({ ft_id, to_explain, bound }) => {
+  async ({ ft_id, to_explain, bound, app }) => {
+    const scope = callScope(app)
     if (AREST_MODE === 'local') {
       // Build the FFP-shaped argument the engine's `platform_induce`
       // parser expects: a Seq of pair-bindings keyed by `ft_id`,
@@ -1675,7 +1677,7 @@ server.registerTool(
         pairs.push(`<bound, ${renderValue(bound)}>`)
       }
       const arg = `<${pairs.join(', ')}>`
-      const raw = await systemCall('induce', arg)
+      const raw = await systemCall('induce', arg, scope)
       return textResult(parseInduceResponse(raw))
     }
     const data = await httpRequest('/arest/default/induce', {
@@ -2555,9 +2557,11 @@ server.registerTool(
       nouns: z.array(z.string()).optional().describe('Noun names to declare'),
       constraints: z.array(z.string()).optional().describe('Constraint texts'),
       verbs: z.array(z.string()).optional().describe('Verb names to declare'),
+      app: z.string().optional().describe('Route this call to the named app instead of the default (multi-agent-safe). Omit to use the current default app.'),
     },
   },
-  async ({ context_receipt, rationale, target_domain, readings, nouns, constraints, verbs }) => {
+  async ({ context_receipt, rationale, target_domain, readings, nouns, constraints, verbs, app }) => {
+    const scope = callScope(app)
     const blocked = mutationGateResult('propose', context_receipt, { rationale, target_domain, readings, nouns, constraints, verbs })
     if (blocked) return blocked
 
@@ -2578,7 +2582,7 @@ server.registerTool(
         targetDomain: target_domain,
       },
     }
-    const createRaw = await systemCall(`create:Domain Change`, JSON.stringify(createCmd))
+    const createRaw = await systemCall(`create:Domain Change`, JSON.stringify(createCmd), scope)
     let createResult: any
     try { createResult = JSON.parse(createRaw) } catch { createResult = { raw: createRaw } }
 
@@ -2695,16 +2699,18 @@ server.registerTool(
     inputSchema: {
       question: z.string().describe('Natural language question, e.g. "How many orders did acme place this month?"'),
       noun: z.string().optional().describe('Optional scope hint: fact type or entity noun name'),
+      app: z.string().optional().describe('Route this call to the named app instead of the default (multi-agent-safe). Omit to use the current default app.'),
       llm_response: z.string().optional().describe('Pre-sampled JSON projection spec (skip client sampling). Shape: {"fact_type":..., "filter":{...}}'),
     },
   },
-  async ({ question, noun, llm_response }) => {
+  async ({ question, noun, llm_response, app }) => {
+    const scope = callScope(app)
     if (AREST_MODE !== 'local') {
       return textResult({ error: 'ask requires local mode' })
     }
     const schemaRaw = noun
-      ? await systemCall(`schema:${noun}`, '')
-      : await systemCall('list:Noun', '')
+      ? await systemCall(`schema:${noun}`, '', scope)
+      : await systemCall('list:Noun', '', scope)
 
     const prompt = `You are translating a natural-language question into a projection query.
 
@@ -2747,7 +2753,7 @@ Use the exact fact_type names from the schema. Leave filter empty {} if no speci
 
     const filterStr = Object.entries(spec.filter || {})
       .map(([k, v]) => `<${k},${v}>`).join('')
-    const raw = await systemCall(`query:${spec.fact_type}`, filterStr)
+    const raw = await systemCall(`query:${spec.fact_type}`, filterStr, scope)
     let results: any
     try {
       const parsed = JSON.parse(raw)
@@ -2766,17 +2772,19 @@ server.registerTool(
     description: 'Turn entity facts into concise natural-language prose. Engine first runs the full pipeline (resolve + derive to LFP + validate) so the prose reflects implicit/derived facts, then the client LLM shapes the prose. Engine guarantees content correctness; LLM only shapes wording. Pass llm_response to supply pre-written prose and skip sampling.',
     inputSchema: {
       noun: z.string().describe('Entity noun, e.g. "Order"'),
+      app: z.string().optional().describe('Route this call to the named app instead of the default (multi-agent-safe). Omit to use the current default app.'),
       id: z.string().optional().describe('Specific entity ID, or synthesize all entities of the noun if omitted'),
       llm_response: z.string().optional().describe('Pre-sampled prose (skip client sampling). Used verbatim as the `prose` field.'),
     },
   },
-  async ({ noun, id, llm_response }) => {
+  async ({ noun, id, llm_response, app }) => {
+    const scope = callScope(app)
     if (AREST_MODE !== 'local') {
       return textResult({ error: 'synthesize requires local mode' })
     }
     const raw = id
-      ? await systemCall(`get:${noun}`, id)
-      : await systemCall(`list:${noun}`, '')
+      ? await systemCall(`get:${noun}`, id, scope)
+      : await systemCall(`list:${noun}`, '', scope)
     let data: any
     try { data = JSON.parse(raw) } catch { data = { raw } }
 
@@ -2810,14 +2818,16 @@ server.registerTool(
     inputSchema: {
       text: z.string().describe('Raw text to check'),
       constraint: z.string().describe('Constraint ID (from compiled defs) or the constraint reading text'),
+      app: z.string().optional().describe('Route this call to the named app instead of the default (multi-agent-safe). Omit to use the current default app.'),
       llm_response: z.string().optional().describe('Pre-sampled JSON facts array (skip client sampling). Shape: [{"fact_type":..., "bindings":{...}}, ...]'),
     },
   },
-  async ({ text, constraint, llm_response }) => {
+  async ({ text, constraint, llm_response, app }) => {
+    const scope = callScope(app)
     if (AREST_MODE !== 'local') {
       return textResult({ error: 'validate requires local mode' })
     }
-    const constraintRaw = await systemCall(`constraint:${constraint}`, '').catch(() => '')
+    const constraintRaw = await systemCall(`constraint:${constraint}`, '', scope).catch(() => '')
 
     const prompt = `Extract fact instances from the text that are relevant to the given constraint.
 
@@ -2865,7 +2875,7 @@ Only include facts clearly stated or strongly implied by the text. Do not invent
       const factStr = Object.entries(bindings)
         .map(([k, v]) => `<${k},${v}>`).join('')
       try {
-        const vraw = await systemCall(`verify:${fact.fact_type}`, factStr)
+        const vraw = await systemCall(`verify:${fact.fact_type}`, factStr, scope)
         const result = (() => { try { return JSON.parse(vraw) } catch { return { raw: vraw } } })()
         if (result.violations && result.violations.length > 0) {
           violations.push({ fact, violations: result.violations })
