@@ -387,7 +387,7 @@ function appSummary(app: ArestApp = activeApp, detail: AppDetail = 'summary') {
     nextActions.push({
       tool: 'apps.use',
       args: { name: app.name },
-      reason: 'make this app the active UoD for subsequent local operations',
+      reason: `set '${app.name}' as the default for calls that omit \`app\` — or pass app="${app.name}" on a single verb to route just that call without changing the default (multi-agent-safe)`,
     })
   }
   return {
@@ -1010,7 +1010,7 @@ server.registerTool(
   'apps.current',
   {
     description:
-      'Show the active AREST app (readings dir, DB path, health). WHEN: you only need a quick "which app am I in?" answer mid-session. ALTERNATIVE: orient when you also want recent activity + sibling apps in one envelope; apps.status when you want full health of a specific (possibly non-active) app; apps.list when you want every app, not just the active one. GOTCHA: this reports the currently selected scope — it does NOT switch apps. NEXT: apps.use name=... to change scope, or apps.compile if the readings have drifted from the DB.',
+      'Show the DEFAULT app (readings dir, DB path, health) — the app used when a call omits `app`. WHEN: you need a quick "what is the default scope right now?" answer mid-session. ALTERNATIVE: orient when you also want recent activity + sibling apps in one envelope; apps.status for full health of a specific (possibly non-default) app; apps.list for every app. GOTCHA: this reports the default only — individual calls can still route elsewhere by passing `app=<name>`, which does NOT change this default. NEXT: apps.use name=… to change the default, or pass app=<name> on a single verb to route just that call.',
     inputSchema: {
       detail: z.enum(['summary', 'full']).optional().describe('summary returns compact health. full includes reading file details.'),
     },
@@ -1111,7 +1111,7 @@ server.registerTool(
   'apps.use',
   {
     description:
-      'Switch the active local AREST app — subsequent get / query / sql / cells / apply / compile run against THIS app\'s readings + DB. WHEN: you need to read from or mutate a different UoD than the current one. ALTERNATIVE: apps.create when the app does not yet exist (creates dir + activates in one step); apps.status when you only want to peek at an app without making it active. GOTCHA: this INVALIDATES any context_receipt minted under the prior active app — mutating verbs will reject stale receipts after a switch, so call context again. Library entries (no readings/ + no .db) refuse activation with error="app_is_library". NEXT: context to mint a receipt for the new scope, then orient (or apps.current) to confirm the switch.',
+      'Set the process DEFAULT app — the app used by calls that OMIT `app`. WHEN: you are working single-app for a while and want to stop repeating `app=` on every call. PREFER passing `app=<name>` per call instead: that routes a single call statelessly and is the multi-agent-safe default (two agents sharing this server never clobber each other). ALTERNATIVE: pass `app` on the individual verb (get / query / sql / cells / apply / orient / …) to route ONE call without changing the shared default; apps.create when the app does not yet exist; apps.status to peek at an app without making it the default. GOTCHA: this changes a process-wide default shared by every call that omits `app`, and it INVALIDATES any context_receipt minted under the prior default — mutating verbs reject stale receipts after a switch, so call context again. Library entries (no readings/ + no .db) refuse activation with error="app_is_library". NEXT: context to mint a receipt for the new default, then orient (or apps.current) to confirm.',
     inputSchema: {
       name: z.string().describe('AREST app name under the apps directory.'),
     },
@@ -1636,7 +1636,7 @@ server.registerTool(
       ft_id: z.string().describe('Fact type id to search over (e.g. "Hypothesis_has_Plausibility").'),
       to_explain: z.array(z.unknown()).optional().describe('Optional seq of InstanceFact-shaped facts the candidate should forward-chain-derive. Empty (default) means open-ended search.'),
       bound: z.record(z.string(), z.string()).optional().describe('Optional pre-bound role values keyed by role name. Constrains the cartesian enumeration to candidates that match these bindings.'),
-      app: z.string().optional().describe('Route this call to the named app instead of the default (multi-agent-safe). Omit to use the current default app.'),
+      app: z.string().optional().describe(APP_OVERRIDE_FIELD_DESCRIPTION),
     },
   },
   async ({ ft_id, to_explain, bound, app }) => {
@@ -1936,7 +1936,7 @@ server.registerTool(
     inputSchema: {
       apps_dir: z.string().optional().describe('Optional absolute path to the apps directory. When set, sibling apps are enumerated from filesystem (each must carry a `readings/` directory and a `*.db` file). When omitted, only the active app is reported.'),
       active_app: z.string().optional().describe('DEPRECATED label-only fallback (honored only when `app` is omitted): names the active entry + suggested_next without routing. Prefer `app`, which both routes and labels.'),
-      app: z.string().optional().describe('Route this call to the named app instead of the default (multi-agent-safe). Omit to use the current default app.'),
+      app: z.string().optional().describe(APP_OVERRIDE_FIELD_DESCRIPTION),
     },
   },
   async ({ apps_dir, active_app, app }) => {
@@ -2557,7 +2557,7 @@ server.registerTool(
       nouns: z.array(z.string()).optional().describe('Noun names to declare'),
       constraints: z.array(z.string()).optional().describe('Constraint texts'),
       verbs: z.array(z.string()).optional().describe('Verb names to declare'),
-      app: z.string().optional().describe('Route this call to the named app instead of the default (multi-agent-safe). Omit to use the current default app.'),
+      app: z.string().optional().describe(APP_OVERRIDE_FIELD_DESCRIPTION),
     },
   },
   async ({ context_receipt, rationale, target_domain, readings, nouns, constraints, verbs, app }) => {
@@ -2699,7 +2699,7 @@ server.registerTool(
     inputSchema: {
       question: z.string().describe('Natural language question, e.g. "How many orders did acme place this month?"'),
       noun: z.string().optional().describe('Optional scope hint: fact type or entity noun name'),
-      app: z.string().optional().describe('Route this call to the named app instead of the default (multi-agent-safe). Omit to use the current default app.'),
+      app: z.string().optional().describe(APP_OVERRIDE_FIELD_DESCRIPTION),
       llm_response: z.string().optional().describe('Pre-sampled JSON projection spec (skip client sampling). Shape: {"fact_type":..., "filter":{...}}'),
     },
   },
@@ -2772,7 +2772,7 @@ server.registerTool(
     description: 'Turn entity facts into concise natural-language prose. Engine first runs the full pipeline (resolve + derive to LFP + validate) so the prose reflects implicit/derived facts, then the client LLM shapes the prose. Engine guarantees content correctness; LLM only shapes wording. Pass llm_response to supply pre-written prose and skip sampling.',
     inputSchema: {
       noun: z.string().describe('Entity noun, e.g. "Order"'),
-      app: z.string().optional().describe('Route this call to the named app instead of the default (multi-agent-safe). Omit to use the current default app.'),
+      app: z.string().optional().describe(APP_OVERRIDE_FIELD_DESCRIPTION),
       id: z.string().optional().describe('Specific entity ID, or synthesize all entities of the noun if omitted'),
       llm_response: z.string().optional().describe('Pre-sampled prose (skip client sampling). Used verbatim as the `prose` field.'),
     },
@@ -2818,7 +2818,7 @@ server.registerTool(
     inputSchema: {
       text: z.string().describe('Raw text to check'),
       constraint: z.string().describe('Constraint ID (from compiled defs) or the constraint reading text'),
-      app: z.string().optional().describe('Route this call to the named app instead of the default (multi-agent-safe). Omit to use the current default app.'),
+      app: z.string().optional().describe(APP_OVERRIDE_FIELD_DESCRIPTION),
       llm_response: z.string().optional().describe('Pre-sampled JSON facts array (skip client sampling). Shape: [{"fact_type":..., "bindings":{...}}, ...]'),
     },
   },
