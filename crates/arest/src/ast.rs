@@ -7389,6 +7389,47 @@ mod tests {
         assert!(rs.literal.is_empty() && !rs.has_dynamic);
     }
 
+    // delta-occ-2 soundness gate (empirically grounded on the real
+    // metamodel). The delta-view completeness marker must be emitted ONLY
+    // for rules whose compiled Func has no dynamic fetch and no indirect Def
+    // AND whose sidecar covers every literal cell the Func fetches — so the
+    // dark AREST_DELTA_JOINS view-swap can never leave a read at full
+    // population (the B2 divergence). Measured 2026-06-16: of 87 metamodel
+    // derivations, 23 are view-complete and 64 carry a dynamic read (e.g.
+    // the User_accesses_Domain 3-hop joins) and are correctly NOT marked —
+    // they full-evaluate (sound) until per-occurrence delta (delta-occ-3)
+    // accelerates them. This pins the gate so a regression cannot re-mark a
+    // dynamic-read rule complete.
+    #[test]
+    fn occ2_completeness_marker_is_sound_across_metamodel() {
+        let state = crate::metamodel_state();
+        let model = crate::compile::compile(&state);
+        let mut marked = 0usize;
+        for id in &model.derivation_reads_complete {
+            let d = model.derivations.iter().find(|d| &d.id == id)
+                .expect("a marked rule must have a compiled derivation");
+            let rs = func_read_set(&d.func);
+            assert!(!rs.has_dynamic,
+                "marked rule {} ({}) has a dynamic fetch — unsound for the delta view path",
+                id, d.consequent_cell);
+            assert!(rs.def_refs.is_empty(),
+                "marked rule {} ({}) makes an indirect Def call — sidecar not provably complete",
+                id, d.consequent_cell);
+            let sidecar = model.derivation_positive_reads.get(id).cloned().unwrap_or_default();
+            for cell in &rs.literal {
+                assert!(sidecar.contains(cell),
+                    "marked rule {} ({}) fetches {} but it is absent from the sidecar — the \
+                     delta view-swap would leave it at full population", id, d.consequent_cell, cell);
+            }
+            marked += 1;
+        }
+        assert!(marked > 0, "expected some func-complete metamodel rules to carry the marker");
+        let dynamic = model.derivations.iter()
+            .filter(|d| func_read_set(&d.func).has_dynamic).count();
+        eprintln!("[occ2] metamodel derivations={} view-complete(marker)={} full-eval(dynamic)={}",
+            model.derivations.len(), marked, dynamic);
+    }
+
     #[test]
     fn stamp_file_domain_tags_declared_functions() {
         let state = crate::parse_forml2::parse_to_state(
