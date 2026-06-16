@@ -1930,18 +1930,24 @@ server.registerTool(
   'orient',
   {
     description:
-      'One-screen session re-orientation (#871) — apps inventory + active app + recent cell-graph activity + suggested-next pointer, in a single envelope. WHEN: FIRST call in a new session (replaces the old 5-6-verb probe of apps_list + apps_current + query Task_has_Task_Status + cells trace). Also useful any time the agent has lost the thread and wants "where am I, what just happened, what should I do next?". ALTERNATIVE: apps.current when you only need the active app name (cheaper); apps.list / apps.check when you want depth on every app and do NOT need the recent-activity summary; context when you specifically need a mutation receipt (orient does not mint one). GOTCHA: counts come from the ACTIVE app\'s loaded snapshot only — sibling apps appear with last_compile mtimes but no per-app row counts (the engine holds one DB at a time). Pass apps_dir only when you want sibling enumeration; omit it for active-app-only mode. NEXT: follow the `suggested_next` pointer in the response, or call context if the next move is a mutation.',
+      'One-screen session re-orientation (#871) — apps inventory + active app + recent cell-graph activity + suggested-next pointer, in a single envelope. WHEN: FIRST call in a new session, or any time the agent has lost the thread and wants "where am I, what just happened, what should I do next?". ALTERNATIVE: apps.current when you only need the active app name (cheaper); apps.list / apps.check when you want depth on every app and do NOT need the recent-activity summary; context when you specifically need a mutation receipt (orient does not mint one). GOTCHA: pass `app=<name>` to route the counts + recent activity to THAT app (the multi-agent-safe way — it never changes the shared default); omit `app` to report the current default app. Counts come from the routed app\'s loaded snapshot; sibling apps appear with last_compile mtimes but no per-app row counts (the engine holds one DB at a time). Pass apps_dir only when you want sibling enumeration. NEXT: follow the `suggested_next` pointer in the response, or call context if the next move is a mutation.',
     inputSchema: {
       apps_dir: z.string().optional().describe('Optional absolute path to the apps directory. When set, sibling apps are enumerated from filesystem (each must carry a `readings/` directory and a `*.db` file). When omitted, only the active app is reported.'),
-      active_app: z.string().optional().describe('Optional active app name. The verb uses this to name the active entry in the apps list and to render the suggested_next template. When omitted, suggested_next falls back to a "pick an app" pointer.'),
+      active_app: z.string().optional().describe('DEPRECATED label-only fallback (honored only when `app` is omitted): names the active entry + suggested_next without routing. Prefer `app`, which both routes and labels.'),
+      app: z.string().optional().describe('Route this call to the named app instead of the default (multi-agent-safe). Omit to use the current default app.'),
     },
   },
-  async ({ apps_dir, active_app }) => {
+  async ({ apps_dir, active_app, app }) => {
+    const scope = callScope(app)
     const envelope: Record<string, string> = {}
     if (apps_dir !== undefined) envelope.apps_dir = apps_dir
-    if (active_app !== undefined) envelope.active_app = active_app
+    // `app` (routing) names the active entry + suggested_next; else the
+    // deprecated `active_app` label; else the global default app's name.
+    // This is also the bug fix: counts now come from `scope`'s DB, not
+    // whatever app happens to be globally active.
+    envelope.active_app = scope ? scope.name : (active_app ?? activeApp.name)
     if (AREST_MODE === 'local') {
-      const raw = await systemCall('orient', JSON.stringify(envelope))
+      const raw = await systemCall('orient', JSON.stringify(envelope), scope)
       return textResult(parseOrientResponse(raw))
     }
     const data = await httpRequest('/arest/default/orient', {

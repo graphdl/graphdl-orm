@@ -1307,6 +1307,7 @@ describe('per-call app scoping (p0 mcp-active-app-isolation, option b)', () => {
     const SCOPED_VERBS = [
       'get', 'query', 'sql', 'cells',
       'apply', 'retract', 'schema', 'actions', 'explain',
+      'orient',
     ] as const
 
     for (const verb of SCOPED_VERBS) {
@@ -1316,6 +1317,17 @@ describe('per-call app scoping (p0 mcp-active-app-isolation, option b)', () => {
         // can scope itself without `apps.use`.
         expect(config, `${verb}: missing app input field`)
           .toMatch(/app:\s*z\.string\(\)\.optional\(\)/)
+      })
+
+      it(`'${verb}' resolves a per-call scope and threads it into its engine call`, () => {
+        const config = sliceConfig(verb)
+        // The handler must resolve the optional `app` to a CallScope and
+        // pass it to its systemCall / dispatchRead / dispatchCommand, so
+        // the override actually changes which app's DB/readings are read.
+        expect(config, `${verb}: handler does not resolve callScope(app)`)
+          .toMatch(/const scope = callScope\(app\)/)
+        expect(config, `${verb}: scope not threaded into an engine call`)
+          .toContain(', scope)')
       })
     }
 
