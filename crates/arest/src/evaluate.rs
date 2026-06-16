@@ -916,18 +916,29 @@ fn semi_naive_inner(
     // supplies one today; full compiles stay naive — the #836 wipe
     // means everything is new in round 0 anyway).
     //
-    // ⚠ SHIPPED DARK (2026-06-12): the B2 equivalence fixture is RED —
-    // delta-vs-naive diverges on the ns-domain propagation cells
-    // (Resource_belongs_to_Domain / Resource_is_of_Function) through
-    // THREE guards (sidecar count-completeness; all-or-nothing sidecar
-    // emission; self-join/recursive exclusion). The residual mechanism
-    // reads below every static metadata surface available here; sound
-    // delta evaluation for that rule class needs PER-OCCURRENCE deltas
-    // (compiled-Func parameterization), not whole-cell view swaps. Do
-    // NOT enable in production until the fixture's B2 leg passes.
-    // Measured upside when it does: chain 82.5s → 8.0s at 171MB.
+    // DEFAULT-ON for the spec-agreeing subset (2026-06-16; was shipped-dark
+    // behind AREST_DELTA_JOINS=1 from 2026-06-12). Semi-naive (delta)
+    // evaluation IS the AREST.tex sec:exec cost model — Knaster-Tarski: for
+    // monotone append-only P the delta path equals the lfp specification. The
+    // gate was a CORRECTNESS gate, not a prohibition (operating rule
+    // `no-delta-joins`): it existed only because the whole-cell view-swap
+    // disagreed with the spec (the B2 divergence) for rules reading a cell
+    // beyond their static sidecar. occ-2 (6d8e84e9 + soundness gate
+    // f4be0892) resolves that: the `derivation_reads_complete` marker is
+    // emitted ONLY for the 23 func-complete metamodel rules whose sidecar
+    // covers every cell their Func reads, and `view_ok` gates the delta-view
+    // path to exactly those. The 64 dynamic-read rules (the ns-domain 3-hop
+    // joins that were the B2 site) carry no marker and full-evaluate (= naive
+    // lfp). Real-corpus validated: delta==naive on the marked subset
+    // (delta_joins_equivalence_real_metamodel_marked_subset, metamodel-wide
+    // soundness via occ2_completeness_marker_is_sound_across_metamodel) and on
+    // a real leaf-ingest apply (~16% faster chain, identical 78 facts).
+    // AREST_DELTA_JOINS=0 is the opt-out / rollback; occ-3 (per-occurrence
+    // deltas) will extend correct delta to the dynamic-read class. Only the
+    // leaf path supplies an initial delta (`initial_delta.is_some()`); full
+    // compiles stay naive.
     #[cfg(not(feature = "no_std"))]
-    let delta_joins = std::env::var("AREST_DELTA_JOINS").map(|v| v == "1").unwrap_or(false)
+    let delta_joins = std::env::var("AREST_DELTA_JOINS").map(|v| v != "0").unwrap_or(true)
         && initial_delta.is_some();
     #[cfg(feature = "no_std")]
     let delta_joins = false;
