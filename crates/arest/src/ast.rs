@@ -1441,6 +1441,135 @@ fn collect_func_reads(f: &Func, rs: &mut FuncReadSet) {
     }
 }
 
+// ── delta-occ-3: per-occurrence read rewriting ───────────────────────
+//
+// occ-1's [`func_read_set`] gives the SET of cells a Func reads. True
+// semi-naive evaluation of a SELF-JOIN (or any rule reading one cell at
+// several occurrences) needs to vary the delta ONE OCCURRENCE AT A TIME:
+//   R :- A(x,y), A(y,z)   ⇒   ΔR = (ΔA ⋈ A) ∪ (A ⋈ ΔA)
+// A whole-cell view swap can only produce ΔA ⋈ ΔA (both occurrences
+// swapped together), which misses the cross terms. The two helpers below
+// let the caller (semi_naive_inner) enumerate a cell's read occurrences
+// and rebuild the Func with exactly ONE occurrence reading a synthetic
+// delta cell while every other occurrence keeps the full population —
+// the "compiled-Func parameterization" the shipped-dark note called for.
+//
+// Both mirror [`collect_func_reads`]'s recognition of the fetch shape
+//   Compose(FetchOrPhi|Fetch, Construction([Constant(atom(cell)), <pop>]))
+// and [`normalize_children`]'s rebuild over every compound variant.
+
+/// Number of literal-name read occurrences of `cell` in `f` (delta-occ-3).
+/// Each is an independent semi-naive delta site. A cell the Func reads
+/// only indirectly (through a `Def`, or via a runtime-computed name)
+/// contributes 0 — the caller must full-evaluate such a rule, since a
+/// per-occurrence rewrite cannot reach an indirect read.
+pub fn func_read_occurrence_count(f: &Func, cell: &str) -> usize {
+    let mut n = 0usize;
+    count_read_occ(f, cell, &mut n);
+    n
+}
+
+fn count_read_occ(f: &Func, cell: &str, n: &mut usize) {
+    match f {
+        Func::Compose(g, h) if matches!(**g, Func::Fetch | Func::FetchOrPhi) => {
+            match &**h {
+                Func::Construction(elems) if !elems.is_empty() => {
+                    if let Func::Constant(obj) = &elems[0] {
+                        if obj.as_atom() == Some(cell) { *n += 1; }
+                    } else {
+                        count_read_occ(&elems[0], cell, n);
+                    }
+                    for e in &elems[1..] { count_read_occ(e, cell, n); }
+                }
+                other => count_read_occ(other, cell, n),
+            }
+        }
+        Func::Compose(g, h) => { count_read_occ(g, cell, n); count_read_occ(h, cell, n); }
+        Func::Construction(v) => for g in v { count_read_occ(g, cell, n); },
+        Func::Condition(a, b, c) => {
+            count_read_occ(a, cell, n); count_read_occ(b, cell, n); count_read_occ(c, cell, n);
+        }
+        Func::While(a, b) => { count_read_occ(a, cell, n); count_read_occ(b, cell, n); }
+        Func::ApplyToAll(g) | Func::Insert(g) | Func::Filter(g) | Func::FoldL(g)
+        | Func::IndexBy(g) | Func::OrderBy(g) | Func::BinaryToUnary(g, _) =>
+            count_read_occ(g, cell, n),
+        _ => {}
+    }
+}
+
+/// Clone `f`, rewriting the `target`-th literal-name read occurrence of
+/// `cell` (left-to-right walk order, same order as
+/// [`func_read_occurrence_count`]) so it fetches `new_name` instead
+/// (delta-occ-3). Every OTHER occurrence — including other reads of the
+/// same `cell` — is preserved. The caller injects the delta rows into
+/// the state under `new_name`, leaving `cell` at full population, so the
+/// rewritten variant evaluates exactly the semi-naive term that varies
+/// this one occurrence. `target` ≥ the occurrence count is a no-op clone.
+pub fn func_rewrite_read_occurrence(f: &Func, cell: &str, target: usize, new_name: &str) -> Func {
+    let mut cursor = 0usize;
+    rewrite_read_occ(f, cell, target, new_name, &mut cursor)
+}
+
+fn rewrite_read_occ(f: &Func, cell: &str, target: usize, new_name: &str, cursor: &mut usize) -> Func {
+    match f {
+        Func::Compose(g, h) if matches!(**g, Func::Fetch | Func::FetchOrPhi) => {
+            match &**h {
+                Func::Construction(elems) if !elems.is_empty() => {
+                    let mut new_elems: Vec<Func> = Vec::with_capacity(elems.len());
+                    match &elems[0] {
+                        Func::Constant(obj) if obj.as_atom() == Some(cell) => {
+                            if *cursor == target {
+                                new_elems.push(Func::Constant(Object::atom(new_name)));
+                            } else {
+                                new_elems.push(elems[0].clone());
+                            }
+                            *cursor += 1;
+                        }
+                        // A different literal cell, or a computed name —
+                        // the computed case may itself fetch `cell`, so recurse.
+                        other => new_elems.push(
+                            rewrite_read_occ(other, cell, target, new_name, cursor)),
+                    }
+                    for e in &elems[1..] {
+                        new_elems.push(rewrite_read_occ(e, cell, target, new_name, cursor));
+                    }
+                    Func::Compose(g.clone(), Box::new(Func::Construction(new_elems)))
+                }
+                other => Func::Compose(
+                    g.clone(),
+                    Box::new(rewrite_read_occ(other, cell, target, new_name, cursor))),
+            }
+        }
+        Func::Compose(a, b) => Func::Compose(
+            Box::new(rewrite_read_occ(a, cell, target, new_name, cursor)),
+            Box::new(rewrite_read_occ(b, cell, target, new_name, cursor))),
+        Func::Construction(fs) => Func::Construction(
+            fs.iter().map(|g| rewrite_read_occ(g, cell, target, new_name, cursor)).collect()),
+        Func::Condition(p, t, e) => Func::Condition(
+            Box::new(rewrite_read_occ(p, cell, target, new_name, cursor)),
+            Box::new(rewrite_read_occ(t, cell, target, new_name, cursor)),
+            Box::new(rewrite_read_occ(e, cell, target, new_name, cursor))),
+        Func::ApplyToAll(inner) =>
+            Func::ApplyToAll(Box::new(rewrite_read_occ(inner, cell, target, new_name, cursor))),
+        Func::Insert(inner) =>
+            Func::Insert(Box::new(rewrite_read_occ(inner, cell, target, new_name, cursor))),
+        Func::Filter(p) =>
+            Func::Filter(Box::new(rewrite_read_occ(p, cell, target, new_name, cursor))),
+        Func::BinaryToUnary(g, x) =>
+            Func::BinaryToUnary(Box::new(rewrite_read_occ(g, cell, target, new_name, cursor)), x.clone()),
+        Func::While(p, body) => Func::While(
+            Box::new(rewrite_read_occ(p, cell, target, new_name, cursor)),
+            Box::new(rewrite_read_occ(body, cell, target, new_name, cursor))),
+        Func::FoldL(g) =>
+            Func::FoldL(Box::new(rewrite_read_occ(g, cell, target, new_name, cursor))),
+        Func::IndexBy(g) =>
+            Func::IndexBy(Box::new(rewrite_read_occ(g, cell, target, new_name, cursor))),
+        Func::OrderBy(g) =>
+            Func::OrderBy(Box::new(rewrite_read_occ(g, cell, target, new_name, cursor))),
+        leaf => leaf.clone(),
+    }
+}
+
 fn apply_arithmetic(x: &Object, op: fn(f64, f64) -> Option<f64>) -> Object {
     match x.as_seq() {
         Some(items) if items.len() == 2 => {
@@ -7387,6 +7516,55 @@ mod tests {
         let rs = func_read_set(&Func::Def("derivation:rbd".to_string()));
         assert!(rs.def_refs.contains("derivation:rbd"));
         assert!(rs.literal.is_empty() && !rs.has_dynamic);
+    }
+
+    // delta-occ-3: per-occurrence read rewriting. The point is the
+    // SELF-JOIN — varying ONE occurrence's delta while the other stays at
+    // full population, which a whole-cell swap cannot express.
+    #[test]
+    fn occ3_rewrites_one_self_join_occurrence_at_a_time() {
+        let extract = |cell: &str| Func::compose(
+            Func::FetchOrPhi,
+            Func::construction(vec![Func::constant(Object::atom(cell)), Func::Id]),
+        );
+
+        // A self-join reads `edge` at two occurrences; occurrence 0 is
+        // nested under ApplyToAll so the two are positionally distinct in
+        // left-to-right walk order.
+        let self_join = Func::construction(vec![
+            Func::ApplyToAll(Box::new(extract("edge"))),
+            extract("edge"),
+        ]);
+        assert_eq!(func_read_occurrence_count(&self_join, "edge"), 2);
+        assert_eq!(func_read_occurrence_count(&self_join, "other"), 0);
+
+        // Rewriting occurrence 0 leaves exactly one full `edge` read and
+        // one synthetic-delta read.
+        let v0 = func_rewrite_read_occurrence(&self_join, "edge", 0, "\u{0394}edge");
+        assert_eq!(func_read_occurrence_count(&v0, "edge"), 1,
+            "one full `edge` read must remain after swapping occ 0");
+        assert_eq!(func_read_occurrence_count(&v0, "\u{0394}edge"), 1);
+
+        // Rewriting occurrence 1 also leaves one of each, but is a DIFFERENT
+        // variant — proving the two calls target different occurrences (so
+        // the union is ΔA⋈A ∪ A⋈ΔA, not ΔA⋈ΔA twice).
+        let v1 = func_rewrite_read_occurrence(&self_join, "edge", 1, "\u{0394}edge");
+        assert_eq!(func_read_occurrence_count(&v1, "edge"), 1);
+        assert_eq!(func_read_occurrence_count(&v1, "\u{0394}edge"), 1);
+        assert_ne!(format!("{:?}", v0), format!("{:?}", v1),
+            "occ 0 and occ 1 rewrites must produce structurally different funcs");
+
+        // A target past the occurrence count is a no-op clone.
+        let noop = func_rewrite_read_occurrence(&self_join, "edge", 9, "\u{0394}edge");
+        assert_eq!(format!("{:?}", noop), format!("{:?}", self_join));
+
+        // Rewriting touches only the named cell; a distinct co-antecedent
+        // is left fully intact (the classical 2-cell-join case).
+        let join = Func::construction(vec![extract("a"), extract("b")]);
+        let ra = func_rewrite_read_occurrence(&join, "a", 0, "\u{0394}a");
+        assert_eq!(func_read_occurrence_count(&ra, "a"), 0);
+        assert_eq!(func_read_occurrence_count(&ra, "b"), 1, "co-antecedent `b` untouched");
+        assert_eq!(func_read_occurrence_count(&ra, "\u{0394}a"), 1);
     }
 
     // delta-occ-2 soundness gate (empirically grounded on the real

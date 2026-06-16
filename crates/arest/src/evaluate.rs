@@ -1044,14 +1044,17 @@ fn semi_naive_inner(
                 // COMPLETENESS MARKER present (emitted only when every
                 // antecedent source is a FactType — partial sidecars
                 // now exist again for activation gating, so count
-                // arithmetic can no longer prove completeness) AND no
-                // duplicate reads AND not self-recursive — a SELF-JOIN
-                // or consequent-reader gets the whole cell swapped at
-                // EVERY occurrence under a view, yielding ΔA×ΔA and
-                // missing ΔA×A_full (fixture v10). Classical
-                // semi-naive needs per-OCCURRENCE deltas; whole-cell
-                // swaps cannot express that — full-eval them.
-                let view_ok = |r: &[String], name: &str| -> bool {
+                // arithmetic can no longer prove completeness) AND not
+                // consequent-recursive. delta-occ-3: self-joins and
+                // duplicate reads are NO LONGER excluded — the view path
+                // below now varies ONE read occurrence at a time
+                // (func_rewrite_read_occurrence), so ΔA⋈A_full and
+                // A_full⋈ΔA are both produced. Soundness guard: every
+                // sidecar read must be a LITERAL fetch in the Func (≥1
+                // occurrence) — a read reachable only indirectly (Def /
+                // computed name) cannot be rewritten per-occurrence and
+                // would silently under-derive, so full-eval such a rule.
+                let view_ok = |r: &[String], name: &str, func: &ast::Func| -> bool {
                     let Some((_, consequent)) = antecedent_meta.get(name) else { return false };
                     let id = name.split_once(':').map(|(_, i)| i).unwrap_or(name);
                     let marker = ast::fetch_or_phi(
@@ -1059,13 +1062,12 @@ fn semi_naive_inner(
                     if matches!(marker, ast::Object::Bottom) || marker == ast::Object::phi() {
                         return false;
                     }
-                    let uniq: hashbrown::HashSet<&str> =
-                        r.iter().map(|s| s.as_str()).collect();
-                    uniq.len() == r.len() && !r.iter().any(|c| c == consequent)
+                    if r.iter().any(|c| c == consequent) { return false; }
+                    r.iter().all(|c| ast::func_read_occurrence_count(func, c) >= 1)
                 };
                 match reads {
                     Some(r) if !name.starts_with("derivation:_sm_")
-                        && view_ok(r, name) =>
+                        && view_ok(r, name, func) =>
                         view_defs.push((*name, *func, r)),
                     _ => full_defs.push((*name, *func)),
                 }
@@ -1095,44 +1097,58 @@ fn semi_naive_inner(
                 for (name, func, reads) in view_defs {
                     let name_s = name.to_string();
                     for cell in reads.iter().filter(|c| delta.contains_key(c.as_str())) {
-                        let t_def = crate::time_shim::Instant::now();
+                        // delta-occ-3: PER-OCCURRENCE deltas. The view is
+                        // the full population PLUS one synthetic cell
+                        // holding this antecedent's delta rows; it is the
+                        // SAME for every occurrence of `cell`, so build it
+                        // once. Then, for each read occurrence, rewrite
+                        // THAT occurrence to fetch the synthetic cell while
+                        // every other occurrence (including other reads of
+                        // `cell` — the self-join case) keeps reading the
+                        // full population. The union over occurrences is
+                        // (ΔA⋈A) ∪ (A⋈ΔA) for a 2-occurrence self-join, and
+                        // the classical single-term ΔA⋈B for a lone read.
+                        let occ_count = ast::func_read_occurrence_count(func, cell);
+                        if occ_count == 0 { continue; }
                         let delta_rows = encode_rows(delta.get(cell.as_str())
                             .expect("filtered on contains_key"));
+                        // Synthetic name carries a Δ prefix that no compiled
+                        // FT cell uses, so it cannot shadow a real cell.
+                        let synth = alloc::format!("\u{0394}occ:{}", cell);
                         let view: ast::Object = match &encoded {
-                            ast::Object::Seq(entries) => ast::Object::Seq(
-                                entries.iter().map(|e| {
-                                    let is_target = e.as_seq()
-                                        .and_then(|p| p.first()
-                                            .and_then(|a| a.as_atom()))
-                                        .map(|s| s == cell.as_str())
-                                        .unwrap_or(false);
-                                    if is_target {
-                                        ast::Object::seq(vec![
-                                            ast::Object::atom(cell),
-                                            delta_rows.clone(),
-                                        ])
-                                    } else { e.clone() }
-                                }).collect::<Vec<_>>().into()),
+                            ast::Object::Seq(entries) => {
+                                let mut v: Vec<ast::Object> =
+                                    Vec::with_capacity(entries.len() + 1);
+                                v.extend(entries.iter().cloned());
+                                v.push(ast::Object::seq(vec![
+                                    ast::Object::atom(&synth), delta_rows]));
+                                ast::Object::Seq(v.into())
+                            }
                             other => other.clone(),
                         };
-                        let result = ast::apply(func, &view, d);
-                        let cands: Vec<DerivedFact> = result.as_seq().into_iter()
-                            .flat_map(|items| items.iter().cloned().collect::<Vec<_>>())
-                            .filter_map(|item| parse_derived_fact(&item, &name_s))
-                            .collect();
-                        let cands = enforce_value_constraints_on_candidates(cands, &vcs);
-                        for cand in cands {
-                            let key = fact_key(&cand);
-                            if !existing_keys.contains(&key)
-                                && !derived_keys.contains(&key)
-                                && round_keys.insert(key)
-                            {
-                                round_facts.push(cand);
+                        for occ in 0..occ_count {
+                            let t_def = crate::time_shim::Instant::now();
+                            let variant =
+                                ast::func_rewrite_read_occurrence(func, cell, occ, &synth);
+                            let result = ast::apply(&variant, &view, d);
+                            let cands: Vec<DerivedFact> = result.as_seq().into_iter()
+                                .flat_map(|items| items.iter().cloned().collect::<Vec<_>>())
+                                .filter_map(|item| parse_derived_fact(&item, &name_s))
+                                .collect();
+                            let cands = enforce_value_constraints_on_candidates(cands, &vcs);
+                            for cand in cands {
+                                let key = fact_key(&cand);
+                                if !existing_keys.contains(&key)
+                                    && !derived_keys.contains(&key)
+                                    && round_keys.insert(key)
+                                {
+                                    round_facts.push(cand);
+                                }
                             }
-                        }
-                        if chain_timings {
-                            *def_times.entry(name_s.clone().into()).or_default() +=
-                                t_def.elapsed();
+                            if chain_timings {
+                                *def_times.entry(name_s.clone().into()).or_default() +=
+                                    t_def.elapsed();
+                            }
                         }
                     }
                 }
