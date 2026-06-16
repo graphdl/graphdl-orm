@@ -6074,6 +6074,15 @@ Animal 'fido' has Owner 'alice'.\n\
     // the view gate reads (omitting them silently forces full-eval and makes
     // the equivalence vacuous — the reflect_then_defs trap the two-hop test
     // documents); a non-vacuity assert guards against that.
+    //
+    // Real-apply speedup (delta-occ-4 (a) measurement, 2026-06-16): on the
+    // tasks corpus (~18MB), a 1-file instance-only leaf-ingest delta, debug
+    // build, the seeded `chain` lap is ~2.62s with AREST_DELTA_JOINS=1 vs
+    // ~3.13s naive (~16% faster), deriving an identical 78 facts across reps.
+    // Modest here because only occ-2's 23 view-complete rules take the delta
+    // path (the 64 dynamic-read rules still full-eval until occ-3); the
+    // 82.5s->8.0s figure is arc-scale (171MB), where per-round full-population
+    // rescans dominate. Confirms the path is correct AND faster on a real apply.
     #[test]
     fn delta_joins_equivalence_real_metamodel_marked_subset() {
         let state = crate::metamodel_state();
