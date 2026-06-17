@@ -1332,6 +1332,24 @@ describe('per-call app scoping (p0 mcp-active-app-isolation, option b)', () => {
       })
     }
 
+    // apps.compile is NOT a systemCall-scoped verb (it targets the app
+    // REGISTRY, not a read/write through the active engine), so it uses a
+    // different override shape: `app=` selects which app's readings to
+    // compile WITHOUT activating it — multi-app consistency with the verbs
+    // above. Regression: `app=` used to be ignored, silently compiling the
+    // ACTIVE app instead of the named target.
+    it("'apps.compile' accepts an `app=` override that compiles without activating", () => {
+      const config = sliceConfig('apps.compile')
+      expect(config, 'apps.compile: missing app input field')
+        .toMatch(/app:\s*z\.string\(\)\.optional\(\)/)
+      // Target resolved from the override first, then the legacy `name`.
+      expect(config, 'apps.compile: target not resolved from `app ?? name`')
+        .toMatch(/app\s*\?\?\s*name/)
+      // The `app=` override must NEVER activate (leave the session active app intact).
+      expect(config, 'apps.compile: `app=` override must not activate')
+        .toMatch(/shouldActivate\s*=\s*app\s*\?\s*false/)
+    })
+
     it('resolveCallScope NEVER writes the global activeApp or the marker', () => {
       // The whole bug is a shared mutated global. The per-call resolver
       // must be pure: it may call resolveArestApp (a pure fs read) but

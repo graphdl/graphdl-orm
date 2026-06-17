@@ -1180,14 +1180,18 @@ server.registerTool(
     description:
       'Re-compile an app\'s readings/*.md INTO its SQLite .db (full refresh; readings are the source of truth). WHEN: apps.status reports stale=true, or you have just edited readings/ for an app and need the engine to see them. ALTERNATIVE: compile (no `apps.` prefix) when you want to ADD readings to the LIVE active engine without rebuilding the DB on disk (Corollary 5 — in-process self-modification, no file write); use apps.compile when you want the DB on disk to reflect the readings. GOTCHA: this refreshes the SCHEMA from readings while PRESERVING live population — per Closure Under Self-Modification (cor:closure), the load reads the existing DB and merges the freshly-parsed schema over the prior population, so apply-created entity facts survive (FT cells like Task_has_Task_Subject and SM cells like State_Machine_is_currently_in_Status are carried forward; identity-aware merge_states dedupes overlaps). Only readings-derived schema cells (Noun, FactType, Constraint, derivation rules) and internal derived cells (names containing a colon) are regenerated — live apply facts are NOT wiped (see cli/entry.rs run_load: "preserving N user-population cells from existing DB"). The verb refuses on library entries and on apps with zero .md files. NEXT: apps.status to confirm stale=false, then apps.use (if activate=false was set) and orient.',
     inputSchema: {
-      name: z.string().optional().describe('AREST app name. Defaults to the active app.'),
-      activate: z.boolean().optional().describe('Make the compiled app active. Default true when name is provided, otherwise leaves current active app.'),
+      name: z.string().optional().describe('AREST app name. Defaults to the active app. Compiling by `name` activates it by default (set activate=false to keep the current active app).'),
+      app: z.string().optional().describe('Per-call app override (multi-app scoping): compile THIS app WITHOUT changing the session active app — the same `app=` convention query/apply/retract use. Takes precedence over `name`, and never activates.'),
+      activate: z.boolean().optional().describe('Make the compiled app active. Default true when `name` is given; always false when the `app=` override is used.'),
     },
   },
-  async ({ name, activate }) => {
+  async ({ name, app, activate }) => {
     if (AREST_MODE !== 'local') return textResult({ error: 'apps.compile requires local mode' })
 
-    const target = name ? resolveArestApp(name, appRegistryOptions()) : activeApp
+    // `app=` is the multi-app per-call override (compile a non-active app without
+    // switching); `name` is the legacy activating form. `app` wins when both given.
+    const targetName = app ?? name
+    const target = targetName ? resolveArestApp(targetName, appRegistryOptions()) : activeApp
     const before = inspectArestApp(target, appRegistryOptions())
     if (before.health.status === 'library') {
       return textResult({
@@ -1205,7 +1209,10 @@ server.registerTool(
     }
     const { stdout, stderr } = await compileAppReadings(target)
     const refreshed = resolveArestApp(target.name, appRegistryOptions())
-    const shouldActivate = name ? activate !== false : activate === true
+    // The `app=` override never activates (multi-app: leave the session active app
+    // untouched); `name` activates by default unless activate===false; a bare call
+    // activates only if activate===true.
+    const shouldActivate = app ? false : (name ? activate !== false : activate === true)
     if (shouldActivate) activateApp(refreshed.name)
 
     return textResult({
