@@ -1624,6 +1624,33 @@ fn resolve_derivation_rule(
     // ORIGINAL rule text — only this local resolution view drops them.
     let resolve_fact_type = |fragment: &str| -> Option<String> {
         let cleaned = strip_role_variables(&strip_anaphora(fragment));
+        // valuetyped-join-key-noun-inflation: exact-reading match FIRST,
+        // mirroring `resolve_consequent_strict` below. An antecedent clause
+        // whose VERB phrase contains a word that case-insensitively collides
+        // with a declared type name — e.g. `Shape has confidence Count` when
+        // the metamodel declares `Confidence is a value type` — has its role
+        // set inflated by `find_nouns` ([Shape, confidence, Count] instead of
+        // [Shape, Count]), so the verb/role-set rho-lookup below MISSES and
+        // the clause is dropped, collapsing a 2-antecedent join to one and
+        // losing the projected non-key role (the `Count` in the consequent
+        // head). Normalising the clause's tokens (strip Halpin subscripts,
+        // lowercase) and comparing to each declared FT's reading binds it
+        // directly, independent of the noun-extraction path. An exact reading
+        // match is the most specific resolution; non-matches fall through to
+        // the verb/role-set path unchanged. (Halpin §9.7 p383: a conceptual
+        // join must propagate the joined role; the rule is Ullman-safe, so
+        // this is an evaluation/resolution gap, not an unsafe rule.)
+        let norm_reading = |s: &str| s.split_whitespace()
+            .map(|t| parse_role_token(t).0.to_lowercase())
+            .collect::<Vec<_>>().join(" ");
+        let clause_norm = norm_reading(&cleaned);
+        if !clause_norm.is_empty() {
+            if let Some((id, _)) = fact_types_map.iter()
+                .find(|(_, ft)| norm_reading(&ft.reading) == clause_norm)
+            {
+                return Some(id.clone());
+            }
+        }
         let found_nouns: Vec<(usize, usize, String)> = find_nouns(&cleaned, &noun_names);
         if found_nouns.is_empty() { return None; }
         let base_refs: Vec<String> = found_nouns.iter()

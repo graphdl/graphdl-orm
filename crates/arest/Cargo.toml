@@ -257,6 +257,19 @@ name = "antecedent_literal_value_comparison_e2e"
 path = "tests/antecedent_literal_value_comparison_e2e.rs"
 required-features = ["test-bins"]
 
+# Value-typed JOIN KEY projection. A derivation that joins two FTs on a
+# VALUE-TYPED role (`Problem wins by Shape` ⋈ `Shape has confidence Count`
+# on Shape) must project the OTHER role of the second antecedent (`Count`)
+# into the consequent head (`Problem ranks Shape at Count`). Regression:
+# the value-typed join key dropped the projected non-key role, leaving
+# Count UNBOUND. Halpin §9.7 p383 — a conceptual join propagates the
+# joined role across the join. Control: an ENTITY-typed join key projects
+# the same shape fine, so the trigger is specifically the value-typed key.
+[[test]]
+name = "valuetyped_join_key_projection_e2e"
+path = "tests/valuetyped_join_key_projection_e2e.rs"
+required-features = ["test-bins"]
+
 # Subtype-join → supertype FT derivation-resolver gap. A derivation
 # whose join clause has a SUBTYPE subject (`that Noun belongs to Domain`)
 # but whose target FT is declared on the SUPERTYPE (`Function belongs to
