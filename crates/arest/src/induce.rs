@@ -729,29 +729,65 @@ fn project_instance_fact_to_per_ft(candidate: &Object) -> Object {
     fact_from_pairs(&pair_refs)
 }
 
-/// Membership test for a `to_explain` fact (InstanceFact-shape) in a
-/// post-LFP state. Project the target to per-FT shape, fetch the
-/// matching per-FT cell, and test for any fact whose bindings
-/// superset-cover the target's. Order-independent (per-FT cells write
-/// pairs in declared role order, but the check tolerates re-ordering
-/// for robustness against future cell-shape evolution).
+/// Membership test for a `to_explain` fact in a post-LFP state. Accepts
+/// TWO target shapes:
+///   1. Canonical InstanceFact (carries `fieldName` + subjectNoun /
+///      objectNoun / values): project to per-FT pairs and match in the
+///      named cell. The shape the Sherlock/test fixtures build directly.
+///   2. Role-keyed per-FT pairs (e.g. `{Cell:a, Color:5}`) with NO
+///      `fieldName` — the shape the MCP `induce` shim renders `to_explain`
+///      facts as. The target's own kv-pairs ARE the match shape; with no
+///      `fieldName` to name a cell, accept a superset-match in ANY
+///      post-state cell ("the candidate makes this binding derivable
+///      somewhere in the forward-chain closure").
+/// Fixes induce-coverage-gate-returns-empty: a missing `fieldName`
+/// previously short-circuited to `false`, so every candidate failed
+/// coverage and induce returned `[]`. Either shape matches by
+/// superset-cover, order-independent. Cells are read via `fetch_cell_seq`
+/// so Map-folded per-FT cells flatten (a raw `as_seq` returns None on a Map).
 fn target_in_post_state(target: &Object, post_state: &Object) -> bool {
-    let Some(ft_id) = binding(target, "fieldName") else { return false; };
-    if ft_id.is_empty() { return false; }
-    let projected = project_instance_fact_to_per_ft(target);
-    let target_pairs: Vec<(&str, &str)> = match projected.as_seq() {
+    match binding(target, "fieldName").filter(|s| !s.is_empty()) {
+        // (1) Canonical InstanceFact: project to per-FT pairs, match the named cell.
+        Some(ft_id) => {
+            let projected = project_instance_fact_to_per_ft(target);
+            let target_pairs = target_match_pairs(&projected);
+            if target_pairs.is_empty() { return false; }
+            let cell = fetch_cell_seq(ft_id, post_state);
+            let Some(facts) = cell.as_seq() else { return false; };
+            facts.iter().any(|fact| {
+                target_pairs.iter().all(|(k, v)| binding(fact, k) == Some(*v))
+            })
+        }
+        // (2) Role-keyed target (MCP induce shim shape): its own kv-pairs ARE the
+        // per-FT match shape; with no fieldName, superset-match in any post cell.
+        None => {
+            let target_pairs = target_match_pairs(target);
+            if target_pairs.is_empty() { return false; }
+            crate::ast::cells_iter(post_state).into_iter().any(|(name, _contents)| {
+                let cell = fetch_cell_seq(name, post_state);
+                match cell.as_seq() {
+                    Some(facts) => facts.iter().any(|fact| {
+                        target_pairs.iter().all(|(k, v)| binding(fact, k) == Some(*v))
+                    }),
+                    None => false,
+                }
+            })
+        }
+    }
+}
+
+/// Extract `(role, value)` match-pairs from a per-FT-shaped Object (a Seq
+/// of `<role, value>` pairs) — shared by `target_in_post_state` for both
+/// the projected canonical target and the already-per-FT role-keyed target.
+fn target_match_pairs(o: &Object) -> Vec<(&str, &str)> {
+    match o.as_seq() {
         Some(items) => items.iter().filter_map(|p| {
             let kv = p.as_seq()?;
             if kv.len() != 2 { return None; }
             Some((kv[0].as_atom()?, kv[1].as_atom()?))
         }).collect(),
-        None => return false,
-    };
-    let cell = fetch_cell_seq(ft_id, post_state);
-    let Some(facts) = cell.as_seq() else { return false; };
-    facts.iter().any(|fact| {
-        target_pairs.iter().all(|(k, v)| binding(fact, k) == Some(*v))
-    })
+        None => Vec::new(),
+    }
 }
 
 // ─── #856 Rule induction primitive ────────────────────────────────────────
@@ -1621,6 +1657,38 @@ Thing has Other.
         let pointer = &hidden.as_seq().expect("hidden seq")[0];
         assert_eq!(binding(pointer, "Side"), Some("tails"),
             "the surviving candidate must carry the bound Side value");
+    }
+
+    /// Repro + fix guard for induce-coverage-gate-returns-empty. The MCP
+    /// `induce` shim renders `to_explain` targets ROLE-KEYED (e.g.
+    /// `{Cell:a, Color:5}`) with no `fieldName`; `target_in_post_state`
+    /// must still match them against the derived cell, else every
+    /// candidate fails the coverage gate and induce returns `[]`.
+    #[test]
+    fn coverage_gate_matches_role_keyed_to_explain_target() {
+        use crate::ast::cell_push;
+        // Post-LFP state with a derived Cell_predicts_Color fact {Cell:a, Color:5}.
+        let post = cell_push(
+            "Cell_predicts_Color",
+            fact_from_pairs(&[("Cell", "a"), ("Color", "5")]),
+            &Object::phi(),
+        );
+        // (1) role-keyed target (no fieldName) — the MCP shim shape — must match.
+        let role_keyed = fact_from_pairs(&[("Cell", "a"), ("Color", "5")]);
+        assert!(target_in_post_state(&role_keyed, &post),
+            "role-keyed to_explain target must match its derived cell");
+        // (2) a role-keyed target NOT derivable must not match (no false positive).
+        let absent = fact_from_pairs(&[("Cell", "a"), ("Color", "9")]);
+        assert!(!target_in_post_state(&absent, &post),
+            "an underivable role-keyed target must not match");
+        // (3) regression: canonical InstanceFact target still matches via fieldName.
+        let canonical = fact_from_pairs(&[
+            ("subjectNoun", "Cell"), ("subjectValue", "a"),
+            ("objectNoun", "Color"), ("objectValue", "5"),
+            ("fieldName", "Cell_predicts_Color"),
+        ]);
+        assert!(target_in_post_state(&canonical, &post),
+            "canonical InstanceFact target must still match via the fieldName path");
     }
 
     // ─── #852 Scoring Rules — rank Hypothesis Candidates by Confidence Score ──
