@@ -656,7 +656,7 @@ fn build_hypothesis_candidate(
         Vec::from([project_instance_fact_to_per_ft(candidate)]).into());
     let explains = Object::Seq(
         to_explain.iter()
-            .map(project_instance_fact_to_per_ft)
+            .map(project_to_explain_to_per_ft)
             .collect::<Vec<Object>>()
             .into());
     let mut state = Object::phi();
@@ -729,40 +729,39 @@ fn project_instance_fact_to_per_ft(candidate: &Object) -> Object {
     fact_from_pairs(&pair_refs)
 }
 
-/// Membership test for a `to_explain` fact in a post-LFP state. Accepts
-/// TWO target shapes:
-///   1. Canonical InstanceFact (carries `fieldName` + subjectNoun /
-///      objectNoun / values): project to per-FT pairs and match in the
-///      named cell. The shape the Sherlock/test fixtures build directly.
-///   2. Role-keyed per-FT pairs (e.g. `{Cell:a, Color:5}`) with NO
-///      `fieldName` — the shape the MCP `induce` shim renders `to_explain`
-///      facts as. The target's own kv-pairs ARE the match shape; with no
-///      `fieldName` to name a cell, accept a superset-match in ANY
-///      post-state cell ("the candidate makes this binding derivable
-///      somewhere in the forward-chain closure").
-/// Fixes induce-coverage-gate-returns-empty: a missing `fieldName`
-/// previously short-circuited to `false`, so every candidate failed
-/// coverage and induce returned `[]`. Either shape matches by
-/// superset-cover, order-independent. Cells are read via `fetch_cell_seq`
-/// so Map-folded per-FT cells flatten (a raw `as_seq` returns None on a Map).
+/// Membership test for a `to_explain` fact in a post-LFP state. Accepts the
+/// three shapes the engine sees, all normalised by `project_to_explain_to_per_ft`:
+///   1. Canonical InstanceFact (`subjectNoun`/`objectNoun`/... + `fieldName`) —
+///      the shape Sherlock/test fixtures build.
+///   2. Concise `{fieldName, <role>:<value>, ...}` — names the FT and carries
+///      role-keyed values; the natural shape for a hand-written `to_explain`.
+///   3. Bare `{<role>:<value>, ...}` (no `fieldName`) — ambiguous shorthand.
+/// Shapes 1 & 2 carry a `fieldName`, so the role-pairs are matched in THAT cell
+/// (scoped: a `Cell_predicts_Color` target cannot false-match a same-shaped GIVEN
+/// cell like `Cell_has_output_Color`). Shape 3 has no FT to scope to, so it falls
+/// back to a best-effort superset-match in ANY post cell. Fixes
+/// induce-coverage-gate-returns-empty (a missing `fieldName` previously
+/// short-circuited to `false`, so every candidate failed coverage → `[]`). Cells
+/// are read via `fetch_cell_seq` so Map-folded per-FT cells flatten.
 fn target_in_post_state(target: &Object, post_state: &Object) -> bool {
+    // Normalise the target to per-FT pairs ONCE (handles all three shapes).
+    let projected = project_to_explain_to_per_ft(target);
+    let target_pairs = target_match_pairs(&projected);
+    if target_pairs.is_empty() { return false; }
     match binding(target, "fieldName").filter(|s| !s.is_empty()) {
-        // (1) Canonical InstanceFact: project to per-FT pairs, match the named cell.
+        // FT named (canonical OR concise): scope the match to THAT cell, so a
+        // target for e.g. Cell_predicts_Color cannot false-match a same-shaped
+        // GIVEN cell like Cell_has_output_Color.
         Some(ft_id) => {
-            let projected = project_instance_fact_to_per_ft(target);
-            let target_pairs = target_match_pairs(&projected);
-            if target_pairs.is_empty() { return false; }
             let cell = fetch_cell_seq(ft_id, post_state);
             let Some(facts) = cell.as_seq() else { return false; };
             facts.iter().any(|fact| {
                 target_pairs.iter().all(|(k, v)| binding(fact, k) == Some(*v))
             })
         }
-        // (2) Role-keyed target (MCP induce shim shape): its own kv-pairs ARE the
-        // per-FT match shape; with no fieldName, superset-match in any post cell.
+        // No FT (bare role-keyed shorthand): ambiguous — best-effort superset-match
+        // in ANY post-state cell. Prefer the concise {fieldName, role:val} shape.
         None => {
-            let target_pairs = target_match_pairs(target);
-            if target_pairs.is_empty() { return false; }
             crate::ast::cells_iter(post_state).into_iter().any(|(name, _contents)| {
                 let cell = fetch_cell_seq(name, post_state);
                 match cell.as_seq() {
@@ -773,6 +772,30 @@ fn target_in_post_state(target: &Object, post_state: &Object) -> bool {
                 }
             })
         }
+    }
+}
+
+/// Normalise a `to_explain` target to per-FT `<role,value>` pairs, accepting all
+/// three shapes: canonical InstanceFact (carries `subjectNoun`) goes through
+/// `project_instance_fact_to_per_ft`; concise `{fieldName, role:val, ...}` and
+/// bare `{role:val, ...}` already ARE role-keyed pairs, so drop only the
+/// `fieldName` meta-pair (when present) and keep the rest. Lets the coverage gate
+/// AND the explains-Fact builder treat a hand-written, FT-named to_explain the
+/// same as a Sherlock-fixture InstanceFact.
+fn project_to_explain_to_per_ft(target: &Object) -> Object {
+    if binding(target, "subjectNoun").is_some() {
+        return project_instance_fact_to_per_ft(target);
+    }
+    match target.as_seq() {
+        Some(items) => Object::Seq(
+            items.iter()
+                .filter(|p| p.as_seq()
+                    .and_then(|kv| kv.first())
+                    .and_then(|k| k.as_atom()) != Some("fieldName"))
+                .cloned()
+                .collect::<Vec<Object>>()
+                .into()),
+        None => Object::phi(),
     }
 }
 
@@ -1689,6 +1712,30 @@ Thing has Other.
         ]);
         assert!(target_in_post_state(&canonical, &post),
             "canonical InstanceFact target must still match via the fieldName path");
+    }
+
+    /// Concise + FT-scoped to_explain: a `{fieldName, role:val}` target must match
+    /// its NAMED FT cell and NOT a same-shaped fact in a different (GIVEN) cell.
+    /// Guards induce-demo's real case — Cell_has_output_Color carries a->5 too, so
+    /// an unscoped match would false-pass every candidate.
+    #[test]
+    fn coverage_gate_concise_to_explain_scopes_to_named_ft() {
+        use crate::ast::cell_push;
+        let mut post = cell_push("Cell_predicts_Color",
+            fact_from_pairs(&[("Cell", "a"), ("Color", "5")]), &Object::phi());
+        post = cell_push("Cell_has_output_Color",
+            fact_from_pairs(&[("Cell", "a"), ("Color", "7")]), &post);
+        // concise, present in the NAMED FT -> matches.
+        let hit = fact_from_pairs(&[
+            ("fieldName", "Cell_predicts_Color"), ("Cell", "a"), ("Color", "5")]);
+        assert!(target_in_post_state(&hit, &post),
+            "concise to_explain must match its named FT cell");
+        // concise, value present only in ANOTHER cell (Cell_has_output_Color a->7)
+        // -> must NOT match: the fieldName scopes the search to Cell_predicts_Color.
+        let miss = fact_from_pairs(&[
+            ("fieldName", "Cell_predicts_Color"), ("Cell", "a"), ("Color", "7")]);
+        assert!(!target_in_post_state(&miss, &post),
+            "concise to_explain must NOT match a same-shaped fact in a different cell");
     }
 
     // ─── #852 Scoring Rules — rank Hypothesis Candidates by Confidence Score ──
