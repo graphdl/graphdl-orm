@@ -2728,6 +2728,63 @@ pub(crate) fn sm_family_consequent_cells(d: &ast::Object) -> hashbrown::HashSet<
         .collect()
 }
 
+/// recommendation-derivation-stale-on-mutation: the forward-reachable set of
+/// derived consequent cells from a mutation `seed`, following the derivation
+/// reads→consequent graph to a fixpoint.
+///
+/// The #836 apply wipe is noun-scoped (`derivation_index[noun]`), so it only
+/// clears THIS noun's consequents. A CROSS-NOUN cell whose rule the mutation
+/// still re-fires — e.g. `Task_has_Task_Status` (indexed under Resource but
+/// fed by the SM status a Task transition dirties), and the recommendation
+/// cascade below it — escapes the wipe. Left un-wiped, the full-mode re-derive
+/// ADDS the new value and `merge_delta` UNIONS it onto the stale old one, so
+/// the prior status survives (the live "completed task still recommended"
+/// staleness: every apply re-staled the slop, which the recommendation read).
+///
+/// Wiping this closure makes the apply path recompute every affected cell to
+/// its true LFP — matching what a whole-cell recompile produces — instead of
+/// accumulating. Callers filter sm_family / trigger cells back out (those are
+/// keyed-per-resource and self-correct via keyed upsert, so they must survive
+/// the wipe). Rules with no reads sidecar contribute nothing here: they run
+/// unconditionally every round regardless, so the chain re-derives them with
+/// or without a wipe; only the sidecar'd, seed-reachable rules need the clear.
+fn forward_reachable_consequents(
+    d: &ast::Object,
+    drule_cell: &ast::Object,
+    seed: &hashbrown::HashSet<String>,
+) -> hashbrown::HashSet<String> {
+    // (reads, consequent) per rule, decoded once.
+    let rules: Vec<(Vec<String>, String)> = drule_cell.as_seq()
+        .map(|facts| facts.iter().filter_map(|f| {
+            let id = ast::binding(f, "id")?;
+            let consequent = crate::types::ConsequentCellSource::decode(
+                ast::binding(f, "consequentFactTypeId")?).literal_id().to_string();
+            if consequent.is_empty() { return None; }
+            let reads = crate::evaluate::read_derivation_reads(d, id).unwrap_or_default();
+            Some((reads, consequent))
+        }).collect())
+        .unwrap_or_default();
+    // Monotone fixpoint: a rule's consequent joins the dirty/affected set once
+    // any of its reads is dirty. Bounded by the rule count (each consequent is
+    // added at most once); converges in ≤ derivation-depth passes.
+    let mut dirty = seed.clone();
+    let mut affected: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+    loop {
+        let mut grew = false;
+        for (reads, consequent) in &rules {
+            if !affected.contains(consequent.as_str())
+                && reads.iter().any(|r| dirty.contains(r.as_str()))
+            {
+                affected.insert(consequent.clone());
+                dirty.insert(consequent.clone());
+                grew = true;
+            }
+        }
+        if !grew { break; }
+    }
+    affected
+}
+
 /// apply-rederive (Fix 2, perf half): noun-scope the packed SM-fold
 /// family. The SM folds (`_sm_init_<N>` / `_sm_event_fold_<N>` /
 /// `_sm_for_resource_backfill_<N>` / `_sm_instance_of_def_backfill_<N>`)
@@ -3311,7 +3368,14 @@ fn transition_via_defs(
         // (the bridge `Task has Task Status iff Resource is currently in
         // Status and ...` reads the wiped-empty upstream and emits nothing).
         let drule_cell = ast::fetch_cell_seq("DerivationRule", d);
-        let dropped_cells: hashbrown::HashSet<String> = drule_cell.as_seq()
+        // recommendation-derivation-stale-on-mutation: extend the noun-scoped
+        // wipe with the forward-reachable consequent closure from the seed, so
+        // CROSS-NOUN cells the transition re-fires (e.g. Task_has_Task_Status,
+        // indexed under Resource but fed by the SM status this transition just
+        // dirtied) are wiped + recomputed to their LFP instead of unioned onto
+        // their stale prior value. sm_family/trigger cells are filtered out below.
+        let reachable_consequents = forward_reachable_consequents(d, &drule_cell, &seed);
+        let mut dropped_cells: hashbrown::HashSet<String> = drule_cell.as_seq()
             .map(|facts| facts.iter()
                 .filter(|f| relevant_ids.is_empty()
                     || ast::binding(f, "id")
@@ -3323,6 +3387,7 @@ fn transition_via_defs(
                 .filter(|s| !s.is_empty())
                 .collect())
             .unwrap_or_default();
+        dropped_cells.extend(reachable_consequents);
         // sm-trigger-cell guard (reconcile-vs-fold, 2026-06-08): drop SM trigger
         // cells back OUT of dropped_cells — they hold real transition events and
         // must never be wiped (see sm_trigger_cell_set). All downstream uses
@@ -8859,6 +8924,97 @@ Resource is mirroring Status.
         // (full-chain vs seeded) confirms no divergence. The load-bearing
         // claim for this guard is that Placed is REACHED across the
         // cross-noun edge.
+    }
+
+    /// recommendation-derivation-stale-on-mutation (the REAL fix): the apply
+    /// path must leave a cross-noun status bridge equal to the SM fold — the
+    /// CURRENT status ONLY, for EVERY entity — matching what a full recompile
+    /// (#836 whole-cell wipe + LFP) produces. The sibling test above ACCEPTS
+    /// a stale tuple "coexisting"; that coexistence IS the live tasks bug:
+    /// every apply re-staled `Task_has_Task_Status` with a spurious old
+    /// status that the recommendation then read. Two orders so we also catch
+    /// cross-entity corruption — a transition of ORD-1 must not touch ORD-2's
+    /// derived status.
+    #[test]
+    fn seeded_transition_bridge_matches_lfp_no_stale_no_crosstalk() {
+        const BRIDGE_READINGS: &str = r#"
+# seeded-transition-chain cross-noun fixture
+
+## Entity Types
+
+Resource(.Reference) is an entity type.
+State Machine(.id) is an entity type.
+
+## Fact Types
+
+State Machine is for Resource.
+State Machine is currently in Status.
+Resource is mirroring Status.
+
+## Derivation Rules
+
+* Resource is mirroring Status iff some State Machine is for that Resource and that State Machine is currently in that Status.
+"#;
+        let meta = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let orders = crate::parse_forml2::parse_to_state_with_nouns(ORDER_READINGS, &meta).unwrap();
+        let bridge = crate::parse_forml2::parse_to_state_with_nouns(BRIDGE_READINGS, &meta).unwrap();
+        let state = ast::merge_states(&ast::merge_states(&meta, &orders), &bridge);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_obj = ast::defs_to_state(&defs, &state);
+
+        // Create ORD-1 (SM init → Draft).
+        let mut f1 = HashMap::new();
+        f1.insert("orderNumber".to_string(), "ORD-1".to_string());
+        f1.insert("amount".to_string(), "100".to_string());
+        let c1 = apply_command_defs(&def_obj, &Command::CreateEntity {
+            noun: "Order".to_string(), domain: "orders".to_string(),
+            id: Some("ORD-1".to_string()), fields: f1, sender: None, signature: None,
+        }, &state);
+        assert!(!c1.rejected, "create ORD-1 rejected: {:?}", c1.violations);
+        let s1 = ast::merge_delta(&state, &c1.state, None);
+
+        // Create ORD-2 (SM init → Draft).
+        let mut f2 = HashMap::new();
+        f2.insert("orderNumber".to_string(), "ORD-2".to_string());
+        f2.insert("amount".to_string(), "200".to_string());
+        let c2 = apply_command_defs(&def_obj, &Command::CreateEntity {
+            noun: "Order".to_string(), domain: "orders".to_string(),
+            id: Some("ORD-2".to_string()), fields: f2, sender: None, signature: None,
+        }, &s1);
+        assert!(!c2.rejected, "create ORD-2 rejected: {:?}", c2.violations);
+        let s2 = ast::merge_delta(&s1, &c2.state, None);
+
+        // Transition ONLY ORD-1: Draft → Placed.
+        let t = apply_command_defs(&def_obj, &Command::Transition {
+            entity_id: "ORD-1".to_string(), event: "place".to_string(),
+            domain: "orders".to_string(), current_status: Some("Draft".to_string()),
+            sender: None, signature: None,
+        }, &s2);
+        assert!(!t.rejected, "transition rejected: {:?}", t.violations);
+        let after = ast::merge_delta(&s2, &t.state, None);
+
+        let mirror = |st: &ast::Object, res: &str| -> Vec<String> {
+            let mut v: Vec<String> = ast::fetch_cell_seq("Resource_is_mirroring_Status", st)
+                .as_seq()
+                .map(|fs| fs.iter()
+                    .filter(|f| ast::binding(f, "Resource") == Some(res))
+                    .filter_map(|f| ast::binding(f, "Status").map(String::from))
+                    .collect())
+                .unwrap_or_default();
+            v.sort();
+            v
+        };
+
+        // ORD-1: exactly Placed — no stale Draft coexisting.
+        assert_eq!(mirror(&after, "ORD-1"), vec!["Placed".to_string()],
+            "after Draft->Placed, ORD-1's bridge must hold ONLY Placed; a stale Draft \
+             coexisting is recommendation-derivation-stale-on-mutation — the apply path \
+             must match a full recompile's whole-cell LFP, not union the new status onto \
+             the stale one. Got: {:?}", mirror(&after, "ORD-1"));
+        // ORD-2: untouched — still exactly Draft, no crosstalk from ORD-1's txn.
+        assert_eq!(mirror(&after, "ORD-2"), vec!["Draft".to_string()],
+            "ORD-2 was not transitioned; its bridge must stay exactly Draft. Got: {:?}",
+            mirror(&after, "ORD-2"));
     }
 
     /// seeded-transition-chain (p2) — GATING / perf guard.
