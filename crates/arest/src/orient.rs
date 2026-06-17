@@ -30,8 +30,10 @@
 //     "suggested_next":  "Try: ..."
 //   }
 //
-// Counts come from the `Task_has_Task_Status` cell in the active
-// app's snapshot (the only DB the engine has loaded). Other apps in
+// Counts come from the core `Resource_is_currently_in_Status` cell —
+// the SM-derived latest-wins status, NOT the slop `Task_has_Task_Status`
+// bridge — in the active app's snapshot (the only DB the engine has
+// loaded). Other apps in
 // `apps_dir` surface as bare entries with `last_compile` from their
 // .db file mtime — no row counts (the engine has one snapshot at a
 // time). This keeps the verb cheap and predictable; agents that need
@@ -118,24 +120,27 @@ struct TaskCounts {
     completed: u64,
 }
 
-/// Count Task_has_Task_Status rows by status. Status values the
-/// apps/tasks domain emits today: 'ready', 'in_progress' (or
-/// 'in-progress'), 'completed'. Anything else falls into none of
-/// the three counters — the suggested_next template handles the
-/// "no tasks at all" path.
+/// Count tasks by their CURRENT state-machine status, read from the
+/// CORE object `Resource_is_currently_in_Status` (the SM event-fold,
+/// latest-wins) — NOT the denormalized `Task_has_Task_Status` bridge,
+/// which is a "slop" cell that accumulates un-retracted direct facts
+/// and drifts from SM truth (orient-reorient-snapshot). The tasks
+/// domain's SM statuses are pending / in_progress / blocked /
+/// completed / deleted; `ready` here means "actionable" = pending.
+/// blocked / deleted fall into none of the three counters — the
+/// suggested_next template handles the "no tasks at all" path.
 fn compute_task_counts(state: &Object) -> TaskCounts {
-    // #932 W6: `Task_has_Task_Status` is a per-field FT-image instance-fact
-    // cell — the parse materializer folds it to `Object::Map` (and the
-    // runtime keyed-entity path keeps it Map). A raw `fetch(...).as_seq()`
-    // returns None on a Map, silently zeroing every count. `fetch_cell_seq`
-    // flattens Map -> key-sorted Seq (and passes a legacy Seq through).
-    let cell = ast::fetch_cell_seq("Task_has_Task_Status", state);
+    // `Resource_is_currently_in_Status` (roles: Resource, Status) can be
+    // folded to `Object::Map` by the materializer; `fetch_cell_seq`
+    // flattens Map -> key-sorted Seq (and passes a legacy Seq through)
+    // so a raw `as_seq()` does not silently zero the counts.
+    let cell = ast::fetch_cell_seq("Resource_is_currently_in_Status", state);
     let Some(facts) = cell.as_seq() else { return TaskCounts::default() };
     let mut counts = TaskCounts::default();
     for fact in facts {
-        let Some(status) = ast::binding(fact, "Task Status") else { continue };
+        let Some(status) = ast::binding(fact, "Status") else { continue };
         match status {
-            "ready" => counts.ready += 1,
+            "pending" => counts.ready += 1,
             "in_progress" | "in-progress" => counts.in_progress += 1,
             "completed" => counts.completed += 1,
             _ => {}
@@ -414,28 +419,34 @@ mod tests {
         // Seed FactType so the schema cell exists.
         state = cell_push("FactType",
             fact_from_pairs(&[("id", "Task_has_Task_Status")]), &state);
-        // 3 ready, 2 in_progress, 4 completed.
+        // 3 pending (=ready), 2 in_progress, 4 completed — on the CORE
+        // `Resource_is_currently_in_Status` cell (the new count source).
         for i in 1..=3 {
-            state = cell_push("Task_has_Task_Status",
+            state = cell_push("Resource_is_currently_in_Status",
                 fact_from_pairs(&[
-                    ("Task", &format!("ready-{}", i)),
-                    ("Task Status", "ready"),
+                    ("Resource", &format!("ready-{}", i)),
+                    ("Status", "pending"),
                 ]), &state);
         }
         for i in 1..=2 {
-            state = cell_push("Task_has_Task_Status",
+            state = cell_push("Resource_is_currently_in_Status",
                 fact_from_pairs(&[
-                    ("Task", &format!("inprog-{}", i)),
-                    ("Task Status", "in_progress"),
+                    ("Resource", &format!("inprog-{}", i)),
+                    ("Status", "in_progress"),
                 ]), &state);
         }
         for i in 1..=4 {
-            state = cell_push("Task_has_Task_Status",
+            state = cell_push("Resource_is_currently_in_Status",
                 fact_from_pairs(&[
-                    ("Task", &format!("done-{}", i)),
-                    ("Task Status", "completed"),
+                    ("Resource", &format!("done-{}", i)),
+                    ("Status", "completed"),
                 ]), &state);
         }
+        // Stale slop row the counts MUST ignore: if compute_task_counts
+        // regressed to reading `Task_has_Task_Status`, this would wrongly
+        // bump in_progress to 3 (regression guard for orient-reorient-snapshot).
+        state = cell_push("Task_has_Task_Status",
+            fact_from_pairs(&[("Task", "stale-1"), ("Task Status", "in_progress")]), &state);
         state
     }
 
@@ -490,10 +501,10 @@ mod tests {
     #[test]
     fn accepts_alternate_in_progress_spelling_with_dash() {
         let mut state = Object::phi();
-        state = cell_push("Task_has_Task_Status",
-            fact_from_pairs(&[("Task", "1"), ("Task Status", "in-progress")]), &state);
-        state = cell_push("Task_has_Task_Status",
-            fact_from_pairs(&[("Task", "2"), ("Task Status", "in_progress")]), &state);
+        state = cell_push("Resource_is_currently_in_Status",
+            fact_from_pairs(&[("Resource", "1"), ("Status", "in-progress")]), &state);
+        state = cell_push("Resource_is_currently_in_Status",
+            fact_from_pairs(&[("Resource", "2"), ("Status", "in_progress")]), &state);
         let env = orient(&state, r#"{"active_app":"tasks"}"#);
         let v = parse_envelope(&env);
         let apps = v.get("apps").and_then(|a| a.as_array()).expect("apps");
