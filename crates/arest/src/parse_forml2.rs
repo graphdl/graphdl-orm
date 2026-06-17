@@ -1943,6 +1943,33 @@ fn resolve_derivation_rule(
             }
         }
     }
+    // derivation-literal-consequent-subject-binding: ALSO capture a LEADING
+    // (subject / first-role) entity-literal pin, e.g. `Site 'resolver' re-derives
+    // Cell`. The trailing path above only pins the LAST role (object/value
+    // literals like `... Classification 'X'`), so a subject literal was silently
+    // dropped and the emitted fact carried an unbound subject (an orphan tuple).
+    // FORML2 sanctions a constant subject in an apply-to-all derivation (alpha
+    // over Filter), so bind it. `find_nouns` already ignored the quoted segment
+    // when resolving the consequent FT, so the FT is unaffected either way.
+    if !rule.consequent_cell.is_empty_literal() {
+        if let Some(first_noun) = fact_types_map.get(rule.consequent_cell.literal_id())
+            .and_then(|ft| ft.roles.first())
+            .map(|r| r.noun_name.clone())
+        {
+            if let Some(rest) = consequent_text.trim().strip_prefix(first_noun.as_str()) {
+                if let Some(after_open) = rest.trim_start().strip_prefix('\'') {
+                    if let Some(end) = after_open.find('\'') {
+                        let lit = after_open[..end].to_string();
+                        if !lit.is_empty()
+                            && !rule.consequent_role_literals.iter().any(|c| c.role == first_noun) {
+                            rule.consequent_role_literals.push(
+                                crate::types::ConsequentRoleLiteral { role: first_noun, value: lit });
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Resolve antecedents, carrying inline-comparator filters AND
     // arithmetic-definitional clauses alongside. A definitional clause

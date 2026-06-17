@@ -90,6 +90,39 @@ fn decode_derived(out: &Object) -> Vec<(String, String, Vec<(String, String)>)> 
 // consequent fact whose role is pinned to a fixed atom regardless of
 // the antecedent's bindings.
 
+// derivation-literal-consequent-subject-binding: a consequent SUBJECT entity
+// literal (`Site 'resolver' owns Cell`) must bind into the emitted fact's FIRST
+// role. Previously only a TRAILING (last-role) literal bound, so a subject
+// literal was silently dropped -> the emitted fact carried an unbound subject.
+#[test]
+fn shape_literal_in_consequent_subject_pins_first_role() {
+    let src = r#"# Test
+Site(.Name) is an entity type.
+Cell(.Label) is an entity type.
+Name is a value type.
+Label is a value type.
+
+## Fact Types
+Cell is view-defined.
+Site owns Cell.
+
+## Derivation Rules
+* Site 'resolver' owns Cell iff Cell is view-defined.
+"#;
+    let (rule, _func) = parse_and_compile(src);
+    match &rule.consequent_cell {
+        ConsequentCellSource::Literal(id) => {
+            assert!(!id.is_empty(), "literal consequent cell id must resolve");
+        }
+        other => panic!("expected Literal(..), got {:?}", other),
+    }
+    assert!(
+        rule.consequent_role_literals.iter().any(|l| l.role == "Site" && l.value == "resolver"),
+        "expected consequent_role_literals to pin Site='resolver' (subject literal), got {:#?}",
+        rule.consequent_role_literals,
+    );
+}
+
 #[test]
 fn shape_literal_in_consequent_pins_role_to_atom() {
     let src = r#"# Test
