@@ -789,12 +789,26 @@ fn check_variable_disjoint_antecedents(state: &Object) -> Vec<ReadingDiagnostic>
                 .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect::<Vec<_>>())
                 .unwrap_or_default())
             .collect();
+        // A clause is NOT disjoint if a join_on equi-key or a match_on bridge
+        // (subtype<->supertype / cross-role value match) links it to another
+        // clause. The name-only test below misses those — it flagged e.g.
+        // `Resource belongs to Domain iff Resource is instance of Noun and that
+        // Noun belongs to Domain` (Noun<->Function bridged via subtype) as
+        // deriving an EMPTY cell when it actually FIRES through the bridge (the
+        // perf-hashjoin subtype-bridge path). Treat bridge-linked nouns as
+        // shared so the warning fires only on TRULY disjoint clauses (the
+        // unit-cost-guard class it was built for).
+        let bridge_nouns: Vec<&str> = rule.match_on.iter()
+            .flat_map(|(l, r)| [l.as_str(), r.as_str()])
+            .chain(rule.join_on.iter().map(|k| k.as_str()))
+            .collect();
         let disjoint: Vec<&str> = (0..ft_ids.len())
             .filter(|&i| {
                 !noun_sets[i].is_empty()
                     && !noun_sets[i].iter().any(|n|
                         noun_sets.iter().enumerate()
                             .any(|(j, other)| j != i && other.contains(n)))
+                    && !noun_sets[i].iter().any(|n| bridge_nouns.contains(&n.as_str()))
             })
             .map(|i| ft_ids[i])
             .collect();
