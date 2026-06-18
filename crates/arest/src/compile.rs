@@ -8575,7 +8575,7 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
         // carries the (antecedent, role) slots resolved from the rule's
         // Halpin subscripts. Drive the equi-join from those positions when
         // present; otherwise fall back to noun-name resolution.
-        let join_key_specs: Vec<(Func, usize, usize)> = if let Some(rj) = &rule.ring_join {
+        let mut join_key_specs: Vec<(Func, usize, usize)> = if let Some(rj) = &rule.ring_join {
             rj.join_groups.iter().filter_map(|group| {
                 // Link antecedent j's slot in this variable's group to its
                 // first earlier antecedent's slot — the equi-join key.
@@ -8604,6 +8604,41 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
             ))
             }).collect()
         };
+
+        // arc-agi-3 / support-compile perf (subtype-bridge hash-join): an
+        // entity-typed match_pair (subtype role ↔ supertype role, SAME entity
+        // id) is an EQUI-join on the value — `Contains` over atom ids IS
+        // equality. Promote it to a hash key so the subtype-bridged join
+        // (Resource/Fact belongs to Domain, via Noun / Fact Type < Function)
+        // indexes in O(n) instead of the O(|A|×|B|) cross-product + Contains
+        // filter (support.auto.dev hit 35s on exactly this). SOUND only for
+        // atom values: both roles' nouns must be entity types (carry a reference
+        // scheme) so `Contains` == id-equality with no proper subsets. Genuine
+        // containment over value/sequence types (no ref scheme) is NOT promoted
+        // and keeps the cross-product + Filter. The `match_pair_raws` Contains
+        // filter below is kept unchanged, so the index only NARROWS the
+        // candidate set — identical results to the cross product.
+        let match_key_specs: Vec<(Func, usize, usize)> = match_pairs.iter()
+            .filter_map(|(left_noun, right_noun)| {
+                if !data.ref_schemes.contains_key(left_noun)
+                    || !data.ref_schemes.contains_key(right_noun) { return None; }
+                let left_ft = (0..=j).find(|&fi| find_role(fi, left_noun).is_some())?;
+                let right_ft = (0..=j).find(|&fi| find_role(fi, right_noun).is_some())?;
+                // exactly one side is THIS step's ft_j; the other an earlier ref.
+                let (ref_ft, ref_noun, j_noun) = if right_ft == j && left_ft < j {
+                    (left_ft, left_noun, right_noun)
+                } else if left_ft == j && right_ft < j {
+                    (right_ft, right_noun, left_noun)
+                } else { return None; };
+                let ref_role = find_role(ref_ft, ref_noun)?;
+                let j_role = find_role(j, j_noun)?;
+                Some((
+                    Func::compose(access_fact(ref_ft, j), Func::Selector(1)),
+                    ref_role,
+                    j_role,
+                ))
+            }).collect();
+        join_key_specs.extend(match_key_specs);
 
         // Î±(match_pair â†' contains Func) : match_pairs â€"
         // Contains isn't a FolTerm atom (yet); each pair lowers
