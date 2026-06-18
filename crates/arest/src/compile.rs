@@ -10043,25 +10043,28 @@ fn compile_ring_asymmetric_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
     let facts = extract_facts_multi(&ft_ids);
 
-    // For each pair (x,y) where x!=y, check if (y,x) also exists.
-    // This is O(n^2) but populations are entity-scoped (bounded).
-
     // AS: xRy -> not yRx. Violation when both <x,y> and <y,x> exist (and x!=y).
     //
-    // Pure Func using distl for membership test:
-    //   distr  .  [facts, facts] : ctx -> <<f1, all>, <f2, all>, ...>
-    //   For each <fact, all>:
-    //     distl : <fact, all> -> <<fact,f1>, <fact,f2>, ...>
-    //     Filter(match_reversed) -> candidates where role0(candidate)=role1(fact)  AND  role1(candidate)=role0(fact)
-    //     not null -> has_reverse
-    //   Filter facts where has_reverse  AND  x!=y, wrap in violations.
-
+    // perf-hashjoin (was O(n^2)): the old form built `DistR ∘ [facts,
+    // facts]` (the full self cross product) then probed each `<fact,
+    // all>` with `Filter(match_reversed) ∘ DistL`. `match_reversed` on
+    // `<fact, cand>` is the pure-equality pair `cand.role0 = fact.role1
+    // ∧ cand.role1 = fact.role0`. Index the facts ONCE by `role0`, then
+    // probe with the fact's `role1`: the index narrows to candidates
+    // whose `role0 = fact.role1` — exactly the FIRST conjunct — and the
+    // retained `Filter(match_reversed)` re-checks BOTH conjuncts, so the
+    // candidate that closes the reverse edge is found iff it existed in
+    // the cross product. `not_self` (role0 ≠ role1, on the fact alone)
+    // and the per-fact violation shape are unchanged → identical
+    // violation set, now O(N+M).
     let match_reversed = crate::fol::constraint::ring_match_reversed().to_func();
 
-    // check_one: <fact, all_facts> -> T if reverse exists, else F
+    let index = hashjoin_index(facts.clone(), role_value(0));
+
+    // check_one: <fact, index> -> T if a reverse pair exists, else F.
     let check_one = Func::compose(
         Func::compose(Func::Not, Func::NullTest),
-        Func::compose(Func::filter(match_reversed), Func::DistL),
+        Func::compose(Func::filter(match_reversed), hashjoin_probe_distl(role_value(1))),
     );
 
     let not_self = crate::fol::constraint::ring_not_self().to_func();
@@ -10071,7 +10074,7 @@ fn compile_ring_asymmetric_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
 
     // Violation detail (#898). Template `Asymmetric violation: {x}
     // relates to {y} and vice versa` from readings/core/validation.md.
-    // Input context here is `<fact, all_facts>` (post-DistR), so the
+    // Input context here is `<fact, index>` (post-DistR), so the
     // role accessors must Selector(1) into the fact slot before
     // taking the role binding.
     let detail = data.violation_templates.compile_detail("AS", |name| match name {
@@ -10081,12 +10084,12 @@ fn compile_ring_asymmetric_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     });
     let viol = make_violation_func(&def.id, &def.text, detail);
 
-    // alpha(make_viol)  .  Filter(pred)  .  distr  .  [facts, facts] : ctx
+    // alpha(make_viol)  .  Filter(pred)  .  distr  .  [facts, index] : ctx
     Func::compose(
         Func::apply_to_all(viol),
         Func::compose(
             Func::filter(pred),
-            Func::compose(Func::DistR, Func::construction(vec![facts.clone(), facts])),
+            Func::compose(Func::DistR, Func::construction(vec![facts, index])),
         ),
     )
 }
@@ -10098,9 +10101,18 @@ fn compile_ring_symmetric_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
 
     let match_reversed = crate::fol::constraint::ring_match_reversed().to_func();
 
+    // perf-hashjoin (was O(n^2)): identical narrowing to AS — index by
+    // `role0`, probe with `role1` (`match_reversed`'s first conjunct is
+    // the index key), retain `Filter(match_reversed)`. SY differs from
+    // AS only in polarity: the violation fires when NO reverse exists
+    // (`NullTest` over the narrowed-then-filtered pairs). The narrowing
+    // is exact (the reverse edge is found iff present), so "no match
+    // survives the Filter" holds for the same facts as the cross-scan.
+    let index = hashjoin_index(facts.clone(), role_value(0));
+
     let has_no_reverse = Func::compose(
         Func::NullTest,
-        Func::compose(Func::filter(match_reversed), Func::DistL),
+        Func::compose(Func::filter(match_reversed), hashjoin_probe_distl(role_value(1))),
     );
 
     let not_self = crate::fol::constraint::ring_not_self().to_func();
@@ -10108,7 +10120,7 @@ fn compile_ring_symmetric_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     let pred = Func::compose(Func::And, Func::construction(vec![has_no_reverse, not_self]));
 
     // Violation detail (#898). Template `Symmetric violation: {x}
-    // relates to {y} but not the reverse`. Same DistR `<fact, all>`
+    // relates to {y} but not the reverse`. Same DistR `<fact, index>`
     // context shape as AS, so role accessors Selector(1) into the
     // fact slot.
     let detail = data.violation_templates.compile_detail("SY", |name| match name {
@@ -10122,7 +10134,7 @@ fn compile_ring_symmetric_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         Func::apply_to_all(viol),
         Func::compose(
             Func::filter(pred),
-            Func::compose(Func::DistR, Func::construction(vec![facts.clone(), facts])),
+            Func::compose(Func::DistR, Func::construction(vec![facts, index])),
         ),
     )
 }
@@ -10134,9 +10146,16 @@ fn compile_ring_antisymmetric_ast(data: &CellIndex, def: &ConstraintDef) -> Func
 
     let match_reversed = crate::fol::constraint::ring_match_reversed().to_func();
 
+    // perf-hashjoin (was O(n^2)): identical narrowing to AS — index by
+    // `role0`, probe with `role1`, retain `Filter(match_reversed)`. AT
+    // shares AS's "reverse exists ∧ not-self" predicate (a reverse edge
+    // between DISTINCT entities is the violation), so the narrowing is
+    // exact and the violation set is unchanged.
+    let index = hashjoin_index(facts.clone(), role_value(0));
+
     let has_reverse = Func::compose(
         Func::compose(Func::Not, Func::NullTest),
-        Func::compose(Func::filter(match_reversed), Func::DistL),
+        Func::compose(Func::filter(match_reversed), hashjoin_probe_distl(role_value(1))),
     );
 
     let not_self = crate::fol::constraint::ring_not_self().to_func();
@@ -10145,7 +10164,7 @@ fn compile_ring_antisymmetric_ast(data: &CellIndex, def: &ConstraintDef) -> Func
 
     // Violation detail (#898). Template `Antisymmetric violation:
     // {x} and {y} relate to each other but are not the same`. Same
-    // `<fact, all_facts>` context as AS/SY — Selector(1) into the
+    // `<fact, index>` context as AS/SY — Selector(1) into the
     // fact slot before taking each role binding.
     let detail = data.violation_templates.compile_detail("AT", |name| match name {
         "x" => vec![Func::compose(role_value(0), Func::Selector(1))],
@@ -10158,7 +10177,7 @@ fn compile_ring_antisymmetric_ast(data: &CellIndex, def: &ConstraintDef) -> Func
         Func::apply_to_all(viol),
         Func::compose(
             Func::filter(pred),
-            Func::compose(Func::DistR, Func::construction(vec![facts.clone(), facts])),
+            Func::compose(Func::DistR, Func::construction(vec![facts, index])),
         ),
     )
 }
@@ -10499,6 +10518,61 @@ fn uc_storage_covered_for_all_groups(
     })
 }
 
+// ── perf-hashjoin (safety-critical): O(n) equi-join helpers ─────────
+//
+// Several constraint compilers below evaluated their predicate over the
+// FULL cross product `DistR ∘ [facts, facts]` (a self-join) or
+// `DistR ∘ [a_facts, b_facts]` (a cross-FT join), then `Filter`'d each
+// `<fact, all_other_facts>` pair down with a per-fact membership probe
+// built from `Filter(pred) ∘ DistL`. That is O(N×M) and dominated the
+// validate hot path on large apps.
+//
+// These two helpers narrow the candidate set to ONLY the facts that
+// share an equi-key with the current fact, WITHOUT changing the
+// predicate that decides a violation — exactly the proven pattern the
+// SS single-column anti-join (`compile_subset_ast`, `common.len()==1`)
+// and the derivation joiner (`perf-hashjoin`, ~line 8683) already use:
+// build a hash index ONCE (`IndexBy`, read-only, no Store cap gate),
+// probe it per fact (`FetchOrPhi`), and KEEP the original `Filter(pred)`
+// so it re-checks the full predicate over the narrowed pairs. Because
+// the index key is one CONJUNCT of the (pure-equality) predicate, every
+// pair the cross product would have kept is still produced and
+// re-checked, and every pair it would have dropped is either never
+// produced (key mismatch) or dropped by the retained Filter — so the
+// violation set is byte-identical to the cross product.
+
+/// Build a hash index of `facts` keyed by the atom `key_fn:fact`.
+/// `IndexBy(key_fn) ∘ facts` → `Map<key, <fact…>>`. Replaces the right
+/// arm `facts` of a `DistR ∘ [facts, facts]` (or `[a_facts, b_facts]`)
+/// pair generator; the per-fact context then becomes `<fact, index>`.
+fn hashjoin_index(facts: Func, key_fn: Func) -> Func {
+    Func::compose(Func::IndexBy(alloc::boxed::Box::new(key_fn)), facts)
+}
+
+/// Drop-in replacement for `Func::DistL` when the right arm of the
+/// enclosing `DistR` is a hash index (built by `hashjoin_index`) rather
+/// than the raw fact Seq. Input context is `<fact, index>`; output is
+/// the same `<fact, candidate>` pair Seq that `DistL:<fact, all_facts>`
+/// produced, but containing ONLY candidates whose index key equals
+/// `probe_key:fact` (φ when none — `DistL` over φ is φ, identical to the
+/// empty cross-product slice). `probe_key` is the accessor that, applied
+/// to the current fact, yields the equi-key value to look up.
+fn hashjoin_probe_distl(probe_key: Func) -> Func {
+    Func::compose(
+        Func::DistL,
+        Func::construction(vec![
+            Func::Selector(1),
+            Func::compose(
+                Func::FetchOrPhi,
+                Func::construction(vec![
+                    Func::compose(probe_key, Func::Selector(1)),
+                    Func::Selector(2),
+                ]),
+            ),
+        ]),
+    )
+}
+
 /// UC: |bu(fact_type, scope_value) : P| <= 1. Violation when > 1.
 fn compile_uniqueness_ast(
     data: &CellIndex,
@@ -10583,16 +10657,26 @@ fn compile_uniqueness_ast(
         // 0-indexed scope/other → 1-indexed `FactRole::role` inside.
         let dup_check = crate::fol::constraint::uc_dup_check(scope_idx, other_idx).to_func();
 
-        // has_any_dup: <fact, all> -> T if scope is duplicated
+        // perf-hashjoin: index facts by their SCOPE value once, then per
+        // fact probe only same-scope candidates. `dup_check`'s first
+        // conjunct IS `role[scope] of fact = role[scope] of candidate`,
+        // so the index narrows to exactly the candidates that pass it;
+        // the retained `Filter(dup_check)` still re-checks BOTH conjuncts
+        // (same scope ∧ different other), so the violating set is
+        // identical to the `[facts, facts]` cross-scan.
+        let index = hashjoin_index(facts.clone(), role_value(scope_idx));
+
+        // has_any_dup: <fact, index> -> T if scope is duplicated (a
+        // same-scope candidate with a different `other` exists).
         let has_any_dup = Func::compose(
             Func::compose(Func::Not, Func::NullTest),
-            Func::compose(Func::filter(dup_check), Func::DistL),
+            Func::compose(Func::filter(dup_check), hashjoin_probe_distl(role_value(scope_idx))),
         );
 
-        // violating_facts = Filter(has_any_dup) . distr . [facts, facts]
+        // violating_facts = Filter(has_any_dup) . distr . [facts, index]
         let violating = Func::compose(
             Func::filter(has_any_dup),
-            Func::compose(Func::DistR, Func::construction(vec![facts.clone(), facts])),
+            Func::compose(Func::DistR, Func::construction(vec![facts, index])),
         );
 
         // ONE violation if non-empty (Corollary 2: one per constraint).
@@ -10648,14 +10732,20 @@ fn compile_uniqueness_ast(
                 ]))),
             ]));
 
+            // perf-hashjoin: same single-role-scope narrowing as the
+            // single-FT path — index by scope, probe same-scope
+            // candidates, retain `Filter(dup_check)` (same scope ∧
+            // different other). Identical violating set to the cross-scan.
+            let index = hashjoin_index(facts.clone(), role_value(scope_idx));
+
             let has_any_dup = Func::compose(
                 Func::compose(Func::Not, Func::NullTest),
-                Func::compose(Func::filter(dup_check), Func::DistL),
+                Func::compose(Func::filter(dup_check), hashjoin_probe_distl(role_value(scope_idx))),
             );
 
             let violating = Func::compose(
                 Func::filter(has_any_dup),
-                Func::compose(Func::DistR, Func::construction(vec![facts.clone(), facts])),
+                Func::compose(Func::DistR, Func::construction(vec![facts, index])),
             );
 
             let noun = group_spans[0].noun_name.clone();
@@ -10709,14 +10799,26 @@ fn compile_uniqueness_ast(
                 not_identical,
             ]));
 
+            // perf-hashjoin: composite scope key. An atom-keyed index can
+            // only hold ONE role, so index on the FIRST constrained role;
+            // `scope_eq` includes `role[first](fact)=role[first](cand)` as
+            // one conjunct, so this narrows to a superset of the true
+            // same-scope candidates. The retained `Filter(dup_check)`
+            // re-checks the FULL composite scope ∧ not-identical, so the
+            // violating set is identical to the cross-scan (same argument
+            // the derivation joiner uses: index on key[0], Filter re-checks
+            // every key).
+            let first_scope_role = group_spans[0].role_index;
+            let index = hashjoin_index(facts.clone(), role_value(first_scope_role));
+
             let has_any_dup = Func::compose(
                 Func::compose(Func::Not, Func::NullTest),
-                Func::compose(Func::filter(dup_check), Func::DistL),
+                Func::compose(Func::filter(dup_check), hashjoin_probe_distl(role_value(first_scope_role))),
             );
 
             let violating = Func::compose(
                 Func::filter(has_any_dup),
-                Func::compose(Func::DistR, Func::construction(vec![facts.clone(), facts])),
+                Func::compose(Func::DistR, Func::construction(vec![facts, index])),
             );
 
             let label = group_spans.iter().map(|s| s.noun_name.as_str()).collect::<Vec<_>>().join(", ");
@@ -11285,13 +11387,43 @@ fn compile_subset_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         );
     }
 
-    // Cross-product path (common.len() == 0 or >= 2). match_pred:
-    // <a_fact, b_candidate> -> common noun values all equal. Sourced from
-    // `crate::fol::constraint::ss_match_pred` — `FolTerm::And` with one Eq
-    // per common noun handles the empty / single / N-ary cases uniformly
-    // (empty And = True, single And passes through, N >= 2 becomes
-    // Insert(And) ∘ Construction).
+    // match_pred: <a_fact, b_candidate> -> common noun values all equal.
+    // Sourced from `crate::fol::constraint::ss_match_pred` — `FolTerm::And`
+    // with one Eq per common noun handles the empty / single / N-ary cases
+    // uniformly (empty And = True, single And passes through, N >= 2
+    // becomes Insert(And) ∘ Construction).
     let match_pred = crate::fol::constraint::ss_match_pred(&common).to_func();
+
+    // perf-hashjoin: MULTI-column tuple subset (common.len() >= 2). An
+    // atom-keyed `IndexBy` cannot hold the full composite key, so index
+    // the SUPERSET facts on the FIRST common column and probe with A's
+    // matching column. That column's equality is ONE conjunct of
+    // `match_pred`, so the index narrows to a superset of the true
+    // matches; the retained `Filter(match_pred)` re-checks ALL common
+    // columns, so the anti-join witness set (A \ B over the full tuple)
+    // is identical to the cross product — the same "index on key[0],
+    // Filter re-checks every key" soundness the derivation joiner relies
+    // on. The degenerate common.len()==0 case has NO join key to index
+    // on, so it keeps the cross product (and is not a measured hotspot).
+    if common.len() >= 2 {
+        let (ai0, bi0) = common[0];
+        let b_index = hashjoin_index(b_facts, role_value(bi0));
+        // not_in_b: <a_fact, b_index> -> T when, among the candidates
+        // sharing A's first common value, none matches all common cols.
+        let not_in_b = Func::compose(
+            Func::NullTest,
+            Func::compose(Func::filter(match_pred), hashjoin_probe_distl(role_value(ai0))),
+        );
+        return Func::compose(
+            Func::apply_to_all(viol),
+            Func::compose(
+                Func::filter(not_in_b),
+                Func::compose(Func::DistR, Func::construction(vec![a_facts, b_index])),
+            ),
+        );
+    }
+
+    // Cross-product path (common.len() == 0). No equi-key to index on.
     // not_in_b: <a_fact, b_facts> -> T when no b_candidate matches a_fact.
     // NullTest . Filter(match_pred) . DistL
     let not_in_b = Func::compose(
@@ -17140,6 +17272,275 @@ mod mandatory_role_alethic_rejection_tests {
         // (4) Alethic -> rejects (thm:complete: D' = D).
         assert!(ss_violations[0].alethic,
             "SS violation must be alethic (rejects); got {:?}", ss_violations[0]);
+    }
+
+    // ── perf-hashjoin (safety-critical): O(n) equi-join ≡ cross product ──
+    //
+    // These three tests pin that rewriting the AS ring / spanning-UC /
+    // multi-column-SS cross products into `IndexBy` hash-joins produces
+    // the IDENTICAL violation set. Each drives the FULL validate path
+    // (`compile_to_defs_state` → ρ(validate) → `decode_violations`) over a
+    // MULTI-instance cell (≥3 instances) in BOTH a violating and a clean
+    // configuration: the violation must be caught in the first and absent
+    // in the second. If the hash-join narrowed too aggressively the
+    // violating case would go quiet; if it narrowed incorrectly the clean
+    // case would emit a phantom — so green on both ⇒ hash-join ≡ cross
+    // product on these populations.
+
+    /// Run ρ(validate) over `state` and return the violations whose
+    /// `constraint_id` matches `cid`. Shared by the hash-join tests.
+    fn hashjoin_violations_for(state: &Object, cid: &str) -> Vec<crate::types::Violation> {
+        let defs = compile_to_defs_state(state);
+        let d = ast::defs_to_state(&defs, state);
+        let ctx = ast::encode_eval_context_state("", None, state);
+        let violations_obj = ast::apply(&ast::Func::Def("validate".to_string()), &ctx, &d);
+        ast::decode_violations(&violations_obj)
+            .into_iter()
+            .filter(|v| v.constraint_id == cid)
+            .collect()
+    }
+
+    /// Build a state with one self-referential binary FT `ft_edge`
+    /// (`Node links Node`) carrying the given directed edges, plus an AS
+    /// (asymmetric) ring constraint over it.
+    fn ring_as_state(edges: &[(&str, &str)]) -> Object {
+        let mut cells: HashMap<String, Vec<Object>> = HashMap::new();
+        cells.entry("Noun".into()).or_default().push(fact_from_pairs(&[
+            ("name", "Node"), ("objectType", "entity")]));
+        cells.entry("FactType".into()).or_default().push(fact_from_pairs(&[
+            ("id", "ft_edge"), ("reading", "Node links Node"), ("arity", "2")]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "ft_edge"), ("nounName", "Node"), ("position", "0")]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "ft_edge"), ("nounName", "Node"), ("position", "1")]));
+        let as_c = ConstraintDef {
+            id: "as_edge".into(),
+            kind: "AS".into(),
+            modality: "alethic".into(),
+            text: "If some Node links some Node then not the reverse".into(),
+            spans: vec![
+                SpanDef { fact_type_id: "ft_edge".into(), role_index: 0, subset_autofill: None },
+                SpanDef { fact_type_id: "ft_edge".into(), role_index: 1, subset_autofill: None },
+            ],
+            ..Default::default()
+        };
+        cells.entry("Constraint".into()).or_default()
+            .push(crate::parse_forml2::constraint_to_fact_test(&as_c));
+        for (a, b) in edges {
+            cells.entry("ft_edge".into()).or_default().push(Object::seq(vec![
+                Object::seq(vec![Object::atom("Node"), Object::atom(*a)]),
+                Object::seq(vec![Object::atom("Node"), Object::atom(*b)]),
+            ]));
+        }
+        Object::Map(cells.into_iter()
+            .map(|(k, v)| (k, Object::Seq(v.into())))
+            .collect::<hashbrown::HashMap<_, _>>().into())
+    }
+
+    /// (a) Ring AS hash-join ≡ cross product. A reverse pair among a
+    /// ≥3-edge population is flagged; a directed acyclic/cyclic set with
+    /// no 2-edge reverse pair is clean.
+    #[test]
+    fn ring_as_hashjoin_matches_cross_product() {
+        // Violating: na↔nb is a reverse pair (both na→nb and nb→na flag);
+        // nc→nd has no reverse (must stay quiet). Three edges = multi-
+        // instance. (Node ids are matched as whole `{x} relates to {y}`
+        // phrases below, not single chars, so they can't collide with the
+        // template words "vice"/"and".)
+        let viol = ring_as_state(&[("na", "nb"), ("nb", "na"), ("nc", "nd")]);
+        let vs = hashjoin_violations_for(&viol, "as_edge");
+        // The cross product flags EXACTLY the reverse pair {na→nb, nb→na}.
+        // The hash-join must reproduce that set verbatim — same count, same
+        // members — and must NOT flag the unreversed edge nc→nd.
+        assert_eq!(vs.len(), 2,
+            "AS: exactly the reverse pair {{na→nb, nb→na}} must flag; details {:?}",
+            vs.iter().map(|v| v.detail.as_str()).collect::<Vec<_>>());
+        assert!(vs.iter().any(|v| v.detail.contains("na relates to nb")),
+            "AS: na→nb (reverse exists) must flag; details {:?}",
+            vs.iter().map(|v| v.detail.as_str()).collect::<Vec<_>>());
+        assert!(vs.iter().any(|v| v.detail.contains("nb relates to na")),
+            "AS: nb→na (reverse exists) must flag; details {:?}",
+            vs.iter().map(|v| v.detail.as_str()).collect::<Vec<_>>());
+        assert!(!vs.iter().any(|v| v.detail.contains("nc relates to nd")),
+            "AS: the unreversed edge nc→nd must NOT be flagged; details {:?}",
+            vs.iter().map(|v| v.detail.as_str()).collect::<Vec<_>>());
+
+        // Clean: a 3-cycle na→nb→nc→na has NO 2-edge reverse pair → no AS
+        // violation (the hash-join must not invent one).
+        let clean = ring_as_state(&[("na", "nb"), ("nb", "nc"), ("nc", "na")]);
+        let cv = hashjoin_violations_for(&clean, "as_edge");
+        assert!(cv.is_empty(),
+            "AS: a reverse-pair-free 3-cycle must be clean; got {:?}",
+            cv.iter().map(|v| v.detail.as_str()).collect::<Vec<_>>());
+    }
+
+    /// Build a state with a binary FT `ft_tag` (`Tag is for Item`) and a
+    /// SPANNING alethic UC over BOTH roles. A spanning UC gets
+    /// `key_roles = None` (no Map-storage short-circuit), so it reaches
+    /// the legacy cross-scan branch this rewrite replaced. Both spans
+    /// land on one FT → the single-group arm fires with scope = role 0
+    /// (Tag), other = role 1 (Item): "each Tag has at most one Item".
+    fn uc_spanning_state(rows: &[(&str, &str)]) -> Object {
+        let mut cells: HashMap<String, Vec<Object>> = HashMap::new();
+        cells.entry("Noun".into()).or_default().push(fact_from_pairs(&[
+            ("name", "Tag"), ("objectType", "entity")]));
+        cells.entry("Noun".into()).or_default().push(fact_from_pairs(&[
+            ("name", "Item"), ("objectType", "entity")]));
+        cells.entry("FactType".into()).or_default().push(fact_from_pairs(&[
+            ("id", "ft_tag"), ("reading", "Tag is for Item"), ("arity", "2")]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "ft_tag"), ("nounName", "Tag"), ("position", "0")]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "ft_tag"), ("nounName", "Item"), ("position", "1")]));
+        let uc = ConstraintDef {
+            id: "uc_tag".into(),
+            kind: "UC".into(),
+            modality: "alethic".into(),
+            text: "Each (Tag, Item) pair appears at most once".into(),
+            spans: vec![
+                SpanDef { fact_type_id: "ft_tag".into(), role_index: 0, subset_autofill: None },
+                SpanDef { fact_type_id: "ft_tag".into(), role_index: 1, subset_autofill: None },
+            ],
+            ..Default::default()
+        };
+        cells.entry("Constraint".into()).or_default()
+            .push(crate::parse_forml2::constraint_to_fact_test(&uc));
+        for (tag, item) in rows {
+            cells.entry("ft_tag".into()).or_default().push(Object::seq(vec![
+                Object::seq(vec![Object::atom("Tag"), Object::atom(*tag)]),
+                Object::seq(vec![Object::atom("Item"), Object::atom(*item)]),
+            ]));
+        }
+        Object::Map(cells.into_iter()
+            .map(|(k, v)| (k, Object::Seq(v.into())))
+            .collect::<hashbrown::HashMap<_, _>>().into())
+    }
+
+    /// (b) Spanning-UC hash-join ≡ cross product. The cross-scan flagged
+    /// any scope value that appears with two distinct `other` values;
+    /// the hash-join indexes by scope and re-checks the same predicate.
+    #[test]
+    fn uc_spanning_hashjoin_matches_cross_product() {
+        // Precondition: spanning UC over the binary FT is NOT key-covered
+        // (key_roles None) so it really takes the cross-scan path, not
+        // the Map-storage φ short-circuit.
+        let viol_state = uc_spanning_state(&[("t1", "i1"), ("t1", "i2"), ("t2", "i3")]);
+        let model = compile(&viol_state);
+        assert_eq!(model.schemas.get("ft_tag").and_then(|s| s.key_roles.clone()), None,
+            "spanning UC must leave the cell un-keyed (precondition for the cross-scan path)");
+        assert!(!matches!(&model.constraints.iter().find(|c| c.id == "uc_tag").unwrap().func,
+            crate::ast::Func::Constant(_)),
+            "spanning UC must compile to the cross-scan Func, not the φ no-op");
+
+        // Violating: Tag t1 appears with two distinct Items (i1, i2) →
+        // duplicate scope. t2 is unique. Three instances = multi-instance.
+        let vs = hashjoin_violations_for(&viol_state, "uc_tag");
+        assert!(!vs.is_empty(),
+            "UC: Tag t1 bound to two Items among ≥3 rows must flag; got none");
+        assert!(vs.iter().any(|v| v.detail.contains("t1")),
+            "UC violation must name the duplicated scope t1; details {:?}",
+            vs.iter().map(|v| v.detail.as_str()).collect::<Vec<_>>());
+
+        // Clean: every Tag is distinct → no scope appears twice → no UC
+        // violation (the hash-join must not invent one).
+        let clean_state = uc_spanning_state(&[("t1", "i1"), ("t2", "i2"), ("t3", "i3")]);
+        let cv = hashjoin_violations_for(&clean_state, "uc_tag");
+        assert!(cv.is_empty(),
+            "UC: all-distinct Tags must be clean; got {:?}",
+            cv.iter().map(|v| v.detail.as_str()).collect::<Vec<_>>());
+    }
+
+    /// Build a state with two ternary FTs sharing TWO common nouns
+    /// (User, Operation) and an SS subset `performs ⊆ authorized`. Two
+    /// common columns ⇒ the multi-column SS branch (the rewrite's
+    /// site (c)); `set_comparison_argument_length = 1` splits the spans
+    /// into the subset side (ft_performs) and superset side (ft_authorized).
+    fn ss_multicol_state(
+        performs: &[(&str, &str)],
+        authorized: &[(&str, &str)],
+    ) -> Object {
+        let mut cells: HashMap<String, Vec<Object>> = HashMap::new();
+        for n in ["User", "Operation"] {
+            cells.entry("Noun".into()).or_default().push(fact_from_pairs(&[
+                ("name", n), ("objectType", "entity")]));
+        }
+        for (id, reading) in [("ft_performs", "User performs Operation"),
+                              ("ft_authorized", "User authorized Operation")] {
+            cells.entry("FactType".into()).or_default().push(fact_from_pairs(&[
+                ("id", id), ("reading", reading), ("arity", "2")]));
+            cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+                ("factType", id), ("nounName", "User"), ("position", "0")]));
+            cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+                ("factType", id), ("nounName", "Operation"), ("position", "1")]));
+        }
+        let ss = ConstraintDef {
+            id: "ss_perf_auth".into(),
+            kind: "SS".into(),
+            modality: "alethic".into(),
+            text: "If some User performs some Operation then that User is authorized that Operation".into(),
+            set_comparison_argument_length: Some(1),
+            spans: vec![
+                SpanDef { fact_type_id: "ft_performs".into(), role_index: 0, subset_autofill: None },
+                SpanDef { fact_type_id: "ft_authorized".into(), role_index: 0, subset_autofill: None },
+            ],
+            ..Default::default()
+        };
+        cells.entry("Constraint".into()).or_default()
+            .push(crate::parse_forml2::constraint_to_fact_test(&ss));
+        for (cell, rows) in [("ft_performs", performs), ("ft_authorized", authorized)] {
+            for (u, o) in rows {
+                cells.entry(cell.into()).or_default().push(Object::seq(vec![
+                    Object::seq(vec![Object::atom("User"), Object::atom(*u)]),
+                    Object::seq(vec![Object::atom("Operation"), Object::atom(*o)]),
+                ]));
+            }
+        }
+        Object::Map(cells.into_iter()
+            .map(|(k, v)| (k, Object::Seq(v.into())))
+            .collect::<hashbrown::HashMap<_, _>>().into())
+    }
+
+    /// (c) Multi-column SS hash-join ≡ cross product. The witness set is
+    /// A \ B over the FULL (User, Operation) tuple: a `performs` row whose
+    /// EXACT pair is missing from `authorized` flags, even if a row
+    /// sharing only ONE column exists (proving the retained Filter
+    /// re-checks every common column, not just the indexed one).
+    #[test]
+    fn ss_multicolumn_hashjoin_matches_cross_product() {
+        // Violating population (≥3 subset instances):
+        //   (alice, read)   authorized          -> satisfier
+        //   (alice, write)  NOT authorized      -> WITNESS (alice authorized only `read`,
+        //                                          so the indexed col User=alice matches
+        //                                          a row, but the full pair does not).
+        //   (bob,   read)   NOT authorized      -> WITNESS (no bob row at all).
+        let viol_state = ss_multicol_state(
+            &[("alice", "read"), ("alice", "write"), ("bob", "read")],
+            &[("alice", "read"), ("carol", "write")],
+        );
+        let vs = hashjoin_violations_for(&viol_state, "ss_perf_auth");
+        assert!(!vs.is_empty(),
+            "SS multi-col: (alice,write) and (bob,read) are unauthorized → expected violations; got none");
+        // Witnesses name `write` (alice,write) and `bob` (bob,read); the
+        // satisfier (alice,read) must not be the sole content — at least
+        // one witness must mention an unauthorized pair component.
+        assert!(vs.iter().any(|v| v.detail.contains("write")),
+            "SS multi-col: (alice,write) shares User=alice with an authorized row but the \
+             FULL pair is unauthorized — the retained Filter must still flag it; details {:?}",
+            vs.iter().map(|v| v.detail.as_str()).collect::<Vec<_>>());
+        assert!(vs.iter().any(|v| v.detail.contains("bob")),
+            "SS multi-col: (bob,read) is unauthorized and must flag; details {:?}",
+            vs.iter().map(|v| v.detail.as_str()).collect::<Vec<_>>());
+
+        // Clean: every performs pair is authorized verbatim (superset has
+        // extras). The full-tuple subset holds → no SS violation.
+        let clean_state = ss_multicol_state(
+            &[("alice", "read"), ("alice", "write"), ("bob", "read")],
+            &[("alice", "read"), ("alice", "write"), ("bob", "read"), ("carol", "write")],
+        );
+        let cv = hashjoin_violations_for(&clean_state, "ss_perf_auth");
+        assert!(cv.is_empty(),
+            "SS multi-col: a satisfied full-tuple subset must be clean; got {:?}",
+            cv.iter().map(|v| v.detail.as_str()).collect::<Vec<_>>());
     }
 
     /// Steady-state D for the SS tests: parsed state ⊕ reflected
