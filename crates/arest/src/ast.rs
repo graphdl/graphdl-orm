@@ -4300,14 +4300,44 @@ fn extract_fact_pairs(x: &Object) -> (Option<String>, hashbrown::HashMap<String,
     (id, fields)
 }
 
+/// Set of DECLARED fact-type ids (the `id` role of every `FactType` cell row).
+/// Reads via `cell_facts_iter` so a folded (Map) `FactType` cell is scanned too,
+/// not just a Seq cell. Mirrors the private `is_declared_ft` in `command.rs`
+/// (lifted here so `ast.rs` read paths can gate on declaration without crossing
+/// the module boundary), but materializes the whole set once so a hot fold can
+/// test membership in O(1) instead of rescanning the cell per candidate field.
+#[cfg(not(feature = "no_std"))]
+fn declared_ft_ids(d: &Object) -> hashbrown::HashSet<String> {
+    let cell = fetch_or_phi("FactType", d);
+    cell_facts_iter(&cell)
+        .filter_map(|f| binding(f, "id").map(|s| s.to_string()))
+        .collect()
+}
+
 /// Platform primitive: list entities of a noun by reading D at apply-time.
 /// Key: "list_noun:{noun}". Input: operand is ignored (may be empty).
 ///
 /// Walks every fact cell in D. A fact contributes to an entity summary if
 /// one of its role bindings has a role name equal to the target noun — the
-/// role's value is the entity id. All other bindings on that fact become
-/// field/value entries on the entity summary. Multiple facts about the same
-/// entity merge; later facts overwrite earlier ones for the same field.
+/// role's value is the entity id. Every OTHER role binding on that fact becomes
+/// a field/value entry on the entity summary, BUT ONLY when the synthesized
+/// per-field id `{noun}_has_{role}` (spaces underscored, matching the parser's
+/// id-formation — see `command::fallback_ft_id`) is a DECLARED fact type. That
+/// gate is the 3NF-field contract: the entity row is the set of declared
+/// `{noun} has {ValueType}` value facts (the same `{noun}_has_` shape the view
+/// renderer recovers in `viewproj::enum_options_for_fact_type`). Multiple facts
+/// about the same entity merge; later facts overwrite earlier ones for the same
+/// field.
+///
+/// sm-event-stamp-phantom (2026-06): without the declared-FT gate, an SM event
+/// stamp — `command.rs` writes `<<{noun},id>,<Timestamp,occurred>>` into the
+/// base trigger cell (e.g. `Task_is_started`) so the reconstruction fold can
+/// order events — leaked a phantom `Timestamp` field onto the entity row. That
+/// field maps to no declared fact type (`Task_has_Timestamp` is never declared),
+/// so a round-trip through update flagged `apply:unresolvable-field-key`. The
+/// gate rejects it while keeping a LEGITIMATELY declared `{noun} has Timestamp`
+/// (e.g. `Log_Entry_has_Timestamp`, `Migration_Application_has_Timestamp`),
+/// which IS in the `FactType` cell.
 ///
 /// Returns an atom holding a JSON array: `[{"id":..., <field>:<value>, ...}, ...]`.
 /// Returns `Bottom` if no matching entities are found.
@@ -4318,6 +4348,16 @@ fn platform_list_noun(noun: &str, d: &Object) -> Object {
     // Destructive rewrite would violate §5 Thm 5; projecting here lets
     // every read path pick up the MA-filtered view for free.
     let d = visible_population(d);
+    // sm-event-stamp-phantom: a field is folded onto the row only when its
+    // synthesized id `{noun}_has_{role}` is a declared fact type. Materialize
+    // the declared-id set once (not per fold step) so the inner gate is O(1).
+    let declared = declared_ft_ids(&d);
+    // `{noun}_has_{role}` with spaces underscored — the canonical 3NF-field id
+    // form (identical to `command::fallback_ft_id`'s `{noun}_has_{field}`).
+    let noun_us = noun.replace(' ', "_");
+    let field_ft_id = |role: &str| -> String {
+        alloc::format!("{}_has_{}", noun_us, role.replace(' ', "_"))
+    };
     let mut entities: HashMap<String, HashMap<String, String>> = HashMap::new();
 
     cells_iter(&d).iter().for_each(|(name, contents)| {
@@ -4349,7 +4389,18 @@ fn platform_list_noun(noun: &str, d: &Object) -> Object {
                     let kv = match pair.as_seq() { Some(s) => s, None => return };
                     let role = match kv.first().and_then(|k| k.as_atom()) { Some(r) => r, None => return };
                     let val = match kv.get(1).and_then(|v| v.as_atom()) { Some(v) => v, None => return };
-                    (role != noun).then(|| entry.insert(role.to_string(), val.to_string()));
+                    // Skip the noun's own id role, and any role whose synthesized
+                    // `{noun}_has_{role}` is NOT a declared fact type (the
+                    // sm-event-stamp `Timestamp` phantom, and any other
+                    // non-canonical base-cell binding). Declared value fields —
+                    // e.g. `Task_has_Task_Priority` — pass; relationship roles
+                    // (verb-phrase / cross-noun ids like
+                    // `State_Machine_is_for_Resource`) are surfaced as navigation,
+                    // not folded onto the row, so the declared-`_has_` gate is the
+                    // exact 3NF-field contract.
+                    if role == noun { return; }
+                    if !declared.contains(&field_ft_id(role)) { return; }
+                    entry.insert(role.to_string(), val.to_string());
                 });
             }
         });
@@ -14463,8 +14514,14 @@ Thing 'b1' has Name 'n1'.\n";
     #[test]
     fn list_noun_excludes_transitive_and_namespaced_cells() {
         let s0 = Object::phi();
+        // Declare the base value FT so the declared-`{noun}_has_` field gate
+        // (sm-event-stamp-phantom) keeps `Color`. The phantom-cell fields below
+        // (`Phantom`, `Schemic`) are excluded by the base-cell name guard AND
+        // are undeclared, so they never reach the row regardless.
+        let sd = cell_push("FactType",
+            fact_from_pairs(&[("id", "Widget_has_Color")]), &s0);
         let s1 = cell_push("Widget_has_Color",
-            fact_from_pairs(&[("Widget", "w1"), ("Color", "red")]), &s0);
+            fact_from_pairs(&[("Widget", "w1"), ("Color", "red")]), &sd);
         let s2 = cell_push("_transitive_Widget_phantom",
             fact_from_pairs(&[("Widget", "w1"), ("Phantom", "ghost")]), &s1);
         let s3 = cell_push("schema:Widget_has_Color",
@@ -14483,6 +14540,78 @@ Thing 'b1' has Name 'n1'.\n";
             "field from a _transitive_* cell must NOT be folded into the entity; got {w1:?}");
         assert!(!w1.contains_key("Schemic"),
             "field from a ':'-namespaced cell must NOT be folded into the entity; got {w1:?}");
+    }
+
+    /// sm-event-stamp-phantom — when an SM event fires, `command.rs` stamps the
+    /// occurred-at into the SM-noun-keyed trigger cell as
+    /// `<<Task, id>, <Timestamp, occurred>>` (see `transition_via_defs`,
+    /// command.rs ~3178, `fact_from_pairs(&[(noun, id), ("Timestamp", occurred)])`).
+    /// That trigger cell (`Task_is_started`) is a BASE cell (no ':' namespace, no
+    /// `_transitive_` prefix), so `platform_list_noun`'s fold used to leak the
+    /// event's `Timestamp` role onto the `Task` row — a non-canonical field that
+    /// maps to no declared fact type (`Task_has_Timestamp`), tripping
+    /// `apply:unresolvable-field-key` on the next update round-trip.
+    ///
+    /// The declared-`{noun}_has_{role}` field gate must DROP that phantom while
+    /// KEEPING the declared value field `Task_has_Task_Priority`. This drives the
+    /// REAL `platform_list_noun` primitive (not a mocked row): the stamp is the
+    /// exact shape the engine writes, the priority FT is declared in the
+    /// `FactType` cell, and we assert on the parsed JSON row.
+    #[test]
+    fn list_noun_excludes_sm_event_stamp_timestamp() {
+        let s0 = Object::phi();
+        // Declare ONLY the priority value FT — the canonical 3NF field. The SM
+        // event stamp's `Task_has_Timestamp` is NOT declared (it is an internal
+        // event ordering key, never a fact type), so the gate must reject it.
+        let s1 = cell_push("FactType",
+            fact_from_pairs(&[("id", "Task_has_Task_Priority")]), &s0);
+        // Seed the declared value fact.
+        let s2 = cell_push("Task_has_Task_Priority",
+            fact_from_pairs(&[("Task", "t1"), ("Task Priority", "p0")]), &s1);
+        // Land the SM event stamp byte-for-byte as command.rs does: the SM-noun
+        // role keys the trigger cell, `Timestamp` carries the occurred-at. The
+        // `Task_is_started` trigger cell is a base cell (folded by list_noun).
+        let s3 = cell_push("Task_is_started",
+            fact_from_pairs(&[("Task", "t1"), ("Timestamp", "2026-06-17T00:00:00Z")]), &s2);
+
+        let result = platform_list_noun("Task", &s3);
+        let json_str = result.as_atom().expect("list result must be a JSON atom");
+        let parsed: serde_json::Value = serde_json::from_str(json_str).expect("valid JSON");
+        let arr = parsed.as_array().expect("array");
+        let t1 = arr.iter()
+            .find(|r| r.get("id").and_then(|v| v.as_str()) == Some("t1"))
+            .expect("t1 must be listed").as_object().expect("object");
+
+        assert_eq!(t1.get("Task Priority").and_then(|v| v.as_str()), Some("p0"),
+            "declared value field `Task Priority` must survive the gate; got {t1:?}");
+        assert!(!t1.contains_key("Timestamp"),
+            "SM event-stamp `Timestamp` (undeclared `Task_has_Timestamp`) must NOT \
+             be folded onto the entity row; got {t1:?}");
+    }
+
+    /// sm-event-stamp-phantom (companion) — the gate keys off DECLARATION, not
+    /// the literal field name: a LEGITIMATELY declared `{noun} has Timestamp`
+    /// value field (e.g. `Log_Entry_has_Timestamp`) must still appear. This pins
+    /// that the fix discriminates the phantom by "is this `{noun}_has_{role}` a
+    /// declared FT?" and never blanket-drops a field named `Timestamp`.
+    #[test]
+    fn list_noun_keeps_declared_timestamp_value_field() {
+        let s0 = Object::phi();
+        let s1 = cell_push("FactType",
+            fact_from_pairs(&[("id", "Log_Entry_has_Timestamp")]), &s0);
+        let s2 = cell_push("Log_Entry_has_Timestamp",
+            fact_from_pairs(&[("Log Entry", "L1"), ("Timestamp", "2026-06-17T00:00:00Z")]), &s1);
+
+        let result = platform_list_noun("Log Entry", &s2);
+        let json_str = result.as_atom().expect("list result must be a JSON atom");
+        let parsed: serde_json::Value = serde_json::from_str(json_str).expect("valid JSON");
+        let arr = parsed.as_array().expect("array");
+        let l1 = arr.iter()
+            .find(|r| r.get("id").and_then(|v| v.as_str()) == Some("L1"))
+            .expect("L1 must be listed").as_object().expect("object");
+
+        assert_eq!(l1.get("Timestamp").and_then(|v| v.as_str()), Some("2026-06-17T00:00:00Z"),
+            "a DECLARED `Log Entry has Timestamp` value field must survive; got {l1:?}");
     }
 
     /// task-956 — `same_identity`/`concat_dedup` must treat the fan-out's
