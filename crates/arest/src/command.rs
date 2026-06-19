@@ -9209,6 +9209,350 @@ Transition 'block' is defined in State Machine Definition 'Task'.
              'blocked'; a stale 'in_progress' here is the reported bug.");
     }
 
+    /// store-on-derive STEP 0 — the IVM oracle (regression net for the
+    /// later IVM steps; NO engine change here).
+    ///
+    /// Differential invariant (plan §"Correctness invariant"):
+    ///   `materialized_derived(apply(S0, m1..mn))
+    ///      == derived(full_recompile(final base population))`
+    /// for ANY mutation sequence. We drive a deterministic sequence of
+    /// create / update / transition through the NORMAL apply path
+    /// (`apply_command_defs` + the production `merge_delta` persist), then
+    /// assert every derivation-rule consequent cell EQUALS what a FULL,
+    /// non-incremental re-derivation over the SAME final base population
+    /// produces.
+    ///
+    /// PASSES TODAY because BOTH paths drop-and-re-derive: the apply path
+    /// wipes the derived consequents and re-runs the (seeded) chain on each
+    /// op, and the reference here wipes the same set and runs the full
+    /// (un-seeded, round-1-everything) chain. Once Step 2+ route the apply
+    /// path through incremental view maintenance, this test becomes the
+    /// genuine differential gate — and it directly closes
+    /// `leaf-metamodel-non-idempotent-vs-recompile`.
+    ///
+    /// Deterministic: fixed fixtures + a fixed mutation list, no
+    /// `Date::now`/random. The full-recompile reference reuses the EXACT
+    /// stratum/drop machinery the apply path uses (`metacompose` of the
+    /// `derivation:` stratum, the `DerivationRule` consequent set minus the
+    /// `sm_trigger`/`sm_family` exclusions), so the oracle stays in lockstep
+    /// with the apply path's notion of "derived cell" rather than a
+    /// hand-maintained list that could silently drift.
+    #[test]
+    fn ivm_after_n_mutations_equals_full_recompile() {
+        // Bridge metamodel: an SM-driven status that cascades through two
+        // derivation rules (a cross-noun intermediate + a bridge) into a
+        // recommendation. Mirrors apps/tasks; identical shape to the
+        // `transition_refreshes_cross_noun_derived_cells` fixture so the
+        // cross-noun retraction cascade is exercised.
+        const BRIDGE_READINGS: &str = r#"
+# Tasks bridge (IVM oracle)
+
+## Entity Types
+
+Task(.id) is an entity type.
+Resource(.id) is an entity type.
+State Machine(.id) is an entity type.
+
+## Value Types
+
+Status is a value type.
+Task Status is a value type.
+
+## Fact Types
+
+State Machine is for Resource.
+State Machine is currently in Status.
+Resource is currently in Status.
+  Each Resource is currently in at most one Status.
+Task has Task Status.
+  Each Task has at most one Task Status.
+Task has Task Priority.
+Task is recommended.
+
+## Derivation Rules
+
+* Resource is currently in Status iff some State Machine is for that Resource and that State Machine is currently in that Status.
+* Task has Task Status iff that Resource is currently in some Status and Task Status is Status and Task is Resource.
+* Task is recommended iff Task has Task Status 'pending'.
+
+## Instance Facts
+
+State Machine Definition 'Task' is for Noun 'Task'.
+Status 'pending' is initial in State Machine Definition 'Task'.
+
+Transition 'start' is defined in State Machine Definition 'Task'.
+  Transition 'start' is from Status 'pending'.
+  Transition 'start' is to Status 'in_progress'.
+  Transition 'start' is triggered by Event Type 'start'.
+
+Transition 'complete' is defined in State Machine Definition 'Task'.
+  Transition 'complete' is from Status 'in_progress'.
+  Transition 'complete' is to Status 'completed'.
+  Transition 'complete' is triggered by Event Type 'complete'.
+"#;
+        let meta = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let tasks = crate::parse_forml2::parse_to_state_with_nouns(BRIDGE_READINGS, &meta).unwrap();
+        let state = ast::merge_states(&meta, &tasks);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_obj = ast::defs_to_state(&defs, &state);
+
+        // ── full_recompile reference ──────────────────────────────────
+        // Drop the derivation-rule consequent cells (the SAME set the apply
+        // wipe targets: every `DerivationRule` literal consequent, MINUS the
+        // SM-trigger cells and the SM-fold-family per-resource cells, which
+        // are maintained by the transition writer / keyed upsert, not by a
+        // wipe-and-rederive) and run the FULL, un-seeded forward chain. The
+        // result is the materialized-view value for the given base.
+        let full_recompile = |st: &ast::Object| -> ast::Object {
+            // The derivation stratum, exactly as the apply path builds it.
+            let stratum: Vec<(String, ast::Func)> = ast::cells_iter(&def_obj).into_iter()
+                .filter(|(n, _)| n.starts_with("derivation:"))
+                .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, &def_obj)))
+                .collect();
+            let packed: Vec<(String, Vec<String>, ast::Func)> = stratum.iter()
+                .map(|(name, func)| {
+                    let id = name.split_once(':').map(|(_, id)| id).unwrap_or(name);
+                    let reads = crate::evaluate::read_derivation_reads(&def_obj, id)
+                        .unwrap_or_default();
+                    (name.clone(), reads, func.clone())
+                })
+                .collect();
+            let refs = to_seeded_refs(&packed);
+
+            // Drop set: DerivationRule literal consequents minus SM exclusions.
+            let drule_cell = ast::fetch_cell_seq("DerivationRule", &def_obj);
+            let dropped: hashbrown::HashSet<String> = drule_cell.as_seq()
+                .map(|facts| facts.iter()
+                    .filter_map(|f| ast::binding(f, "consequentFactTypeId"))
+                    .map(|enc| crate::types::ConsequentCellSource::decode(enc)
+                        .literal_id().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect())
+                .unwrap_or_default();
+            let sm_triggers = sm_trigger_cell_set(&def_obj);
+            let sm_family = sm_family_consequent_cells(&def_obj);
+            let dropped: hashbrown::HashSet<String> = dropped.into_iter()
+                .filter(|c| !sm_triggers.contains(c.as_str())
+                    && !sm_family.contains(c.as_str()))
+                .collect();
+
+            let mut wiped: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+            for (name, contents) in ast::cells_iter(st).into_iter() {
+                if dropped.contains(name) {
+                    wiped.insert(name.to_string(), ast::Object::phi());
+                } else {
+                    wiped.insert(name.to_string(), contents.clone());
+                }
+            }
+            let wiped = ast::Object::Map(wiped.into());
+            // Un-seeded full chain (round-1 runs every rule) → the naive LFP.
+            let (recompiled, _) =
+                crate::evaluate::forward_chain_defs_state_semi_naive(&refs, &wiped, 100);
+            recompiled
+        };
+
+        // Canonicalize a cell's contents to an order-independent multiset of
+        // facts: sort each fact's <role,value> bindings, then sort the fact
+        // list. `fetch_cell_seq` already key-flattens folded Map cells, so
+        // the incremental (possibly Map-folded) and full (Seq) shapes
+        // compare on equal footing.
+        let canon_cell = |st: &ast::Object, name: &str| -> Vec<String> {
+            let mut facts: Vec<String> = ast::fetch_cell_seq(name, st).as_seq()
+                .map(|fs| fs.iter().map(|f| {
+                    match f.as_seq() {
+                        Some(bindings) => {
+                            let mut bs: Vec<String> = bindings.iter()
+                                .map(|b| b.to_json_string())
+                                .collect();
+                            bs.sort();
+                            bs.join("|")
+                        }
+                        None => f.to_json_string(),
+                    }
+                }).collect())
+                .unwrap_or_default();
+            facts.sort();
+            facts
+        };
+
+        // The cells the Step-0 invariant is over: the PURE positive-join
+        // derivation-rule consequents that the apply path maintains by
+        // drop-and-re-derive (the #836 wipe + seeded re-chain + bridge-clobber
+        // restore). These are idempotent vs a full recompile TODAY, so the
+        // oracle is GREEN now and becomes the regression net for the IVM steps.
+        //
+        // DELIBERATELY EXCLUDED — `Resource_is_currently_in_Status`: this is
+        // the SM CURRENT-STATUS PROJECTION (keyed last-write-wins per Resource,
+        // `evaluate.rs:575`), maintained by the transition writer's
+        // hand-rolled keyed upsert, NOT by drop-and-re-derive. It is the ONE
+        // controlled non-monotonicity the plan's sanction calls out
+        // (`AREST.tex:299` — status projection as classical IVM, Gupta93) and
+        // the explicit v1 negative-delta target of the plan's "Deletion /
+        // non-monotone scope" section. TODAY the union-only commit
+        // (`merge_delta`, task-922) cannot retract the stale folded tuple a
+        // status change leaves behind, so this cell is NON-idempotent vs a
+        // recompile — that IS the `leaf-metamodel-non-idempotent-vs-recompile`
+        // defect this whole effort closes. The retraction channel added in
+        // Step 1 (`merge_delta_with_removals`) + the IVM wiring in Step 2 are
+        // what make it idempotent. It is tracked here as a DIAG-only cell
+        // (`DIAG_CELLS`): its divergence is printed, not gated, so when a later
+        // step fixes it the diag goes quiet and the cell can be promoted into
+        // `DERIVED_CELLS`. (The existing `transition_refreshes_cross_noun_
+        // derived_cells` harness likewise asserts only on the two downstream
+        // consequents, never on this raw projection.)
+        //
+        // NOTE (cross-apply poisoning, found while building this oracle): the
+        // two downstream consequents are idempotent vs a recompile at every
+        // step of THIS sequence, but ONLY because the update is applied before
+        // any transition. An update applied AFTER a transition re-derives the
+        // bridge off the stale projection above and resurrects the prior
+        // status into these consequents — the same union-only-commit defect,
+        // one hop downstream. Out of Step-0 scope; the master gate covers it
+        // post-`AREST_IVM`.
+        const DERIVED_CELLS: [&str; 2] = [
+            "Task_has_Task_Status",
+            "Task_is_recommended",
+        ];
+        // Diagnostic-only: also probe the deferred status projection so the
+        // run records WHEN it diverges (it is not part of the green gate).
+        const DIAG_CELLS: [&str; 1] = ["Resource_is_currently_in_Status"];
+
+        // Assert the materialized derived cells of `committed` match a full
+        // recompile of the same base. Reports EVERY diverging cell in one
+        // shot (not just the first) so the regression net gives a complete
+        // diagnostic picture rather than a one-cell-at-a-time bisect.
+        //
+        // For the deferred status projection (`DIAG_CELLS`) the result is NOT
+        // gated — it is recorded to stderr only when it diverges, documenting
+        // the known controlled-non-monotone staleness without failing the net.
+        // Under `--nocapture` this maps exactly where the projection goes
+        // stale (after each transition) for the next engineer.
+        let assert_matches_recompile = |committed: &ast::Object, label: &str| {
+            let recompiled = full_recompile(committed);
+            for cell in DIAG_CELLS {
+                let got = canon_cell(committed, cell);
+                let want = canon_cell(&recompiled, cell);
+                if got != want {
+                    eprintln!("[oracle-diag][{label}] deferred projection `{cell}` \
+                        diverges from recompile (known controlled-non-monotone case, \
+                        fixed by the IVM steps):\n      apply     = {got:?}\n      recompile = {want:?}");
+                }
+            }
+            let mut diffs: Vec<String> = Vec::new();
+            for cell in DERIVED_CELLS {
+                let got = canon_cell(committed, cell);
+                let want = canon_cell(&recompiled, cell);
+                if got != want {
+                    diffs.push(format!("  cell `{cell}`:\n    apply     = {got:?}\n    recompile = {want:?}"));
+                }
+            }
+            assert!(diffs.is_empty(),
+                "[{label}] these derived cells diverged from a full recompile of the \
+                 final base population (store-on-derive IVM oracle):\n{}",
+                diffs.join("\n"));
+        };
+
+        // ── deterministic mutation sequence ───────────────────────────
+        let create = |st: &ast::Object, id: &str| -> ast::Object {
+            let mut fields = HashMap::new();
+            fields.insert("id".to_string(), id.to_string());
+            let r = apply_command_defs(&def_obj, &Command::CreateEntity {
+                noun: "Task".to_string(),
+                domain: "tasks".to_string(),
+                id: Some(id.to_string()),
+                fields,
+                sender: None,
+                signature: None,
+            }, st);
+            assert!(!r.rejected, "create {id} rejected: {:?}", r.violations);
+            ast::merge_delta(st, &r.state, None)
+        };
+        let transition = |st: &ast::Object, id: &str, event: &str, from: &str| -> ast::Object {
+            let r = apply_command_defs(&def_obj, &Command::Transition {
+                entity_id: id.to_string(),
+                event: event.to_string(),
+                domain: "tasks".to_string(),
+                current_status: Some(from.to_string()),
+                sender: None,
+                signature: None,
+            }, st);
+            assert!(!r.rejected, "transition {event} on {id} rejected: {:?}", r.violations);
+            ast::merge_delta(st, &r.state, None)
+        };
+        let update = |st: &ast::Object, id: &str, prio: &str| -> ast::Object {
+            let mut upd = HashMap::new();
+            upd.insert("Task Priority".to_string(), prio.to_string());
+            let r = apply_command_defs(&def_obj, &Command::UpdateEntity {
+                noun: "Task".to_string(), domain: "tasks".to_string(),
+                entity_id: id.to_string(), fields: upd,
+                sender: None, signature: None, force: false,
+            }, st);
+            assert!(!r.rejected, "update {id} rejected: {:?}", r.violations);
+            ast::merge_delta(st, &r.state, None)
+        };
+
+        // Mutation sequence — create / update / transition, ordered so the
+        // PURE positive-join consequents (`Task_has_Task_Status`,
+        // `Task_is_recommended`) match a full recompile at EVERY step today.
+        //
+        // The update is placed while every entity is still at its clean
+        // initial status (before any transition), so the update path re-derives
+        // the bridge from a CLEAN upstream status projection. A KNOWN, separate
+        // defect (reported with this work, fixed by the IVM steps): an update
+        // applied AFTER a transition re-derives the bridge from the stale
+        // `Resource_is_currently_in_Status` the union-only commit left behind,
+        // resurrecting the prior status into the downstream consequents (the
+        // `apply_update_does_not_wipe_sm_trigger_cell...` class of cross-apply
+        // poisoning). That poisoning is precisely what `merge_delta_with_
+        // removals` (Step 1) + the IVM wiring (Step 2+) remove; the master
+        // gate widens to cover it once `AREST_IVM` lands.
+
+        // m1: create t-1 (→ pending, recommended)
+        let s = create(&state, "t-1");
+        assert_matches_recompile(&s, "after create t-1");
+        // m2: create t-2 (→ pending, recommended) — multi-entity guard: every
+        // later step must leave t-2's derived tuples matching a recompile.
+        let s = create(&s, "t-2");
+        assert_matches_recompile(&s, "after create t-2");
+        // m3: UPDATE t-2's benign priority field at the clean point — exercises
+        // the update path's drop-and-re-derive; must not disturb any derived cell.
+        let s = update(&s, "t-2", "p1");
+        assert_matches_recompile(&s, "after update t-2");
+        // m4: TRANSITION t-1 start (pending → in_progress) — t-1 must DROP from
+        // recommended and its bridge refresh to in_progress; t-2 must stay
+        // pending+recommended. This is the cross-noun RETRACTION cascade.
+        let s = transition(&s, "t-1", "start", "pending");
+        assert_matches_recompile(&s, "after start t-1");
+        // m5: TRANSITION t-1 complete (in_progress → completed) — the bridge
+        // value changes again; t-1 still not recommended, t-2 unchanged.
+        let s = transition(&s, "t-1", "complete", "in_progress");
+        assert_matches_recompile(&s, "after complete t-1");
+
+        // Direct value spot-checks at the final state (independent of the
+        // recompile equality), so a recompile that is ITSELF wrong can't
+        // mask a real divergence. These also confirm the two compared cells
+        // are SUBSTANTIVE (the net is not vacuously green): the bridge reads
+        // the correct latest status even though its upstream status
+        // projection carries a stale tuple today.
+        let is_recommended = |st: &ast::Object, task: &str| -> bool {
+            ast::fetch_cell_seq("Task_is_recommended", st).as_seq()
+                .map(|fs| fs.iter().any(|f| ast::binding(f, "Task") == Some(task)))
+                .unwrap_or(false)
+        };
+        let bridge_status = |st: &ast::Object, task: &str| -> Option<String> {
+            ast::fetch_cell_seq("Task_has_Task_Status", st).as_seq()
+                .and_then(|fs| fs.iter()
+                    .find(|f| ast::binding(f, "Task") == Some(task))
+                    .and_then(|f| ast::binding(f, "Task Status").map(String::from)))
+        };
+        assert!(is_recommended(&s, "t-2"), "t-2 (still pending) must be recommended");
+        assert!(!is_recommended(&s, "t-1"), "t-1 (completed) must NOT be recommended");
+        assert_eq!(bridge_status(&s, "t-1").as_deref(), Some("completed"),
+            "t-1's bridge must read its latest (completed) status");
+        assert_eq!(bridge_status(&s, "t-2").as_deref(), Some("pending"),
+            "t-2's bridge must read pending");
+    }
+
     /// REPRO (reconcile-vs-fold session, 2026-06-08): an `apply update` of a
     /// BENIGN field on a Task collapses every started/finished Task's SM status to
     /// `pending` on the live tasks board. ROOT CAUSE: the migration backfill rule

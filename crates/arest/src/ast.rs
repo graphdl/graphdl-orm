@@ -6638,6 +6638,243 @@ fn merge_map_cell_contents(existing_chain: &Object, delta_value: &Object) -> Obj
     Object::Map(merged.into())
 }
 
+// ── store-on-derive STEP 1 (keystone): the retraction channel ────────
+//
+// Plan: `docs/superpowers/plans/2026-06-19-store-on-derive-default.md`
+// §"The keystone: the retraction wall".
+//
+// `merge_delta`/`merge_map_cell_contents` are UNION-only (task-922): a
+// cell delta can ADD or OVERWRITE-BY-KEY, but never REMOVE a tuple. A
+// derived cell that should LOSE a tuple (a completed task leaving
+// `Task_is_recommended`, an `update` re-keying a folded tuple) therefore
+// cannot be expressed as a delta — so the apply path wipes the whole
+// cell and force-replaces with the full recompute (the workarounds in
+// `command::transition_via_defs`). IVM (Step 2+) needs deltas that carry
+// REMOVALS (ΔD⁻) so the commit can shrink a cell without a wipe.
+//
+// This step adds that capability ADDITIVELY, leaving `merge_delta` /
+// `diff_cells` / `merge_map_cell_contents` byte-identical so the apply
+// path and every existing caller are UNCHANGED (Step 2 rewires the apply
+// path; the Step-0 oracle must keep passing here). The removal channel is
+// a SIBLING `Object::Map` (`cell_name → Seq[tuples-to-remove]`), shaped
+// like the additions delta but carrying the tuples to retract. The
+// retraction-aware merge removes ΔD⁻ FIRST, then applies the existing
+// additions/union/overwrite logic — so the task-922 UNION semantics for
+// ADDITIONS are reused verbatim, never re-implemented.
+
+/// Remove the logical tuples in `removals` from a cell's latest logical
+/// contents. Pure helper; the inverse of the union half of
+/// `merge_map_cell_contents`.
+///
+/// Shape handling mirrors the read path (`cell_contents_view` unwraps a
+/// chain to its latest contents first):
+///   * **Map-form cell** (folded / keyed `D_n`, #932): each entry is
+///     `key → fact`. A removal tuple drops any entry whose VALUE equals
+///     it (folded cells key by the full-tuple hash, so value-equality is
+///     the tuple identity the plan's "remove ΔD⁻ tuples/keys" refers to —
+///     and it is robust to a tuple stored under a stale/legacy key).
+///   * **Seq-form cell**: drop every element equal to a removal tuple.
+///   * **Atom / absent**: no tuples to remove — returned unchanged.
+///
+/// Returns the shrunk LOGICAL contents (not chain-wrapped); the caller
+/// threads it through `chain_append` exactly as the union path does, so
+/// the version chain still gets one new entry per commit.
+fn remove_tuples_from_cell_contents(existing_chain: &Object, removals: &[Object]) -> Object {
+    if removals.is_empty() {
+        return cell_contents_view(existing_chain).clone();
+    }
+    let existing_contents = cell_contents_view(existing_chain);
+    match existing_contents {
+        Object::Map(m) => {
+            // Drop entries whose VALUE matches a removal tuple. Equality is
+            // structural on the logical fact, so a folded cell retracts the
+            // right tuple regardless of which hash key it sits under.
+            let kept: HashMap<String, Object> = m.iter()
+                .filter(|(_, v)| !removals.iter().any(|r| r == *v))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            Object::Map(kept.into())
+        }
+        Object::Seq(items) => {
+            let kept: Vec<Object> = items.iter()
+                .filter(|f| !removals.iter().any(|r| r == *f))
+                .cloned()
+                .collect();
+            Object::Seq(kept.into())
+        }
+        // Atom / Bottom / other: nothing tuple-shaped to retract.
+        _ => existing_contents.clone(),
+    }
+}
+
+/// Read a removals-channel value (`cell_name → tuples`) into a flat list
+/// of logical tuples for one cell. Accepts the same two encodings as the
+/// additions delta: an `Object::Seq` of tuples (the canonical form) or a
+/// folded `Object::Map` whose VALUES are the tuples (so a removal set
+/// lifted straight off a Map cell round-trips without flattening).
+fn removal_tuples(value: &Object) -> Vec<Object> {
+    match value {
+        Object::Seq(items) => items.iter().cloned().collect(),
+        Object::Map(m) => m.values().cloned().collect(),
+        Object::Bottom => Vec::new(),
+        other => alloc::vec![other.clone()],
+    }
+}
+
+/// Retraction-capable sibling of [`merge_delta`]: commit a delta that
+/// carries both ADDITIONS (`delta`, identical shape + semantics to
+/// `merge_delta`'s argument) and REMOVALS (`removals`, a sibling
+/// `cell_name → tuples-to-remove` Map). For every cell named in EITHER
+/// channel, the new chain entry's contents are computed by:
+///   1. removing the cell's ΔD⁻ tuples from its existing latest contents
+///      (`remove_tuples_from_cell_contents`), THEN
+///   2. applying the EXISTING addition logic (`merge_map_cell_contents`
+///      union for Map+Map, overwrite/replace otherwise) on top.
+/// Order is load-bearing: removal-then-add lets an `update` expressed as
+/// `δ⁻ + δ⁺` (retract the old tuple, add the new one — possibly at a
+/// different folded key) resolve to exactly the new tuple.
+///
+/// `merge_delta(base, delta, event)` is EXACTLY
+/// `merge_delta_with_removals(base, delta, &phi, event)` — the empty
+/// removal channel reduces this to the union-only path verbatim (asserted
+/// by `merge_delta_with_empty_removals_equals_merge_delta`), so existing
+/// callers are unaffected and need no migration.
+pub fn merge_delta_with_removals(
+    base: &Object,
+    delta: &Object,
+    removals: &Object,
+    event: Option<Object>,
+) -> Object {
+    // Read base WITHOUT unwrapping — chains are preserved (parity with
+    // `merge_delta`).
+    let mut base_map: HashMap<String, Object> = match base {
+        Object::Map(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        Object::Seq(cells) => cells.iter().filter_map(|c| {
+            let items = c.as_seq()?;
+            if items.len() == 3 && items[0].as_atom() == Some(CELL_TAG) {
+                Some((items[1].as_atom()?.to_string(), items[2].clone()))
+            } else {
+                None
+            }
+        }).collect(),
+        _ => HashMap::new(),
+    };
+
+    // Additions: raw logical contents per cell (diff_cells contract).
+    let delta_pairs: Vec<(String, Object)> = match delta {
+        Object::Map(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        Object::Seq(cells) => cells.iter().filter_map(|c| {
+            let items = c.as_seq()?;
+            if items.len() == 3 && items[0].as_atom() == Some(CELL_TAG) {
+                Some((items[1].as_atom()?.to_string(), items[2].clone()))
+            } else {
+                None
+            }
+        }).collect(),
+        _ => Vec::new(),
+    };
+
+    // Removals: per-cell tuples to retract. Keyed by cell name; the value
+    // is read by `removal_tuples`.
+    let removal_map: HashMap<String, Vec<Object>> = match removals {
+        Object::Map(m) => m.iter()
+            .map(|(k, v)| (k.clone(), removal_tuples(v)))
+            .filter(|(_, ts)| !ts.is_empty())
+            .collect(),
+        _ => HashMap::new(),
+    };
+
+    let recorded_at = logical_commit_stamp();
+
+    // Cells touched by EITHER channel get a fresh chain entry. Process the
+    // union of (addition keys ∪ removal keys); a removal-only cell still
+    // needs a new version with the tuple gone.
+    let addition_keys: alloc::collections::BTreeSet<String> =
+        delta_pairs.iter().map(|(k, _)| k.clone()).collect();
+    let mut delta_by_key: HashMap<String, Object> = delta_pairs.into_iter().collect();
+
+    // Deterministic processing order (BTreeSet) — the cell map is a set, so
+    // order carries no semantics, only reproducibility (parity with
+    // fetch_cell_seq's key-ordered flatten).
+    let mut all_keys: alloc::collections::BTreeSet<String> = addition_keys;
+    for k in removal_map.keys() { all_keys.insert(k.clone()); }
+
+    for k in all_keys {
+        let removals_for_cell = removal_map.get(&k).map(|v| v.as_slice()).unwrap_or(&[]);
+        let addition_for_cell = delta_by_key.remove(&k);
+        let new_chain = match base_map.get(&k) {
+            Some(existing) => {
+                // 1. Retract ΔD⁻ from the existing latest contents.
+                let after_removal = remove_tuples_from_cell_contents(existing, removals_for_cell);
+                // 2. Layer ΔD⁺ on top using the EXISTING union/overwrite
+                //    logic. `merge_map_cell_contents` reads its first
+                //    argument via `cell_contents_view`; `after_removal` is
+                //    already unwrapped logical contents, which that view
+                //    passes through unchanged, so the union sees the
+                //    post-removal Map and the task-922 semantics are reused
+                //    verbatim.
+                let merged_contents = match &addition_for_cell {
+                    Some(v) => merge_map_cell_contents(&after_removal, v),
+                    None => after_removal,
+                };
+                chain_append(existing, merged_contents, recorded_at.clone(), event.clone())
+            }
+            None => {
+                // Cell absent from base: there is nothing to retract, so the
+                // result is just the additions (if any). A removal-only delta
+                // for an absent cell is a no-op (don't mint an empty cell).
+                match addition_for_cell {
+                    Some(v) => wrap_as_chain(v, recorded_at.clone(), event.clone()),
+                    None => continue,
+                }
+            }
+        };
+        base_map.insert(k, new_chain);
+    }
+    Object::Map(base_map.into())
+}
+
+/// Retraction-aware sibling of [`diff_cells`]: emit BOTH the additions
+/// patch (identical to `diff_cells(old, new)`) AND the per-cell removals
+/// (`cell_name → Seq[tuples present in old but absent from new]`).
+///
+/// `diff_cells_with_removals(old, new)` paired with
+/// `merge_delta_with_removals(old, additions, removals, _)` reconstructs
+/// `new`'s logical view for every cell — INCLUDING cells that LOST tuples,
+/// which `diff_cells`+`merge_delta` alone cannot express (a shrunk Map
+/// cell unions back the dropped tuple). For a cell present in both with
+/// only additions, `removals` carries an empty (or absent) entry and the
+/// behavior collapses to the union-only round-trip.
+///
+/// Removals are computed on the LOGICAL tuple sets (`fetch_cell_seq`
+/// key-flattens folded Map cells first), so the diff is shape-agnostic:
+/// a tuple counts as removed iff it appears in `old`'s contents and not in
+/// `new`'s. Only cells whose tuple set actually shrank appear in the
+/// removals Map (an added-only or unchanged cell contributes nothing).
+pub fn diff_cells_with_removals(old: &Object, new: &Object) -> (Object, Object) {
+    let additions = diff_cells(old, new);
+
+    // Per-cell removed tuples: for every cell in `old`, the logical tuples
+    // that are gone from `new`. Cells absent from `new` entirely surface
+    // every one of their old tuples as removed.
+    let mut removals: HashMap<String, Object> = HashMap::new();
+    for (name, _) in cells_iter(old).into_iter() {
+        let old_tuples = fetch_cell_seq(name, old);
+        let Some(old_items) = old_tuples.as_seq() else { continue };
+        if old_items.is_empty() { continue; }
+        let new_tuples = fetch_cell_seq(name, new);
+        let new_items: &[Object] = new_tuples.as_seq().unwrap_or(&[]);
+        let removed: Vec<Object> = old_items.iter()
+            .filter(|t| !new_items.iter().any(|n| n == *t))
+            .cloned()
+            .collect();
+        if !removed.is_empty() {
+            removals.insert(name.to_string(), Object::Seq(removed.into()));
+        }
+    }
+    (additions, Object::Map(removals.into()))
+}
+
 /// Demultiplex events by cell assignment (paper Eq. demux).
 /// E_n = Filter(eq ∘ [RMAP, n̄]) : E
 /// Splits a sequence of (fact_type_id, fact) pairs into per-cell groups
@@ -12441,6 +12678,167 @@ mod tests {
             assert_eq!(fetch_or_phi(name, &reconstructed), fetch_or_phi(name, &new),
                 "cell {} must match after merge_delta(old, diff(old,new))", name);
         }
+
+        // store-on-derive STEP 1: the inverse receipt must ALSO hold when a
+        // cell LOSES tuples — the case the union-only path cannot express.
+        // A folded Map cell shrinks (one tuple retracted); a Seq cell shrinks;
+        // a cell vanishes entirely. `diff_cells_with_removals` +
+        // `merge_delta_with_removals` must reconstruct `new` exactly, where
+        // plain `diff_cells`+`merge_delta` would resurrect the dropped tuples
+        // via the union.
+        let fa = fact_from_pairs(&[("Task", "a"), ("Status", "pending")]);
+        let fb = fact_from_pairs(&[("Task", "b"), ("Status", "pending")]);
+        let mut map_old: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        map_old.insert("ka".to_string(), fa.clone());
+        map_old.insert("kb".to_string(), fb.clone());
+        let s_old = Object::seq(vec![
+            cell("Folded", Object::Map(map_old.into())),
+            cell("Seqcell", Object::seq(vec![Object::atom("x"), Object::atom("y")])),
+            cell("Vanish", Object::seq(vec![Object::atom("gone")])),
+            cell("Keep", Object::atom("same")),
+        ]);
+        // new: Folded loses b, Seqcell loses y, Vanish becomes empty, Keep stays.
+        let mut map_new: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        map_new.insert("ka".to_string(), fa.clone());
+        let s_new = Object::seq(vec![
+            cell("Folded", Object::Map(map_new.into())),
+            cell("Seqcell", Object::seq(vec![Object::atom("x")])),
+            cell("Vanish", Object::seq(vec![])),
+            cell("Keep", Object::atom("same")),
+        ]);
+        let (adds, rems) = diff_cells_with_removals(&s_old, &s_new);
+        let recon = merge_delta_with_removals(&s_old, &adds, &rems, None);
+        for name in ["Folded", "Seqcell", "Vanish", "Keep"] {
+            assert_eq!(
+                fetch_cell_seq(name, &recon), fetch_cell_seq(name, &s_new),
+                "cell {} must match new after retraction-aware diff+merge round-trip",
+                name);
+        }
+    }
+
+    /// store-on-derive STEP 1 (keystone): a removal channel retracts a
+    /// tuple from a folded Map cell. cell {a,b}; delta removes b ⇒ {a}.
+    #[test]
+    fn merge_delta_removes_retracted_tuple_from_map_cell() {
+        let fa = fact_from_pairs(&[("Task", "a")]);
+        let fb = fact_from_pairs(&[("Task", "b")]);
+        let mut m: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        m.insert("ka".to_string(), fa.clone());
+        m.insert("kb".to_string(), fb.clone());
+        let base = Object::seq(vec![cell("Cell", Object::Map(m.into()))]);
+
+        // Removal channel: drop tuple `b` from `Cell`. No additions.
+        let mut rem: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        rem.insert("Cell".to_string(), Object::seq(vec![fb.clone()]));
+        let merged = merge_delta_with_removals(
+            &base, &Object::Map(hashbrown::HashMap::new().into()),
+            &Object::Map(rem.into()), None);
+
+        let got = fetch_cell_seq("Cell", &merged);
+        let items = got.as_seq().expect("cell is a Seq view");
+        assert_eq!(items.len(), 1, "exactly one tuple must remain after removing b");
+        assert_eq!(items[0], fa, "the surviving tuple must be a");
+        assert!(!items.iter().any(|f| *f == fb), "tuple b must be gone");
+
+        // A new chain version was minted (the commit is recorded, not a no-op).
+        let hist = cells_iter_history(&merged, "Cell");
+        assert_eq!(hist.len(), 2, "retraction commits one new version on top of base");
+    }
+
+    /// store-on-derive STEP 1: retract-then-reinsert the SAME tuple is
+    /// idempotent on the logical view — removal happens BEFORE the add, so
+    /// adding it back lands exactly one copy (a folded cell keys it by
+    /// tuple identity; the union overwrites at that key).
+    #[test]
+    fn merge_delta_retraction_then_reinsert_is_idempotent() {
+        let fa = fact_from_pairs(&[("Task", "a")]);
+        let fb = fact_from_pairs(&[("Task", "b")]);
+        let mut m: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        m.insert("ka".to_string(), fa.clone());
+        m.insert("kb".to_string(), fb.clone());
+        let base = Object::seq(vec![cell("Cell", Object::Map(m.into()))]);
+
+        // Commit: remove b AND add b back (same tuple) in one delta. Removal
+        // is applied first, then the addition re-lands it — net no change to
+        // the logical set {a, b}.
+        let mut rem: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        rem.insert("Cell".to_string(), Object::seq(vec![fb.clone()]));
+        let mut add_map: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        add_map.insert("kb".to_string(), fb.clone());
+        let mut adds: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        adds.insert("Cell".to_string(), Object::Map(add_map.into()));
+        let merged = merge_delta_with_removals(
+            &base, &Object::Map(adds.into()), &Object::Map(rem.into()), None);
+
+        let got = fetch_cell_seq("Cell", &merged);
+        let items = got.as_seq().expect("cell is a Seq view");
+        assert_eq!(items.len(), 2, "retract-then-reinsert keeps the set {{a,b}} (no dup)");
+        assert!(items.iter().any(|f| *f == fa), "a still present");
+        assert!(items.iter().filter(|f| **f == fb).count() == 1, "exactly one b (idempotent)");
+    }
+
+    /// store-on-derive STEP 1: `merge_delta_with_removals` with an EMPTY
+    /// removal channel is byte-for-byte the union-only `merge_delta` — the
+    /// proof that the additions/union/overwrite behavior is UNCHANGED and
+    /// every existing caller can adopt the retraction-aware merge with a
+    /// `phi` removals argument and observe no difference.
+    #[test]
+    fn merge_delta_with_empty_removals_equals_merge_delta() {
+        // Mix: Map base (union case), legacy-raw promote, absent-cell create.
+        let fa = fact_from_pairs(&[("Task", "a")]);
+        let mut m: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        m.insert("ka".to_string(), fa);
+        let base = Object::seq(vec![
+            cell("Folded", Object::Map(m.into())),
+            cell("Raw", Object::atom("legacy")),
+        ]);
+        // Delta: union a tuple into Folded, overwrite Raw, create Fresh.
+        let fb = fact_from_pairs(&[("Task", "b")]);
+        let mut fold_add: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        fold_add.insert("kb".to_string(), fb);
+        let mut delta: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        delta.insert("Folded".to_string(), Object::Map(fold_add.into()));
+        delta.insert("Raw".to_string(), Object::atom("new"));
+        delta.insert("Fresh".to_string(), Object::atom("hello"));
+        let delta = Object::Map(delta.into());
+
+        let union_only = merge_delta(&base, &delta, None);
+        let via_removals = merge_delta_with_removals(
+            &base, &delta, &Object::Map(hashbrown::HashMap::new().into()), None);
+
+        // Compare modulo the per-commit `recorded_at` stamp: `merge_delta`
+        // and `merge_delta_with_removals` each call `logical_commit_stamp()`
+        // (a global monotonic counter), so two separate commits get distinct
+        // stamps and a raw whole-object `==` would differ on the stamp alone.
+        // The additions behavior is proven by: (a) identical logical views,
+        // and (b) identical version chains down to id / prev / CONTENTS for
+        // every cell.
+        for name in ["Folded", "Raw", "Fresh"] {
+            assert_eq!(
+                fetch_cell_seq(name, &union_only), fetch_cell_seq(name, &via_removals),
+                "cell {} logical view must be identical with an empty removal channel",
+                name);
+            let h_union = cells_iter_history(&union_only, name);
+            let h_rem = cells_iter_history(&via_removals, name);
+            assert_eq!(h_union.len(), h_rem.len(),
+                "cell {} must have the same number of versions", name);
+            for (a, b) in h_union.iter().zip(h_rem.iter()) {
+                assert_eq!(version_entry_id(a), version_entry_id(b),
+                    "cell {} version ids must match", name);
+                assert_eq!(version_entry_prev(a), version_entry_prev(b),
+                    "cell {} version prev pointers must match", name);
+                assert_eq!(version_entry_contents(a), version_entry_contents(b),
+                    "cell {} version CONTENTS must match (additions behavior unchanged)",
+                    name);
+            }
+        }
+        // Cell set is identical (no spurious cells minted/dropped).
+        let mut names_union: Vec<&str> = cells_iter(&union_only).into_iter().map(|(n, _)| n).collect();
+        let mut names_rem: Vec<&str> = cells_iter(&via_removals).into_iter().map(|(n, _)| n).collect();
+        names_union.sort();
+        names_rem.sort();
+        assert_eq!(names_union, names_rem,
+            "the empty removal channel must mint/drop NO cells vs merge_delta");
     }
 
     #[test]
