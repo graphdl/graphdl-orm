@@ -1323,6 +1323,17 @@ fn noun_runtime_defined(noun: &str, state: &ast::Object, d: &ast::Object) -> boo
     noun_instantiable_per_cell(noun, state, d) == Some(true)
 }
 
+/// store-on-derive Step 3: IVM (the retraction-carrying apply commit via
+/// `diff_cells_with_removals`) is the DEFAULT-ON maintenance strategy for
+/// create/update/transition. `AREST_IVM=0` is the documented rollback to the
+/// union-only drop-and-re-derive commit. (no_std: always the OFF path.)
+#[cfg(not(feature = "no_std"))]
+fn ivm_apply_enabled() -> bool {
+    std::env::var("AREST_IVM").map(|v| v != "0" && !v.is_empty()).unwrap_or(true)
+}
+#[cfg(feature = "no_std")]
+fn ivm_apply_enabled() -> bool { false }
+
 fn create_via_defs(
     d: &ast::Object,
     noun: &str,
@@ -2155,7 +2166,29 @@ fn create_via_defs(
     let final_state = match rejected { true => state.clone(), false => derived_state };
     // #209: return only the cells this command modified, not the full D.
     // system_impl merges this delta onto the snapshot before commit.
-    let delta = ast::diff_cells(state, &final_state);
+    // store-on-derive Step 3: under IVM the commit carries retractions —
+    // mirror transition_via_defs (a created entity can shrink a recomputed
+    // superlative/aggregate consequent; the union-only commit can't drop it).
+    // When rejected, final_state == state so both branches yield an empty delta.
+    let ivm_enabled = ivm_apply_enabled();
+    let delta = if ivm_enabled {
+        let (additions, removals) = ast::diff_cells_with_removals(state, &final_state);
+        let removed_cells: hashbrown::HashSet<String> = removals.as_map()
+            .map(|m| m.keys().cloned().collect()).unwrap_or_default();
+        match additions {
+            ast::Object::Map(add_map) => {
+                let mut out: hashbrown::HashMap<String, ast::Object> = add_map.iter()
+                    .map(|(k, v)| (k.clone(), v.clone())).collect();
+                for cell in removed_cells.iter() {
+                    out.insert(cell.clone(), ast::fetch_cell_seq(cell, &final_state));
+                }
+                ast::Object::Map(out.into())
+            }
+            other => other,
+        }
+    } else {
+        ast::diff_cells(state, &final_state)
+    };
     CommandResult {
         entities, status, transitions, navigation, violations,
         derived_count: derived.len(), rejected, view, crudl,
@@ -3018,11 +3051,7 @@ fn transition_via_defs(
     // COMMIT (item 2) plus routing the additions through the insertion
     // primitive (item 1); swapping the scoped recompute out entirely waits
     // for the DRed lever (a later step) so we do not silently under-retract.
-    #[cfg(not(feature = "no_std"))]
-    let ivm_enabled = std::env::var("AREST_IVM").map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false);
-    #[cfg(feature = "no_std")]
-    let ivm_enabled = false;
+    let ivm_enabled = ivm_apply_enabled();
 
     // Find the machine def, compute transition, capture noun name
     let transition_result: Option<(String, String)> = ast::cells_iter(d).into_iter()
@@ -4390,7 +4419,30 @@ fn update_via_defs(
     // #209: return only the cells this update modified. When rejected,
     // emit an empty delta (no cells change); otherwise diff new_state
     // against the input state so only touched FT cells ship.
-    let delta = if rejected { ast::Object::phi() } else { ast::diff_cells(state, &new_state) };
+    // store-on-derive Step 3: under IVM the commit carries retractions
+    // (mirrors transition_via_defs) — an update that flips a keyed/functional
+    // antecedent must DROP the superseded derived tuple, not union it back.
+    let ivm_enabled = ivm_apply_enabled();
+    let delta = if rejected {
+        ast::Object::phi()
+    } else if ivm_enabled {
+        let (additions, removals) = ast::diff_cells_with_removals(state, &new_state);
+        let removed_cells: hashbrown::HashSet<String> = removals.as_map()
+            .map(|m| m.keys().cloned().collect()).unwrap_or_default();
+        match additions {
+            ast::Object::Map(add_map) => {
+                let mut out: hashbrown::HashMap<String, ast::Object> = add_map.iter()
+                    .map(|(k, v)| (k.clone(), v.clone())).collect();
+                for cell in removed_cells.iter() {
+                    out.insert(cell.clone(), ast::fetch_cell_seq(cell, &new_state));
+                }
+                ast::Object::Map(out.into())
+            }
+            other => other,
+        }
+    } else {
+        ast::diff_cells(state, &new_state)
+    };
     // pb-live-binding-reeval (a): cross-noun delivery — subscriptions on
     // OTHER nouns re-deliver when this delta touched a cell the view
     // rules read (e.g. a value type's Format flip re-widgets every view
@@ -9376,7 +9428,7 @@ Transition 'block' is defined in State Machine Definition 'Task'.
         // satisfy are gated on `ivm` so the suite is green in both modes.
         #[cfg(not(feature = "no_std"))]
         let ivm = std::env::var("AREST_IVM").map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false);
+            .unwrap_or(true); // store-on-derive Step 3: IVM is default-on
         #[cfg(feature = "no_std")]
         let ivm = false;
 
@@ -9861,11 +9913,11 @@ Transition 'start' is defined in State Machine Definition 'Task'.
 
         // Build a shared base (created entity at the clean initial status),
         // OFF — so both runs start from the identical drop-and-re-derive base.
-        std::env::remove_var("AREST_IVM");
+        std::env::set_var("AREST_IVM", "0");
         let base = create(&state, "t-1");
 
         // OFF-path transition (drop + full re-derive + restore; union commit).
-        std::env::remove_var("AREST_IVM");
+        std::env::set_var("AREST_IVM", "0");
         let off = transition_commit(&base, "t-1", "start", "pending");
 
         // ON-path transition (IVM insertion + retraction-carrying commit).
