@@ -872,6 +872,33 @@ pub fn forward_chain_defs_state_seeded_tracked(
     semi_naive_inner(derivation_defs, Some(seed), d, max_rounds, None, Some(activated), None)
 }
 
+/// store-on-derive STEP 2: the IVM insertion primitive
+/// ([`forward_chain_defs_state_seeded_with_delta`]) AND the activated-rule
+/// tracker ([`forward_chain_defs_state_seeded_tracked`]) in one call.
+///
+/// The transition apply path (`command::transition_via_defs` under the
+/// `AREST_IVM` gate) routes its post-transition derivation through the
+/// semi-naive DELTA-JOIN evaluation (additions computed over per-antecedent
+/// delta views, |ΔA|×|B| instead of |A|×|B|) while STILL needing the
+/// `activated` set so the drop-and-rederive bridge-preservation restore can
+/// distinguish "rule fired (keep its emit, incl. a legitimate stale-clear)"
+/// from "rule never fired (restore pre-drop snapshot)". The two existing
+/// public wrappers each expose only ONE of `initial_delta` / `activated`;
+/// this exposes both. Behaviour is byte-identical to
+/// `forward_chain_defs_state_seeded_with_delta` plus the activated
+/// bookkeeping (`semi_naive_inner` with both `Some`).
+pub fn forward_chain_defs_state_seeded_with_delta_tracked(
+    derivation_defs: &[(&str, &ast::Func, Option<&[String]>)],
+    seed: HashSet<String>,
+    initial_delta: hashbrown::HashMap<String, Vec<ast::Object>>,
+    d: &ast::Object,
+    max_rounds: usize,
+    activated: &mut HashSet<String>,
+) -> (ast::Object, Vec<DerivedFact>) {
+    semi_naive_inner(derivation_defs, Some(seed), d, max_rounds, None,
+        Some(activated), Some(initial_delta))
+}
+
 /// Shared body of the semi-naive variants. `initial_dirty == None`
 /// matches the classical "round 1 runs everything" behavior; `Some(set)`
 /// seeds the round-1 filter from `set` (used by
