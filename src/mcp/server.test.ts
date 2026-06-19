@@ -927,6 +927,46 @@ describe('#872 apply footgun-resistance', () => {
       expect(result.fields['Task Subject']).toBe('X')
       expect(result.fields['Task Description']).toBe('new')
     })
+
+    it('drops a pre-fetched phantom field with no declared fact type (#868 Timestamp leak)', () => {
+      // A force-update on an SM-governed noun pre-fetches the entity; the get
+      // can surface a bare `Timestamp` (an SM event stamp) that maps to no
+      // declared FT. Re-asserting it forks data into a non-canonical fallback
+      // cell. The merge must drop it while keeping declared fields + payload.
+      const existing = {
+        id: 'store-on-derive-default',
+        'Task Subject': 'subj',
+        'Task Status': 'in_progress',
+        Timestamp: '1781867633701-000000000000',
+        view: { elements: [
+          { factType: 'Task_has_Task_Subject' },
+          { factType: 'Task_has_Task_Status' },
+          { factType: 'Task_has_Task_Description' },
+        ] },
+      }
+      const result = buildApplyMergedUpdatePayload({
+        existing,
+        payload: { 'Task Description': 'new' },
+        fields_only_replace: false,
+      })
+      expect(result.fields['Task Description']).toBe('new')
+      expect(result.fields['Task Subject']).toBe('subj')
+      expect(result.fields['Task Status']).toBe('in_progress')
+      expect('Timestamp' in result.fields).toBe(false)
+    })
+
+    it('degrades safely when the get response carries no view (re-assert every scalar)', () => {
+      // No view.elements to discriminate declared vs phantom — fall back to the
+      // prior behavior (keep every scalar) rather than risk dropping real fields.
+      const existing = { id: 't', 'Task Subject': 'x', Timestamp: 'y' }
+      const result = buildApplyMergedUpdatePayload({
+        existing,
+        payload: { 'Task Description': 'new' },
+        fields_only_replace: false,
+      })
+      expect(result.fields['Task Subject']).toBe('x')
+      expect(result.fields.Timestamp).toBe('y')
+    })
   })
 })
 

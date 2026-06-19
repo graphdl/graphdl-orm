@@ -1782,17 +1782,54 @@ export function parseOrientResponse(raw: string): unknown {
  * the payload" so the helper is safe to call regardless of whether
  * the get-fetch hit anything.
  */
+/**
+ * The set of field-keys that map to a DECLARED fact type, derived from a
+ * get response's `view.elements` (each carries a `factType` like
+ * `Task_has_Task_Subject`, whose value-type name is the displayed field key).
+ * The #868 merge uses this to avoid re-asserting NON-canonical phantom fields
+ * — e.g. a bare `Timestamp` the get surfaced from an SM event fallback cell —
+ * which the engine would only land back in a non-canonical fallback cell (a
+ * silent data fork; see command.rs `unresolvable_field_key_violation`).
+ * Returns null when no view/elements are present so the merge degrades to its
+ * prior "re-assert every scalar" behavior rather than dropping real fields.
+ */
+export function declaredFieldKeysFromView(
+  existing: Record<string, unknown> | null | undefined,
+): Set<string> | null {
+  const view = existing && typeof existing === 'object'
+    ? (existing as Record<string, unknown>).view : undefined
+  const elements = view && typeof view === 'object'
+    ? (view as Record<string, unknown>).elements : undefined
+  if (!Array.isArray(elements) || elements.length === 0) return null
+  const keys = new Set<string>()
+  for (const el of elements) {
+    const ft = el && typeof el === 'object'
+      ? (el as Record<string, unknown>).factType : undefined
+    if (typeof ft === 'string' && ft.length > 0) {
+      // Task_has_Task_Subject -> "Task Subject"; Task_has_Owner -> "Owner".
+      keys.add(ft.replace(/^.*_has_/, '').replace(/_/g, ' '))
+    }
+  }
+  return keys.size > 0 ? keys : null
+}
+
 export function mergeUpdateFields(
   existing: Record<string, unknown> | null | undefined,
   payload: Record<string, string>,
 ): Record<string, string> {
   const merged: Record<string, string> = {}
+  const declaredKeys = declaredFieldKeysFromView(existing)
   if (existing && typeof existing === 'object') {
     for (const [k, v] of Object.entries(existing)) {
       if (k === 'id') continue
       if (v === null || v === undefined) continue
       if (Array.isArray(v)) continue
       if (typeof v === 'object') continue
+      // #868 phantom guard: skip a pre-fetched scalar that maps to no declared
+      // fact type (e.g. an SM event `Timestamp` surfaced from a fallback cell).
+      // Re-asserting it would fork data into a non-canonical cell. Payload
+      // fields (below) are always kept — the agent asked for those explicitly.
+      if (declaredKeys && !declaredKeys.has(k)) continue
       merged[k] = String(v)
     }
   }
