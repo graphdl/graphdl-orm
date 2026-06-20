@@ -257,6 +257,44 @@ Guard Run has Result.
 
 * Fact belongs to Domain iff Fact is of Function and that Function belongs to Domain.
 
+<!-- sm-retire-forml2: SM/Resource status projections lifted from imperative
+     Rust into reading-level derivations.
+
+     (1) instance-of-definition (noun-scoped): replaces the compile-time-baked
+         definition_id / compile_sm_instance_of_definition_backfill_for. A State
+         Machine is an instance of the SM Definition that governs the Noun its
+         Resource is an instance of. 3-antecedent equi-join, derivation.md
+         shape 6. NOTE: `State Machine is for Resource` (the WHICH-SM binding)
+         is NOT lifted — the `same entity as` identity equi-binding the safe
+         rule would need is NOT supported by the parser (verified: no
+         `same entity as` lowering in parse_forml2), and the underspecified
+         partial-tuple form was REMOVED 2026-06-12 for KeyConflict-displacing
+         real facts (instances.md 155-167). So compile_sm_for_resource_backfill_for
+         is RETAINED.
+
+     (2) Resource-is-currently-in-Status projection: lifts the per-app
+         projection (apps/tasks/readings/app.md) to core, replacing the
+         imperative Resource_is_currently_in_Status maintenance block in
+         command.rs. 2-antecedent equi-join (derivation.md shape 6),
+         single-valued.
+
+     (3) SM seed branch: a fresh / eventless SM instance sits at its
+         Definition's effective-initial status. 1-antecedent + effective-initial
+         join. This is the ONLY authorable half of the current-status producer;
+         the ADVANCE branch (last-applicable-transition fold over the
+         occurred-ordered trigger-event history) has NO authorable shape (no
+         ordered-foldl-into-the-same-cell antecedent in derivation.md 255-368)
+         AND requires derived-cell retraction, so the live advance fold
+         (compile_sm_reconstruction_fold) stays engine-synthesised. The keyed UC
+         on State_Machine_is_currently_in_Status (instances.md 184-193) collapses
+         the seed emit and the fold emits to last-write-wins. -->
+
+* State Machine is instance of State Machine Definition iff that State Machine is for some Resource and that Resource is instance of some Noun and that State Machine Definition is for that Noun.
+
+* Resource is currently in Status iff some State Machine is for that Resource and that State Machine is currently in that Status.
+
+* State Machine is currently in Status iff that State Machine is instance of some State Machine Definition and that Status is effective initial in that State Machine Definition.
+
 ## Instance Facts
 
 Domain 'instances' has Access 'public'.

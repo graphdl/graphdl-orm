@@ -3,9 +3,9 @@
 ## Entity Types
 
 Status(.Name) is an entity type.
-Status is a subtype of Resource.
+Status is a subtype of Noun.
 State Machine Definition(.Name) is an entity type.
-State Machine Definition is a subtype of Resource.
+State Machine Definition is a subtype of Status.
 Transition(.id) is an entity type.
 Guard(.Name) is an entity type.
 
@@ -15,7 +15,7 @@ Stream(.id) is an entity type.
 
 ### State Machine Definition
 State Machine Definition is for Noun.
-  Each State Machine Definition is for exactly one Noun.
+  Each State Machine Definition is for at most one Noun.
 
 ### Status
 Verb is performed in Status.
@@ -41,6 +41,33 @@ Status is initial in State Machine Definition.
 Status is defined in State Machine Definition. *
 Status is terminal in State Machine Definition. *
 Status is rooted in State Machine Definition. *
+Status is effective initial in State Machine Definition. *
+<!-- sm-retire-forml2: the resolved seed status of a machine. The cardinality
+     gate ("exactly one rooted ⇒ initial, else empty") is a non-monotonic
+     predicate FORML 2 cannot express (count+`=1` does not compose as a same-rule
+     filter; `no Status is initial` is not an antecedent kind — derivation.md
+     193-223 / 414-422). So this `*` cell is populated by the RETAINED Rust
+     effective-initial helper, which prefers an explicit `Status is initial in
+     State Machine Definition` and else applies the cardinality gate over
+     `Status is rooted in State Machine Definition`. The seed-branch rule for
+     `State Machine is currently in Status` joins against this cell. This is the
+     one deliberate, documented (state.md "Two things the rule is NOT able to
+     express") non-monotonic remnant — retained, not newly added. -->
+
+### Effective Transition (post-Harel available-transition relation)
+<!-- sm-retire-forml2: the post-Harel <from, to, event> available-transition
+     relation, multi-valued. REPLACES the Rust Harel expansion + transition_table
+     + machine:{noun} + transitions:{noun} (compile.rs compile_state_machine
+     11957-12003 fan-out). Rule 1 is the DIRECT declared edge; rule 2 is the
+     INHERITED (Harel) edge: because State Machine Definition is a subtype of
+     Status, a Transition whose single `from` Status IS the machine super-state
+     induces an effective transition out of every child Status defined in that
+     machine. Override-suppression (a child's own <event> edge shadowing the
+     inherited one) is NOT expressible as a rule (negation is not an antecedent
+     kind, and it would recurse through negation over this same FT) — the union
+     deliberately over-emits and consumer-side firing precedence prefers the
+     DIRECT row. The rules are under "## Derivation Rules". -->
+Status has effective Transition to Status on Event Type. *
 
 ### Guard
 Guard references Fact Type.
@@ -125,6 +152,25 @@ Guard guards Transition.
 -->
 
 * Status is rooted in State Machine Definition iff some Transition is defined in that State Machine Definition and that Transition is from that Status and no Transition is defined in that State Machine Definition where that Transition is to that Status.
+
+<!-- sm-retire-forml2: post-Harel effective-transition relation. Rule 1 is the
+     DIRECT declared edge (the literal Transition from its single `from` Status).
+     Rule 2 is the INHERITED / Harel edge: State Machine Definition is a subtype
+     of Status, so a Transition whose single `from` Status IS the machine
+     super-state induces an effective transition out of every child Status that
+     is defined in that machine. The two from-roles never collapse: rule 2's
+     first antecedent types the from-value as a State Machine Definition entity,
+     so it fires ONLY when the from-Status is itself a machine; the child clause
+     then ranges over that machine's members via the already-derived
+     `Status is defined in State Machine Definition` cell. Noun-scoping is
+     intrinsic (the join is through the SMD), preserving #813 — shared status
+     names never cross-attach. The union over-emits a child's overridden edge
+     (direct + inherited); firing precedence (consumer-side) picks the direct
+     row, the affordance path tolerates the extra legal row. -->
+
+* Status has effective Transition to Status on Event Type iff some Transition is from the first Status and that Transition is to the second Status and that Transition is triggered by that Event Type.
+
+* Status has effective Transition to Status on Event Type iff some Transition is from some State Machine Definition and that Transition is to the second Status and that Transition is triggered by that Event Type and the first Status is defined in that State Machine Definition.
 
 ## Constraints
 
