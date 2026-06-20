@@ -5734,15 +5734,29 @@ fn cell_put_keyed_batch_with<K: Fn(&Object) -> Option<String>>(
 /// `Run 'X' has Action Count '0'.` corrected to `'25'` left BOTH rows
 /// in the cell despite `Each Run has at most one Action Count.`
 ///
-/// For every cell named in `key_roles` whose contents are still
-/// Seq-shaped (Map cells are same-key-dup-free by construction):
-/// rebuild via the keyed upsert in Seq order — later rows win, and the
-/// merge appends freshly-parsed rows AFTER carried-forward priors, so
-/// corrected readings beat stale values. Conservative gate: a cell
-/// where any row fails to extract its key (dirty legacy shapes) is
-/// left untouched — dropping unkeyable rows is not this pass's job.
-/// Returns the reconciled state plus `(cell, displaced_count)` for the
-/// caller's `[load]` report.
+/// For every cell named in `key_roles`: rebuild via the keyed upsert in
+/// Seq order — later rows win, and the merge appends freshly-parsed rows
+/// AFTER carried-forward priors, so corrected readings beat stale values.
+/// Conservative gate: a cell where any row fails to extract its key
+/// (dirty legacy shapes) is left untouched — dropping unkeyable rows is
+/// not this pass's job. Returns the reconciled state plus `(cell,
+/// displaced_count)` for the caller's `[load]` report.
+///
+/// store-on-derive STEP 4 (leaf-ingest convergence): read the cell via
+/// `fetch_cell_seq`, NOT `fetch_or_phi(..).as_seq()`. The earlier form
+/// SILENTLY SKIPPED folded **Map** cells (the #932/#940 silent-no-op bug
+/// class) on the assumption that a Map cell is same-key-dup-free. That
+/// assumption holds for the apply/full-compile path (cells reach here as
+/// freshly-parsed Seqs) but is FALSE on the LEAF-INGEST path: the prior
+/// db persists keyed cells in folded Map form, and `merge_states` unions
+/// the new readings' rows onto that Map via `concat_dedup`, which dedups
+/// only by identity (id/name), NOT by the UC key — so a corrected
+/// single-valued fact (e.g. `Task 't1' has Task Status 'completed'`)
+/// coexisted with its stale prior (`… 'pending'`) inside the Map and the
+/// leaf db DIVERGED from a recompile (which never accumulated the stale
+/// value). `fetch_cell_seq` key-flattens the Map so the upsert sees and
+/// retracts the stale tuple regardless of storage shape; on a genuinely
+/// dup-free cell the re-key is idempotent (no displacement).
 pub(crate) fn reconcile_keyed_cells(
     state: &Object,
     key_roles: &hashbrown::HashMap<String, alloc::vec::Vec<String>>,
@@ -5752,7 +5766,7 @@ pub(crate) fn reconcile_keyed_cells(
     let mut cells: alloc::vec::Vec<&String> = key_roles.keys().collect();
     cells.sort();
     for cell in cells {
-        let contents = fetch_or_phi(cell, &out);
+        let contents = fetch_cell_seq(cell, &out);
         let Some(items) = contents.as_seq() else { continue };
         if items.len() < 2 { continue; }
         let names: alloc::vec::Vec<&str> =
@@ -5762,7 +5776,19 @@ pub(crate) fn reconcile_keyed_cells(
         }
         let before = items.len();
         let facts: alloc::vec::Vec<Object> = items.to_vec();
-        let (next, _conflicts) = cell_put_keyed_batch(cell, &names, facts, true, &out);
+        // store-on-derive STEP 4: REBUILD the cell from the flattened tuples
+        // keyed by the UC key. A folded Map cell stores entries under their
+        // FULL-TUPLE hash, so a stale same-UC-key dup (`t1→pending`) sits
+        // under a DIFFERENT map key than its correction (`t1→completed`) and
+        // a batch that started from the existing Map would preserve BOTH
+        // (the upsert only collides on equal UC keys, never across the two
+        // full-tuple keys). Zeroing the cell first makes `cell_put_keyed_batch`
+        // build the Map fresh from `facts` — every tuple re-keyed by the UC,
+        // last-write-wins dropping the stale prior. `facts` already holds the
+        // complete tuple set (fetch_cell_seq flattened it), so nothing is
+        // lost; for a dup-free cell the rebuild is a faithful round-trip.
+        let cleared = store(cell, Object::phi(), &out);
+        let (next, _conflicts) = cell_put_keyed_batch(cell, &names, facts, true, &cleared);
         let after = cell_facts_iter(&fetch_or_phi(cell, &next)).count();
         if after < before {
             displaced.push((cell.clone(), before - after));

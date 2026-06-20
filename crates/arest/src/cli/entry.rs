@@ -767,6 +767,200 @@ mod db {
                 "_FileSigs must reflect v2 after the leaf ingest");
         }
 
+        /// store-on-derive STEP 4 (leaf-ingest convergence) — the
+        /// differential gate that closes `leaf-metamodel-non-idempotent`.
+        ///
+        /// Construct a scenario where a leaf delta RETRACTS a derived
+        /// tuple: a functional (keyed, `at most one`) status fact whose
+        /// NEW value in the changed file DISPLACES the prior value via the
+        /// UC-upsert (`reconcile_keyed_cells`), so the rule
+        /// `Task is recommended iff Task has Task Status 'pending'` must
+        /// LOSE its derived `Task_is_recommended` tuple for that task. Run
+        /// the SAME v2 corpus through BOTH:
+        ///   * the REAL leaf-ingest path (`try_leaf_ingest`), and
+        ///   * a full recompile (the production wipe-set drop +
+        ///     stratified re-derive — entry.rs:3121-3258 — over a
+        ///     from-scratch `compile_to_defs_state` of the whole corpus),
+        /// then assert the materialized derived cells are BYTE-IDENTICAL.
+        ///
+        /// FAILS on `ee51fb28`: leaf-ingest is additions-only (it carries
+        /// the prior `Task_is_recommended` tuple forward and the delta-join
+        /// can only ADD), so the leaf DB keeps the stale recommendation
+        /// while the recompile drops it. PASSES after the Step-4 retraction
+        /// reconciliation makes the leaf path's derived cells authoritative.
+        ///
+        /// Deterministic: fixed fixtures, no `Date::now`/random; the
+        /// recompile reference reuses the EXACT production derive sequence
+        /// (`derived_wipe_set` minus the SM exclusions, then
+        /// `forward_chain_defs_state_stratified`) so the oracle stays in
+        /// lockstep with the full path rather than a hand-rolled list.
+        #[test]
+        fn leaf_ingest_equals_full_recompile_with_retraction() {
+            // The full-compile DERIVE step, lifted verbatim from the CLI
+            // dispatch (entry.rs:3121-3258): drop the `derived_wipe_set`
+            // consequents, then run the stratified semi-naive chain over
+            // the user `rule_*` + SM-synthetic strata to the LFP. Given a
+            // compiled `def_state` (defs + raw population), returns the
+            // state with its derived cells materialized from scratch.
+            let full_recompile_derive = |def_state: &crate::ast::Object| -> crate::ast::Object {
+                let derived_cells = super::super::derived_wipe_set(def_state);
+                let d = if derived_cells.is_empty() { def_state.clone() } else {
+                    let mut m: hashbrown::HashMap<String, crate::ast::Object> =
+                        crate::ast::cells_iter(def_state).into_iter()
+                            .map(|(n, c)| (n.to_string(), c.clone())).collect();
+                    for name in &derived_cells { m.insert(name.clone(), crate::ast::Object::phi()); }
+                    crate::ast::Object::map(m)
+                };
+                let collect = |prefix: &str, st: &crate::ast::Object| -> Vec<(String, crate::ast::Func)> {
+                    crate::ast::cells_iter(st).into_iter()
+                        .filter(|(n, _)| n.starts_with(prefix))
+                        .map(|(n, c)| (n.to_string(), crate::ast::metacompose(c, st)))
+                        .collect()
+                };
+                let mut stratum1 = collect("derivation:rule_", &d);
+                stratum1.extend(collect("derivation:_sm_init_", &d));
+                stratum1.extend(collect("derivation:_sm_event_fold_", &d));
+                stratum1.extend(collect("derivation:_sm_for_resource_backfill_", &d));
+                stratum1.extend(collect("derivation:_sm_instance_of_def_backfill_", &d));
+                if stratum1.is_empty() { return d; }
+                let packed: Vec<(&str, &crate::ast::Func, Option<Vec<String>>)> = stratum1.iter()
+                    .map(|(name, func)| {
+                        let id = name.split_once(':').map(|(_, id)| id).unwrap_or(name.as_str());
+                        (name.as_str(), func, crate::evaluate::read_derivation_reads(&d, id))
+                    })
+                    .collect();
+                let refs: Vec<(&str, &crate::ast::Func, Option<&[String]>)> = packed.iter()
+                    .map(|(name, func, reads)| (*name, *func, reads.as_deref()))
+                    .collect();
+                let (out, _) = crate::evaluate::forward_chain_defs_state_stratified(&refs, &d, 100);
+                crate::evaluate::take_chain_abort();
+                out
+            };
+
+            // Schema: a functional (keyed) status fact + a derivation that
+            // recommends only the `pending` status. The UC `at most one`
+            // is what makes the changed file's new status DISPLACE the prior
+            // one (reconcile_keyed_cells), removing the rule's support.
+            let app_md =
+                "# App\n\n## Entity Types\n\nTask(.id) is an entity type.\n\n\
+                 ## Value Types\n\nTask Status is a value type.\n\n\
+                 ## Fact Types\n\nTask has Task Status.\n  \
+                 Each Task has at most one Task Status.\nTask is recommended.\n\n\
+                 ## Derivation Rules\n\n\
+                 * Task is recommended iff Task has Task Status 'pending'.\n";
+            // Prior population: t1 is pending → recommended; t2 is pending
+            // → recommended (the untouched-task guard: t2 must stay
+            // recommended on BOTH paths).
+            let v1 = vec![
+                ("app.md".to_string(), app_md.to_string()),
+                ("data.md".to_string(),
+                 "## Description\n\nPercept log.\n\n## Instance Facts\n\n\
+                  Task 't1' has Task Status 'pending'.\nTask 't2' has Task Status 'pending'.\n"
+                    .to_string()),
+            ];
+            // The leaf delta: t1's status is CORRECTED to 'completed' in the
+            // changed instance file. Functional displacement retracts t1's
+            // recommendation; t2 is untouched.
+            let mut v2 = v1.clone();
+            v2[1].1 =
+                "## Description\n\nPercept log.\n\n## Instance Facts\n\n\
+                 Task 't1' has Task Status 'completed'.\nTask 't2' has Task Status 'pending'.\n"
+                    .to_string();
+
+            // Helper: a real mini full compile of a corpus → the persisted
+            // population state, with derived cells materialized exactly as
+            // the production full-compile path does (wipe + re-derive).
+            let full_compile_state = |readings: &[(String, String)]| -> crate::ast::Object {
+                let corpus: String = readings.iter().map(|(_, t)| t.as_str())
+                    .collect::<Vec<_>>().join("\n\n");
+                let parsed = crate::parse_forml2::parse_to_state_from(
+                    &corpus, &crate::ast::Object::phi()).expect("corpus parses");
+                let defs = crate::compile::compile_to_defs_state(&parsed);
+                let def_state = crate::ast::defs_to_state(&defs, &parsed);
+                full_recompile_derive(&def_state)
+            };
+
+            // ── Build the PRIOR db from v1 (a real full compile), the way
+            //    leaf_ingest_executes_instance_only_delta does. ──
+            let conn = Connection::open_in_memory().expect("in-memory sqlite");
+            ensure_meta_tables(&conn);
+            let d_v1 = full_compile_state(&v1);
+            let d_v1 = crate::ast::store("_FileSigs",
+                crate::ast::Object::atom(&super::super::encode_file_sigs(&v1)), &d_v1);
+            persist_state(&conn, &d_v1);
+            // Sanity: the prior db recommends BOTH tasks.
+            let pending_then = crate::ast::fetch_cell_seq("Task_is_recommended", &d_v1);
+            assert!(pending_then.as_seq().map_or(0, |s| s.len()) >= 2,
+                "fixture precondition: both tasks recommended in the prior db; got {:?}",
+                pending_then);
+
+            // The delta is leaf-eligible (instance-only edit to data.md).
+            let changed = super::super::leaf_only_changed_files(&conn, &v2)
+                .expect("the instance-only status correction is leaf-eligible");
+            assert_eq!(changed, vec!["data.md".to_string()]);
+            // Drive the REAL leaf-ingest path.
+            assert!(super::super::try_leaf_ingest(&conn, None, &v2, &changed),
+                "leaf ingest should run to completion on the status-correction delta");
+            let leaf_db = super::super::db::load_state(&conn);
+
+            // ── The full-recompile oracle: the SAME v2 corpus, compiled
+            //    from scratch with the production wipe + re-derive. ──
+            let recompile_db = full_compile_state(&v2);
+
+            // Compare every DERIVED cell byte-for-byte (canonicalized to an
+            // order-independent fact multiset; fetch_cell_seq key-flattens
+            // folded Map cells so leaf-Map vs recompile-Seq compare fairly).
+            let canon = |st: &crate::ast::Object, name: &str| -> Vec<String> {
+                let mut facts: Vec<String> = crate::ast::fetch_cell_seq(name, st).as_seq()
+                    .map(|fs| fs.iter().map(|f| match f.as_seq() {
+                        Some(bs) => { let mut v: Vec<String> = bs.iter()
+                            .map(|b| b.to_json_string()).collect(); v.sort(); v.join("|") }
+                        None => f.to_json_string(),
+                    }).collect())
+                    .unwrap_or_default();
+                facts.sort();
+                facts
+            };
+            // Sanity: BOTH paths converge the keyed PRIMARY cell too — the
+            // leaf merge unions the corrected status onto the prior folded
+            // Map, and the (Map-aware) UC-upsert must displace the stale
+            // `pending` tuple so the derived re-derive reads a clean base.
+            assert_eq!(canon(&leaf_db, "Task_has_Task_Status"),
+                       canon(&recompile_db, "Task_has_Task_Status"),
+                "leaf-ingest must displace the stale keyed primary tuple (folded \
+                 Map) so it matches a recompile — the upstream of the retraction");
+            // The wipe set names exactly the materialized derived cells the
+            // two paths must agree on (user-rule + SM-synthetic consequents).
+            let derived_cells = super::super::derived_wipe_set(&recompile_db);
+            let mut diffs: Vec<String> = Vec::new();
+            for cell in &derived_cells {
+                let got = canon(&leaf_db, cell);
+                let want = canon(&recompile_db, cell);
+                if got != want {
+                    diffs.push(format!("  cell `{cell}`:\n    leaf      = {got:?}\n    recompile = {want:?}"));
+                }
+            }
+            assert!(diffs.is_empty(),
+                "leaf-ingest derived cells diverged from a full recompile of the same \
+                 corpus (store-on-derive STEP 4 — leaf-metamodel-non-idempotent):\n{}",
+                diffs.join("\n"));
+
+            // The load-bearing retraction: t1 is NO LONGER recommended on
+            // either path, and t2 IS still recommended on both (a wipe that
+            // over-retracted t2 would fail here, not just the byte compare).
+            let leaf_rec = canon(&leaf_db, "Task_is_recommended");
+            let recompile_rec = canon(&recompile_db, "Task_is_recommended");
+            let mentions_t1 = |v: &[String]| v.iter().any(|s| s.contains("\"t1\""));
+            let mentions_t2 = |v: &[String]| v.iter().any(|s| s.contains("\"t2\""));
+            assert!(!mentions_t1(&recompile_rec),
+                "recompile oracle must DROP t1's recommendation; got {:?}", recompile_rec);
+            assert!(!mentions_t1(&leaf_rec),
+                "leaf ingest must RETRACT t1's recommendation (the defect); got {:?}", leaf_rec);
+            assert!(mentions_t2(&leaf_rec) && mentions_t2(&recompile_rec),
+                "t2 stays recommended on BOTH paths (no over-retraction); leaf={:?} recompile={:?}",
+                leaf_rec, recompile_rec);
+        }
+
         /// rmap-3nf-tables Stage 3 (fossil sweep): apply_ddl drops
         /// tables whose names fall outside the [A-Za-z0-9_] emission
         /// alphabet (pre-prose-leak-gate relics — arc-agi-3's backtick
@@ -1589,18 +1783,24 @@ fn leaf_ingest_enabled() -> bool {
 ///     ns-3/ns-4 stamping as the full path's per-file fold);
 ///   - skip `compile_to_defs_state`: schema unchanged ⇒ defs unchanged
 ///     (the Generator-opt-in guard declines the one counterexample);
-///   - skip the #836 wipe: the wipe exists for support REMOVAL; this
-///     path's contract is ADDITIVE (a removed instance line does not
-///     retract until the next full compile — printed loudly), and
-///     aggregate/superlative supersession rides the keyed upsert
-///     (`_UpsertSafeCells` / `_CellKeyRoles`) exactly as it does on
-///     every `apply` mutation;
 ///   - run the SAME seeded semi-naive chain the apply path runs — all
 ///     rule defs, sidecar-gated, seeded with the cells the changed
 ///     files wrote; sidecar-less rules (aggregates, the SM fold
 ///     family) run every round, conservatively — NOT an SM-only
 ///     stratum, so a percept that triggers an SM event still updates
 ///     every downstream bridge exactly as an apply would;
+///   - store-on-derive STEP 4 (retraction reconcile): the seeded chain
+///     above is ADDITIONS-ONLY, so AFTER it, drop the packed rules'
+///     positive-join consequents (the #836 wipe, SCOPED to the rules
+///     this ingest packed; SM-fold-family / trigger cells EXCLUDED —
+///     keyed-per-resource, self-correcting) and re-derive them to their
+///     LFP over the same pack. A derived tuple that LOST support (a
+///     keyed status correction the UC-upsert displaced; an aggregate /
+///     superlative that shrank) is then RETRACTED — making leaf-ingest
+///     byte-identical to a full recompile (closes
+///     `leaf-metamodel-non-idempotent`). A removed PRIMARY instance
+///     line still reconciles only at the next compile (`merge_states`
+///     unions percepts — outside this path's delta);
 ///   - tail parity: converged-sig stores → persist-dedup → schema
 ///     reflection (new instances need their membership sweep) → DDL →
 ///     persist.
@@ -1859,6 +2059,125 @@ fn try_leaf_ingest(
         (new_d, derived.len(), written)
     };
     laps.push(("chain", t_phase.elapsed())); t_phase = std::time::Instant::now();
+    // ── store-on-derive STEP 4: leaf-ingest RETRACTION convergence ───────
+    //
+    // Plan: `docs/superpowers/plans/2026-06-19-store-on-derive-default.md`
+    // §"Step 4". Closes `leaf-metamodel-non-idempotent`: the delta-join
+    // chain above is ADDITIONS-ONLY (insertion-only semi-naive), so a leaf
+    // delta that should RETRACT a derived tuple — a status correction that
+    // the UC-upsert displaces, leaving a `Task is recommended iff … 'pending'`
+    // conclusion unsupported — cannot be expressed; the stale tuple carried
+    // forward from the prior db survives, and the leaf db DIVERGES from a
+    // full recompile (which drops + re-derives). This converges the leaf
+    // commit onto the retraction-capable path so leaf-ingest == recompile.
+    //
+    // Mechanism = the production full-compile derive (entry.rs:#836 wipe +
+    // stratified re-chain), SCOPED to the rules this ingest actually packed
+    // so the leaf path keeps its cold-start win (it does NOT re-fold untouched
+    // nouns): drop the packed rules' derivation consequents, then re-derive
+    // them over the SAME pack via the stratified semi-naive chain (round 0
+    // fires every packed rule ⇒ the LFP for those cells, identical to a
+    // recompile restricted to the same rule set). The authoritative `d` then
+    // flows through the EXISTING persist tail unchanged: `persist_state_delta`
+    // INSERT-OR-REPLACEs each changed cell's contents (never unions) and the
+    // `diff_cells(snapshot, d)` delta already captures a SHRUNK cell (its
+    // contents changed), so a retracted tuple is dropped from the store with
+    // no extra commit-site change.
+    //
+    // EXCLUSIONS (identical to the apply path, plan §"Deletion / non-monotone
+    // scope"): the SM-fold family (`sm_family_consequent_cells`) is keyed
+    // PER-RESOURCE and self-corrects via the keyed upsert the delta-join chain
+    // already ran — and its cells (e.g. the SHARED
+    // `State_Machine_is_currently_in_Status`) span EVERY noun, so wiping them
+    // for a touched noun would drop untouched resources' statuses. SM TRIGGER
+    // cells hold real events and are never re-derivable; `derived_wipe_set`
+    // already drops them. Both are filtered out below, so this wipe only ever
+    // touches pure positive-join user-rule consequents — exactly the
+    // sidecar-complete class the re-chain re-materializes exactly.
+    let (d, retracted_cells) = if rules.is_empty() {
+        (d, hashbrown::HashSet::<String>::new())
+    } else {
+        // The packed-rule consequents that are eligible to retract: the
+        // `derived_wipe_set` (user-rule + synthetic consequents, triggers
+        // already excluded) ∩ the consequents of the rules THIS ingest
+        // packed, MINUS the per-resource SM-fold family. A cell whose
+        // producer is NOT in the pack must NOT be wiped — re-derivation would
+        // leave it empty (the untouched-noun SM cells take exactly this
+        // skip, surviving with their correct carried value).
+        let wipe_universe = derived_wipe_set(&d);
+        let sm_family = crate::command::sm_family_consequent_cells(&d);
+        let packed_ids: hashbrown::HashSet<&str> = rules.iter()
+            .map(|(name, _)| name.split_once(':').map(|(_, id)| id).unwrap_or(name.as_str()))
+            .collect();
+        // Only the DerivationRule (user `rule_*`) literal consequents are
+        // eligible: packed SM synthetics write the per-resource SM-fold cells
+        // (sm_family — excluded), which the delta-join chain already kept
+        // correct via keyed upsert. So `wipe` is exactly the positive-join
+        // user-rule consequents THIS ingest could have shrunk.
+        let drule_cell = ast::fetch_cell_seq("DerivationRule", &d);
+        let wipe: hashbrown::HashSet<String> = drule_cell.as_seq()
+            .map(|facts| facts.iter()
+                .filter(|f| ast::binding(f, "id").map_or(false, |id| packed_ids.contains(id)))
+                .filter_map(|f| ast::binding(f, "consequentFactTypeId"))
+                .map(|enc| crate::types::ConsequentCellSource::decode(enc)
+                    .literal_id().to_string())
+                .filter(|c| !c.is_empty()
+                    && wipe_universe.contains(c.as_str())
+                    && !sm_family.contains(c.as_str()))
+                .collect())
+            .unwrap_or_default();
+        if wipe.is_empty() {
+            (d, hashbrown::HashSet::<String>::new())
+        } else {
+            // Tuple counts BEFORE the wipe+re-derive, to report net retractions
+            // (a derived tuple present pre-reconcile but absent after).
+            let before: usize = wipe.iter()
+                .map(|c| ast::fetch_cell_seq(c, &d).as_seq().map_or(0, |s| s.len()))
+                .sum();
+            let wiped = {
+                let mut map: hashbrown::HashMap<String, ast::Object> =
+                    ast::cells_iter(&d).into_iter()
+                        .map(|(name, contents)| (name.to_string(), contents.clone()))
+                        .collect();
+                for name in &wipe { map.insert(name.clone(), ast::Object::phi()); }
+                ast::Object::map(map)
+            };
+            // Re-derive over the SAME pack (all user rule_* + touched-noun SM
+            // synthetics). The stratified chain runs round 0 over every packed
+            // rule (`dirty_cells` starts None), reaching the complete LFP for
+            // the wiped cells — byte-identical to a recompile restricted to
+            // this rule set. `metacompose` against `d` (defs live there).
+            let packed: Vec<(&str, &ast::Func, Option<Vec<String>>)> = rules.iter()
+                .map(|(name, func)| {
+                    let id = name.split_once(':').map(|(_, id)| id).unwrap_or(name.as_str());
+                    (name.as_str(), func, crate::evaluate::read_derivation_reads(&d, id))
+                })
+                .collect();
+            let refs: Vec<(&str, &ast::Func, Option<&[String]>)> = packed.iter()
+                .map(|(name, func, reads)| (*name, *func, reads.as_deref()))
+                .collect();
+            let (rederived, _) =
+                crate::evaluate::forward_chain_defs_state_stratified(&refs, &wiped, 100);
+            if crate::evaluate::take_chain_abort() {
+                eprintln!("[load] leaf-ingest declined: the retraction re-chain hit \
+                           its time budget — NOTHING was persisted; falling back to \
+                           the full pipeline");
+                return false;
+            }
+            let after: usize = wipe.iter()
+                .map(|c| ast::fetch_cell_seq(c, &rederived).as_seq().map_or(0, |s| s.len()))
+                .sum();
+            let net = before.saturating_sub(after);
+            if net > 0 {
+                eprintln!("[load] leaf-ingest retraction reconcile: re-derived {} \
+                           positive-join consequent cell(s) from a clean base \
+                           (#836 wipe, noun-scoped); {} stale derived tuple(s) \
+                           retracted (leaf-ingest == recompile)", wipe.len(), net);
+            }
+            (rederived, wipe)
+        }
+    };
+    laps.push(("retract-reconcile", t_phase.elapsed())); t_phase = std::time::Instant::now();
     // Tail parity with the full pipeline, same order: converged-sig
     // stores → persist-dedup → schema reflection → DDL → persist. The
     // reflection re-runs because changed files can mint NEW instances
@@ -1874,9 +2193,14 @@ fn try_leaf_ingest(
     // cells — instead of diffing the whole store. One full diff per
     // ingest remains (the persist delta below); equivalence is
     // guarded by the A/B fixture.
+    // STEP 4: the retraction-reconcile wipe set joins `touched` — a cell
+    // that only SHRANK (no new additions) is otherwise absent from
+    // targets/chain_written, and the scoped 3NF projection refresh must
+    // re-run for it so the persisted table loses the retracted row too.
     let touched: hashbrown::HashSet<String> = targets.iter().cloned()
         .chain(chain_written.iter().cloned())
         .chain(reconciled_cells.iter().cloned())
+        .chain(retracted_cells.iter().cloned())
         .collect();
     let d = super::dedup_state_for_persist_scoped(&d, &touched);
     laps.push(("dedup-scoped+diff1", t_phase.elapsed())); t_phase = std::time::Instant::now();
@@ -1937,12 +2261,14 @@ fn try_leaf_ingest(
         laps.iter().map(|(n, dur)| alloc::format!("{} {:?}", n, dur))
             .collect::<Vec<_>>().join(", "));
     eprintln!("[load] leaf-ingest EXECUTED: {} changed file(s) {:?} → {} target \
-               cell(s); {} rule def(s) packed (seeded), {} fact(s) derived; \
-               {} cell(s) in the persist delta; load {:?}, total {:?}. \
-               Additive contract: a REMOVED instance line does not retract on \
-               this path — the next full compile reconciles.",
+               cell(s); {} rule def(s) packed (seeded), {} fact(s) derived, {} \
+               consequent cell(s) retraction-reconciled; {} cell(s) in the \
+               persist delta; load {:?}, total {:?}. STEP 4: DERIVED tuples that \
+               lose support DO retract (leaf-ingest == full recompile); a removed \
+               PRIMARY instance line still reconciles only at the next compile \
+               (merge_states unions percepts — out of this path's delta scope).",
         changed.len(), changed, targets.len(), n_rules, n_derived,
-        changed_cells.len(), t_load, t0.elapsed());
+        retracted_cells.len(), changed_cells.len(), t_load, t0.elapsed());
     true
 }
 
