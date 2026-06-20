@@ -1334,6 +1334,62 @@ fn ivm_apply_enabled() -> bool {
 #[cfg(feature = "no_std")]
 fn ivm_apply_enabled() -> bool { false }
 
+/// store-on-derive PERF WIN — the recompute-skip sub-flag.
+///
+/// Under IVM (`ivm_apply_enabled`), DROP the #836 wipe + full re-derive +
+/// restore for the UPSERT-SAFE class and commit the pure delta-join result
+/// (O(|delta|) on that class instead of O(rules × population)). DEFAULT-ON
+/// under IVM; `AREST_IVM_SKIP_RECOMPUTE=0` is the in-IVM rollback to the
+/// scoped recompute, and `AREST_IVM=0` disables it transitively (the skip is
+/// gated on `ivm_enabled && ivm_skip_recompute_enabled()`). Only fires when
+/// every wiped cell is BOTH upsert-safe AND functionally keyed —
+/// `dropped_cells ⊆ (_UpsertSafeCells ∩ _CellKeyRoles)` — so its only
+/// per-transition change is a KEYED VALUE-OVERWRITE the keyed upsert (re-keying
+/// a folded Map, `ast::cell_put_keyed_batch`, folded-stale-tuple wall) displaces
+/// and `diff_cells_with_removals` ships as a removal, keeping `new_state`
+/// correct WITHOUT the wipe. `_UpsertSafeCells` alone is INSUFFICIENT: compile
+/// sweeps in UNKEYED downstream cascade consequents whose population can SHRINK
+/// (the `Task_is_recommended` lost-support filter), which an upsert can never
+/// retract — those keep the recompute as the FALLBACK. The differential oracle
+/// `ivm_after_n_mutations_equals_full_recompile` is the hard correctness gate.
+#[cfg(not(feature = "no_std"))]
+fn ivm_skip_recompute_enabled() -> bool {
+    std::env::var("AREST_IVM_SKIP_RECOMPUTE")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(true)
+}
+#[cfg(feature = "no_std")]
+fn ivm_skip_recompute_enabled() -> bool { false }
+
+/// store-on-derive PERF WIN — skip-hit counter. Increments each time
+/// `transition_via_defs` (or a sibling apply path) DROPS the #836 wipe +
+/// recompute and commits the pure delta-join result for the upsert-safe
+/// class. Tests snapshot it around a transition to PROVE the recompute was
+/// actually skipped (not silently fallen back to the recompute). Mirrors
+/// `evaluate::chain_eval_counter` / `reconcile_pass_counter`. Thread-local so
+/// the differential oracle (which mutates the `AREST_IVM*` env, serialized by
+/// its own mutex) reads its own thread's hits without cross-test bleed.
+#[cfg(any(test, feature = "test-bins"))]
+mod ivm_skip_counter {
+    use core::cell::Cell;
+    std::thread_local! {
+        pub static HITS: Cell<usize> = const { Cell::new(0) };
+    }
+}
+#[cfg(any(test, feature = "test-bins"))]
+pub(crate) fn reset_ivm_skip_hits() {
+    ivm_skip_counter::HITS.with(|c| c.set(0));
+}
+#[cfg(any(test, feature = "test-bins"))]
+pub(crate) fn get_ivm_skip_hits() -> usize {
+    ivm_skip_counter::HITS.with(|c| c.get())
+}
+#[inline]
+fn record_ivm_skip_hit() {
+    #[cfg(any(test, feature = "test-bins"))]
+    ivm_skip_counter::HITS.with(|c| c.set(c.get() + 1));
+}
+
 fn create_via_defs(
     d: &ast::Object,
     noun: &str,
@@ -3482,6 +3538,71 @@ fn transition_via_defs(
             let sm_family = sm_family_consequent_cells(d);
             dropped_cells.into_iter().filter(|c| !sm_family.contains(c.as_str())).collect()
         };
+
+        // ── store-on-derive PERF WIN — recompute-skip for the upsert-safe
+        //    class ──────────────────────────────────────────────────────────
+        //
+        // The #836 wipe + full re-derive + restore below exists for ONE
+        // reason: retract derived tuples that LOSE support under a non-monotone
+        // change — the one thing the insertion-only delta-join cannot express.
+        // It is REDUNDANT exactly when every cell the wipe would clear is a
+        // KEYED, UPSERT-SAFE projection of the monotone-advancing SM fold: a
+        // status change there is a δ⁻+δ⁺ at one ROLE KEY that the delta-join's
+        // keyed upsert collapses in place (and `diff_cells_with_removals` ships
+        // as a removal).
+        //
+        // The prior obstruction (4dfc76eb) was that the keyed upsert took a
+        // pre-existing FOLDED Map verbatim, so a stale `(t-1,pending)` at a
+        // full-tuple-hash key survived the fresh `(t-1,in_progress)` upsert at
+        // role-key `t-1` and `new_state` was wrong without the wipe. That wall
+        // is now removed at the storage layer: `cell_put_keyed_batch` RE-KEYS a
+        // pre-existing Map under the role key (ast.rs, symmetric with the Seq
+        // arm), so the fresh upsert COLLIDES on `t-1` and overwrites — the
+        // displacement the wipe used to provide (plus the routing-metadata
+        // overlay below, so the chain ACTUALLY routes these cells keyed). So
+        // for this class `new_state` is correct WITHOUT the wipe, and we commit
+        // the pure delta-join result (O(|delta|), no O(rules × population)).
+        //
+        // Gated: `ivm_enabled && ivm_skip_recompute_enabled()` (default-on
+        // under IVM; `AREST_IVM_SKIP_RECOMPUTE=0` rolls back to the recompute,
+        // `AREST_IVM=0` disables transitively). Empty `dropped_cells` ⇒ nothing
+        // to recompute either way (NOT treated as skippable here — the gate
+        // requires a non-empty set so a no-op transition keeps the trivial
+        // path and the skip-hit counter only counts genuine drops). The
+        // skip-hit counter PROVES (in the oracle) the recompute was dropped,
+        // not silently fallen back.
+        //
+        // The skip is safe ONLY for cells where a transition's change is a
+        // KEYED VALUE-OVERWRITE (δ⁻+δ⁺ at one persisting key — the keyed
+        // upsert displaces the stale value, and `diff_cells_with_removals`
+        // ships the displaced tuple as a removal). `_UpsertSafeCells` alone is
+        // NOT sufficient: compile sweeps DOWNSTREAM cascade consequents whose
+        // population can SHRINK (a key DISAPPEARING, not its value changing)
+        // into that set too — e.g. the `Task_is_recommended` membership filter
+        // a completed task LEAVES. Those are UNKEYED (no functional UC, absent
+        // from `_CellKeyRoles`): they fold by full-tuple hash, an upsert can
+        // never REMOVE the stale membership row, and `diff_cells_with_removals`
+        // emits no removal for them under the skip — exactly the lost-support
+        // (DRed) class that is OUT OF SCOPE v1 and MUST keep the recompute
+        // (proven: the `ivm_after_n_mutations_equals_full_recompile` oracle
+        // diverges on `Task_is_recommended` if the skip engages for it).
+        //
+        // So the gate is `dropped_cells ⊆ (_UpsertSafeCells ∩ keyed)`: every
+        // wiped cell must be both upsert-safe AND functionally keyed
+        // (`_CellKeyRoles`), so its only per-transition change is a value
+        // overwrite the keyed upsert + retraction-carrying commit already
+        // express. A single unkeyed (or non-upsert-safe) dropped cell forces
+        // the full wipe+recompute FALLBACK.
+        let skip_recompute = ivm_enabled
+            && ivm_skip_recompute_enabled()
+            && !dropped_cells.is_empty()
+            && {
+                let upsert_safe = crate::evaluate::read_upsert_safe_cells(d);
+                let key_roles = crate::evaluate::read_cell_key_roles(d);
+                dropped_cells.iter()
+                    .all(|c| upsert_safe.contains(c) && key_roles.contains_key(c))
+            };
+
         // Bridge-clobber guard (parity with update_via_defs L3432+):
         // snapshot the pre-drop value of every cell about to clear, plus
         // the rule_id -> consequent_cell map. After the chain runs,
@@ -3510,7 +3631,11 @@ fn transition_via_defs(
                 })
                 .collect())
             .unwrap_or_default();
-        let resolved = if dropped_cells.is_empty() {
+        // store-on-derive PERF WIN: when skipping, do NOT wipe — the delta-join
+        // folds the op's additions onto the LIVE `new_state` and the keyed
+        // re-keying upsert displaces stale folded tuples in place. When not
+        // skipping, this is today's #836 pre-drop (clear every dropped cell).
+        let resolved = if dropped_cells.is_empty() || skip_recompute {
             new_state
         } else {
             let mut new_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
@@ -3545,6 +3670,57 @@ fn transition_via_defs(
                 .collect())
             .unwrap_or_default();
         seed.extend(drop_writer_reads);
+
+        // store-on-derive PERF WIN — chain ROUTING metadata overlay (skip path
+        // only). The seeded chainer reads its keyed-vs-folded ROUTING metadata
+        // (`_CellKeyRoles`, `_UpsertSafeCells`, `_CellAggKeyIndices`,
+        // `_CellValueConstraints`) and its delta-view completeness markers
+        // (`derivation_reads_complete:*`) from its `d` parameter, which here is
+        // the POPULATION (`resolved`) — NOT the compiled defs `d`. The
+        // population carries no such metadata, so EVERY derived cell routes
+        // through the folded (full-tuple-hash) path. That is harmless under the
+        // wipe (the cell was emptied, so a fresh re-derivation just inserts),
+        // but FATAL under the skip: a folded write leaves the stale tuple
+        // (`t-1,pending`) coexisting with the fresh one (`t-1,in_progress`)
+        // instead of displacing it. To make the keyed UPSERT (and the re-keying
+        // displacement in `cell_put_keyed_batch`) actually fire, overlay the
+        // reserved metadata cells from the defs `d` onto the chain input. They
+        // are constants (rules never write them) and are STRIPPED back out below
+        // before the commit delta so they never leak into the population.
+        // The names whose def value we overlay. The population may carry these
+        // ABSENT *or* as a stale/empty placeholder (the oracle's population
+        // holds `_CellKeyRoles` as an empty Seq, which parses to no key roles
+        // and forces folded routing), so we override unconditionally with the
+        // defs `d` value and capture each cell's ORIGINAL population value to
+        // restore verbatim after the chain — guaranteeing the metadata never
+        // perturbs the committed population (delta computed against base `state`).
+        let metadata_overrides: Vec<(String, ast::Object)> = if skip_recompute {
+            let mut names: Vec<String> = ast::cells_iter(d).into_iter()
+                .map(|(n, _)| n.to_string())
+                .filter(|n| n == "_CellKeyRoles"
+                    || n == "_UpsertSafeCells"
+                    || n == "_CellAggKeyIndices"
+                    || n == "_CellValueConstraints"
+                    || n.starts_with("derivation_reads_complete:")
+                    || n.starts_with("derivation_reads:"))
+                .collect();
+            names.sort();
+            names.into_iter()
+                .map(|n| { let orig = ast::fetch_or_phi(&n, &resolved).clone(); (n, orig) })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let resolved = if metadata_overrides.is_empty() {
+            resolved
+        } else {
+            let mut m: hashbrown::HashMap<String, ast::Object> = ast::cells_iter(&resolved)
+                .into_iter().map(|(n, c)| (n.to_string(), c.clone())).collect();
+            for (name, _orig) in &metadata_overrides {
+                m.insert(name.clone(), ast::fetch_or_phi(name, d).clone());
+            }
+            ast::Object::Map(m.into())
+        };
 
         let mut activated_rule_defs: hashbrown::HashSet<String> = hashbrown::HashSet::new();
         let (post_s1, derived) = if stratum1.is_empty() {
@@ -3588,7 +3764,41 @@ fn transition_via_defs(
         // Bridge-clobber restore: for any dropped cell whose producing
         // rule was never activated, restore the pre-drop value (see the
         // guard rationale above). Mirror of update_via_defs L3505+.
-        let post_s1 = if dropped_cells.is_empty() {
+        //
+        // store-on-derive PERF WIN: SKIP the restore when the recompute was
+        // skipped — there was no wipe, so nothing to restore, and the snapshot
+        // holds the PRE-transition (stale) values whose re-insertion would
+        // resurrect exactly what the upsert just displaced. The skip-hit
+        // counter records that the recompute (wipe + restore) was dropped for
+        // the upsert-safe class, proving (in the oracle) the fast path ran
+        // rather than silently falling back.
+        let post_s1 = if skip_recompute {
+            record_ivm_skip_hit();
+            // RESTORE the routing-metadata cells to their ORIGINAL population
+            // value so the overlay never reaches the commit delta
+            // (`diff_cells_with_removals` would otherwise emit the def value as
+            // an addition/change vs the base, leaking def metadata into the
+            // population). Restoring verbatim — empty Seq, absent, or whatever
+            // the population held — leaves the committed cell set identical to
+            // the no-overlay path.
+            if metadata_overrides.is_empty() {
+                post_s1
+            } else {
+                let restore: hashbrown::HashMap<&str, &ast::Object> =
+                    metadata_overrides.iter().map(|(n, o)| (n.as_str(), o)).collect();
+                let mut m: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+                for (name, contents) in ast::cells_iter(&post_s1).into_iter() {
+                    match restore.get(name) {
+                        // Original was absent (Bottom): drop the overlaid cell.
+                        Some(orig) if matches!(orig, ast::Object::Bottom) => continue,
+                        // Original present: restore its verbatim value.
+                        Some(orig) => { m.insert(name.to_string(), (*orig).clone()); }
+                        None => { m.insert(name.to_string(), contents.clone()); }
+                    }
+                }
+                ast::Object::Map(m.into())
+            }
+        } else if dropped_cells.is_empty() {
             post_s1
         } else {
             let activated_consequent_cells: hashbrown::HashSet<String> = activated_rule_defs.iter()
@@ -9965,6 +10175,269 @@ Transition 'complete' is defined in State Machine Definition 'Task'.
             assert_eq!(t1_statuses, vec!["completed".to_string()],
                 "IVM: t-1's status projection must be exactly [completed], got {t1_statuses:?}");
         }
+    }
+
+    /// store-on-derive PERF WIN — the recompute-skip CORRECTNESS oracle.
+    ///
+    /// Recreated (un-`#[ignore]`d) from the proven-obstruction characterization
+    /// at 4dfc76eb. Now that the folded-stale-tuple wall is fixed at the storage
+    /// layer (`ast::cell_put_keyed_batch` re-keys a pre-existing Map, so a keyed
+    /// upsert displaces a stale folded tuple), the apply path DROPS the #836
+    /// wipe + recompute for the upsert-safe class and commits the pure
+    /// delta-join. This oracle PROVES that drop is correct:
+    ///
+    ///   (a) cascade == recompile — a purely upsert-safe transition cascade
+    ///       (SM status → resource projection → task bridge, NO
+    ///       `Task_is_recommended` lost-support filter) committed via the apply
+    ///       path EQUALS a full, un-seeded re-derivation of the same base, at
+    ///       every step. This is the differential gate the prior increment
+    ///       FAILED (a stale `(t-1,pending)` coexisted with `(t-1,in_progress)`
+    ///       in `Task_has_Task_Status`).
+    ///
+    ///   (b) skip-hit > 0 — the skip-hit counter (bumped only when the wipe +
+    ///       recompute is actually DROPPED for `dropped_cells ⊆ _UpsertSafeCells`)
+    ///       increases across the transitions, proving the fast path RAN rather
+    ///       than silently falling back to the recompute (which would also pass
+    ///       (a) but defeat the whole PERF WIN).
+    ///
+    /// Engages the skip path explicitly (`AREST_IVM=1` + `AREST_IVM_SKIP_
+    /// RECOMPUTE=1`) under a process-global env GATE, restoring env on exit.
+    #[test]
+    fn transition_skips_recompute_for_upsert_safe_cascade_and_equals_recompile() {
+        use std::sync::Mutex;
+        static GATE: Mutex<()> = Mutex::new(());
+        let _guard = GATE.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Save + force the skip path ON; restore on scope exit (RAII guard so
+        // an assertion panic cannot leak the env into sibling tests).
+        struct EnvRestore { ivm: Option<String>, skip: Option<String> }
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match &self.ivm {
+                    Some(v) => std::env::set_var("AREST_IVM", v),
+                    None => std::env::remove_var("AREST_IVM"),
+                }
+                match &self.skip {
+                    Some(v) => std::env::set_var("AREST_IVM_SKIP_RECOMPUTE", v),
+                    None => std::env::remove_var("AREST_IVM_SKIP_RECOMPUTE"),
+                }
+            }
+        }
+        let _env = EnvRestore {
+            ivm: std::env::var("AREST_IVM").ok(),
+            skip: std::env::var("AREST_IVM_SKIP_RECOMPUTE").ok(),
+        };
+        std::env::set_var("AREST_IVM", "1");
+        std::env::set_var("AREST_IVM_SKIP_RECOMPUTE", "1");
+
+        // Upsert-safe-ONLY cascade: SM status → resource projection → task
+        // bridge. NO `Task is recommended` filter (that is the non-upsert-safe
+        // cell that forces the fallback in the master oracle). Identical SM
+        // shape otherwise so the transition machinery is exercised the same.
+        const BRIDGE_READINGS: &str = r#"
+# Tasks bridge (PERF WIN — upsert-safe-only cascade)
+
+## Entity Types
+
+Task(.id) is an entity type.
+Resource(.id) is an entity type.
+State Machine(.id) is an entity type.
+
+## Value Types
+
+Status is a value type.
+Task Status is a value type.
+
+## Fact Types
+
+State Machine is for Resource.
+State Machine is currently in Status.
+Resource is currently in Status.
+  Each Resource is currently in at most one Status.
+Task has Task Status.
+  Each Task has at most one Task Status.
+
+## Derivation Rules
+
+* Resource is currently in Status iff some State Machine is for that Resource and that State Machine is currently in that Status.
+* Task has Task Status iff that Resource is currently in some Status and Task Status is Status and Task is Resource.
+
+## Instance Facts
+
+State Machine Definition 'Task' is for Noun 'Task'.
+Status 'pending' is initial in State Machine Definition 'Task'.
+
+Transition 'start' is defined in State Machine Definition 'Task'.
+  Transition 'start' is from Status 'pending'.
+  Transition 'start' is to Status 'in_progress'.
+  Transition 'start' is triggered by Event Type 'start'.
+
+Transition 'complete' is defined in State Machine Definition 'Task'.
+  Transition 'complete' is from Status 'in_progress'.
+  Transition 'complete' is to Status 'completed'.
+  Transition 'complete' is triggered by Event Type 'complete'.
+"#;
+        let meta = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let tasks = crate::parse_forml2::parse_to_state_with_nouns(BRIDGE_READINGS, &meta).unwrap();
+        let state = ast::merge_states(&meta, &tasks);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_obj = ast::defs_to_state(&defs, &state);
+
+        // Precondition: the two projection cells MUST be marked upsert-safe
+        // (else the skip can never qualify and (b) would be unreachable), and
+        // the fixture must carry NO non-upsert-safe derived consequent a
+        // transition can reach — otherwise the fallback would fire.
+        let upsert_safe = crate::evaluate::read_upsert_safe_cells(&def_obj);
+        assert!(upsert_safe.contains("Resource_is_currently_in_Status"),
+            "fixture precondition: Resource_is_currently_in_Status must be upsert-safe");
+        assert!(upsert_safe.contains("Task_has_Task_Status"),
+            "fixture precondition: Task_has_Task_Status must be upsert-safe; \
+             got upsert-safe set = {upsert_safe:?}");
+
+        // Same full-recompile reference the master oracle uses: wipe the
+        // DerivationRule consequents (minus SM trigger/family) and run the
+        // full un-seeded chain → the materialized-view value for the base.
+        let full_recompile = |st: &ast::Object| -> ast::Object {
+            let stratum: Vec<(String, ast::Func)> = ast::cells_iter(&def_obj).into_iter()
+                .filter(|(n, _)| n.starts_with("derivation:"))
+                .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, &def_obj)))
+                .collect();
+            let packed: Vec<(String, Vec<String>, ast::Func)> = stratum.iter()
+                .map(|(name, func)| {
+                    let id = name.split_once(':').map(|(_, id)| id).unwrap_or(name);
+                    let reads = crate::evaluate::read_derivation_reads(&def_obj, id)
+                        .unwrap_or_default();
+                    (name.clone(), reads, func.clone())
+                })
+                .collect();
+            let refs = to_seeded_refs(&packed);
+            let drule_cell = ast::fetch_cell_seq("DerivationRule", &def_obj);
+            let dropped: hashbrown::HashSet<String> = drule_cell.as_seq()
+                .map(|facts| facts.iter()
+                    .filter_map(|f| ast::binding(f, "consequentFactTypeId"))
+                    .map(|enc| crate::types::ConsequentCellSource::decode(enc)
+                        .literal_id().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect())
+                .unwrap_or_default();
+            let sm_triggers = sm_trigger_cell_set(&def_obj);
+            let sm_family = sm_family_consequent_cells(&def_obj);
+            let dropped: hashbrown::HashSet<String> = dropped.into_iter()
+                .filter(|c| !sm_triggers.contains(c.as_str())
+                    && !sm_family.contains(c.as_str()))
+                .collect();
+            let mut wiped: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+            for (name, contents) in ast::cells_iter(st).into_iter() {
+                if dropped.contains(name) {
+                    wiped.insert(name.to_string(), ast::Object::phi());
+                } else {
+                    wiped.insert(name.to_string(), contents.clone());
+                }
+            }
+            let wiped = ast::Object::Map(wiped.into());
+            let (recompiled, _) =
+                crate::evaluate::forward_chain_defs_state_semi_naive(&refs, &wiped, 100);
+            recompiled
+        };
+        let canon_cell = |st: &ast::Object, name: &str| -> Vec<String> {
+            let mut facts: Vec<String> = ast::fetch_cell_seq(name, st).as_seq()
+                .map(|fs| fs.iter().map(|f| match f.as_seq() {
+                    Some(bindings) => {
+                        let mut bs: Vec<String> = bindings.iter()
+                            .map(|b| b.to_json_string()).collect();
+                        bs.sort();
+                        bs.join("|")
+                    }
+                    None => f.to_json_string(),
+                }).collect())
+                .unwrap_or_default();
+            facts.sort();
+            facts
+        };
+        const CELLS: [&str; 2] = ["Task_has_Task_Status", "Resource_is_currently_in_Status"];
+        let assert_matches_recompile = |committed: &ast::Object, label: &str| {
+            let recompiled = full_recompile(committed);
+            let mut diffs: Vec<String> = Vec::new();
+            for cell in CELLS {
+                let got = canon_cell(committed, cell);
+                let want = canon_cell(&recompiled, cell);
+                if got != want {
+                    diffs.push(format!("  cell `{cell}`:\n    apply     = {got:?}\n    recompile = {want:?}"));
+                }
+            }
+            assert!(diffs.is_empty(),
+                "[{label}] upsert-safe cascade diverged from a full recompile \
+                 (PERF-WIN skip must stay correct):\n{}", diffs.join("\n"));
+        };
+
+        let create = |st: &ast::Object, id: &str| -> ast::Object {
+            let mut fields = HashMap::new();
+            fields.insert("id".to_string(), id.to_string());
+            let r = apply_command_defs(&def_obj, &Command::CreateEntity {
+                noun: "Task".to_string(), domain: "tasks".to_string(),
+                id: Some(id.to_string()), fields, sender: None, signature: None,
+            }, st);
+            assert!(!r.rejected, "create {id} rejected: {:?}", r.violations);
+            ast::merge_delta(st, &r.state, None)
+        };
+        let transition = |st: &ast::Object, id: &str, event: &str, from: &str| -> ast::Object {
+            let r = apply_command_defs(&def_obj, &Command::Transition {
+                entity_id: id.to_string(), event: event.to_string(),
+                domain: "tasks".to_string(), current_status: Some(from.to_string()),
+                sender: None, signature: None,
+            }, st);
+            assert!(!r.rejected, "transition {event} on {id} rejected: {:?}", r.violations);
+            ast::merge_delta(st, &r.state, None)
+        };
+
+        // Two tasks (multi-entity guard: transitioning t-1 must not perturb
+        // t-2's projection), then drive two transitions on t-1. Snapshot the
+        // skip-hit counter around ONLY the transitions so (b) attributes the
+        // recompute-drop to the transitions, not the creates.
+        let s = create(&state, "t-1");
+        let s = create(&s, "t-2");
+        assert_matches_recompile(&s, "after create");
+
+        reset_ivm_skip_hits();
+        let s = transition(&s, "t-1", "start", "pending");
+        assert_matches_recompile(&s, "after start t-1");
+        let s = transition(&s, "t-1", "complete", "in_progress");
+        assert_matches_recompile(&s, "after complete t-1");
+        let skip_hits = get_ivm_skip_hits();
+
+        // (b) the recompute was actually DROPPED — not silently fallen back.
+        // Both transitions reach the upsert-safe class, so >= 2 hits; assert
+        // > 0 (the load-bearing claim is "the recompute did not run") and that
+        // it is at least the number of firing transitions.
+        assert!(skip_hits >= 2,
+            "PERF WIN: the recompute-skip must FIRE on the upsert-safe cascade \
+             (proving the #836 wipe+recompute was dropped, not silently fallen \
+             back); expected >= 2 skip-hits across the two transitions, got {skip_hits}");
+
+        // The projection must read the latest status with NO stale duplicate —
+        // this is exactly what regressed under the prior dropped-wipe increment
+        // (the folded bridge kept the stale tuple). With the re-keying fix it
+        // is displaced in place; the recompile equality above is the full gate.
+        let bridge_status = |st: &ast::Object, task: &str| -> Option<String> {
+            ast::fetch_cell_seq("Task_has_Task_Status", st).as_seq()
+                .and_then(|fs| fs.iter()
+                    .find(|f| ast::binding(f, "Task") == Some(task))
+                    .and_then(|f| ast::binding(f, "Task Status").map(String::from)))
+        };
+        assert_eq!(bridge_status(&s, "t-1").as_deref(), Some("completed"),
+            "t-1's bridge must read completed (latest status), no stale duplicate");
+        assert_eq!(bridge_status(&s, "t-2").as_deref(), Some("pending"),
+            "t-2 (untouched) must keep pending through t-1's transitions");
+        let t1_statuses: Vec<String> = ast::fetch_cell_seq("Resource_is_currently_in_Status", &s)
+            .as_seq()
+            .map(|fs| fs.iter()
+                .filter(|f| ast::binding(f, "Resource") == Some("t-1"))
+                .filter_map(|f| ast::binding(f, "Status").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        assert_eq!(t1_statuses, vec!["completed".to_string()],
+            "t-1's status projection must be exactly [completed] — no duplicate; \
+             got {t1_statuses:?}");
     }
 
     /// store-on-derive STEP 2: with `AREST_IVM=1`, a transition's COMMITTED

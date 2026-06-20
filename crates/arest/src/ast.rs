@@ -5670,7 +5670,36 @@ fn cell_put_keyed_batch_with<K: Fn(&Object) -> Option<String>>(
     }
     let existing = fetch_or_phi(name, state);
     let mut map: HashMap<String, Object> = match &existing {
-        Object::Map(m) => { record_cell_map_clone(); (**m).clone() }
+        // store-on-derive PERF WIN (folded-stale-tuple wall): RE-KEY a
+        // pre-existing Map under `key_of`, symmetric with the Seq arm
+        // below — do NOT take it verbatim. A folded keyed cell stores
+        // entries under the FULL-TUPLE hash (`cell_put_folded` /
+        // `merge_delta`'s union commit), so a stale same-UC-key tuple
+        // (`t1→pending`) sits under a DIFFERENT map key than the role-key
+        // an incoming upsert (`t1→in_progress`) writes at. Verbatim-clone
+        // (the pre-fix `(**m).clone()`) preserved BOTH and the upsert never
+        // displaced the stale one — the exact wall that forced the #836
+        // wipe to stay load-bearing in `transition_via_defs`. Re-keying
+        // collapses the cell to one entry per `key_of` (later wins on a
+        // clash — a genuine UC violation in folded legacy data, resolved
+        // the same last-write-wins direction the Seq migration uses), so a
+        // subsequent keyed upsert now COLLIDES on the role key and
+        // overwrites in place. Entries whose `key_of` is `None` (a partial
+        // tuple a keyed upsert can never address) are PRESERVED under their
+        // original map key, so nothing re-derivable is lost. One logical
+        // cell-map materialization, counted once (perf contract: a keyed
+        // batch clones the cell Map exactly once regardless of n).
+        Object::Map(m) => {
+            record_cell_map_clone();
+            let mut rekeyed: HashMap<String, Object> = HashMap::with_capacity(m.len());
+            for (orig_key, f) in m.iter() {
+                match key_of(f) {
+                    Some(k) => { rekeyed.insert(k, f.clone()); }
+                    None => { rekeyed.insert(orig_key.clone(), f.clone()); }
+                }
+            }
+            rekeyed
+        }
         Object::Seq(items) if items.is_empty() => HashMap::new(),
         Object::Seq(items) => {
             // Migration: rebuild a pre-existing Seq cell into the Map
@@ -11547,6 +11576,41 @@ mod tests {
         assert_eq!(m.len(), 2);
         assert!(conflicts.is_empty(),
             "re-asserting the byte-identical existing fact is NOT a conflict");
+    }
+
+    /// store-on-derive PERF WIN (folded-stale-tuple wall): a keyed upsert
+    /// DISPLACES a stale tuple sitting in a pre-existing FOLDED Map cell at a
+    /// different (full-tuple-hash) map key. This is the storage-layer fix that
+    /// lets `transition_via_defs` DROP the #836 wipe for the upsert-safe class:
+    /// before it, `cell_put_keyed_batch` took a pre-existing Map VERBATIM, so
+    /// `(t1→pending)` (folded under its full-tuple hash) and the upserted
+    /// `(t1→in_progress)` (at role-key `t1`) COEXISTED — the exact divergence
+    /// the prior increment (4dfc76eb) hit. Re-keying the pre-existing Map under
+    /// the role key collapses the stale tuple onto `t1`, where the upsert
+    /// overwrites it.
+    #[test]
+    fn cell_put_keyed_batch_upsert_displaces_stale_folded_tuple() {
+        // Pre-existing FOLDED cell (keyed by full-tuple hash, as the union-only
+        // `merge_delta` / `cell_put_folded` apply commit leaves a derived
+        // bridge): holds the stale (t1, pending).
+        let stale = fact_from_pairs(&[("Task", "t1"), ("Task Status", "pending")]);
+        let folded = cell_put_folded("Task_has_Task_Status", stale.clone(), &Object::phi());
+        // Sanity: the stale tuple is NOT under the role key `t1` — it is under
+        // its full-tuple hash, so a naive verbatim-Map upsert would never see it.
+        let pre = fetch_or_phi("Task_has_Task_Status", &folded).as_map().cloned().expect("Map");
+        assert_eq!(pre.len(), 1);
+        assert!(pre.get("t1").is_none(),
+            "precondition: the folded tuple is keyed by full-tuple hash, not role-key t1");
+
+        // A keyed UPSERT of the fresh (t1, in_progress) must DISPLACE the stale
+        // pending — one tuple per role key, holding the latest value.
+        let fresh = fact_from_pairs(&[("Task", "t1"), ("Task Status", "in_progress")]);
+        let (next, conflicts) = cell_put_keyed_batch(
+            "Task_has_Task_Status", &["Task"], vec![fresh.clone()], /*upsert=*/true, &folded);
+        let m = fetch_or_phi("Task_has_Task_Status", &next).as_map().cloned().expect("Map");
+        assert_eq!(m.len(), 1, "stale folded (t1,pending) must be displaced, not coexist; got {m:?}");
+        assert_eq!(m.get("t1"), Some(&fresh), "the surviving tuple is the fresh in_progress");
+        assert!(conflicts.is_empty(), "upsert overwrite is not a conflict");
     }
 
     // ── derivation-aggregate-composite-key-upsert: positional keying ──
