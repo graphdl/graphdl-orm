@@ -2614,6 +2614,29 @@ pub fn desired_stack_bytes() -> usize {
     stack_bytes_from_env(std::env::var("AREST_STACK_MB").ok())
 }
 
+/// Parse a wall-clock timeout (seconds) from an optional env override. Split out
+/// from `desired_timeout_secs` so the parse/default logic is unit-testable
+/// without mutating the process environment. Unlike `stack_bytes_from_env`, a
+/// `0` is HONORED — it disables the watchdog (debugging session or a
+/// legitimately long-running op). None / unparseable falls back to the default.
+pub fn timeout_secs_from_env(override_secs: Option<String>) -> u64 {
+    const DEFAULT_SECS: u64 = 300;
+    override_secs
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SECS)
+}
+
+/// Wall-clock budget (seconds) for a single CLI invocation. A watchdog thread in
+/// `main.rs` aborts the process with code 124 if `main_entry` overruns it, so a
+/// runaway op (an unbounded `induce` abduction search, a non-terminating forward
+/// chain) fails fast instead of hanging the caller / MCP request. Default 300s
+/// (a heavy full-dependency app compile legitimately runs >120s; the watchdog is
+/// a hang-catcher, not a compile-killer); raise it with `AREST_TIMEOUT_SECS`
+/// (0 disables the watchdog entirely).
+pub fn desired_timeout_secs() -> u64 {
+    timeout_secs_from_env(std::env::var("AREST_TIMEOUT_SECS").ok())
+}
+
 /// CLI entry point. Called from src/main.rs's `fn main()` shim.
 pub fn main_entry() {
     // Install host entropy source (#591 / #574) BEFORE any subcommand
@@ -2685,6 +2708,7 @@ pub fn main_entry() {
     // direct apply) names them; both pre-approved (sec-2 audit). The
     // wasm32/uefi targets never reach this entry point, so the
     // http_fetch submodule's target gate matches.
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "uefi")))]
     crate::platform::http_fetch::install();
     crate::platform::notify::install();
 
@@ -4172,7 +4196,7 @@ mod version_embedding_tests {
 
 #[cfg(test)]
 mod stack_size_tests {
-    use super::stack_bytes_from_env;
+    use super::{stack_bytes_from_env, timeout_secs_from_env};
 
     const MB: usize = 1024 * 1024;
 
@@ -4198,5 +4222,33 @@ mod stack_size_tests {
         assert_eq!(stack_bytes_from_env(Some("0".to_string())), 512 * MB);
         assert_eq!(stack_bytes_from_env(Some("abc".to_string())), 512 * MB);
         assert_eq!(stack_bytes_from_env(Some("".to_string())), 512 * MB);
+    }
+
+    #[test]
+    fn timeout_defaults_to_300s_when_unset() {
+        assert_eq!(timeout_secs_from_env(None), 300);
+    }
+
+    #[test]
+    fn timeout_honors_a_valid_override() {
+        assert_eq!(timeout_secs_from_env(Some("60".to_string())), 60);
+        assert_eq!(timeout_secs_from_env(Some("300".to_string())), 300);
+    }
+
+    #[test]
+    fn timeout_trims_surrounding_whitespace() {
+        assert_eq!(timeout_secs_from_env(Some("  45  ".to_string())), 45);
+    }
+
+    #[test]
+    fn timeout_honors_zero_as_disabled() {
+        // Unlike stack size, 0 is meaningful here: it switches the watchdog off.
+        assert_eq!(timeout_secs_from_env(Some("0".to_string())), 0);
+    }
+
+    #[test]
+    fn timeout_falls_back_to_default_on_garbage() {
+        assert_eq!(timeout_secs_from_env(Some("abc".to_string())), 300);
+        assert_eq!(timeout_secs_from_env(Some("".to_string())), 300);
     }
 }

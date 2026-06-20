@@ -11061,3 +11061,315 @@ fn multiword_unary_aggregate_consequent_resolves_via_stage12() {
     assert!(!multiword.iter().any(|id| id.is_empty()),
         "no aggregate consequent may resolve to an EMPTY id; got {multiword:?}");
 }
+
+#[test]
+fn diag_samekey_rule_dump() {
+    use crate::ast::{self, fact_from_pairs};
+    let src = r#"# diag
+Observation(.id) is an entity type.
+Structure(.id) is an entity type.
+Count(.id) is an entity type.
+Run(.id) is an entity type.
+
+## Fact Types
+Run considers Structure.
+Structure has size Count.
+Observation sharekey Observation in Structure at Count.
+Observation samekey Observation in Structure.
+
+## Derivation Rules
+* Observation1 samekey Observation2 in Structure1 iff Run1 considers Structure1 and Observation1 sharekey Observation2 in Structure1 at Count1 and Structure1 has size Count1.
+"#;
+    let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src).expect("parse");
+    let rule = crate::compile::cell_index_from_state(&state).derivation_rules
+        .into_iter().find(|r| r.text.contains("samekey"))
+        .expect("samekey rule");
+    eprintln!("DIAG kind={:?}", rule.kind);
+    eprintln!("DIAG ring_join={:?}", rule.ring_join);
+    eprintln!("DIAG join_on={:?}", rule.join_on);
+    eprintln!("DIAG antecedent_sources={:?}", rule.antecedent_sources);
+
+    let model = crate::compile::compile(&state);
+    let cd = model.derivations.iter().find(|d| d.id == rule.id)
+        .expect("compiled samekey derivation");
+
+    // Population: a cross-pair (xt1, yt1) and a self-pair (xt1, xt1)
+    // in s1; size(s1)=1; run considers s1.
+    let mut st = ast::Object::phi();
+    st = ast::cell_push("Run_considers_Structure",
+        fact_from_pairs(&[("Run", "r"), ("Structure", "s1")]), &st);
+    st = ast::cell_push("Structure_has_size_Count",
+        fact_from_pairs(&[("Structure", "s1"), ("Count", "1")]), &st);
+    // sharekey self-pair
+    st = ast::cell_push("Observation_sharekey_Observation_in_Structure_at_Count",
+        fact_from_pairs(&[("Observation", "xt1"), ("Observation", "xt1"), ("Structure", "s1"), ("Count", "1")]), &st);
+    // sharekey cross-pair  (Observation1=xt1, Observation2=yt1)
+    st = ast::cell_push("Observation_sharekey_Observation_in_Structure_at_Count",
+        fact_from_pairs(&[("Observation", "xt1"), ("Observation", "yt1"), ("Structure", "s1"), ("Count", "1")]), &st);
+    let pop = ast::encode_state(&st);
+
+    for (ft, _, b) in decode_derived(&ast::apply(&cd.func, &pop, &st)) {
+        if ft == "Observation_samekey_Observation_in_Structure" {
+            eprintln!("DIAG derived: {:?}", b);
+        }
+    }
+}
+
+#[test]
+fn diag_samekey_bisect_multistructure() {
+    use crate::ast::{self, fact_from_pairs};
+    let src = r#"# diag
+Observation(.id) is an entity type.
+Structure(.id) is an entity type.
+Count(.id) is an entity type.
+Run(.id) is an entity type.
+
+## Fact Types
+Run considers Structure.
+Structure has size Count.
+Observation sharekey Observation in Structure at Count.
+Observation samekey Observation in Structure.
+
+## Derivation Rules
+* Observation1 samekey Observation2 in Structure1 iff Run1 considers Structure1 and Observation1 sharekey Observation2 in Structure1 at Count1 and Structure1 has size Count1.
+"#;
+    let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src).expect("parse");
+    let rule = crate::compile::cell_index_from_state(&state).derivation_rules
+        .into_iter().find(|r| r.text.contains("samekey")).expect("samekey rule");
+    let model = crate::compile::compile(&state);
+    let cd = model.derivations.iter().find(|d| d.id == rule.id).expect("compiled samekey");
+
+    let sk = "Observation_sharekey_Observation_in_Structure_at_Count";
+    let mut st = ast::Object::phi();
+    // TWO structures of different size (mirrors induce-driver s_color size1 + s_mc size2).
+    st = ast::cell_push("Run_considers_Structure", fact_from_pairs(&[("Run", "r"), ("Structure", "s1")]), &st);
+    st = ast::cell_push("Run_considers_Structure", fact_from_pairs(&[("Run", "r"), ("Structure", "s2")]), &st);
+    st = ast::cell_push("Structure_has_size_Count", fact_from_pairs(&[("Structure", "s1"), ("Count", "1")]), &st);
+    st = ast::cell_push("Structure_has_size_Count", fact_from_pairs(&[("Structure", "s2"), ("Count", "2")]), &st);
+    // s1 (size 1): the colliding bucket at (s1,1) -- 2 self + 2 cross, all Count 1.
+    st = ast::cell_push(sk, fact_from_pairs(&[("Observation", "xt1"), ("Observation", "xt1"), ("Structure", "s1"), ("Count", "1")]), &st);
+    st = ast::cell_push(sk, fact_from_pairs(&[("Observation", "yt1"), ("Observation", "yt1"), ("Structure", "s1"), ("Count", "1")]), &st);
+    st = ast::cell_push(sk, fact_from_pairs(&[("Observation", "xt1"), ("Observation", "yt1"), ("Structure", "s1"), ("Count", "1")]), &st);
+    st = ast::cell_push(sk, fact_from_pairs(&[("Observation", "yt1"), ("Observation", "xt1"), ("Structure", "s1"), ("Count", "1")]), &st);
+    // s2 (size 2): self at Count 2 (matches size), cross at Count 1 (does NOT match size 2).
+    st = ast::cell_push(sk, fact_from_pairs(&[("Observation", "xt1"), ("Observation", "xt1"), ("Structure", "s2"), ("Count", "2")]), &st);
+    st = ast::cell_push(sk, fact_from_pairs(&[("Observation", "yt1"), ("Observation", "yt1"), ("Structure", "s2"), ("Count", "2")]), &st);
+    st = ast::cell_push(sk, fact_from_pairs(&[("Observation", "xt1"), ("Observation", "yt1"), ("Structure", "s2"), ("Count", "1")]), &st);
+    let pop = ast::encode_state(&st);
+
+    eprintln!("BISECT samekey derived (correct = 6: s1 {{xx,yy,xy,yx}} + s2 {{xx,yy}}; bug => s1 cross xy/yx drop):");
+    for (ft, _, b) in decode_derived(&ast::apply(&cd.func, &pop, &st)) {
+        if ft == "Observation_samekey_Observation_in_Structure" {
+            eprintln!("  {:?}", b);
+        }
+    }
+}
+
+#[test]
+fn diag_samekey_cross_only() {
+    use crate::ast::{self, fact_from_pairs};
+    let src = r#"# diag
+Observation(.id) is an entity type.
+Structure(.id) is an entity type.
+Count(.id) is an entity type.
+Run(.id) is an entity type.
+
+## Fact Types
+Run considers Structure.
+Structure has size Count.
+Observation sharekey Observation in Structure at Count.
+Observation samekey Observation in Structure.
+
+## Derivation Rules
+* Observation1 samekey Observation2 in Structure1 iff Run1 considers Structure1 and Observation1 sharekey Observation2 in Structure1 at Count1 and Structure1 has size Count1.
+"#;
+    let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src).expect("parse");
+    let rule = crate::compile::cell_index_from_state(&state).derivation_rules
+        .into_iter().find(|r| r.text.contains("samekey")).expect("samekey rule");
+    let model = crate::compile::compile(&state);
+    let cd = model.derivations.iter().find(|d| d.id == rule.id).expect("compiled samekey");
+
+    let sk = "Observation_sharekey_Observation_in_Structure_at_Count";
+    let mut st = ast::Object::phi();
+    st = ast::cell_push("Run_considers_Structure", fact_from_pairs(&[("Run", "r"), ("Structure", "s")]), &st);
+    st = ast::cell_push("Structure_has_size_Count", fact_from_pairs(&[("Structure", "s"), ("Count", "1")]), &st);
+    // CROSS-pair ONLY, no self-pair anywhere -- exactly the s3 case the chain collapsed.
+    st = ast::cell_push(sk, fact_from_pairs(&[("Observation", "xt1"), ("Observation", "yt1"), ("Structure", "s"), ("Count", "1")]), &st);
+    let pop = ast::encode_state(&st);
+
+    eprintln!("CROSSONLY direct-func samekey (correct = (xt1,yt1,s); bug => (xt1,xt1,s)):");
+    for (ft, _, b) in decode_derived(&ast::apply(&cd.func, &pop, &st)) {
+        if ft == "Observation_samekey_Observation_in_Structure" {
+            eprintln!("  {:?}", b);
+        }
+    }
+}
+
+#[test]
+fn diag_samekey_chain_vs_direct_crossonly() {
+    use crate::ast::{self, fact_from_pairs, cell_push, fetch_cell_seq, encode_state};
+    let src = r#"# diag
+Observation(.id) is an entity type.
+Structure(.id) is an entity type.
+Count(.id) is an entity type.
+Run(.id) is an entity type.
+
+## Fact Types
+Run considers Structure.
+Structure has size Count.
+Observation sharekey Observation in Structure at Count.
+Observation samekey Observation in Structure.
+
+## Derivation Rules
+* Observation1 samekey Observation2 in Structure1 iff Run1 considers Structure1 and Observation1 sharekey Observation2 in Structure1 at Count1 and Structure1 has size Count1.
+"#;
+    let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+    let model = crate::compile::compile(&state);
+    let rule = crate::compile::cell_index_from_state(&state).derivation_rules
+        .into_iter().find(|r| r.text.contains("samekey")).expect("samekey rule");
+    let cd = model.derivations.iter().find(|d| d.id == rule.id).expect("compiled samekey");
+
+    let sk = "Observation_sharekey_Observation_in_Structure_at_Count";
+    let state = cell_push("Run_considers_Structure", fact_from_pairs(&[("Run", "r"), ("Structure", "s")]), &state);
+    let state = cell_push("Structure_has_size_Count", fact_from_pairs(&[("Structure", "s"), ("Count", "1")]), &state);
+    // CROSS-pair ONLY, no self.
+    let state = cell_push(sk, fact_from_pairs(&[("Observation", "xt1"), ("Observation", "yt1"), ("Structure", "s"), ("Count", "1")]), &state);
+
+    // DIRECT func apply on this exact state.
+    eprintln!("DIRECT (correct=(xt1,yt1,s)):");
+    for (ft, _, b) in decode_derived(&ast::apply(&cd.func, &encode_state(&state), &state)) {
+        if ft == "Observation_samekey_Observation_in_Structure" { eprintln!("  {:?}", b); }
+    }
+
+    // FULL forward chain on the SAME state -- only the orchestration differs.
+    let derivation_refs: Vec<(&str, &ast::Func)> =
+        model.derivations.iter().map(|d| (d.id.as_str(), &d.func)).collect();
+    let (final_state, _derived) = crate::evaluate::forward_chain_defs_state(&derivation_refs, &state);
+    let cell = fetch_cell_seq("Observation_samekey_Observation_in_Structure", &final_state);
+    eprintln!("CHAIN basic (forward_chain_defs_state):");
+    if let Some(facts) = cell.as_seq() {
+        for f in facts.iter() { eprintln!("  {}", f); }
+    } else { eprintln!("  (empty)"); }
+
+    // SEMI-NAIVE chain -- what the app's stratified compile path delegates to.
+    let sn_refs: Vec<(&str, &ast::Func, Option<&[String]>)> =
+        model.derivations.iter().map(|d| (d.id.as_str(), &d.func, None)).collect();
+    let (sn_state, _) = crate::evaluate::forward_chain_defs_state_semi_naive(&sn_refs, &state, 100);
+    let sn_cell = fetch_cell_seq("Observation_samekey_Observation_in_Structure", &sn_state);
+    eprintln!("CHAIN semi-naive (app path; bug=(xt1,xt1,s)):");
+    if let Some(facts) = sn_cell.as_seq() {
+        for f in facts.iter() { eprintln!("  {}", f); }
+    } else { eprintln!("  (empty)"); }
+}
+
+#[test]
+fn samekey_ring_survives_predicate_noun_collision() {
+    // Regression for ring-join-predicate-noun-collision (the self-join hunt,
+    // 2026-06-18). A noun whose NAME collides with a PREDICATE word in a ring
+    // rule's antecedent clause -- here `Size` vs the `has size` predicate in
+    // `Structure has size Count` -- makes `find_nouns` over-tokenize the clause
+    // (3 tokens for a 2-role FT). `compute_ring_join_plan` then bails on its
+    // arity check, so the rule falls to the noun-name join fallback, which binds
+    // a ring's two same-noun roles BY NAME -- both resolve to antecedent role 0,
+    // collapsing every derived pair to a self-pair (O2 := O1). The role-noun
+    // token filter keeps only tokens whose base noun is a role of the FT, so the
+    // ring plan survives and the cross-pair holds. The `Size` entity type is
+    // LOAD-BEARING -- it IS the collision; remove it and the bug vanishes, which
+    // is exactly why this only ever reproduced against the full kernel.
+    let src = r#"# ring predicate-noun collision regression
+Observation(.id) is an entity type.
+Structure(.id) is an entity type.
+Count(.id) is an entity type.
+Run(.id) is an entity type.
+Size(.id) is an entity type.
+
+## Fact Types
+Run considers Structure.
+Structure has size Count.
+Observation sharekey Observation in Structure at Count.
+Observation samekey Observation in Structure.
+
+## Derivation Rules
+* Observation1 samekey Observation2 in Structure1 iff Run1 considers Structure1 and Observation1 sharekey Observation2 in Structure1 at Count1 and Structure1 has size Count1.
+
+## Instance Facts
+Run 'r' considers Structure 's'.
+Structure 's' has size Count '1'.
+Observation 'xt1' sharekey Observation 'yt1' in Structure 's' at Count '1'.
+"#;
+    let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+    let all_defs = crate::compile::compile_to_defs_state(&state);
+    let d = crate::ast::defs_to_state(&all_defs, &state);
+    let model = crate::compile::compile(&state);
+    let cd = model.derivations.iter()
+        .find(|x| x.text.contains("samekey"))
+        .expect("samekey rule compiles to a derivation");
+    let out = crate::ast::apply(&cd.func, &crate::ast::encode_state(&d), &d);
+    let pairs: Vec<(String, String)> = decode_derived(&out).into_iter()
+        .filter(|(ft, _, _)| ft.as_str() == "Observation_samekey_Observation_in_Structure")
+        .filter_map(|(_, _, b)| {
+            let obs: Vec<String> = b.iter()
+                .filter(|(role, _)| role.as_str() == "Observation")
+                .map(|(_, v)| v.clone())
+                .collect();
+            (obs.len() >= 2).then(|| (obs[0].clone(), obs[1].clone()))
+        })
+        .collect();
+    assert!(pairs.contains(&("xt1".to_string(), "yt1".to_string())),
+        "derived ring head must preserve the cross-pair (xt1,yt1); a `Size`/`size` \
+         predicate-noun collision must not bail the ring plan and self-collapse \
+         O2:=O1. got {:?}", pairs);
+    assert!(!pairs.iter().any(|(a, b)| a == b),
+        "a single cross-pair sharekey input must derive NO self-pair; got {:?}", pairs);
+}
+
+#[test]
+fn diag_samekey_full_defstate() {
+    use crate::ast::{self, fact_from_pairs, cell_push, fetch_cell_seq, defs_to_state};
+    let src = r#"# diag
+Observation(.id) is an entity type.
+Structure(.id) is an entity type.
+Count(.id) is an entity type.
+Run(.id) is an entity type.
+
+## Fact Types
+Run considers Structure.
+Structure has size Count.
+Observation sharekey Observation in Structure at Count.
+Observation samekey Observation in Structure.
+
+## Derivation Rules
+* Observation1 samekey Observation2 in Structure1 iff Run1 considers Structure1 and Observation1 sharekey Observation2 in Structure1 at Count1 and Structure1 has size Count1.
+
+## Instance Facts
+Run 'r' considers Structure 's'.
+Structure 's' has size Count '1'.
+Observation 'xt1' sharekey Observation 'yt1' in Structure 's' at Count '1'.
+"#;
+    let _ = (&fact_from_pairs, &cell_push); // silence unused after switching to loaded facts
+    let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+    // LOADED via parse (the cli path): instance facts live in the readings, NOT cell_push.
+    // This is the last untested difference from the real cli compile.
+    let all_defs = crate::compile::compile_to_defs_state(&state);
+    let d = defs_to_state(&all_defs, &state);
+
+    // The app's actual chain entry: stratified, over the full def-state, WITH the
+    // real derivation_reads sidecar (cli/entry.rs:3243 does this -- None was the
+    // naive baseline; Some(reads) enables semi-naive dirty-cell gating).
+    let packed: Vec<(&str, &ast::Func, Option<Vec<String>>)> = all_defs.iter()
+        .filter(|(n, _)| n.starts_with("derivation:"))
+        .map(|(n, f)| {
+            let id = n.split_once(':').map(|(_, i)| i).unwrap_or(n.as_str());
+            (n.as_str(), f, crate::evaluate::read_derivation_reads(&d, id))
+        })
+        .collect();
+    let sn_refs: Vec<(&str, &ast::Func, Option<&[String]>)> = packed.iter()
+        .map(|(n, f, reads)| (*n, *f, reads.as_deref()))
+        .collect();
+    let (final_state, _) = crate::evaluate::forward_chain_defs_state_stratified(&sn_refs, &d, 100);
+    let cell = fetch_cell_seq("Observation_samekey_Observation_in_Structure", &final_state);
+    eprintln!("FULL-DEFSTATE stratified samekey (correct=(xt1,yt1,s); bug=(xt1,xt1,s)):");
+    if let Some(facts) = cell.as_seq() {
+        for f in facts.iter() { eprintln!("  {}", f); }
+    } else { eprintln!("  (empty)"); }
+}

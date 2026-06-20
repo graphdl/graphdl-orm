@@ -1377,6 +1377,11 @@ pub struct FuncReadSet {
     /// read-set is NOT provably complete and the delta-view soundness gate
     /// must full-evaluate this rule rather than swap views.
     pub has_dynamic: bool,
+    /// Subset of `has_dynamic`: a Platform/Native escape hatch — genuine
+    /// runtime/federation dynamism (eq:federation), NOT recoverable by static
+    /// resolution. A `has_dynamic` rule that is NOT `has_federation` is a
+    /// Fetch/metacomposition pattern that may be statically resolvable.
+    pub has_federation: bool,
     /// Named defs referenced (Func::Def). Reads THROUGH a def are indirect;
     /// resolve these against the def map for a fully-complete read-set.
     pub def_refs: alloc::collections::BTreeSet<alloc::string::String>,
@@ -1433,7 +1438,7 @@ fn collect_func_reads(f: &Func, rs: &mut FuncReadSet) {
 
         // Indirect / opaque surfaces.
         Func::Def(name) => { rs.def_refs.insert(name.clone()); }
-        Func::Platform(_) | Func::Native(_) => rs.has_dynamic = true,
+        Func::Platform(_) | Func::Native(_) => { rs.has_dynamic = true; rs.has_federation = true; }
 
         // All remaining variants are nullary leaves with no cell reads
         // (Id, Selector, Tail, Eq, arithmetic/logic, Constant, Store, …).

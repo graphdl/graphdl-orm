@@ -9630,8 +9630,37 @@ fn sm_ordered_fold_branch(sm: &CompiledStateMachine) -> Func {
 
     // grouped (Map) -> per-resource emit (ApplyToAll iterates Map values) ->
     // Concat to a flat fact stream.
+    //
+    // IVM scoping (AREST.tex sec:exec: the current-status projection maintained
+    // as an incremental view, not re-chased per request). When the leaf path
+    // supplies `_DeltaResources_<noun>` (resources whose events are in the
+    // delta, one resource atom per fact), fold ONLY those resources' groups:
+    // O(|delta|) FetchOrPhi look-ups into the already-built `grouped` Map, not
+    // a re-fold of every resource. Absent on a full compile, NullTest . fetch
+    // -> phi -> T -> the full Map is folded (output byte-identical). The seed
+    // branch needs no scoping: it is is_new-guarded against the current-status
+    // cell, so it only fires for genuinely new resources and never clobbers.
+    let delta_cell = format!("_DeltaResources_{}", sm_noun.replace(' ', "_"));
+    let delta_fetch = extract_facts_from_pop(&delta_cell);
+    let delta_atoms = Func::compose(Func::apply_to_all(Func::Selector(1)), delta_fetch.clone());
+    let non_phi = Func::compose(Func::Not, Func::NullTest);
+    let scoped_groups = Func::compose(
+        Func::filter(non_phi),
+        Func::compose(
+            Func::apply_to_all(Func::FetchOrPhi),
+            Func::compose(
+                Func::DistR,
+                Func::construction(vec![delta_atoms, grouped.clone()]),
+            ),
+        ),
+    );
+    let resources_iter = Func::condition(
+        Func::compose(Func::NullTest, delta_fetch),
+        grouped,
+        scoped_groups,
+    );
     Func::compose(Func::Concat,
-        Func::compose(Func::apply_to_all(fold_one_resource), grouped))
+        Func::compose(Func::apply_to_all(fold_one_resource), resources_iter))
 }
 
 fn compile_sm_reconstruction_fold(sm: &CompiledStateMachine) -> CompiledDerivation {

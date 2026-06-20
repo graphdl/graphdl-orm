@@ -98,9 +98,20 @@ pub fn orient(state: &Object, input: &str) -> String {
     }
 
     let recent = recent_changes(state);
-    let suggestion = suggested_next(active_app, &task_counts);
+    // claude-stack: a stack-bearing app re-points the suggestion at its OWN
+    // ledger (what/why/how is in the `stack` field) instead of the generic
+    // tasks-board stub — `tasks` is a SEPARATE app, not part of every app.
+    let stack = stack_overview(state, active_app);
+    let lessons = lessons_overview(state);
+    let suggestion = match &stack {
+        Some(_) => "This app is a cognitive stack — the `stack` field gives what/why/how. \
+            Next: query and OBEY the operational ledger — Engineering_Lever_has_Lever_Status \
+            (current work), Operating_Rule_has_Rule_Statement (standing rules), Engine_Lesson \
+            (durable technical facts).".to_string(),
+        None => suggested_next(active_app, &task_counts),
+    };
 
-    let mut env = Map::with_capacity(4);
+    let mut env = Map::with_capacity(6);
     env.insert("apps".into(), Value::Array(apps_arr));
     env.insert("active_app".into(), match active_app {
         Some(s) => Value::String(s.to_string()),
@@ -108,7 +119,117 @@ pub fn orient(state: &Object, input: &str) -> String {
     });
     env.insert("recent_changes".into(), Value::Array(recent));
     env.insert("suggested_next".into(), Value::String(suggestion));
+    if let Some(s) = stack { env.insert("stack".into(), s); }
+    if let Some(l) = lessons { env.insert("lessons".into(), l); }
     Value::Object(env).to_string()
+}
+
+/// stack-self-description: surface the active app's Purpose / Rationale /
+/// Usage and its Stack Layers, so `orient` tells a re-entering session WHAT
+/// the stack does, WHY it is built this way, and HOW to wield it — not a
+/// generic task pointer. Reads the facts the app declares (App has
+/// Purpose/Rationale/Usage, App includes Stack Layer, Stack Layer has Layer
+/// Description / is sourced from App). Returns None for apps declaring none.
+fn stack_overview(state: &Object, active_app: Option<&str>) -> Option<Value> {
+    let app = active_app?;
+    let one = |cell: &str, val_role: &str| -> Option<String> {
+        let c = crate::ast::fetch_or_phi(cell, state);
+        for f in crate::ast::cell_facts_iter(&c) {
+            if crate::ast::binding(f, "App") == Some(app) {
+                if let Some(v) = crate::ast::binding(f, val_role) { return Some(v.to_string()); }
+            }
+        }
+        None
+    };
+    let field = |cell: &Object, layer: &str, role: &str| -> Option<String> {
+        for f in crate::ast::cell_facts_iter(cell) {
+            if crate::ast::binding(f, "Stack Layer") == Some(layer) {
+                if let Some(v) = crate::ast::binding(f, role) { return Some(v.to_string()); }
+            }
+        }
+        None
+    };
+    let inc = crate::ast::fetch_or_phi("App_includes_Stack_Layer", state);
+    let mut layer_names: Vec<String> = Vec::new();
+    for f in crate::ast::cell_facts_iter(&inc) {
+        if crate::ast::binding(f, "App") == Some(app) {
+            if let Some(l) = crate::ast::binding(f, "Stack Layer") { layer_names.push(l.to_string()); }
+        }
+    }
+    let desc = crate::ast::fetch_or_phi("Stack_Layer_has_Layer_Description", state);
+    let src = crate::ast::fetch_or_phi("Stack_Layer_is_sourced_from_App", state);
+    let layers: Vec<Value> = layer_names.iter().map(|n| {
+        let mut m = Map::new();
+        m.insert("layer".into(), Value::String(n.clone()));
+        if let Some(d) = field(&desc, n, "Layer Description") { m.insert("description".into(), Value::String(d)); }
+        if let Some(s) = field(&src, n, "App") { m.insert("from".into(), Value::String(s)); }
+        Value::Object(m)
+    }).collect();
+    let purpose = one("App_has_Purpose", "Purpose");
+    if purpose.is_none() && layers.is_empty() { return None; }
+    let mut m = Map::new();
+    if let Some(p) = purpose { m.insert("purpose".into(), Value::String(p)); }
+    if let Some(r) = one("App_has_Rationale", "Rationale") { m.insert("rationale".into(), Value::String(r)); }
+    if let Some(u) = one("App_has_Usage", "Usage") { m.insert("usage".into(), Value::String(u)); }
+    if !layers.is_empty() { m.insert("layers".into(), Value::Array(layers)); }
+    Some(Value::Object(m))
+}
+
+/// lessons-surfacing: surface the active app's Engine Lessons so a re-entering
+/// session sees the durable do's (prescribed Constructions) and don'ts (Reading
+/// Traps with their trigger phrases) WITHOUT re-deriving them from a compaction
+/// summary. Reads Engine_Lesson_has_Lesson_Kind (grouped), prescribes
+/// Construction, and Reading_Trap_is_triggered_by_Trigger_Phrase. None when the
+/// app declares no lessons (so non-ledger apps stay unaffected).
+fn lessons_overview(state: &Object) -> Option<Value> {
+    use std::collections::BTreeMap;
+    let kinds = crate::ast::fetch_or_phi("Engine_Lesson_has_Lesson_Kind", state);
+    let mut by_kind: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for f in crate::ast::cell_facts_iter(&kinds) {
+        if let (Some(id), Some(kind)) =
+            (crate::ast::binding(f, "Engine Lesson"), crate::ast::binding(f, "Lesson Kind"))
+        {
+            by_kind.entry(kind.to_string()).or_default().push(id.to_string());
+        }
+    }
+    if by_kind.is_empty() { return None; }
+    let count: u64 = by_kind.values().map(|v| v.len() as u64).sum();
+    let mut kinds_obj = Map::new();
+    for (k, mut v) in by_kind {
+        v.sort();
+        v.dedup();
+        kinds_obj.insert(k, Value::Array(v.into_iter().map(Value::String).collect()));
+    }
+
+    let cons = crate::ast::fetch_or_phi("Engine_Lesson_prescribes_Construction", state);
+    let mut prescribes: Vec<String> = Vec::new();
+    for f in crate::ast::cell_facts_iter(&cons) {
+        if let Some(c) = crate::ast::binding(f, "Construction") { prescribes.push(c.to_string()); }
+    }
+    prescribes.sort();
+    prescribes.dedup();
+
+    let traps = crate::ast::fetch_or_phi("Reading_Trap_is_triggered_by_Trigger_Phrase", state);
+    let mut avoid: Vec<Value> = Vec::new();
+    for f in crate::ast::cell_facts_iter(&traps) {
+        if let (Some(t), Some(p)) =
+            (crate::ast::binding(f, "Reading Trap"), crate::ast::binding(f, "Trigger Phrase"))
+        {
+            let mut tm = Map::new();
+            tm.insert("trap".into(), Value::String(t.to_string()));
+            tm.insert("trigger".into(), Value::String(p.to_string()));
+            avoid.push(Value::Object(tm));
+        }
+    }
+
+    let mut m = Map::new();
+    m.insert("count".into(), Value::from(count));
+    m.insert("by_kind".into(), Value::Object(kinds_obj));
+    if !prescribes.is_empty() {
+        m.insert("prescribes".into(), Value::Array(prescribes.into_iter().map(Value::String).collect()));
+    }
+    if !avoid.is_empty() { m.insert("avoid".into(), Value::Array(avoid)); }
+    Some(Value::Object(m))
 }
 
 // ── Task counts ────────────────────────────────────────────────────

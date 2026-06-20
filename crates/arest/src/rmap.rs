@@ -1603,9 +1603,18 @@ fn projection_plan_inner(
                         row.insert(col.name.clone(), v.clone());
                     }
                 } else {
-                    for col in proj_cols.iter() {
+                    // same-noun-ring-projection: a ring fact type's two
+                    // same-noun columns (observation_id, observation_id_2)
+                    // share a role NAME, so a by-name `find` returns the
+                    // FIRST pair for BOTH, collapsing (xt1,yt1) -> (xt1,xt1).
+                    // Take the OCCURRENCE-th matching pair: the N-th column
+                    // for role R gets the N-th pair whose key is R.
+                    for (i, col) in proj_cols.iter().enumerate() {
                         let Some(role) = &col.source_value_role else { continue };
-                        if let Some((_, v)) = pairs.iter().find(|(k, _)| k == role) {
+                        let occ = proj_cols[..i].iter()
+                            .filter(|c| c.source_value_role.as_deref() == Some(role.as_str()))
+                            .count();
+                        if let Some((_, v)) = pairs.iter().filter(|(k, _)| k == role).nth(occ) {
                             row.insert(col.name.clone(), v.clone());
                         }
                     }

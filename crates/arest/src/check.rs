@@ -21,7 +21,7 @@
 // `Selector`) down into the leaves over time.
 
 use crate::ast::{Object, binding, fetch_cell_seq, Func};
-use crate::parse_forml2::parse_to_state;
+use crate::parse_forml2::{parse_to_state, find_nouns, parse_role_token};
 use crate::naming::atom_id_is_valid;
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned, sync::Arc};
@@ -141,6 +141,7 @@ pub fn check_readings_func() -> Func {
             layer_native(check_computed_bindings_in_multi_antecedent_rules),
             layer_native(check_variable_disjoint_antecedents),
             layer_native(check_effective_widget_agrees_with_most_specific_type),
+            layer_native(check_reading_grammar),
         ]),
     )
 }
@@ -897,6 +898,142 @@ fn check_effective_widget_agrees_with_most_specific_type(state: &Object) -> Vec<
     diags.sort_by(|a, b| a.reading.cmp(&b.reading));
     diags
 }
+
+/// Layer 9 (operating rule `grammatical-fact-readings`): advisory grammar
+/// lint on atomic fact-type readings. The operating rule says "atomic fact
+/// type readings must be proper grammatical English"; a coined/abbreviated
+/// predicate token (`gputs`, `ghit`, `sharekey`, `sameinput`) in the verb
+/// phrase silently violates it. This layer isolates each reading's
+/// VERB-PHRASE tokens (the whitespace tokens NOT inside any declared-noun
+/// span) and flags any token that is not a recognised English word.
+///
+/// ADVISORY ONLY — `Level::Hint`. It must never reject a load: the
+/// load-time gate (`validate_loaded_state`) routes only Error-level
+/// diagnostics to the alethic bucket, so a Hint here adds a note and
+/// never blocks or fails a compile. False positives from a coinage the
+/// substrate legitimately uses are corrected by adding the word to
+/// `READING_LEXICON`, not by silencing the layer.
+fn check_reading_grammar(state: &Object) -> Vec<ReadingDiagnostic> {
+    let noun_names: Vec<String> = fetch_cell_seq("Noun", state).as_seq()
+        .map(|ns| ns.iter()
+            .filter_map(|n| binding(n, "name").map(|s| s.to_string()))
+            .collect())
+        .unwrap_or_default();
+
+    fetch_cell_seq("FactType", state).as_seq()
+        .map(|fts| fts.iter().filter_map(|ft| {
+            let reading = binding(ft, "reading").unwrap_or("");
+            let suspects = suspect_reading_tokens(reading, &noun_names);
+            (!suspects.is_empty()).then(|| {
+                // One diagnostic per reading, listing every suspect token,
+                // so a multi-coinage reading reads cleanly in the report.
+                let listed = suspects.iter()
+                    .map(|t| format!("'{}'", t))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ReadingDiagnostic {
+                    line: 0,
+                    reading: reading.to_string(),
+                    level: Level::Hint,
+                    source: Source::Resolve,
+                    message: format!(
+                        "reading token {} is not recognized English — atomic fact type \
+                         readings should be grammatical English (operating rule \
+                         grammatical-fact-readings); prefer a full phrase over a coined \
+                         predicate",
+                        listed,
+                    ),
+                    suggestion: None,
+                }
+            })
+        }).collect())
+        .unwrap_or_default()
+}
+
+/// The verb-phrase tokens of `reading` that are not recognised English.
+///
+/// Algorithm (per the `grammatical-fact-readings` operating rule):
+///   1. Locate every declared-noun span with `find_nouns` (case-insensitive,
+///      longest-first). These are the role players — never verb tokens.
+///   2. Split `reading` on whitespace; keep only tokens that fall ENTIRELY
+///      outside every noun span (the verb phrase).
+///   3. For each such token, strip a trailing digit subscript via
+///      `parse_role_token` and lowercase the base. Skip it when it is too
+///      short (`< 3`), not purely alphabetic, or present in `READING_LEXICON`.
+///   4. Whatever remains is a coined/abbreviated predicate — return it.
+fn suspect_reading_tokens(reading: &str, noun_names: &[String]) -> Vec<String> {
+    let noun_spans = find_nouns(reading, noun_names);
+    let inside_noun = |start: usize, end: usize| -> bool {
+        noun_spans.iter().any(|&(ns, ne, _)| start < ne && end > ns)
+    };
+    let mut out: Vec<String> = Vec::new();
+    let bytes = reading.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Skip ASCII whitespace.
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        // Token = run up to the next ASCII whitespace.
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let end = i;
+        if inside_noun(start, end) {
+            continue;
+        }
+        let token = &reading[start..end];
+        let base = parse_role_token(token).0;
+        let w = base.to_lowercase();
+        if w.len() < 3 {
+            continue;
+        }
+        if !w.chars().all(|c| c.is_ascii_alphabetic()) {
+            continue;
+        }
+        if READING_LEXICON.contains(&w.as_str()) {
+            continue;
+        }
+        out.push(w);
+    }
+    out
+}
+
+/// Common English words that legitimately appear in atomic fact-type
+/// readings — function words plus the grammatical reading verbs/nouns the
+/// substrate actually uses. A verb-phrase token NOT in this set (after
+/// subscript-strip + lowercasing, length ≥ 3, purely alphabetic) is a
+/// suspect coinage that `check_reading_grammar` flags as a Hint.
+///
+/// This set must contain ONLY grammatical English. Never add a coined
+/// predicate (`gputs`, `ghit`, `sharekey`, `sameinput`, `sourcematch`, …)
+/// here — those are exactly what the lint exists to surface. Extend it
+/// only with genuine function words / real reading verbs as new corpora
+/// introduce them.
+static READING_LEXICON: &[&str] = &[
+    // articles / determiners / conjunctions / prepositions
+    "a", "an", "the", "of", "to", "at", "in", "on", "by", "with", "for",
+    "from", "into", "onto", "over", "under", "per", "as", "and", "or",
+    "not", "no", "than", "then", "that", "this", "these", "those", "where",
+    "when", "which", "who", "whose",
+    // copulas
+    "is", "are", "was", "were", "be", "been", "being", "am",
+    // have / do / modals
+    "has", "have", "had", "having", "do", "does", "did", "can", "could",
+    "may", "might", "must", "shall", "should", "will", "would",
+    // common reading verbs / nouns the substrate uses (grammatical — KEEP)
+    "includes", "include", "predicts", "predict", "agrees", "agree",
+    "spans", "span", "fits", "fit", "considers", "consider", "reads",
+    "read", "writes", "write", "relabels", "relabel", "maps", "map",
+    "gathers", "gather", "tallies", "tally", "recolors", "recolor",
+    "bends", "bend", "sources", "source", "selects", "select", "wins",
+    "win", "ranks", "rank", "solved", "done", "value", "values", "count",
+    "counts", "total", "size", "name", "names", "id", "key", "keys",
+    "input", "output", "mode", "feature", "confidence", "training", "top",
+    "set", "same", "shares", "share",
+];
 
 /// Render the `<domain>.<Noun>` qualifier choices as a natural English
 /// list with `or` before the final item. `domains` is assumed sorted +

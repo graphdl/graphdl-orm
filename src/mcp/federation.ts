@@ -151,7 +151,11 @@ export function parseFederationConfig(raw: string): FederationConfig | null {
     let match
     while ((match = pairRe.exec(raw)) !== null) {
       const [, key, value] = match
-      config[key.trim()] = value.trim()
+      // The populate-def emission escapes delimiter chars in values, so a
+      // ClickHouse URI /?query=... arrives here as /?query\=...; unescape it
+      // before buildFetchUrl, or the fetch ships a stray backslash and the
+      // external system 404s (contact-us federation symptom).
+      config[key.trim()] = value.trim().replace(/\\(.)/g, '$1')
     }
     const fieldsMatch = raw.match(/fields,\s*<([^>]*)>/)
     const fields = fieldsMatch

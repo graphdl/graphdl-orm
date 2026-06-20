@@ -238,10 +238,25 @@ fn find_last_noun_in(text: &str, noun_names: &[String]) -> Option<String> {
 /// hyphen-bound role name (`expires- Timestamp`). Used by
 /// `expand_that_relatives` to skip anaphora — back-references to a
 /// previously-bound role shouldn't be rewritten into conjunctions.
+/// Fact-is-not-special word-boundary guard: true if a reserved metamodel noun
+/// LONGER than `noun_len` begins (case-insensitively) at the start of `text`.
+/// Used so a shorter noun like `Fact` is not recognised INSIDE a longer reserved
+/// noun like `Fact Type` (which resolves as the metamodel relation, not a noun --
+/// task980). The reserved nouns are deliberately absent from `noun_names`, so the
+/// longest-first defense in callers cannot prefer them; this guard does.
+fn shadowed_by_longer_reserved(text: &str, noun_len: usize) -> bool {
+    let lower = text.to_ascii_lowercase();
+    crate::ast::RESERVED_METAMODEL_NOUNS.iter().any(|r| {
+        r.len() > noun_len && lower.starts_with(&r.to_ascii_lowercase())
+    })
+}
+
 fn is_that_anaphora_ref(tail: &str, noun_names: &[String]) -> bool {
     // Shape 1 + 2: <Noun> or <Noun><digits>
     if noun_names.iter().any(|n| {
         let Some(after) = tail.strip_prefix(n.as_str()) else { return false; };
+        // word-boundary guard: don't read `Fact` inside `Fact Type` (etc.).
+        if shadowed_by_longer_reserved(tail, n.len()) { return false; }
         let after_subscript = after.trim_start_matches(|c: char| c.is_ascii_digit());
         matches!(
             after_subscript.chars().next(),
@@ -1047,6 +1062,11 @@ pub(crate) fn re_resolve_rules(
     subtypes: &HashMap<String, String>,
 ) {
     let mut noun_names: Vec<String> = nouns.keys().cloned().collect();
+    // The universal metamodel `Fact` noun (not special) lives outside the domain
+    // `Noun` cell; recognise it so a reading/clause over it (`Bag holds Fact`,
+    // `Fact stimulates Layer`) resolves like a domain entity. `find_nouns` guards
+    // it from eating `Fact Type` (the longer reserved noun resolves separately).
+    if !noun_names.iter().any(|n| n == "Fact") { noun_names.push("Fact".to_string()); }
     noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
 
     let mut catalog = SchemaCatalog::new();
@@ -1162,9 +1182,21 @@ fn try_parse_aggregate_clause(text: &str, noun_names: &[String]) -> Option<(Stri
     let target_base = parse_role_token(&target).0;
     let first_tok_base = target.split_whitespace().next()
         .map(|first| parse_role_token(first).0);
-    let target_resolves = noun_names.iter().any(|n| n == &target)
-        || noun_names.iter().any(|n| n == target_base)
-        || first_tok_base.map_or(false, |first| noun_names.iter().any(|n| n == first));
+    // The counted noun may be a DOMAIN entity OR a metamodel noun. `Fact` is now in
+    // `noun_names` (added in resolve_derivation_rule / re_resolve_rules; find_nouns
+    // guards it from matching inside `Fact Type`, which resolves as the FactType
+    // relation, not a noun — task980), so the plain check accepts it. This is_known
+    // extension additionally accepts the RESERVED metamodel nouns as aggregate
+    // TARGETS (counting Roles, Fact Types, …) without putting them in the clause
+    // resolver.
+    let is_known = |s: &str| {
+        noun_names.iter().any(|n| n == s)
+            || s == "Fact"
+            || crate::ast::RESERVED_METAMODEL_NOUNS.contains(&s)
+    };
+    let target_resolves = is_known(&target)
+        || is_known(target_base)
+        || first_tok_base.map_or(false, |s| is_known(s));
     if !target_resolves { return None; }
     Some((role, op, target, where_clause))
 }
@@ -1477,8 +1509,11 @@ fn resolve_derivation_rule(
     // the materialization field arrives via the DR cell deserialize path
     // in compile::cell_index_from_state.
 
-    // Longest-first noun list for Theorem 1 matching
+    // Longest-first noun list for Theorem 1 matching. Includes the universal
+    // metamodel `Fact` noun (not special); `find_nouns` guards it from matching
+    // inside `Fact Type` so the metamodel subtype rule still resolves (task980).
     let mut noun_names: Vec<String> = nouns_map.keys().cloned().collect();
+    if !noun_names.iter().any(|n| n == "Fact") { noun_names.push("Fact".to_string()); }
     noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
 
     // #914 — Pre-pass: extract cross-antecedent role-vs-role value
@@ -1847,6 +1882,7 @@ fn resolve_derivation_rule(
                 if let Some(noun) = noun_names.iter().find(|noun| {
                     after.starts_with(noun.as_str())
                         && is_word_boundary(bytes.get(noun_start + noun.len()).copied())
+                        && !shadowed_by_longer_reserved(after, noun.len())
                 }) {
                     if !keys.contains(noun) { keys.push(noun.clone()); }
                 }
@@ -2553,8 +2589,11 @@ fn resolve_derivation_rule(
         //     a) "that X has Y" â€” join continuation
         //     b) "X is that Y" â€” anaphoric value assignment
         //        (e.g., "display- Text is that Reference")
-        if part.trim().starts_with("that ") && noun_names.iter()
-            .any(|n| part.to_lowercase().contains(&n.to_lowercase()))
+        // find_nouns (word-boundary + reserved-noun guard), NOT a raw substring
+        // `contains`: else a metamodel clause like `that Fact Type has that Role`
+        // is falsely skipped here (it contains `Fact`) before reaching the
+        // metamodel classifier that resolves it to the FactType relation (task980).
+        if part.trim().starts_with("that ") && !find_nouns(part, &noun_names).is_empty()
         { continue; }
         if part.contains(" is that ") || part.contains(" is some ") { continue; }
 
@@ -3513,7 +3552,24 @@ fn compute_ring_join_plan(
         if ft_id.is_empty() { return None; }
         let ft = fact_types.get(ft_id)?;
         let role_count = ft.roles.len();
-        let toks = tokens_in_order(&antecedent_clauses[i]);
+        // ring-join-predicate-noun-collision: `find_nouns` matches EVERY declared
+        // noun in the clause text, including a PREDICATE word that collides with
+        // a noun declared elsewhere in the model -- e.g. `size` in `Structure
+        // has size Count` collides with the metamodel noun `Size` (`File has
+        // Size`). The spurious token inflates the count past the FT's arity, so
+        // the ring plan bails to the noun-name fallback, which cannot tell a
+        // ring's two same-noun roles apart (both resolve to role 0, so every
+        // derived ring fact self-collapses O2:=O1). Keep only tokens whose base
+        // noun is an actual ROLE of this antecedent's fact type. (A minimal test
+        // substrate lacks the colliding noun -- which is exactly why this bug
+        // only ever manifested in the full kernel, never in an isolated repro.)
+        let role_nouns: Vec<&str> = ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
+        let toks: Vec<String> = tokens_in_order(&antecedent_clauses[i]).into_iter()
+            .filter(|tok| {
+                let (base, _) = parse_role_token(tok);
+                role_nouns.iter().any(|rn| rn.eq_ignore_ascii_case(base))
+            })
+            .collect();
         if toks.len() != role_count { return None; }
         for (role_idx, tok) in toks.into_iter().enumerate() {
             match token_positions.iter_mut().find(|(t, _)| *t == tok) {
@@ -3972,7 +4028,11 @@ pub(crate) fn find_nouns(text: &str, noun_names: &[String]) -> Vec<(usize, usize
                 let after_ok = end >= text.len() || !is_word_byte(text.as_bytes()[end]);
                 let no_overlap = !used.iter().any(|&(s, e)| start < e && end > s);
 
-                if before_ok && after_ok && no_overlap {
+                // word-boundary guard: skip this match if a longer reserved metamodel
+                // noun begins here, so `Fact` is not matched inside `Fact Type`.
+                if before_ok && after_ok && no_overlap
+                    && !shadowed_by_longer_reserved(&text[start..], name.len())
+                {
                     // Capture the subscripted token (e.g. "Person3") so
                     // callers distinguish the ring positions. The base
                     // name is recovered via parse_role_token at the
@@ -4675,6 +4735,41 @@ mod regex_replacement_tests {
         assert!(try_parse_aggregate_clause(
             "Task is the boss of Task", &nouns
         ).is_none());
+    }
+
+    // ── metamodel-noun-uniformity (Fact-is-not-special) ────────────
+    #[test]
+    fn aggregate_count_over_metamodel_fact() {
+        // `Fact` is NOT in the domain noun list, but it is a countable metamodel
+        // noun: `… is the count of Fact1 where Fact1 stimulates Layer1` resolves
+        // exactly like a count over a domain entity (the bug this fixes).
+        let nouns: alloc::vec::Vec<String> = ["Layer"].iter().map(|s| s.to_string()).collect();
+        assert!(try_parse_aggregate_clause(
+            "Drive is the count of Fact1 where Fact1 stimulates Layer1", &nouns
+        ).is_some());
+    }
+
+    #[test]
+    fn aggregate_count_over_reserved_metamodel_noun() {
+        // Reserved metamodel nouns (here `Role`) are countable too (uniformity).
+        let nouns: alloc::vec::Vec<String> = ["Layer"].iter().map(|s| s.to_string()).collect();
+        assert!(try_parse_aggregate_clause(
+            "n is the count of Role1 where Role1 binds Layer1", &nouns
+        ).is_some());
+    }
+
+    #[test]
+    fn find_nouns_guards_fact_against_fact_type() {
+        // Fact-is-not-special word-boundary guard: with `Fact` in noun_names it must
+        // NOT match inside the reserved `Fact Type` (resolved as the FactType
+        // relation elsewhere — task980), but MUST match a standalone `Fact1`.
+        let nouns: alloc::vec::Vec<String> = ["Fact", "Bag"].iter().map(|s| s.to_string()).collect();
+        let inside = find_nouns("that Fact Type has that Role", &nouns);
+        assert!(!inside.iter().any(|(_, _, m)| m.eq_ignore_ascii_case("fact")),
+            "`Fact` must not match inside `Fact Type`; got {:?}", inside);
+        let standalone = find_nouns("Bag holds Fact1", &nouns);
+        assert!(standalone.iter().any(|(_, _, m)| m == "Fact1"),
+            "`Fact` must match the standalone `Fact1`; got {:?}", standalone);
     }
 }
 

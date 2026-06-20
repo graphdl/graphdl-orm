@@ -20,6 +20,29 @@ fn main() {
     // worker thread with a large stack (512 MiB default, AREST_STACK_MB env
     // override). Spawned-thread stacks are honored on every platform, unlike
     // the linker-fixed main-thread reserve.
+    // Watchdog: bound every CLI invocation so a runaway operation (an unbounded
+    // `induce` abduction search, a non-terminating forward chain) aborts instead
+    // of hanging the caller / MCP request. The CLI is one-shot — a fresh binary
+    // execs per MCP call — so a hard process exit is safe: SQLite cell writes are
+    // transactional, hence crash-safe on abort. The thread is detached, so on
+    // every normal (sub-timeout) run the process exits the instant `main` returns
+    // after `worker.join()`, killing this sleeper before it fires. Default 300s;
+    // AREST_TIMEOUT_SECS overrides, 0 disables.
+    let timeout_secs = arest::cli::entry::desired_timeout_secs();
+    if timeout_secs > 0 {
+        std::thread::Builder::new()
+            .name("arest-watchdog".to_string())
+            .spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(timeout_secs));
+                eprintln!(
+                    "arest-cli: operation exceeded {timeout_secs}s timeout \
+                     (set AREST_TIMEOUT_SECS to adjust, 0 disables); aborting"
+                );
+                std::process::exit(124);
+            })
+            .expect("failed to spawn arest-watchdog thread");
+    }
+
     let stack = arest::cli::entry::desired_stack_bytes();
     let worker = std::thread::Builder::new()
         .name("arest-main".to_string())

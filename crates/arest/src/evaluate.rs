@@ -718,17 +718,52 @@ fn derive_one_round_with_keys(
     };
     if trace { crate::diag!("    [rnd] encode_state: {:?} (skipped={})",
         t_en.elapsed(), all_native); }
+    // AREST_APPLY_TIMINGS: the REAL per-def apply cost inside the shared-encode
+    // batch (unlike AREST_CHAIN_TIMINGS, which re-encodes the population per def
+    // and so charges the shared per-round encode to every def, inflating each).
+    // This is the truthful per-rule breakdown of the apply phase.
+    #[cfg(not(feature = "no_std"))]
+    let apply_timings = std::env::var("AREST_APPLY_TIMINGS").map(|v| v == "1").unwrap_or(false);
+    #[cfg(feature = "no_std")]
+    let apply_timings = false;
     let t_ap = crate::time_shim::Instant::now();
-    let candidates: Vec<DerivedFact> = derivation_defs.iter()
-        .flat_map(|(name, func)| {
+    let candidates: Vec<DerivedFact> = if apply_timings {
+        let mut times: Vec<(alloc::string::String, core::time::Duration)> = Vec::new();
+        let mut acc: Vec<DerivedFact> = Vec::new();
+        for (name, func) in derivation_defs.iter() {
+            let td = crate::time_shim::Instant::now();
             let result = ast::apply(func, apply_input, d);
-            let name = name.to_string();
-            result.as_seq().into_iter()
-                .flat_map(move |items| items.iter().cloned().collect::<Vec<_>>())
-                .filter_map(move |item| parse_derived_fact(&item, &name))
-                .collect::<Vec<_>>()
-        })
-        .collect();
+            let dt = td.elapsed();
+            let nm = name.to_string();
+            let cands: Vec<DerivedFact> = result.as_seq().into_iter()
+                .flat_map(|items| items.iter().cloned().collect::<Vec<_>>())
+                .filter_map(|item| parse_derived_fact(&item, &nm))
+                .collect();
+            times.push((nm, dt));
+            acc.extend(cands);
+        }
+        #[cfg(not(feature = "no_std"))]
+        {
+            times.sort_by(|a, b| b.1.cmp(&a.1));
+            let total: core::time::Duration = times.iter().map(|(_, d)| *d).sum();
+            eprintln!("[apply-timings] round: {} defs, total apply {:?}; top:", times.len(), total);
+            for (nm, dt) in times.iter().take(8) {
+                eprintln!("[apply-timings]   {:?}  {}", dt, nm);
+            }
+        }
+        acc
+    } else {
+        derivation_defs.iter()
+            .flat_map(|(name, func)| {
+                let result = ast::apply(func, apply_input, d);
+                let name = name.to_string();
+                result.as_seq().into_iter()
+                    .flat_map(move |items| items.iter().cloned().collect::<Vec<_>>())
+                    .filter_map(move |item| parse_derived_fact(&item, &name))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
     // task-984: enforce value constraints on the candidate batch —
     // alethic violations drop here (never emitted), deontic violations
     // land with a recorded warning. The map build is a linear scan of
@@ -1110,7 +1145,23 @@ fn semi_naive_inner(
                     _ => full_defs.push((*name, *func)),
                 }
             }
-            let mut round_facts = if full_defs.is_empty() { Vec::new() } else {
+            let mut round_facts = if full_defs.is_empty() {
+                Vec::new()
+            } else if chain_timings {
+                // Per-def timing for the full_defs batch (the dynamic-read /
+                // aggregate offenders) — without this AREST_CHAIN_TIMINGS only
+                // sees view_defs in delta mode and is blind to exactly the
+                // rules that own the chain wall.
+                let mut acc: Vec<DerivedFact> = Vec::new();
+                for entry in &full_defs {
+                    let t_def = crate::time_shim::Instant::now();
+                    let one = derive_one_round_with_keys(
+                        core::slice::from_ref(entry), &current_state, &all_derived, d, &existing_keys);
+                    *def_times.entry(entry.0.into()).or_default() += t_def.elapsed();
+                    acc.extend(one);
+                }
+                acc
+            } else {
                 derive_one_round_with_keys(
                     full_defs.as_slice(), &current_state, &all_derived, d, &existing_keys)
             };
