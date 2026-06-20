@@ -10094,10 +10094,12 @@ Transition 'start' is defined in State Machine Definition 'Task'.
                    canon(&off, "State_Machine_is_currently_in_Status"),
                    "IVM transition must match drop-and-re-derive for the SM status cell");
 
-        // The projection: IVM retracts the stale tuple (matches recompile);
-        // OFF does not. Assert the DIVERGENCE so this test pins the behavioural
-        // difference the gate introduces (and would catch a regression that
-        // silently made IVM stop retracting).
+        // The projection: both paths converge on the clean [in_progress]. The OFF
+        // drop-and-re-derive WIPES the UC-keyed projection before re-deriving (so no
+        // stale pending survives), and the IVM commit retracts the superseded tuple.
+        // The union-only-commit's lost-support defect surfaces on NON-keyed folded
+        // consequents (see the ivm_after_n_mutations_equals_full_recompile oracle),
+        // not this keyed projection — so here IVM and OFF MATCH (this test's name).
         let ivm_t1: Vec<String> = ast::fetch_cell_seq("Resource_is_currently_in_Status", &ivm)
             .as_seq().map(|fs| fs.iter()
                 .filter(|f| ast::binding(f, "Resource") == Some("t-1"))
@@ -10110,9 +10112,11 @@ Transition 'start' is defined in State Machine Definition 'Task'.
             .unwrap_or_default();
         assert_eq!(ivm_t1, vec!["in_progress".to_string()],
             "IVM: t-1's projection must be exactly [in_progress] (stale pending retracted), got {ivm_t1:?}");
-        assert!(off_t1.contains(&"pending".to_string()) && off_t1.contains(&"in_progress".to_string()),
-            "OFF: t-1's projection is expected to carry BOTH the stale pending and the new \
-             in_progress (the union-only-commit defect IVM fixes), got {off_t1:?}");
+        assert_eq!(off_t1, vec!["in_progress".to_string()],
+            "OFF: t-1's projection must ALSO be exactly [in_progress] — the OFF drop-and-re-derive \
+             WIPES the UC-keyed projection before re-deriving, so no stale pending survives here; \
+             IVM and OFF converge on this keyed cell. (The union-only-commit's lost-support defect \
+             surfaces on NON-keyed folded consequents, not this UC-keyed projection.) got {off_t1:?}");
     }
 
     /// REPRO (reconcile-vs-fold session, 2026-06-08): an `apply update` of a
