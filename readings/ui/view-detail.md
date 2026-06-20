@@ -3,7 +3,7 @@
 > **Status: task-934-2 (instance-detail slice) — LIVE. Six shared-frontier
 > skolem rules (four widget types: text-input, date-picker, checkbox,
 > combo-box) compile through the join-skolem path, registered in `lib.rs`
-> UI_READINGS after `view-list`. `Fact Type has Format` is an EAGER
+> UI_VIEW_READINGS after `view-list`. `Fact Type has Format` is an EAGER
 > derived-and-stored (`**`) projection from the FT's value-type role's
 > Noun's Format — the lazy widget rules see it materialized. Full ~593-FT
 > metamodel compiles GREEN. Proven by

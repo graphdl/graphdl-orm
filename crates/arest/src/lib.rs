@@ -1077,7 +1077,16 @@ fn allocate(state: ast::Object, defs: Vec<(String, ast::Func)>) -> u32 {
 // Cargo feature in `arest`'s manifest:
 //
 //   * `CORE_READINGS`     — Theorem 1-5 backbone (always included).
-//   * `UI_READINGS`       — UI surfaces; gated on `ui-readings`.
+//   * `UI_SCHEMA_READINGS` — the Render Target SCHEMA + the `App uses
+//     Render Surface` opt-in marker; gated on `ui-readings`, and (unlike
+//     the heavy view machinery) kept in the BASE metamodel so any app can
+//     SEE the render seam and cheaply declare a surface.
+//   * `UI_VIEW_READINGS`  — the HEAVY view machinery (view-projection /
+//     view-detail / view-list / view-menu / render / components / monoview
+//     / ifactr-android / design / ui / render-subscription + the Render
+//     Target INSTANCES). A per-app OVERLAY (view-tree-shaking, 2026-06):
+//     loaded ONLY for an app whose raw readings declare a render surface,
+//     so UI-less agents pay ZERO view-synthesis cost.
 //   * `OS_READINGS`       — OS-only nouns; gated on `os-readings`.
 //   * `TEMPLATE_READINGS` — stock app templates; gated on `templates`.
 //   * `COMPAT_READINGS`   — Windows-via-Wine compat (#463); gated on `wine`.
@@ -1143,11 +1152,34 @@ pub const INGEST_READINGS: &[(&str, &str)] = &[
     ("ingest",        include_str!("../../../readings/core/ingest.md")),
 ];
 
-/// UI surface readings (design tokens, render tree, themes). Included
-/// when any UI projection runs — the in-kernel Slint surface or the
-/// hosted ui.do worker.
+/// UI SCHEMA readings — the lightweight render-seam declarations that stay
+/// in the BASE metamodel (view-tree-shaking, 2026-06). Just `render-target.md`:
+/// the Render Target noun + its fact types (`Render Target has Platform
+/// Function Name`, `… emits MimeType`, …) AND the `App uses Render Surface`
+/// opt-in marker + the `Render Surface` value type. Cheap to carry — a
+/// handful of facts, no derivation rules, no `view:` defs — so every app can
+/// SEE the render seam and declare a surface without inheriting the heavy
+/// view machinery. The discriminators (`view_via_rho`, `render_via_targets`)
+/// still no-op cleanly because the `view:` defs and the Render Target
+/// INSTANCE population both ride the `UI_VIEW_READINGS` overlay below.
 #[cfg(feature = "ui-readings")]
-pub const UI_READINGS: &[(&str, &str)] = &[
+pub const UI_SCHEMA_READINGS: &[(&str, &str)] = &[
+    ("render-target",    include_str!("../../../readings/ui/render-target.md")),
+];
+
+/// UI VIEW readings — the HEAVY view-synthesis machinery (design tokens,
+/// render tree, the lazy `view:` projection rules, the Render Target
+/// INSTANCE population). A per-app OVERLAY (view-tree-shaking, 2026-06):
+/// `metamodel_readings()` does NOT include this; `metamodel_readings_for`
+/// folds it onto the base ONLY for an app whose raw readings declare a
+/// render surface (`uses Render Surface`). A UI-less agent (tasks / claude
+/// / arc-agi-3) never loads any of this, so `view_via_rho` finds no `view:`
+/// defs (no-ops) and `render_via_targets` finds an empty Render Target
+/// population (returns no representations) — the pure-CRM no-op the engine
+/// already implements. `render-target-instances.md` rides here so the
+/// reference 'html' renderer is registered only when a surface is declared.
+#[cfg(feature = "ui-readings")]
+pub const UI_VIEW_READINGS: &[(&str, &str)] = &[
     ("ui",               include_str!("../../../readings/ui/ui.md")),
     ("design",           include_str!("../../../readings/ui/design.md")),
     ("monoview",         include_str!("../../../readings/ui/monoview.md")),
@@ -1158,7 +1190,7 @@ pub const UI_READINGS: &[(&str, &str)] = &[
     ("view-list",        include_str!("../../../readings/ui/view-list.md")),
     ("view-detail",      include_str!("../../../readings/ui/view-detail.md")),
     ("ifactr-android",   include_str!("../../../readings/ui/ifactr-android.md")),
-    ("render-target",    include_str!("../../../readings/ui/render-target.md")),
+    ("render-target-instances", include_str!("../../../readings/ui/render-target-instances.md")),
     ("render-subscription", include_str!("../../../readings/ui/render-subscription.md")),
 ];
 
@@ -1231,17 +1263,68 @@ pub fn metamodel_readings() -> Vec<&'static (&'static str, &'static str)> {
     #[cfg(feature = "templates")]
     { out.extend(TEMPLATE_READINGS.iter()); }
     // access BEFORE ui: access.md declares `Operation` + `Operation applies in
-    // View Context`, which readings/ui/crudl.md (in UI_READINGS) references for
-    // its iFactr decoration — the substrate must land first so the reference
-    // resolves slice-by-slice.
+    // View Context`, which the UI readings reference for their iFactr
+    // decoration — the substrate must land first so the reference resolves
+    // slice-by-slice.
     #[cfg(feature = "access-readings")]
     { out.extend(ACCESS_READINGS.iter()); }
+    // view-tree-shaking (2026-06): ONLY the lightweight render-seam SCHEMA
+    // rides the base. The heavy view machinery (`UI_VIEW_READINGS`) is a
+    // per-app overlay folded by `metamodel_readings_for` when an app declares
+    // a render surface — so UI-less agents never inherit it.
     #[cfg(feature = "ui-readings")]
-    { out.extend(UI_READINGS.iter()); }
+    { out.extend(UI_SCHEMA_READINGS.iter()); }
     #[cfg(feature = "os-readings")]
     { out.extend(OS_READINGS.iter()); }
     #[cfg(feature = "wine")]
     { out.extend(COMPAT_READINGS.iter()); }
+    out
+}
+
+/// view-tree-shaking discriminator (2026-06): does this app's raw readings
+/// declare a render surface? A cheap SUBSTRING scan over the un-parsed
+/// reading bodies for the `App uses Render Surface` marker fact (e.g.
+/// `App 'support' uses Render Surface 'html'.`). Deliberately a text check,
+/// not a full pre-parse — the marker is the opt-in, and a false positive
+/// only costs the (idempotent) view overlay, never correctness.
+///
+/// `app_readings` is `&[(name, text)]` for ANY `Deref<Target = str>` name /
+/// text (so both `&'static (&str, &str)` slices and `Vec<(String, String)>`
+/// call sites pass without an allocation/conversion dance).
+#[cfg(not(feature = "no_std"))]
+pub fn declares_render_surface<N, T>(app_readings: &[(N, T)]) -> bool
+where
+    N: AsRef<str>,
+    T: AsRef<str>,
+{
+    app_readings.iter().any(|(_, text)| text.as_ref().contains("uses Render Surface"))
+}
+
+/// view-tree-shaking (2026-06): the base metamodel readings, PLUS the heavy
+/// `UI_VIEW_READINGS` overlay IFF `app_readings` declares a render surface.
+/// This is what every call site that folds `metamodel_readings()` ahead of
+/// an app's own readings should use instead — the view machinery then loads
+/// exactly for the apps that render, and a pure-CRM agent's corpus stays lean.
+///
+/// The overlay is appended AFTER the base so its `view:` rules and Render
+/// Target instances resolve against the already-folded core + UI schema.
+/// When `ui-readings` is compiled out, or the app declares no surface, this
+/// is byte-identical to `metamodel_readings()`.
+#[cfg(not(feature = "no_std"))]
+pub fn metamodel_readings_for<N, T>(
+    app_readings: &[(N, T)],
+) -> Vec<&'static (&'static str, &'static str)>
+where
+    N: AsRef<str>,
+    T: AsRef<str>,
+{
+    let mut out = metamodel_readings();
+    #[cfg(feature = "ui-readings")]
+    {
+        if declares_render_surface(app_readings) {
+            out.extend(UI_VIEW_READINGS.iter());
+        }
+    }
     out
 }
 
@@ -1254,6 +1337,26 @@ pub fn metamodel_readings() -> Vec<&'static (&'static str, &'static str)> {
 #[cfg(not(feature = "no_std"))]
 pub fn metamodel_corpus() -> String {
     metamodel_readings().iter().fold(String::new(), |mut acc, (_, text)| {
+        acc.push_str(text);
+        acc.push_str("\n\n");
+        acc
+    })
+}
+
+/// TEST-ONLY: the bundled metamodel corpus WITH the heavy view overlay
+/// (`UI_VIEW_READINGS`) folded in — i.e. what `metamodel_corpus()` was
+/// before view-tree-shaking moved the view machinery to a per-app overlay.
+/// Used by the in-crate tests that drive the view-projection / Format-widget
+/// pipeline directly off the full corpus (they need view-projection.md's
+/// seeded Format catalog + the lazy `ViewElement` rules, which no longer ride
+/// the base). Production code never wants this — it folds the overlay per-app
+/// via `metamodel_readings_for`.
+#[cfg(all(test, not(feature = "no_std")))]
+pub(crate) fn metamodel_corpus_with_views() -> String {
+    // An empty marker reading forces `metamodel_readings_for` to append the
+    // view overlay regardless of any real app text.
+    let marker: [(&str, &str); 1] = [("__view_overlay_marker", "App uses Render Surface.")];
+    metamodel_readings_for(&marker).iter().fold(String::new(), |mut acc, (_, text)| {
         acc.push_str(text);
         acc.push_str("\n\n");
         acc
@@ -1439,16 +1542,44 @@ mod render_target_reading_tests {
             with_rt_errors, baseline_errors);
     }
 
-    /// The Render Target population parses out of the reading: the
-    /// reference 'html' target carries its DEFS name and mime type.
+    /// view-tree-shaking: the SCHEMA reading (`render-target.md`, in the
+    /// always-loaded base) declares the Render Target noun + the
+    /// `App uses Render Surface` opt-in marker, but NO LONGER carries the
+    /// instance population — that moved to the per-app overlay reading
+    /// `render-target-instances.md`.
     #[test]
-    fn render_target_html_instance_parses() {
+    fn render_target_schema_declares_noun_and_surface_marker() {
         let state = parse_forml2::parse_to_state(RENDER_TARGET_MD)
             .expect("render-target.md parses standalone");
         let txt = format!("{:?}", state);
+        for needle in ["Render Target", "Platform Function Name", "Render Surface"] {
+            assert!(txt.contains(needle),
+                "parsed render-target.md schema missing {:?}", needle);
+        }
+        // The instance facts are gone from the schema reading.
+        assert!(!txt.contains("render:html"),
+            "the 'html' Render Target INSTANCE must have moved out of the \
+             schema reading into render-target-instances.md; got it in: {}", txt);
+    }
+
+    /// view-tree-shaking: the Render Target INSTANCE population parses out of
+    /// the OVERLAY reading — the reference 'html' target carries its DEFS name
+    /// and mime type. This is what loads only for surface-declaring apps. The
+    /// instances reading is an OVERLAY (instance facts only), so it is parsed
+    /// against the schema reading as context — exactly how it is composed in
+    /// `UI_VIEW_READINGS` (schema in the base, instances in the overlay).
+    #[test]
+    fn render_target_html_instance_parses() {
+        const RENDER_TARGET_INSTANCES_MD: &str =
+            include_str!("../../../readings/ui/render-target-instances.md");
+        let schema = parse_forml2::parse_to_state(RENDER_TARGET_MD)
+            .expect("render-target.md (schema) parses standalone");
+        let state = parse_forml2::parse_to_state_from(RENDER_TARGET_INSTANCES_MD, &schema)
+            .expect("render-target-instances.md parses against the schema");
+        let txt = format!("{:?}", ast::merge_states(&schema, &state));
         for needle in ["Render Target", "render:html", "text/html"] {
             assert!(txt.contains(needle),
-                "parsed render-target.md state missing {:?}", needle);
+                "parsed render-target-instances.md state missing {:?}", needle);
         }
     }
 
@@ -3521,11 +3652,55 @@ mod zero_glue_acceptance_tests {
     use super::*;
 
     /// Faithful subset of apps/csdp/readings/app.md (entity + value type
-    /// + single-valued FT + the SM's first step), plus the Render Target
-    /// population — which is exactly what the bundled render-target.md
-    /// reading declares; restated here because the test compiles ONE
-    /// readings document over the metamodel handle.
+    /// + single-valued FT + the SM's first step). view-tree-shaking
+    /// (2026-06): the app DECLARES A RENDER SURFACE
+    /// (`App 'csdp' uses Render Surface 'html'.`) — the single opt-in fact
+    /// that loads the view machinery overlay (the `view:` projection rules
+    /// + the Render Target 'html' instance). The app carries NO view: rules
+    /// and NO Render Target population itself: those ride the overlay the
+    /// surface declaration opts into, so the "zero per-app glue" property is
+    /// stronger now — the seam loads from ONE fact, not from a base every
+    /// app pays for. The handle is built with that overlay folded in
+    /// (`create_with_view_overlay`), mirroring what the production
+    /// dirs-compile path does for a surface-declaring app.
     const CSDP_SUBSET: &str = r#"# CSDP (zero-glue acceptance subset)
+
+## Entity Types
+
+Schema Design(.name) is an entity type.
+
+## Value Types
+
+Design Note is a value type.
+The data type of Design Note is text.
+
+## Fact Types
+
+Schema Design has Design Note.
+  Each Schema Design has at most one Design Note.
+
+Schema Design notes elementary facts.
+
+## Instance Facts
+
+Noun 'Design Note' has Format 'text'.
+App 'csdp' uses Render Surface 'html'.
+
+## State Machine
+
+State Machine Definition 'CSDP' is for Noun 'Schema Design'.
+Status 'step1-elementary-facts' is initial in State Machine Definition 'CSDP'.
+
+Transition 'advance-to-step2' is defined in State Machine Definition 'CSDP'.
+Transition 'advance-to-step2' is from Status 'step1-elementary-facts'.
+Transition 'advance-to-step2' is to Status 'step2-populate'.
+Transition 'advance-to-step2' is triggered by Event Type 'Schema Design notes elementary facts'.
+"#;
+
+    /// A NON-rendering app: the SAME shape as CSDP_SUBSET MINUS the
+    /// `App … uses Render Surface` marker. Drives the no-surface branch of
+    /// the get-path acceptance test — `getEntity` must carry NO view.
+    const CSDP_NO_SURFACE: &str = r#"# CSDP (no render surface)
 
 ## Entity Types
 
@@ -3558,6 +3733,50 @@ Transition 'advance-to-step2' is to Status 'step2-populate'.
 Transition 'advance-to-step2' is triggered by Event Type 'Schema Design notes elementary facts'.
 "#;
 
+    /// view-tree-shaking: allocate a handle whose metamodel includes the
+    /// HEAVY view overlay (`UI_VIEW_READINGS`) — i.e. the state a
+    /// surface-declaring app gets from the production dirs-compile path
+    /// (`metamodel_readings_for`). `create_impl()` deliberately loads only
+    /// the view-FREE base now, so a test that wants the render seam folds the
+    /// overlay here. Mirrors `metamodel_state()`'s build (fold the readings
+    /// against a global noun seed, compile to defs, add the platform defs)
+    /// but over the overlay-inclusive reading set.
+    #[cfg(feature = "ui-readings")]
+    fn create_with_view_overlay() -> u32 {
+        // Force the overlay in regardless of any real app text.
+        let marker: [(&str, &str); 1] =
+            [("__view_overlay_marker", "App uses Render Surface.")];
+        let readings = crate::metamodel_readings_for(&marker);
+        // Global metamodel-noun seed so cross-slice forward refs resolve no
+        // matter the fold order (same role as metamodel_parsed_state_seeded).
+        let corpus: String = readings.iter().map(|(_, t)| *t)
+            .collect::<Vec<_>>().join("\n\n");
+        let noun_seed = {
+            let full = parse_forml2::parse_to_state_from(&corpus, &ast::Object::phi())
+                .expect("overlay corpus parses for the noun seed");
+            let mut m: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+            m.insert("Noun".to_string(), ast::fetch_cell_seq("Noun", &full));
+            ast::Object::map(m)
+        };
+        let merged = readings.iter().fold(noun_seed, |acc, (name, text)| {
+            let parsed = parse_forml2::parse_to_state_from_in_domain(text, &acc, name)
+                .unwrap_or_else(|e| panic!("overlay parse failed at {}: {}", name, e));
+            let parsed = ast::annotate_noun_domain(&parsed, name);
+            let parsed = ast::merge_states(&parsed, &ast::stamp_file_domain(&parsed, name));
+            ast::merge_states(&acc, &parsed)
+        });
+        let mut defs = crate::compile::compile_to_defs_state(&merged);
+        defs.extend([
+            ("compile".to_string(), ast::Func::Platform("compile".to_string())),
+            ("apply".to_string(), ast::Func::Platform("apply_command".to_string())),
+            ("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())),
+            ("audit".to_string(), ast::Func::Platform("audit".to_string())),
+            ("induce".to_string(), ast::Func::Platform("induce".to_string())),
+        ]);
+        let state = ast::defs_to_state(&defs, &merged);
+        allocate(state, vec![])
+    }
+
     /// THE §5.2 zero-glue proof, passing since 2026-06-10. Three layers
     /// had to land (each found by running this spec and instrumenting):
     /// (1) `reflect_schema_cells` — the compiler reflects the schema
@@ -3569,11 +3788,20 @@ Transition 'advance-to-step2' is triggered by Event Type 'Schema Design notes el
     /// no view: def); (3) `strip_role_variables` — rule clauses like
     /// `Fact Type (FT) has Role` resolve the declared verb instead of
     /// "(FT) has" (which fell to the ambiguous role-set fallback).
+    ///
+    /// view-tree-shaking (2026-06): the intent shifts from "every app
+    /// renders" to "an app that DECLARES A RENDER SURFACE renders". CSDP_SUBSET
+    /// now carries the single opt-in fact (`App 'csdp' uses Render Surface
+    /// 'html'.`); the handle is built with the view overlay folded in
+    /// (`create_with_view_overlay`), mirroring the production dirs-compile path
+    /// for a surface-declaring app. The app STILL carries zero view: rules and
+    /// no Render Target population — the seam loads from that one fact.
+    #[cfg(feature = "ui-readings")]
     #[test]
     fn never_seen_app_renders_through_the_generic_seam() {
         crate::platform::render_html::install();
 
-        let h = create_impl();
+        let h = create_with_view_overlay();
         let compiled = system_impl(h, "compile", CSDP_SUBSET);
         assert!(!compiled.contains("\"rejected\":true"),
             "csdp subset must compile over the metamodel; got: {}",
@@ -3614,6 +3842,74 @@ Transition 'advance-to-step2' is triggered by Event Type 'Schema Design notes el
             assert!(got.contains(needle),
                 "rendered representation missing {:?}; got: {}", needle, got);
         }
+    }
+
+    /// view-tree-shaking ACCEPTANCE (2026-06): the discriminator, end-to-end
+    /// over the REAL get path (`apply getEntity` → `get_entity_via_defs` →
+    /// `view_via_rho` + `render_via_targets`).
+    ///
+    ///   * A synthetic app that does NOT declare a render surface, on a
+    ///     view-FREE base handle (`create_impl`, the default every UI-less
+    ///     agent gets): `getEntity` carries NO `view` and NO
+    ///     `representations` — the engine no-ops cleanly (zero view-synthesis
+    ///     cost).
+    ///   * The SAME app shape that DOES declare a surface, on a handle with
+    ///     the view overlay folded in (`create_with_view_overlay`, what the
+    ///     production dirs-compile path gives a surface-declaring app):
+    ///     `getEntity` carries the populated ViewProjection + the rendered
+    ///     representation.
+    ///
+    /// Same noun ('Schema Design'), same entity id, same get call — the ONLY
+    /// difference is the render-surface opt-in (and the overlay it pulls in).
+    #[cfg(feature = "ui-readings")]
+    #[test]
+    fn surface_declaration_gates_view_synthesis_on_the_get_path() {
+        crate::platform::render_html::install();
+
+        let get = r#"{"command":{"type":"getEntity","noun":"Schema Design","entityId":"sd-acc"},"population":""}"#;
+        let create = r#"{"command":{"type":"createEntity","noun":"Schema Design","domain":"","id":"sd-acc","fields":{"Design Note":"acc facts"}},"population":""}"#;
+
+        // ── No surface: view-free base → view None on the get path ──
+        let h0 = create_impl();
+        let c0 = system_impl(h0, "compile", CSDP_NO_SURFACE);
+        assert!(!c0.contains("\"rejected\":true"),
+            "no-surface app must compile; got: {}", &c0[..c0.len().min(300)]);
+        let r0 = system_impl(h0, "apply", create);
+        assert!(!r0.contains("\"rejected\":true"),
+            "create must land on the no-surface handle; got: {}",
+            &r0[..r0.len().min(300)]);
+        let got0 = system_impl(h0, "apply", get);
+        release_impl(h0);
+        assert!(got0.contains("\"id\":\"sd-acc\"") || got0.contains("sd-acc"),
+            "the entity must still be fetched (only the view is gated); got: {}",
+            &got0[..got0.len().min(400)]);
+        assert!(!got0.contains("instance-view-Schema Design"),
+            "a UI-less app must synthesize NO view on the get path; got: {}", got0);
+        assert!(!got0.contains("\"representations\""),
+            "a UI-less app must produce NO render representations; got: {}", got0);
+
+        // ── Surface declared + overlay loaded: populated view on get ──
+        let h1 = create_with_view_overlay();
+        let c1 = system_impl(h1, "compile", CSDP_SUBSET);
+        assert!(!c1.contains("\"rejected\":true"),
+            "surface app must compile; got: {}", &c1[..c1.len().min(300)]);
+        let r1 = system_impl(h1, "apply", create);
+        assert!(!r1.contains("\"rejected\":true"),
+            "create must land on the surface handle; got: {}",
+            &r1[..r1.len().min(300)]);
+        let got1 = system_impl(h1, "apply", get);
+        release_impl(h1);
+        assert!(got1.contains("\"view\""),
+            "a surface-declaring app must carry the ViewProjection on get; got: {}",
+            &got1[..got1.len().min(500)]);
+        assert!(got1.contains("instance-view-Schema Design"),
+            "the synthesized instance view must project; got: {}",
+            &got1[..got1.len().min(800)]);
+        assert!(got1.contains("\"representations\""),
+            "the html Render Target must render the projection; got: {}",
+            &got1[..got1.len().min(800)]);
+        assert!(got1.contains("acc facts"),
+            "the rendered representation must carry the field value; got: {}", got1);
     }
 }
 

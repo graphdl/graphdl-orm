@@ -2,7 +2,7 @@
 
 > **Status: task-934-2 — LIVE. These two shared-frontier skolem rules compile
 > (real parser+compiler) through the join-skolem path (≥2 antecedents, shared
-> entity-typed frontier), registered in `lib.rs` UI_READINGS after
+> entity-typed frontier), registered in `lib.rs` UI_VIEW_READINGS after
 > `view-menu`. Full ~593-FT metamodel compiles GREEN (no hang, `*`-View lazy
 > only). Proven by
 > `collection_list_view_derivation_compiled_from_authored_reading` in

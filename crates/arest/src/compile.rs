@@ -4564,7 +4564,18 @@ pub fn bundled_domain_fact_type_ids_from(
             crate::ast::fetch_cell_seq("Noun", noun_source));
         crate::ast::Object::map(m)
     };
-    let corpus: String = crate::metamodel_readings().into_iter()
+    // view-tree-shaking: the view modules (ui/design/monoview/components/
+    // render) moved out of the base `metamodel_readings()` into the per-app
+    // `UI_VIEW_READINGS` overlay. This enumeration of TREE-SHAKEABLE domain FT
+    // ids must still see them (they are the prime drop candidates for a
+    // UI-less app), so scan the base AND the view overlay before filtering by
+    // module name.
+    let base = crate::metamodel_readings();
+    #[allow(unused_mut)]
+    let mut domain_sources: Vec<&'static (&'static str, &'static str)> = base;
+    #[cfg(feature = "ui-readings")]
+    { domain_sources.extend(crate::UI_VIEW_READINGS.iter()); }
+    let corpus: String = domain_sources.into_iter()
         .filter(|r| DOMAIN_MODULES.contains(&r.0))
         .map(|r| r.1)
         .collect::<Vec<_>>()
@@ -5017,7 +5028,9 @@ mod reflect_schema_cells_tests {
     /// view_via_rho None for every real app).
     #[test]
     fn renders_fact_type_rule_is_view_materialized() {
-        let corpus = crate::metamodel_corpus();
+        // view-tree-shaking: `ViewElement renders Fact Type` lives in the view
+        // overlay (view-projection.md) now, not the base corpus — fold it in.
+        let corpus = crate::metamodel_corpus_with_views();
         let state = crate::parse_forml2::parse_to_state(&corpus).expect("corpus parses");
         let data = cell_index_from_state(&state);
         let rule = data.derivation_rules.iter()
@@ -5039,7 +5052,8 @@ mod reflect_schema_cells_tests {
     /// view never synthesizes; pb-zero-glue-acceptance blocker).
     #[test]
     fn renders_fact_type_rule_antecedents_resolve_fact_type_has_role() {
-        let corpus = crate::metamodel_corpus();
+        // view-tree-shaking: the renders-Fact-Type rule is in the view overlay.
+        let corpus = crate::metamodel_corpus_with_views();
         let state = crate::parse_forml2::parse_to_state(&corpus).expect("corpus parses");
         let data = cell_index_from_state(&state);
         let rule = data.derivation_rules.iter()
@@ -14878,7 +14892,11 @@ mod schema_tests {
     /// catch divergences (e.g. View-policy def emission) that a direct
     /// `forward_chain_defs_state` over an isolated parse cannot.
     fn live_compile_dirs_pipeline(app: &str) -> ast::Object {
-        let all_readings: Vec<(&str, &str)> = crate::metamodel_readings().into_iter()
+        // view-tree-shaking: fold the heavy view overlay onto the base IFF the
+        // app-under-test declares a render surface, matching the production
+        // dirs-compile path. A non-rendering fixture compiles without it.
+        let app_pairs: [(&str, &str); 1] = [("app-under-test", app)];
+        let all_readings: Vec<(&str, &str)> = crate::metamodel_readings_for(&app_pairs).into_iter()
             .map(|r| (r.0, r.1))
             .chain(core::iter::once(("app-under-test", app)))
             .collect();
@@ -17610,7 +17628,10 @@ mod mandatory_role_alethic_rejection_tests {
     #[test]
     #[cfg(not(feature = "no_std"))]
     fn format_without_cdt_violates_core_subset_constraint() {
-        let corpus = crate::metamodel_corpus();
+        // view-tree-shaking: the seeded Format catalog (`Format 'text' is built
+        // on Conceptual Data Type 'text'`, …) lives in view-projection.md, now
+        // a per-app overlay — fold it in so the conforming case is grounded.
+        let corpus = crate::metamodel_corpus_with_views();
 
         // VIOLATING fragment: a value type declares a Format refinement
         // with NO base data type.
@@ -17666,7 +17687,9 @@ mod mandatory_role_alethic_rejection_tests {
     #[test]
     #[cfg(not(feature = "no_std"))]
     fn ungrounded_format_violates_totality_subset_constraint() {
-        let corpus = crate::metamodel_corpus();
+        // view-tree-shaking: the four seeded Formats (grounded via the
+        // `is built on` rows in view-projection.md) ride the view overlay now.
+        let corpus = crate::metamodel_corpus_with_views();
         let violating = format!(
             "{corpus}\n\nCustom Probe is a value type.\nThe data type of Custom Probe is text.\nNoun 'Custom Probe' has Format 'bespoke'.\n",
         );

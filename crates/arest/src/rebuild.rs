@@ -334,8 +334,10 @@ fn rebuild_init(apps_dir: &Path, x: &Object, d: &Object) -> Object {
     }
     // Metamodel readings FIRST, then the app's — the fresh parse's schema cells
     // (FactType / Noun / Role / …) must include the metamodel, else the merge
-    // would land an app-only schema.
-    let all_readings: Vec<(&str, &str)> = crate::metamodel_readings()
+    // would land an app-only schema. view-tree-shaking: `metamodel_readings_for`
+    // appends the heavy view overlay IFF this app declares a render surface, so
+    // a UI-less app rebuilds without the view machinery.
+    let all_readings: Vec<(&str, &str)> = crate::metamodel_readings_for(&app_readings)
         .into_iter()
         .map(|r| (r.0, r.1))
         .chain(app_readings.iter().map(|(n, t)| (n.as_str(), t.as_str())))

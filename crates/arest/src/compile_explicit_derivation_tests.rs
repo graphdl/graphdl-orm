@@ -5047,7 +5047,9 @@ Merge has derived Security Posture.
 fn effective_component_role_most_specific_source_wins() {
     use crate::ast::resolve_view;
 
-    let corpus = crate::metamodel_corpus();
+    // view-tree-shaking: the Format-else-CDT widget rules + the seeded Format
+    // catalog live in view-projection.md (a per-app overlay now) — fold it in.
+    let corpus = crate::metamodel_corpus_with_views();
     // `date` Format implies date-picker (refinement); CDT `text` implies
     // text-input (base). The refined noun carries BOTH sources with
     // DIFFERENT widgets so a both-fire regression is visible; the
@@ -6292,8 +6294,8 @@ Item is clear.
 //   (f) `has Component Role 'button'` rule → SAME VE id (shared frontier)
 //   (g) NO eager `derivation:` def (lazy-only, never hangs the metamodel)
 //
-// REGISTERED-LIVE: test-only (not in lib.rs UI_READINGS). The full skolem
-// head requires the parser to recognise the `(E)` surface syntax (deferred;
+// REGISTERED-LIVE: test-only (not in lib.rs UI_VIEW_READINGS). The full
+// skolem head requires the parser to recognise the `(E)` surface syntax (deferred;
 // see spec_skolem_head_authored_in_forml2_resolves_lazily and
 // readings/ui/skolem-head-design.md §5).
 //
@@ -6304,7 +6306,7 @@ Item is clear.
 //       wired through `compile_join_derivation` + skolem head emission.
 //   (3) Guard negation (§4.5 guard-filtering): `Guard prevents Transition →
 //       omit the VE` — needs parser-negation idiom not yet available.
-//   (4) Registration in UI_READINGS (lib.rs) + metamodel compile verification.
+//   (4) Registration in UI_VIEW_READINGS (lib.rs) + metamodel compile verification.
 #[test]
 fn menu_view_derivation_via_skolem_head_lazy_idempotent() {
     use crate::ast::{func_to_object, resolve_view, store};

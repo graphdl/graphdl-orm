@@ -2700,8 +2700,9 @@ pub fn main_entry() {
     // (operand in, markup Atom out; no filesystem/network/state reach),
     // pre-approved in `ast::APPROVED_PLATFORM_FN_NAMES`, and inert
     // until a `Render Target` population names `render:html`
-    // (readings/ui/render-target.md declares the 'html' target under
-    // the ui-readings gate).
+    // (the 'html' target INSTANCE rides readings/ui/render-target-instances.md
+    // in the per-app view overlay, loaded only for apps that declare a render
+    // surface — view-tree-shaking 2026-06; the schema is in render-target.md).
     crate::platform::render_html::install();
     // pb-effect-fns-canonical (§5.2) production wiring: the canonical
     // effect bodies. Inert until a Verb's `Function has Name` fact (or a
@@ -2997,9 +2998,34 @@ pub fn main_entry() {
                 // 'derived-and-stored' values stuck around alongside
                 // the corrected 'fully-derived', and index_single's
                 // first-wins picked the stale one).
+                // view-tree-shaking (2026-06): the heavy view machinery
+                // (view-projection / view-detail / render / components / … +
+                // the Render Target instances) moved out of the base metamodel
+                // into a per-app overlay. An app that declares a render surface
+                // (`App '<slug>' uses Render Surface '<surface>'.`) gets the
+                // overlay folded ahead of its own readings here, so its `view:`
+                // defs + Render Target population land and the get-path render
+                // seam fires; a UI-less app (tasks / claude / arc-agi-3) never
+                // loads it and pays zero view-synthesis cost. The base parse
+                // cache (`mm_parsed`) is view-free either way; the overlay
+                // rides the app fold (and the noun/provenance seeds below) so
+                // its nouns resolve against the already-folded core + UI schema.
+                let effective_readings: Vec<(String, String)> = {
+                    let mut v: Vec<(String, String)> = Vec::new();
+                    #[cfg(feature = "ui-readings")]
+                    {
+                        if crate::declares_render_surface(&readings) {
+                            eprintln!("[load] render surface declared — folding UI_VIEW_READINGS overlay");
+                            v.extend(crate::UI_VIEW_READINGS.iter()
+                                .map(|(n, t)| ((*n).to_string(), (*t).to_string())));
+                        }
+                    }
+                    v.extend(readings.iter().cloned());
+                    v
+                };
                 let all_readings: Vec<(&str, &str)> = crate::metamodel_readings().into_iter()
                     .map(|r| (r.0, r.1))
-                    .chain(readings.iter().map(|(n, t)| (n.as_str(), t.as_str())))
+                    .chain(effective_readings.iter().map(|(n, t)| (n.as_str(), t.as_str())))
                     .collect();
                 // perf-metamodel-parse-cache (Step 1 — correctness): fold ONLY
                 // the app readings onto the SEEDED, app-independent metamodel
@@ -3036,7 +3062,7 @@ pub fn main_entry() {
                     }
                 };
                 let app_noun_seed: ast::Object = {
-                    let corpus: String = readings.iter()
+                    let corpus: String = effective_readings.iter()
                         .map(|(_, t)| t.as_str()).collect::<Vec<_>>().join("\n\n");
                     if corpus.trim().is_empty() {
                         ast::Object::phi()
@@ -3096,9 +3122,10 @@ pub fn main_entry() {
                 // NORMA exporter's per-file ORMDiagram tabs. Still over every file.
                 let provenance_cell = build_provenance_cell(&all_readings, &global_noun_seed);
                 // Fold base = cached (seeded) metamodel cells + the app noun
-                // catalog; fold ONLY the app readings on top.
+                // catalog; fold the app readings (with the view overlay folded
+                // ahead, when a surface is declared) on top.
                 let fold_base = ast::merge_states(mm_parsed, &app_noun_seed);
-                let parsed_fresh = readings.iter().fold(
+                let parsed_fresh = effective_readings.iter().fold(
                     fold_base,
                     |merged, (name, text)| {
                         // ns-5: parse knowing this slice's local domain (ns-3

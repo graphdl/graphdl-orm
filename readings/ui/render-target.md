@@ -64,6 +64,28 @@ Render Target has display- Title.
 Render Target has Description.
   Each Render Target has at most one Description.
 
+### App opt-in marker (view-tree-shaking discriminator)
+
+App uses Render Surface.
+  <!-- THE render-surface opt-in (view-tree-shaking, 2026-06). This noun
+       + value type stay in the ALWAYS-loaded base (UI_SCHEMA_READINGS in
+       lib.rs) so the marker is cheap to declare and cheap to detect; the
+       HEAVY view machinery (view-projection / view-detail / view-list /
+       view-menu / render / components / monoview / ifactr-android / design
+       / ui / render-subscription PLUS the Render Target INSTANCES) is a
+       per-app OVERLAY (UI_VIEW_READINGS) that loads ONLY when an app's raw
+       readings carry the substring `uses Render Surface`. A UI-less agent
+       (tasks / claude / arc-agi-3) declares nothing here and pays ZERO view
+       synthesis cost: `view_via_rho` finds no `view:` defs and no-ops, and
+       `render_via_targets` finds no Render Target population and returns
+       empty. The Render Surface value names the render slug an app wants
+       (e.g. 'html'); the engine renders through every INSTALLED target. -->
+
+Render Surface is a value type.
+  <!-- The render slug an app opts into — the same stable slug a Render
+       Target carries ('html' for the reference markup renderer). Declared
+       here in the base so the marker fact resolves without the overlay. -->
+
 ## Constraints
 
 No two Render Targets share the same Platform Function Name.
@@ -72,11 +94,9 @@ No two Render Targets share the same Platform Function Name.
 
 It is obligatory that each Render Target has some Platform Function Name.
 
-## Instance Facts
+<!-- The Render Target INSTANCE declarations (the reference 'html' renderer)
+     moved OUT of this always-loaded schema reading into the per-app overlay
+     `render-target-instances.md` (UI_VIEW_READINGS in lib.rs). They land
+     only for apps that declare `App '<slug>' uses Render Surface '<surface>'`,
+     so a UI-less app never inherits the render-function registry. -->
 
-### Render Target: the reference HTML renderer
-
-Render Target 'html' has Platform Function Name 'render:html'.
-Render Target 'html' emits MimeType 'text/html'.
-Render Target 'html' has display- Title 'Reference HTML renderer'.
-Render Target 'html' has Description 'Engine-installed reference render function: walks the ViewProjection elements in Order, emits one labelled widget per Component Role (text-input, date-picker, checkbox, combo-box) and one rel=transition anchor per HATEOAS affordance. Pure function of its input; knows nouns and widgets, never apps.'.

@@ -2,7 +2,7 @@
 
 > **Status: task-934-3 part (a) — LIVE. The `(E)` skolem-head surface syntax
 > is wired through the parser + join compiler, and these two rules are
-> REGISTERED in `lib.rs` UI_READINGS; the full ~593-FT metamodel compiles
+> REGISTERED in `lib.rs` UI_VIEW_READINGS; the full ~593-FT metamodel compiles
 > GREEN (no hang, `*`-View lazy only). Proven by
 > `menu_view_derivation_compiled_from_authored_reading_reproduces_proven_func`
 > (the COMPILED authored reading reproduces the hand-built target func) and
@@ -133,7 +133,7 @@ the parser-negation idiom (`no Guard prevents Tr` or AbsenceOf in the antecedent
 which is not yet available as a user-authoring surface in FORML 2.
 The basic menu (all legal transitions, no guard filter) is what is proven here.
 
-### (3) Registration in UI_READINGS (lib.rs) — DONE
+### (3) Registration in UI_VIEW_READINGS (lib.rs) — DONE
 `("view-menu", include_str!("../../../readings/ui/view-menu.md"))` is
 registered after `view-projection`. The full metamodel compiles green (no
 hang, no checker errors) — `handle_isolation_tests::create_impl_loads_metamodel`
