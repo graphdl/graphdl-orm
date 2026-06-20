@@ -168,9 +168,37 @@ Guard guards Transition.
      (direct + inherited); firing precedence (consumer-side) picks the direct
      row, the affordance path tolerates the extra legal row. -->
 
-* Status has effective Transition to Status on Event Type iff some Transition is from the first Status and that Transition is to the second Status and that Transition is triggered by that Event Type.
+* Status1 has effective Transition1 to Status2 on Event Type iff Transition1 is from Status1 and Transition1 is to Status2 and Transition1 is triggered by Event Type.
 
-* Status has effective Transition to Status on Event Type iff some Transition is from some State Machine Definition and that Transition is to the second Status and that Transition is triggered by that Event Type and the first Status is defined in that State Machine Definition.
+<!-- sm-retire-forml2 RULE 2 (Harel inherited edge) — NOT AUTHORABLE TODAY,
+     left disabled. VERIFIED empirically (properties.rs
+     smretire_foundation_harel_inherited_edge): the inherited edges
+     (child Status -> super-state target, e.g. Draft/Review/Approved ->
+     Archived on `archive`) are NOT produced by any authorable shape.
+
+     Root cause (parse_forml2.rs compute_ring_join_plan, ~3569-3576): the
+     subscript ring-join planner keeps only clause tokens whose BASE NOUN is
+     a declared ROLE of that antecedent's fact type. The inherited edge needs
+     `Transition1 is from State Machine Definition1` — binding a
+     State Machine Definition (a Status SUBTYPE) into the `Status`-typed
+     `from` role. `State Machine Definition` is not the role noun (`Status`)
+     of `Transition is from Status`, so the token is filtered out, the
+     clause's token count no longer matches the FT arity, the planner bails to
+     the noun-name fallback, and the rule derives nothing (confirmed: the
+     subscript form below produced 0 inherited rows; the legacy prose form
+     collapses both Status roles and pollutes).
+
+     This is a genuine ENGINE join-capability gap (subtype filler in a
+     supertype-typed role across a subscript ring-join). Authoring it would
+     require an engine change (out of scope: commit nothing / never restore
+     deleted SM logic). Until that lands, the Harel expansion in Rust
+     (compile.rs compile_state_machine:11957-12003) MUST be RETAINED — the
+     deletion of that block is BLOCKED on this rule.
+
+* Status1 has effective Transition1 to Status2 on Event Type iff Transition1 is from State Machine Definition1 and Transition1 is to Status2 and Transition1 is triggered by Event Type and Status1 is defined in State Machine Definition1.
+-->
+
+
 
 ## Constraints
 

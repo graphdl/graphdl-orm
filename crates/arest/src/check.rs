@@ -1032,7 +1032,7 @@ static READING_LEXICON: &[&str] = &[
     "win", "ranks", "rank", "solved", "done", "value", "values", "count",
     "counts", "total", "size", "name", "names", "id", "key", "keys",
     "input", "output", "mode", "feature", "confidence", "training", "top",
-    "set", "same", "shares", "share",
+    "set", "same", "shares", "share", "amount",
 ];
 
 /// Render the `<domain>.<Noun>` qualifier choices as a natural English
@@ -1728,14 +1728,16 @@ Customer wrote Review.
         // agrees with the most-specific type's implication).
         // join-warn-variable-disjoint-antecedent added layer 7b (a
         // variable-disjoint antecedent warns), making 9 total.
+        // grammatical-fact-readings added layer 9 (check_reading_grammar:
+        // coined verb-phrase tokens warn), making 10 total.
         let func = check_readings_func();
         match &func {
             Func::Compose(outer, inner) => {
                 assert!(matches!(**outer, Func::Concat),
                     "top-level must compose Concat onto the construction");
                 match &**inner {
-                    Func::Construction(layers) => assert_eq!(layers.len(), 9,
-                        "check_readings_func must expose exactly 9 layer Funcs"),
+                    Func::Construction(layers) => assert_eq!(layers.len(), 10,
+                        "check_readings_func must expose exactly 10 layer Funcs"),
                     other => panic!("inner must be Construction, got {:?}", other),
                 }
             }
