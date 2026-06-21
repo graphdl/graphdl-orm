@@ -6251,6 +6251,165 @@ Item is clear.
         clear, derived);
 }
 
+// ─── ORM2-conformance Gap 2: universal-quantifier vocabulary ────────────────
+//
+// Canonical ORM2 (Halpin/Curland TR ORM2-02 §1.4–1.5 p.4; Halpin/Morgan §6.5
+// p.252) recognises `each` / `For each` / `given any` (and their
+// sentence-initial capitalisations) as universal quantifiers; NORMA's
+// `every` is accepted on input (Postel) though not source-attested. The
+// engine historically recognised ONLY lowercase, case-sensitive `for each `,
+// so every other canonical universal silently failed to parse — which is why
+// the `tasks` rule 369 (which writes `every`) degenerated.
+//
+// These tests ISOLATE the universal machinery from the separate role-fill gap
+// (Gap 3): the predicate resolves DIRECTLY against a plain binary FT
+// (`Other has Flag 'done'`), so a failure here implicates the universal
+// vocabulary / relative-clause split, not role alignment.
+//
+// Shared schema: `Other blocks Head` + an `Other has Flag` predicate (a
+// plain binary FT, so the predicate resolves DIRECTLY — this isolates the
+// universal machinery from Gap 3 role-fill). `Head is clear` holds iff
+// EVERY `Other` that blocks it carries Flag 'done'. Population:
+//   head-A: two blockers (done, done)  → clear
+//   head-B: one blocker  (open)        → NOT clear
+//   head-C: no blockers                → clear (VACUOUS, empty ∀ = TRUE)
+fn gap2_universal_src(rule_body: &str) -> String {
+    format!(
+        "# Test\n\
+         Head(.HID) is an entity type.\n\
+         Other(.OID) is an entity type.\n\
+         HID is a value type.\n\
+         OID is a value type.\n\
+         Flag is a value type.\n\
+         \n\
+         ## Fact Types\n\
+         Head has HID.\n\
+         Other has OID.\n\
+         Other blocks Head.\n\
+         Other has Flag.\n\
+         Head is clear.\n\
+         \n\
+         ## Derivation Rules\n\
+         {}\n",
+        rule_body,
+    )
+}
+
+/// Assert the rule captured a single `ConsequentUniversal` over the
+/// `Other blocks Head` relation with the `Other has Flag` = 'done'
+/// predicate — i.e. it compiled to the universal IR, not the
+/// dropped/empty-antecedent path.
+fn assert_gap2_universal_ir(rule: &DerivationRuleDef) {
+    assert!(!rule.consequent_universals.is_empty(),
+        "the universal antecedent must populate consequent_universals; got {:#?}\n\
+         rule text: {}\nunresolved: {:#?}",
+        rule.consequent_universals, rule.text, rule.unresolved_clauses);
+    let u = &rule.consequent_universals[0];
+    assert_eq!(u.relation_fact_type_id, "Other_blocks_Head",
+        "relating FT must be `Other blocks Head`, got {}", u.relation_fact_type_id);
+    assert_eq!(u.predicate_fact_type_id, "Other_has_Flag",
+        "predicate FT must be `Other has Flag`, got {}", u.predicate_fact_type_id);
+    assert_eq!(u.predicate_filter_role, "Flag");
+    assert_eq!(u.predicate_value, "done");
+}
+
+/// Run the shared population through the compiled func and return the set
+/// of `Head` ids that derived `clear`.
+fn gap2_clear_set(func: &Func) -> Vec<String> {
+    let out = apply_to_facts(func, &[
+        ("Other_blocks_Head", &[("Other", "a-blk-1"), ("Head", "head-A")]),
+        ("Other_blocks_Head", &[("Other", "a-blk-2"), ("Head", "head-A")]),
+        ("Other_blocks_Head", &[("Other", "b-blk-1"), ("Head", "head-B")]),
+        ("Other_has_Flag",    &[("Other", "a-blk-1"), ("Flag", "done")]),
+        ("Other_has_Flag",    &[("Other", "a-blk-2"), ("Flag", "done")]),
+        ("Other_has_Flag",    &[("Other", "b-blk-1"), ("Flag", "open")]),
+        ("Head_has_HID",      &[("Head", "head-C"), ("HID", "head-C")]),
+    ]);
+    decode_derived(&out).iter()
+        .filter(|(ft, _, _)| ft == "Head_is_clear")
+        .filter_map(|(_, _, b)| b.iter().find(|(k, _)| k == "Head").map(|(_, v)| v.clone()))
+        .collect()
+}
+
+fn assert_gap2_clear_semantics(clear: &[String]) {
+    assert!(clear.iter().any(|i| i == "head-A"),
+        "head-A (both blockers Flag=done) MUST be clear; got {:?}", clear);
+    assert!(clear.iter().any(|i| i == "head-C"),
+        "head-C (NO blockers) MUST be clear VACUOUSLY; got {:?}", clear);
+    assert!(!clear.iter().any(|i| i == "head-B"),
+        "head-B (one OPEN blocker) MUST NOT be clear — the universal must check \
+         ALL blockers, not degenerate to a single conjunct; got {:?}", clear);
+}
+
+// Gap 2 — comma form, lowercase `for each` (the historically-working
+// keyword). Baseline that the shared harness reproduces the known-good case.
+#[test]
+fn gap2_for_each_lowercase_comma_form() {
+    let src = gap2_universal_src(
+        "* Head is clear iff for each Other that blocks the Head, Other has Flag 'done'.");
+    let (rule, func) = parse_and_compile(&src);
+    assert_gap2_universal_ir(&rule);
+    assert_gap2_clear_semantics(&gap2_clear_set(&func));
+}
+
+// Gap 2 — capitalised `For each` (canonical, sentence-initial). Pre-fix this
+// failed the case-sensitive `strip_prefix("for each ")` and was dropped.
+#[test]
+fn gap2_for_each_capitalised_comma_form() {
+    let src = gap2_universal_src(
+        "* Head is clear iff For each Other that blocks the Head, Other has Flag 'done'.");
+    let (rule, func) = parse_and_compile(&src);
+    assert_gap2_universal_ir(&rule);
+    assert_gap2_clear_semantics(&gap2_clear_set(&func));
+}
+
+// Gap 2 — bare `each` (canonical), relative-clause / NO-comma form. Exercises
+// BOTH the widened vocabulary AND the relative-clause split.
+#[test]
+fn gap2_each_lowercase_relative_clause_no_comma() {
+    let src = gap2_universal_src(
+        "* Head is clear iff each Other that blocks the Head has Flag 'done'.");
+    let (rule, func) = parse_and_compile(&src);
+    assert_gap2_universal_ir(&rule);
+    assert_gap2_clear_semantics(&gap2_clear_set(&func));
+}
+
+// Gap 2 — capitalised `Each` (canonical), relative-clause / NO-comma form.
+// Paired with the lowercase case above this proves case-insensitivity.
+#[test]
+fn gap2_each_capitalised_relative_clause_no_comma() {
+    let src = gap2_universal_src(
+        "* Head is clear iff Each Other that blocks the Head has Flag 'done'.");
+    let (rule, func) = parse_and_compile(&src);
+    assert_gap2_universal_ir(&rule);
+    assert_gap2_clear_semantics(&gap2_clear_set(&func));
+}
+
+// Gap 2 — NORMA's `every` (accepted on input; the shape `tasks` rule 369
+// uses), relative-clause / NO-comma form. This is the exact 369-shaped
+// universal that degenerated pre-fix. The semantics assertion proves the
+// universal actually checks ALL blockers (head-B with one open blocker is
+// NOT clear) rather than collapsing to a single conjunct.
+#[test]
+fn gap2_every_relative_clause_no_comma_checks_all_blockers() {
+    let src = gap2_universal_src(
+        "* Head is clear iff every Other that blocks the Head has Flag 'done'.");
+    let (rule, func) = parse_and_compile(&src);
+    assert_gap2_universal_ir(&rule);
+    assert_gap2_clear_semantics(&gap2_clear_set(&func));
+}
+
+// Gap 2 — `given any` (canonical), comma form. Completes coverage of the
+// canonical vocabulary set.
+#[test]
+fn gap2_given_any_comma_form() {
+    let src = gap2_universal_src(
+        "* Head is clear iff given any Other that blocks the Head, Other has Flag 'done'.");
+    let (rule, func) = parse_and_compile(&src);
+    assert_gap2_universal_ir(&rule);
+    assert_gap2_clear_semantics(&gap2_clear_set(&func));
+}
+
 // ─── task-934-3a: Menu-View Derivation via Skolem Head ───────────────────────
 //
 // DESIGN SPEC (§4.5 / task-934-3 part a): a Noun's action menu is a DERIVED

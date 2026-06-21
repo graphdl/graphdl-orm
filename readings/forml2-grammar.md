@@ -69,7 +69,7 @@ Superlative Comparator Aggregate Op is a value type.
 Quote Escape is a value type.
   The possible values of Quote Escape are 'doubled-quote'.
 Universal Quantifier Keyword is a value type.
-  The possible values of Universal Quantifier Keyword are 'for each '.
+  The possible values of Universal Quantifier Keyword are 'for each ', 'given any ', 'every ', 'each '.
 Extraction Clause Keyword is a value type.
   The possible values of Extraction Clause Keyword are ' is extracted from ', ' is derived from '.
 Noun Has Noun Literal Keyword is a value type.

@@ -510,28 +510,51 @@ impl RingAdjectiveTable {
 /// `UniversalQuantifierTable` reading the `Universal Quantifier Keyword`
 /// grammar enum. Boot-table rows store the keyword with its trailing
 /// space so the strip semantics round-trip without surprise. Future
-/// keywords (e.g., `For each `, `Each `, `every `, `all `) extend the
-/// grammar declaration and are picked up automatically; no Rust change
-/// is required to recognise more universal-quantifier prefixes.
+/// keywords extend the grammar declaration and are picked up
+/// automatically; no Rust change is required to recognise more
+/// universal-quantifier prefixes.
+///
+/// ORM2-conformance Gap 2 (TR ORM2-02 §1.4–1.5 p.4; Halpin/Morgan
+/// §6.5 p.252) — the canonical universal vocabulary is
+/// `each` / `For each` / `given any` (and their sentence-initial
+/// capitalisations). NORMA's `every` is NOT attested in the sources but
+/// is accepted on input (Postel: accept the canonical superset; the
+/// `tasks` rule 369 writes `every`). The canonical default *emit* is
+/// `each`. The boot table therefore ships the lowercased superset
+/// `{ for each , each , every , given any }` (stored with the trailing
+/// space so the whole-word strip round-trips), and `match_prefix`
+/// matches CASE-INSENSITIVELY at clause start so sentence-initial
+/// `Each` / `Every` / `For each` / `Given any` all parse without a
+/// separate capitalised row.
 #[derive(Debug, Clone)]
 pub struct UniversalQuantifierTable {
     /// The universal-quantifier keyword prefixes. Order matches the
-    /// `'for each ', ...` declaration in `readings/forml2-grammar.md`
-    /// and the legacy `strip_prefix("for each ")` call in
-    /// `is_universal_quantifier_clause` so first-match-wins iteration
-    /// behavior round-trips.
+    /// `'for each ', 'each ', 'every ', 'given any '` declaration in
+    /// `readings/forml2-grammar.md`. Stored lowercased with a trailing
+    /// space; `match_prefix` lowercases the clause start before
+    /// comparing so capitalised sentence-initial forms also match.
+    /// Longest-first iteration so `for each ` wins over `each ` on
+    /// inputs that both could prefix (none in the canonical set — `for
+    /// each X` does not start with `each ` — but the ordering keeps the
+    /// first-match-wins contract robust if rows are extended).
     pub rows: Vec<String>,
 }
 
 impl UniversalQuantifierTable {
     /// Boot table — must stay in sync with `Universal Quantifier
-    /// Keyword` enum-value declaration in
-    /// `readings/forml2-grammar.md`. One keyword (`for each `) in the
-    /// same declaration order as the legacy hardcoded prefix strip.
+    /// Keyword` enum-value declaration in `readings/forml2-grammar.md`.
+    /// The canonical ORM2 universal superset (TR ORM2-02 §1.4–1.5;
+    /// Halpin/Morgan §6.5) plus NORMA's accepted-but-not-canonical
+    /// `every`, in longest-first order so `for each ` is tried before
+    /// `each `. All rows are lowercased and trailing-spaced; the match
+    /// is case-insensitive (see `match_prefix`).
     pub fn boot() -> Self {
         UniversalQuantifierTable {
             rows: alloc::vec![
                 "for each ".to_string(),
+                "given any ".to_string(),
+                "every ".to_string(),
+                "each ".to_string(),
             ],
         }
     }
@@ -555,15 +578,29 @@ impl UniversalQuantifierTable {
         self.rows.iter().map(|s| s.as_str())
     }
 
-    /// Try each keyword in declaration order; on first match return
-    /// the post-keyword tail of `clause`. Mirrors the legacy
-    /// `clause.strip_prefix("for each ")` call exactly: case-sensitive,
-    /// whole-prefix match (the trailing space in the keyword enforces
-    /// the word boundary).
+    /// Try each keyword in declaration (longest-first) order; on first
+    /// match return the post-keyword tail of `clause`, sliced from the
+    /// ORIGINAL (case-preserving) string so downstream noun resolution
+    /// sees the author's casing.
+    ///
+    /// ORM2-conformance Gap 2: the match is CASE-INSENSITIVE at clause
+    /// start, so sentence-initial `Each` / `Every` / `For each` /
+    /// `Given any` match the lowercased boot rows. The trailing space in
+    /// each keyword still enforces the whole-word boundary (`Eachother`
+    /// does not match `each `). Lowercasing is ASCII, which preserves
+    /// byte length, so the matched-prefix length is identical in the
+    /// lowercased and original strings and the tail slice is valid.
     pub fn match_prefix<'a>(&self, clause: &'a str) -> Option<&'a str> {
+        let clause_lower = clause.to_ascii_lowercase();
         for kw in self.rows.iter() {
-            if let Some(rest) = clause.strip_prefix(kw.as_str()) {
-                return Some(rest);
+            // kw is already lowercased at boot; lowercase again is a
+            // no-op for boot rows but normalises runtime grammar-cell
+            // rows that may carry mixed case.
+            let kw_lower = kw.to_ascii_lowercase();
+            if clause_lower.starts_with(kw_lower.as_str()) {
+                // ASCII lowercasing is length-preserving, so the prefix
+                // length in `clause` equals `kw.len()`.
+                return Some(&clause[kw.len()..]);
             }
         }
         None
@@ -11182,38 +11219,59 @@ Foo has Bar.
 
     // ─── #875: universal quantifier table ────────────────────────────
 
-    /// #875 — `is_universal_quantifier_clause` in parse_forml2.rs has a
-    /// hardcoded `strip_prefix("for each ")` cascade (one keyword today,
-    /// historically the smell same as #786/#788/#789/#790/#791 — the
-    /// keyword set lives in code, not in the grammar). This lift moves
-    /// the prefix vocabulary to a typed `UniversalQuantifierTable`
-    /// reading the `Universal Quantifier Keyword` grammar enum. Boot
-    /// table preserves the historic cascade order so the recognizer
-    /// behaves identically before and after the lift.
+    /// #875 / ORM2-conformance Gap 2 — `is_universal_quantifier_clause`
+    /// in parse_forml2.rs historically had a hardcoded
+    /// `strip_prefix("for each ")` cascade (one keyword, case-sensitive).
+    /// The lift moves the prefix vocabulary to a typed
+    /// `UniversalQuantifierTable` reading the `Universal Quantifier
+    /// Keyword` grammar enum; Gap 2 then widens it to the canonical ORM2
+    /// universal superset (TR ORM2-02 §1.4–1.5 p.4; Halpin/Morgan §6.5
+    /// p.252): `for each ` / `each ` / `given any `, plus NORMA's
+    /// accepted-but-not-canonical `every `. Rows are lowercased,
+    /// trailing-spaced, and ordered longest-first so `for each ` is tried
+    /// before `each `.
     #[test]
-    fn universal_quantifier_table_boot_has_one_keyword_in_declared_order() {
+    fn universal_quantifier_table_boot_has_canonical_superset_longest_first() {
         let table = super::UniversalQuantifierTable::boot();
         let words: Vec<&str> = table.iter().collect();
-        assert_eq!(words, vec!["for each "],
-            "boot table must mirror the historic `for each ` strip_prefix \
-             call in is_universal_quantifier_clause, with the trailing \
-             space included so the prefix-strip semantics round-trip.");
+        assert_eq!(words, vec!["for each ", "given any ", "every ", "each "],
+            "boot table must carry the canonical ORM2 universal superset \
+             (for each / given any / each) plus accepted `every`, each with \
+             a trailing space, longest-first so `for each ` wins over \
+             `each `.");
     }
 
-    /// #875 — `match_prefix` returns the post-keyword tail when the
-    /// clause starts with one of the declared keywords; otherwise None.
-    /// Mirrors the historic `clause.strip_prefix("for each ")`
-    /// behavior exactly.
+    /// #875 / Gap 2 — `match_prefix` returns the post-keyword tail
+    /// (sliced from the case-PRESERVING original) for any canonical
+    /// keyword at clause start, matching CASE-INSENSITIVELY so
+    /// sentence-initial capitalisations parse.
     #[test]
     fn universal_quantifier_table_match_prefix_returns_tail_or_none() {
         let table = super::UniversalQuantifierTable::boot();
         assert_eq!(table.match_prefix("for each Authority that …"),
             Some("Authority that …"));
+        // Case-insensitive: capitalised sentence-initial forms match,
+        // and the returned tail preserves the author's casing.
+        assert_eq!(table.match_prefix("For each Authority"),
+            Some("Authority"),
+            "Gap 2: capitalised `For each` must match case-insensitively");
+        assert_eq!(table.match_prefix("Each Person who smokes"),
+            Some("Person who smokes"),
+            "Gap 2: capitalised `Each` must match");
+        assert_eq!(table.match_prefix("each Person who smokes"),
+            Some("Person who smokes"),
+            "Gap 2: lowercase `each` must match");
+        assert_eq!(table.match_prefix("Every Other that blocks"),
+            Some("Other that blocks"),
+            "Gap 2: NORMA `Every` accepted on input");
+        assert_eq!(table.match_prefix("Given any Task that …"),
+            Some("Task that …"),
+            "Gap 2: `Given any` is canonical");
+        // Whole-word boundary still enforced by the trailing space.
+        assert_eq!(table.match_prefix("Eachother is wrong"), None,
+            "the trailing space keeps `each ` a whole-word prefix");
         assert_eq!(table.match_prefix("if X then Y"), None,
             "non-quantifier clause must not match");
-        assert_eq!(table.match_prefix("For each Authority"), None,
-            "case-sensitive: capitalised `For` must not match the \
-             lowercase boot keyword");
         assert_eq!(table.match_prefix(""), None,
             "empty clause cannot start with any keyword");
     }
@@ -11233,8 +11291,8 @@ Foo has Bar.
     fn universal_quantifier_table_falls_back_to_boot_on_empty_state() {
         let state = synthetic_enum_state(&[]);
         let table = super::UniversalQuantifierTable::from_grammar_state(&state);
-        assert_eq!(table.rows.len(), 1,
-            "empty grammar state falls back to the 1-keyword boot table");
+        assert_eq!(table.rows, super::UniversalQuantifierTable::boot().rows,
+            "empty grammar state falls back to the canonical-superset boot table");
     }
 
     // ─── #876: extraction clause table ───────────────────────────────

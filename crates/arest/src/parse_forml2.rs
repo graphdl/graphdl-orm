@@ -44,6 +44,73 @@ fn is_universal_quantifier_clause(clause: &str, noun_names: &[String]) -> bool {
         })
 }
 
+/// Recover the `(restriction, predicate)` clause pair from the canonical
+/// ORM2 *relative-clause* universal form (Halpin/Morgan §6.5 p.252), in
+/// which NO comma separates the restriction from the main predicate:
+///
+///   `<X> who|that|which <restricting FT reading naming the Subject>
+///        <main predicate> '<literal>'`
+///
+/// e.g. `Other that blocks the Head has Flag 'done'` (with subject
+/// `Head`) splits into
+///   restriction = `Other that blocks the Head`
+///   predicate   = `Other has Flag 'done'`
+///
+/// so it compiles to the SAME `ConsequentUniversal` IR the comma form
+/// `Other that blocks the Head, Other has Flag 'done'` produces. The
+/// quantified variable X (the leading noun token) is re-prepended to the
+/// predicate tail because the surface form elides the repeated subject of
+/// the main predicate (`… that blocks the Head **has** Flag 'done'`).
+///
+/// Returns `None` when the shape can't be recovered (no relative pronoun,
+/// or the subject noun isn't found after it) so the caller falls back to
+/// the recognised-but-unstructured path (suppress, don't mis-derive).
+fn split_universal_relative_clause(
+    rest: &str,
+    subject: Option<&str>,
+    noun_names: &[String],
+) -> Option<(String, String)> {
+    let subject = subject?;
+    // The X variable is the leading noun token (carries the ring
+    // subscript that distinguishes it from the subject). Required so we
+    // can re-prepend it to the elided predicate.
+    let tokens = find_nouns(rest, noun_names);
+    let (_, x_end, x_token) = tokens.first()?.clone();
+
+    // The restriction is introduced by a relative pronoun (`who` / `that`
+    // / `which`). Locate the FIRST one AFTER the X token — that's where
+    // the restricting fact-type reading begins. Without a relative
+    // pronoun this is not the relative-clause form (it would be a plain
+    // `<Quant> X <predicate>`, handled elsewhere), so bail.
+    let rel_pronoun_at = [" that ", " who ", " which "]
+        .iter()
+        .filter_map(|p| rest[x_end..].find(p).map(|i| (x_end + i, p.len())))
+        .min_by_key(|&(i, _)| i)?;
+    let restriction_body_start = rel_pronoun_at.0 + rel_pronoun_at.1;
+
+    // Within the restriction body, find the subject-noun occurrence; the
+    // restriction ends right after it and the main predicate begins. Use
+    // the FIRST subject occurrence at/after the relative-pronoun body so
+    // a self-ring (X and subject share a base noun) splits at the subject
+    // mention, not the leading X. Match the subject as a whole declared
+    // noun token (optionally subscripted) via find_nouns over the body.
+    let body = &rest[restriction_body_start..];
+    let body_tokens = find_nouns(body, noun_names);
+    let subj_in_body = body_tokens.iter()
+        .find(|(_, _, n)| parse_role_token(n).0 == subject)?;
+    let subject_end = restriction_body_start + subj_in_body.1;
+
+    let restriction = rest[..subject_end].trim().to_string();
+    let predicate_tail = rest[subject_end..].trim();
+    if predicate_tail.is_empty() { return None; }
+
+    // Re-prepend the quantified variable: `has Flag 'done'` →
+    // `Other has Flag 'done'`. Preserve the X token's subscript so the
+    // predicate's role alignment matches the restriction's X role.
+    let predicate = format!("{} {}", x_token, predicate_tail);
+    Some((restriction, predicate))
+}
+
 /// True when `clause` has the shape `<Noun> is extracted from <Noun>`
 /// or `<Noun> is derived from <Noun>` (per the boot table; future
 /// markers come from the `Extraction Clause Keyword` grammar enum).
@@ -2686,20 +2753,46 @@ fn resolve_derivation_rule(
             if let Some(tail) = crate::parse_forml2_stage2::UniversalQuantifierTable::boot()
                 .match_prefix(part.trim())
             {
-                // Split into the relation clause and the predicate clause at
-                // the first top-level comma. `for each X that R the S, X has
-                // P` — the comma separates the (restriction) relation from
-                // the (body) predicate.
-                if let Some((rel_raw, pred_raw)) = tail.split_once(',') {
-                    let rel_clause = rel_raw.trim();
-                    let pred_clause = pred_raw.trim().trim_end_matches('.').trim();
+                // The consequent subject noun (`Item` in `Item is clear`)
+                // is the ∀-subject. It is the relating clause's role that
+                // is NOT the quantified X. Computed up front because the
+                // relative-clause (no-comma) form needs it to find the
+                // restriction/predicate boundary.
+                let subject_noun: Option<String> =
+                    find_nouns(consequent_text, &noun_names).first()
+                        .map(|(_, _, n)| parse_role_token(n).0.to_string());
 
-                    // The consequent subject noun (`Item` in `Item is clear`)
-                    // is the ∀-subject. It is the relating clause's role that
-                    // is NOT the quantified X.
-                    let subject_noun: Option<String> =
-                        find_nouns(consequent_text, &noun_names).first()
-                            .map(|(_, _, n)| parse_role_token(n).0.to_string());
+                // Recover the (restriction, predicate) clause pair from
+                // EITHER canonical universal surface form:
+                //
+                //   comma form  : `X that R the S, X has P 'lit'`
+                //                  → split at the first top-level comma.
+                //   relative-clause (ORM2 §6.5 p.252, no comma required):
+                //                 `X that R the S has P 'lit'`
+                //                  → the restriction is `X that R the S`
+                //                    (up to & including the subject S
+                //                    mention); the predicate is the tail
+                //                    with the quantified X re-prepended,
+                //                    i.e. `X has P 'lit'`. This yields the
+                //                    SAME (rel_clause, pred_clause) pair the
+                //                    comma form produces, so both compile to
+                //                    the identical `ConsequentUniversal` IR.
+                let clause_pair: Option<(String, String)> =
+                    match tail.split_once(',') {
+                        Some((rel_raw, pred_raw)) => Some((
+                            rel_raw.trim().to_string(),
+                            pred_raw.trim().trim_end_matches('.').trim().to_string(),
+                        )),
+                        None => split_universal_relative_clause(
+                            tail.trim().trim_end_matches('.').trim(),
+                            subject_noun.as_deref(),
+                            &noun_names,
+                        ),
+                    };
+
+                if let Some((rel_clause, pred_clause)) = clause_pair {
+                    let rel_clause = rel_clause.as_str();
+                    let pred_clause = pred_clause.as_str();
 
                     // ── Relation clause: `Item1 that blocks the Item` ──
                     // Quantified X = the FIRST noun token (carries the
