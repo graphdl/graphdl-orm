@@ -1570,6 +1570,33 @@ fn resolve_derivation_rule(
         }
         out
     };
+
+    // derivation-subtype-join-resolution (ORM2 conformance Gap 3): the
+    // universal-instance arm of subtype→supertype role-fill. The
+    // declared subtype lattice above only widens a clause noun to its
+    // DECLARED supertypes (`Noun < Function`). But the reflective
+    // metamodel fact `Resource is instance of Noun` (instances.md:101)
+    // states that EVERY Resource is an instance of some Noun — so
+    // inversely every noun's instances ARE Resources, making `Resource`
+    // the UNIVERSAL instance type. ORM2 role-fill is governed by
+    // object-type compatibility, not role name (Halpin/Morgan p.131,
+    // p.165 pop(role) ⊆ pop(object type)): an instance of ANY noun is a
+    // legal filler of a `Resource`-typed role (a `Task` fills the
+    // `Resource` role of `Resource is currently in Status`). This flag
+    // recognises the relationship FROM THE SCHEMA — it fires only when
+    // the model actually declares the `Resource is instance of Noun`
+    // fact type, so the bare engine and models without the reflective
+    // metamodel are unaffected. Detection is by normalised reading
+    // (subscripts stripped, lowercased) so it is robust to the id
+    // convention. DIRECTION is one-way: a clause noun is widened TO
+    // `Resource` (instance → universal supertype), never the reverse,
+    // mirroring the subtype→supertype-only discipline above.
+    let resource_is_universal_instance = fact_types_map.values().any(|ft| {
+        let norm: alloc::string::String = ft.reading.split_whitespace()
+            .map(|t| parse_role_token(t).0.to_lowercase())
+            .collect::<Vec<_>>().join(" ");
+        norm == "resource is instance of noun"
+    });
     // task-930: marker strip moved to translate_derivation_rules_with_matrix
     // in parse_forml2_stage2 (the layer that writes DR cell facts).
     // resolve_derivation_rule receives an already-normalized rule.text;
@@ -1820,6 +1847,50 @@ fn resolve_derivation_rule(
                         }
                     }
                     if best.is_some() { break; }
+                }
+                best
+            })
+            // derivation-subtype-join-resolution (ORM2 conformance Gap 3) —
+            // the UNIVERSAL-INSTANCE arm of subtype→supertype role-fill. The
+            // DECLARED-supertype bridge above widens a clause noun to its
+            // declared ancestors only. The reflective metamodel fact
+            // `Resource is instance of Noun` (instances.md:101) states that
+            // EVERY Resource is an instance of some Noun — so inversely every
+            // noun's instances ARE Resources, making `Resource` the UNIVERSAL
+            // instance type. ORM2 role-fill is governed by object-type
+            // compatibility, not role name (Halpin/Morgan p.131; p.165
+            // pop(role) ⊆ pop(object type)): an instance of ANY noun legally
+            // fills a `Resource`-typed role (a `Task` fills the `Resource`
+            // role of `Resource is currently in Status`). Substitute
+            // `Resource` for one clause role at a time and retry the
+            // verb-specific rho-lookup.
+            //
+            // ORDER: this runs STRICTLY AFTER the declared-supertype bridge
+            // and only when it found NOTHING — so a clause whose noun has a
+            // genuine declared supertype carrying the same-verb FT (e.g.
+            // `Noun belongs to Domain` → `Function belongs to Domain`, with
+            // `Noun < Function`) still binds the declared-supertype FT, NEVER
+            // the broader `Resource`-substituted one. Gated on the schema
+            // actually declaring `Resource is instance of Noun`, so the bare
+            // engine and models without the reflective metamodel are
+            // unaffected. Verb-specific only (no fuzzy role-set retry), and
+            // DIRECTION is one-way (clause noun → `Resource`), never the
+            // reverse — it can only bind a same-verb FT declared on the
+            // `Resource` universal type, never fabricate a cross-verb match.
+            .or_else(|| {
+                if !resource_is_universal_instance { return None; }
+                let mut best: Option<String> = None;
+                for i in 0..base_refs.len() {
+                    if base_refs[i] == "Resource" { continue; }
+                    let subst: Vec<&str> = {
+                        let mut s = role_refs.clone();
+                        s[i] = "Resource";
+                        s
+                    };
+                    if let Some(id) = catalog.resolve(&subst, verb_opt) {
+                        best = Some(id);
+                        break;
+                    }
                 }
                 best
             })
@@ -3326,6 +3397,87 @@ fn resolve_derivation_rule(
                     .get(rule.consequent_cell.literal_id())
                     .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
                     .unwrap_or_default();
+            }
+        }
+    }
+
+    // derivation-subtype-join-resolution (ORM2 conformance Gap 3) — the
+    // UNIVERSAL-INSTANCE arm of the join-matching bridge. The declared
+    // subtype bridge above links a join key to a SUPERTYPE role only when
+    // the key has a declared supertype carried by another antecedent. But
+    // when a clause noun `N` (e.g. `Task`) was widened to fill a
+    // `Resource`-typed role via the universal-instance relationship
+    // (`Resource is instance of Noun`) — so an antecedent's FT carries a
+    // `Resource` role that semantically stands for an instance of `N` —
+    // the standard same-name detection finds NO shared key (`Task` ≠
+    // `Resource`) and the rule degrades to a first-antecedent ModusPonens,
+    // dropping the per-tuple equi-join. Bridge it: equi-join the
+    // consequent's SUBJECT noun (carried directly by some antecedent) to
+    // the `Resource` role of another antecedent, since every instance of
+    // that subject noun IS a Resource (same entity id). This emits an
+    // asymmetric `match_on` pair `(subject, Resource)` that
+    // `compile_join_derivation`'s entity-typed match-pair path equi-joins
+    // by id — exactly the FORM-A `Task is recommended iff the Task is
+    // currently in Status 'X' and Task has Task Priority` shape (Halpin/
+    // Morgan p.165: pop(role) ⊆ pop(object type); the Task population is a
+    // subset of the Resource population). Narrow by construction: fires
+    // only when the schema declares the reflective fact, the subject is an
+    // entity type, a direct subject-holder antecedent exists, and ANOTHER
+    // antecedent carries a `Resource` role that does NOT already carry the
+    // subject — so it can only complete a join the rule already implies via
+    // a `Resource`-typed clause, never fabricate a cross-type one. DIRECTION
+    // is one-way (instance → `Resource`), never the reverse.
+    if resource_is_universal_instance && rule.antecedent_sources.len() >= 2 {
+        let role_nouns_of = |ft_id: &str| -> Vec<String> {
+            if ft_id.is_empty() { return Vec::new(); }
+            fact_types_map.get(ft_id)
+                .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
+                .unwrap_or_default()
+        };
+        // The consequent subject is the first declared-noun token of the
+        // consequent reading (the role the rule asserts about) — the same
+        // notion the cardinality / comparison blocks use.
+        let subject: Option<String> = find_nouns(consequent_text, &noun_names)
+            .first()
+            .map(|(_, _, n)| parse_role_token(n).0.to_string());
+        if let Some(subj) = subject {
+            let subj_is_entity = nouns_map.get(&subj)
+                .map(|nd| nd.object_type == "entity")
+                .unwrap_or(false);
+            // The subject must NOT itself be `Resource` (that resolves by
+            // name already), must be an entity type (id-equality join), and
+            // must be carried DIRECTLY as a role by some antecedent FT.
+            let has_direct_subject_holder = rule.antecedent_sources.iter().any(|s| {
+                role_nouns_of(s.fact_type_id()).iter().any(|n| n == &subj)
+            });
+            if subj != "Resource" && subj_is_entity && has_direct_subject_holder {
+                // Another antecedent carries a `Resource` role but NOT the
+                // subject — the clause that was widened to the universal
+                // instance type. (Skip if `Resource` is already a join key,
+                // i.e. genuinely its own variable in this rule.)
+                let resource_is_own_key = rule.join_on.iter().any(|k| k == "Resource");
+                let needs_universal_bridge = !resource_is_own_key
+                    && rule.antecedent_sources.iter().any(|s| {
+                        let roles = role_nouns_of(s.fact_type_id());
+                        roles.iter().any(|n| n == "Resource")
+                            && !roles.iter().any(|n| n == &subj)
+                    });
+                if needs_universal_bridge {
+                    let pair = (subj.clone(), "Resource".to_string());
+                    rule.kind = DerivationKind::Join;
+                    // Drop any degenerate `(subj, subj)` self-pair the
+                    // standard block may have emitted for the subject.
+                    rule.match_on.retain(|(a, b)| !(a == &subj && b == &subj));
+                    if !rule.match_on.contains(&pair) {
+                        rule.match_on.push(pair);
+                    }
+                    if rule.consequent_bindings.is_empty() {
+                        rule.consequent_bindings = fact_types_map
+                            .get(rule.consequent_cell.literal_id())
+                            .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
+                            .unwrap_or_default();
+                    }
+                }
             }
         }
     }

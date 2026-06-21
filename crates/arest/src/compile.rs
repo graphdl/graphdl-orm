@@ -14976,17 +14976,20 @@ mod schema_tests {
     ///          wrappers keep ant0's literal filter, so FORM B now yields exactly
     ///          {t1}, keyed on Task -- BOTH well-keyed AND filtering.
     ///
-    /// CONCLUSION: FORM B (the issue-2 footgun) is now correct inline. FORM C's
-    /// blessed decomposition remains a valid (and still-asserted) shape, and is
-    /// still required for FORM A's direct-role-fill phrasing until the clause-
-    /// resolution gap is closed. FORM C: a 1-ANTECEDENT Task-keyed status helper
-    /// `Task is in Status iff that Resource is currently in some Status and
-    /// Task is Resource`, then a join consumer with a literal status filter.
+    /// CONCLUSION: FORM B (the issue-2 footgun) is now correct inline. FORM A
+    /// (direct role-fill) is NOW correct too — the derivation-subtype-join-
+    /// resolution fix (ORM2 conformance Gap 3) lets the `Task` noun fill the
+    /// `Resource` role via the universal-instance relationship (`Resource is
+    /// instance of Noun`), so the FORM-C Task-status helper is no longer required
+    /// for the direct-role-fill phrasing. FORM C remains a valid (and still-
+    /// asserted) decomposition: a 1-ANTECEDENT Task-keyed status helper `Task is
+    /// in Status iff that Resource is currently in some Status and Task is
+    /// Resource`, then a join consumer with a literal status filter.
     ///
     /// Each form runs in its OWN isolated fixture (no shared helper FT that
-    /// could shift another form's clause resolution). FORMS B and C are asserted
-    /// rigorously (both must yield exactly {t1}, Task-keyed); FORM A is pinned as
-    /// STILL-broken with its distinct (resolution-gap) root cause documented.
+    /// could shift another form's clause resolution). All three forms are now
+    /// asserted rigorously — each must yield exactly {t1}, Task-keyed, literal
+    /// filter honored.
     #[test]
     fn status_bridge_consumer_form_diagnostic_records_engine_behavior() {
         // Population shared by all forms: t1 in_progress/p0, t2 pending/p0. A
@@ -14996,12 +14999,15 @@ mod schema_tests {
             Resource(.id) is an entity type.\n\
             Task(.id) is an entity type.\n\
             State Machine(.id) is an entity type.\n\
+            Noun(.NounName) is an entity type.\n\
+            NounName is a value type.\n\
             Status is a value type.\n\
             Task Priority is a value type.\n\
             Name is a value type.\n\
             State Machine is for Resource.\n\
             State Machine is currently in Status.\n\
             Resource is currently in Status.\n\
+            Resource is instance of Noun.\n\
             Task has Task Priority.\n\
               Each Task has at most one Task Priority.\n\
             Task has Name.\n\
@@ -15073,25 +15079,114 @@ mod schema_tests {
              join re-keys to the declared head + keeps the antecedent literal). \
              got tasks={:?} total={}", b_tasks, b_total);
 
-        // FORM A stays BROKEN -- and its root cause is DISTINCT from the issue-2
-        // footgun. FORM A writes `the Task is currently in Status 'in_progress'`,
-        // filling the FT's `Resource` role with the noun `Task`. `resolve_fact_type`
-        // matches FTs by ROLE-NOUN NAME, and `Task` is not `Resource` (nor a
-        // subtype of it), so the whole status clause FAILS TO RESOLVE: only
-        // `Task_has_Task_Priority` survives as an antecedent, and the literal
-        // `'in_progress'` never reaches the IR. That is a CLAUSE-RESOLUTION gap
-        // (noun-fills-differently-named-role), NOT the multi-antecedent
-        // computed-head-binding projection bug this fix targets -- so FORM A is
-        // out of scope here and the blessed FORM-C decomposition remains required
-        // for the direct-role-fill phrasing.
-        let a_correct = a_tasks == vec!["t1".to_string()];
-        assert!(!a_correct,
-            "FORM A (direct role-fill) is NOT expected to be correct (distinct \
-             root cause: the `the Task ... Status 'X'` clause fails FT resolution \
-             because `Task` cannot fill the `Resource` role by name, so the \
-             literal is lost at resolution). If it now yields exactly [t1] the \
-             resolution gap was closed -- revisit. got tasks={:?} total={}",
-            a_tasks, a_total);
+        // FORM A — direct role-fill — is NOW CORRECT (derivation-subtype-join-
+        // resolution / ORM2 conformance Gap 3). FORM A writes `the Task is
+        // currently in Status 'in_progress'`, filling the FT's `Resource` role
+        // with the noun `Task`. Pre-fix, `resolve_fact_type` matched FTs by
+        // ROLE-NOUN NAME and `Task` is not `Resource` (nor a DECLARED subtype of
+        // it), so the whole status clause FAILED TO RESOLVE: only
+        // `Task_has_Task_Priority` survived as an antecedent and the literal
+        // `'in_progress'` never reached the IR. The fix widens role-fill across
+        // the subtype/instance lattice: the metamodel fact `Resource is instance
+        // of Noun` makes `Resource` the UNIVERSAL instance type, so ANY noun
+        // (here `Task`) legally fills a `Resource`-typed role (Halpin/Morgan
+        // p.131/p.165: role-fill is object-type compatibility, not role name).
+        // The clause now resolves to `Resource is currently in Status`, keyed on
+        // the `Task` value, with the `'in_progress'` literal recorded as an
+        // antecedent role literal on the `Status` role — so the join with
+        // `Task has Task Priority` yields exactly {t1}, Task-keyed, filter
+        // honored. This retires the FORM-C Task-status bridge for the direct-
+        // role-fill phrasing.
+        assert_eq!(a_tasks, vec!["t1".to_string()],
+            "FORM A (direct role-fill) MUST now recommend exactly t1, Task-keyed, \
+             literal honored — the derivation-subtype-join-resolution fix lets the \
+             noun `Task` fill the `Resource` role via the universal-instance \
+             relationship (`Resource is instance of Noun`), so the status clause \
+             resolves and carries the 'in_progress' filter. got tasks={:?} \
+             total={}", a_tasks, a_total);
+    }
+
+    /// derivation-subtype-join-resolution (ORM2 conformance Gap 3) — the
+    /// tasks-consumer validation: a plain `Task` noun (NOT a declared subtype
+    /// of `Resource`) fills the `Resource` role of `Resource is currently in
+    /// Status` DIRECTLY, via the universal-instance relationship
+    /// (`Resource is instance of Noun`), with NO Task-keyed bridge/helper FT.
+    /// Exercises the 3-antecedent equi-join (recommendation tier) shape inline.
+    /// Mirrors the FORM-A fixture but adds a third join antecedent so the
+    /// multi-way equi-join over the universal-instance match-pair is covered.
+    #[test]
+    fn gap3_tasks_consumer_shapes_resolve_inline_via_universal_instance() {
+        // Shared metamodel slice: Resource (universal instance type), the
+        // reflective `Resource is instance of Noun` fact, the SM→status
+        // projection, and a `Task` entity that is NOT declared a subtype of
+        // Resource (so resolution can ONLY go through the universal-instance
+        // arm, never a declared subtype chain).
+        let pop = "\
+            Resource(.id) is an entity type.\n\
+            Task(.id) is an entity type.\n\
+            State Machine(.id) is an entity type.\n\
+            Noun(.NounName) is an entity type.\n\
+            NounName is a value type.\n\
+            Status is a value type.\n\
+            Task Priority is a value type.\n\
+            Name is a value type.\n\
+            State Machine is for Resource.\n\
+            State Machine is currently in Status.\n\
+            Resource is currently in Status.\n\
+            Resource is instance of Noun.\n\
+            Task has Task Priority.\n\
+              Each Task has at most one Task Priority.\n\
+            Task has Name.\n\
+            Task is recommended.\n\
+            State Machine 'sm1' is for Resource 't1'.\n\
+            State Machine 'sm1' is currently in Status 'in_progress'.\n\
+            State Machine 'sm2' is for Resource 't2'.\n\
+            State Machine 'sm2' is currently in Status 'pending'.\n\
+            State Machine 'sm3' is for Resource 't3'.\n\
+            State Machine 'sm3' is currently in Status 'in_progress'.\n\
+            Task 't1' has Name 'n1'.\n\
+            Task 't1' has Task Priority 'p0'.\n\
+            Task 't2' has Name 'n2'.\n\
+            Task 't2' has Task Priority 'p0'.\n\
+            Task 't3' has Name 'n3'.\n\
+            Resource is currently in Status iff some State Machine is for that Resource and that State Machine is currently in that Status.\n";
+
+        let run = |rules: &str| -> Vec<String> {
+            let src = format!("{pop}{rules}");
+            let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(&src)
+                .expect("fixture must parse");
+            let defs = compile_to_defs_state(&state);
+            let d = ast::defs_to_state(&defs, &state);
+            let refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d).into_iter()
+                .filter(|(n, _)| n.starts_with("derivation:rule_"))
+                .map(|(n, c)| (n.to_string(), ast::metacompose(c, &d)))
+                .collect();
+            let refs: Vec<(&str, &ast::Func)> = refs_owned.iter()
+                .map(|(n, f)| (n.as_str(), f)).collect();
+            let (new_d, _) = crate::evaluate::forward_chain_defs_state(&refs, &d);
+            let cell = ast::fetch_cell_seq("Task_is_recommended", &new_d);
+            let mut by_task: Vec<String> = cell.as_seq().map(|facts| facts.iter()
+                .filter_map(|f| ast::binding(f, "Task").map(String::from))
+                .collect()).unwrap_or_default();
+            by_task.sort();
+            by_task.dedup();
+            by_task
+        };
+
+        // 3-ANTECEDENT equi-join: Task fills the `Resource` role of the status
+        // clause (universal-instance), AND joins `Task has Task Priority` AND
+        // `Task has Name`. Only t1 is in_progress AND has a priority AND a name
+        // (t3 is in_progress + has a name but NO priority; t2 is pending). The
+        // 'in_progress' literal must be honored and the join Task-keyed.
+        let recommended = run(
+            "Task is recommended iff the Task is currently in Status 'in_progress' \
+             and Task has Task Priority and Task has Name.\n");
+        assert_eq!(recommended, vec!["t1".to_string()],
+            "3-antecedent equi-join: the `Task is currently in Status 'in_progress'` \
+             clause must resolve via the universal-instance relationship (Task fills \
+             the Resource role), key the join on Task across all three antecedents, \
+             and honor the 'in_progress' literal — yielding exactly t1. got {:?}",
+            recommended);
     }
 
     /// arc-agi-3 issue-2 FOCUSED gate: a multi-antecedent rule with a computed
