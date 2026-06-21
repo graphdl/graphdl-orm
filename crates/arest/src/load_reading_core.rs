@@ -3241,25 +3241,28 @@ Order has Order Readiness 'ready' iff Order has Order Status 'pending'.
     /// swallowed, never escalated to a load rejection.
     #[test]
     fn check_state_diagnostics_surfaces_warnings_the_gate_passes() {
-        // The layer-7 footgun shape: computed bindings + a second
-        // real antecedent (same fixture as check.rs's
-        // computed_bindings_in_multi_antecedent_rule_warn).
+        // The layer-7 footgun shape that the arc-agi-3 issue-2 fix does NOT
+        // cover: an ARITHMETIC computed binding (`Total is Width + Height`) in a
+        // multi-antecedent rule. (The identity-RENAME variant is now compiled
+        // correctly via path a'' and no longer warns — see
+        // check::tests::identity_rename_bridge_join_multi_antecedent_no_longer_warns.
+        // An arithmetic binding still falls to the global existence fallback, so
+        // it remains the canonical surface for the warning-vs-reject split.) Two
+        // antecedents share `Box`, so no variable-disjoint warning competes.
         let input = r#"# Test
-Resource(.Reference) is an entity type.
-Reference is a value type.
-Status is a value type.
-Run(.id) is an entity type.
+Box(.id) is an entity type.
 id is a value type.
-Game is a value type.
-Game State is a value type.
+Width is a value type.
+Height is a value type.
+Total is a value type.
 
 ## Fact Types
-Resource is currently in Status.
-Run plays Game.
-Run has Game State.
+Box has Width.
+Box has Height.
+Box has Total.
 
 ## Derivation Rules
-* Run has Game State iff that Resource is currently in some Status and Game State is Status and Run is Resource and the Run plays some Game.
+* Box has Total iff Box has Width and Box has Height and Total is Width + Height.
 "#;
         let state = crate::parse_forml2::parse_to_state(input)
             .expect("footgun fixture parses clean — the shape compiles, it just derives empty");

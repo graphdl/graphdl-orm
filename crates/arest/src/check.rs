@@ -735,6 +735,18 @@ fn check_computed_bindings_in_multi_antecedent_rules(state: &Object) -> Vec<Read
                 .count();
             ft_antecedents >= 2
         })
+        // arc-agi-3 issue 2 (FIXED): a multi-antecedent rule whose computed
+        // head-binding is an IDENTITY rename now compiles to the identity-rename
+        // bridge-join (compile_explicit_derivation path a''), which DOES consult
+        // the binding — it re-keys the consequent to the declared head and keeps
+        // antecedent literal filters, materializing a correct, non-empty cell.
+        // Such rules no longer derive empty, so the "computed bindings are NOT
+        // evaluated" warning would now MISDIRECT (it would push authors toward
+        // the no-longer-needed bridge decomposition). Suppress it for exactly the
+        // shapes the new branch handles; the remaining shapes (arithmetic CBs, or
+        // renames the bridge join can't source/join) still fall to the global
+        // existence fallback and STILL warrant the warning.
+        .filter(|rule| !crate::compile::identity_rename_bridge_join_applies(&data, rule))
         .map(|rule| {
             let renames = rule.consequent_computed_bindings.iter()
                 .map(|cb| format!("`{}`", cb.role))
@@ -1109,11 +1121,18 @@ Glyph reaches Glyph.\n\
 
     // ── computed-binding-join-silent-empty (arc-agi-3 issue 2) ──────
 
-    /// The footgun shape: computed bindings + a second antecedent.
-    /// The join paths never consult the bindings, so the rule derives
-    /// an empty cell — the checker must say so LOUDLY.
+    /// arc-agi-3 issue 2 FIXED: the identity-rename bridge-join shape
+    /// (`Run has Game State iff … Game State is Status and Run is Resource and
+    /// the Run plays some Game`) now compiles to a correct, non-empty cell via
+    /// `compile_explicit_derivation` path a'' — the computed head-bindings ARE
+    /// consulted (re-keyed to the declared head, antecedent literals preserved).
+    /// So the "computed bindings are NOT evaluated" warning must NO LONGER fire
+    /// for it (firing would push authors toward a decomposition they no longer
+    /// need). Pinned by the engine-level materialization test
+    /// `compile::schema_tests::status_bridge_consumer_form_diagnostic_records_engine_behavior`
+    /// (FORM B) + the focused `computed_head_rename_keys_declared_head_and_keeps_literal`.
     #[test]
-    fn computed_bindings_in_multi_antecedent_rule_warn() {
+    fn identity_rename_bridge_join_multi_antecedent_no_longer_warns() {
         let input = r#"# Test
 Resource(.Reference) is an entity type.
 Reference is a value type.
@@ -1132,16 +1151,49 @@ Run has Game State.
 * Run has Game State iff that Resource is currently in some Status and Game State is Status and Run is Resource and the Run plays some Game.
 "#;
         let diags = check_readings(input);
+        assert!(diags.iter().all(|d| !d.message.contains("multi-antecedent rule are NOT")),
+            "the identity-rename bridge-join shape now compiles correctly (path a'') \
+             — the dead-computed-binding warning must be suppressed; got {:?}", diags);
+    }
+
+    /// …but a multi-antecedent rule whose computed binding the bridge join can
+    /// NOT consume — here an ARITHMETIC binding (`Total is A + B`), not an
+    /// identity rename — STILL falls to the global existence fallback and
+    /// derives empty, so the warning must STILL fire for it. Keeps the LOUD
+    /// signal alive for the shapes the fix does not cover.
+    #[test]
+    fn arithmetic_computed_binding_in_multi_antecedent_rule_still_warns() {
+        // Two antecedents share `Box` (so no variable-disjoint warning), and the
+        // computed binding `Total is Width + Height` is ARITHMETIC, not an
+        // identity rename — so `identity_rename_bridge_join_applies` is false and
+        // the dead-computed-binding warning still fires.
+        let input = r#"# Test
+Box(.id) is an entity type.
+id is a value type.
+Width is a value type.
+Height is a value type.
+Total is a value type.
+
+## Fact Types
+Box has Width.
+Box has Height.
+Box has Total.
+
+## Derivation Rules
+* Box has Total iff Box has Width and Box has Height and Total is Width + Height.
+"#;
+        let diags = check_readings(input);
         let hits: Vec<&ReadingDiagnostic> = diags.iter()
             .filter(|d| d.message.contains("multi-antecedent rule are NOT"))
             .collect();
         assert_eq!(hits.len(), 1,
-            "the computed-binding + join shape must surface exactly one warning; got {:?}",
-            diags);
+            "an arithmetic computed binding in a multi-antecedent rule is NOT \
+             handled by the identity-rename bridge join, so it must still warn; \
+             got {:?}", diags);
         assert_eq!(hits[0].level, Level::Warning);
         assert_eq!(hits[0].source, Source::Resolve);
-        assert!(hits[0].message.contains("`Run`") && hits[0].message.contains("`Game State`"),
-            "the warning names the dead renames; got {}", hits[0].message);
+        assert!(hits[0].message.contains("`Total`"),
+            "the warning names the dead binding; got {}", hits[0].message);
         assert!(hits[0].suggestion.as_deref().unwrap_or("").contains("single-antecedent bridge"),
             "the suggestion names the blessed decomposition; got {:?}", hits[0].suggestion);
     }

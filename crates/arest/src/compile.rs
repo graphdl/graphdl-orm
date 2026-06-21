@@ -6514,6 +6514,61 @@ fn guard_identity_bindings_by_noun_population(
     })
 }
 
+/// arc-agi-3 issue 2: does this multi-antecedent rule's computed head-binding
+/// get CONSULTED by the explicit-derivation compiler (the identity-rename
+/// bridge-join, path a'' in `compile_explicit_derivation`), rather than being
+/// silently dropped by the global existence-check fallback (path b)?
+///
+/// Returns true exactly when path a'' would fire: ≥2 FT antecedents, no pinned
+/// consequent literals, at least one IDENTITY rename (`head ← RoleRef(src)`)
+/// whose source role is on antecedent 0 and whose head role bridges to another
+/// antecedent, and every consequent role is sourceable from antecedent 0. Used
+/// by `compile_explicit_derivation` (the live trigger) AND by the checker's
+/// `check_computed_bindings_in_multi_antecedent_rules` to STOP warning about a
+/// shape that now compiles to a correct, non-empty cell. Kept here, next to the
+/// branch it gates, so the two never drift.
+pub(crate) fn identity_rename_bridge_join_applies(
+    data: &CellIndex,
+    rule: &DerivationRuleDef,
+) -> bool {
+    let ft_ante_ids: Vec<&str> = rule.antecedent_sources.iter()
+        .map(|s| s.fact_type_id())
+        .filter(|id| !id.is_empty())
+        .collect();
+    if ft_ante_ids.len() < 2 { return false; }
+    if !rule.consequent_role_literals.is_empty() { return false; }
+    let roles_of = |ft_id: &str| -> Vec<String> {
+        data.fact_types.get(ft_id)
+            .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
+            .unwrap_or_default()
+    };
+    let ant0 = ft_ante_ids[0];
+    let ant0_roles = roles_of(ant0);
+    let cons_roles: Vec<String> = data.fact_types.get(rule.consequent_cell.literal_id())
+        .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
+        .unwrap_or_default();
+    if cons_roles.is_empty() { return false; }
+    // Identity renames whose head is a declared consequent role and whose
+    // source role is carried by antecedent 0.
+    let identity_renames: Vec<(&str, &str)> = rule.consequent_computed_bindings.iter()
+        .filter_map(|cb| match &cb.expr {
+            crate::types::ArithExpr::RoleRef(src) => Some((cb.role.as_str(), src.as_str())),
+            _ => None,
+        })
+        .filter(|(head, src)| cons_roles.iter().any(|r| r == head)
+            && ant0_roles.iter().any(|r| r == src))
+        .collect();
+    if identity_renames.is_empty() { return false; }
+    // At least one head role bridges to another antecedent.
+    let bridges_other = identity_renames.iter().any(|(head, _)|
+        ft_ante_ids[1..].iter().any(|id| roles_of(id).iter().any(|r| r == head)));
+    if !bridges_other { return false; }
+    // Every consequent role sourceable from a0 (identity rename or by name).
+    cons_roles.iter().all(|r|
+        identity_renames.iter().any(|(head, _)| head == r)
+            || ant0_roles.iter().any(|a| a == r))
+}
+
 /// population Seq. Requires a fold-based search (Insert + Condition) that
 /// would be more complex than the direct Object traversal below.
 pub(crate) fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> CompiledDerivation {
@@ -8183,6 +8238,183 @@ pub(crate) fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRul
                     consequent_cell,
                     materialization: rule.materialization.clone(),
                 };
+            }
+
+            // (a'') Identity-rename bridge join (arc-agi-3 issue 2 — the
+            // multi-antecedent computed-head-binding footgun). Trigger:
+            // paths (a)/(a') found no same-name / existential join role, but
+            // the rule carries an IDENTITY computed binding `head ← Resource`
+            // (a bare `ArithExpr::RoleRef`) whose SOURCE role lives on
+            // antecedent 0 and whose HEAD role (a declared consequent role)
+            // ALSO names a role on some OTHER antecedent. Source shape:
+            //
+            //   Task is recommended iff Resource is currently in Status 'X'
+            //     and Task has Task Priority and Task is Resource.
+            //
+            //   antecedent 0: Resource is currently in Status   {Resource, Status}
+            //   antecedent 1: Task has Task Priority            {Task, Task Priority}
+            //   consequent  : Task is recommended               {Task}
+            //   computed     : Task ← RoleRef(Resource)
+            //
+            // The rename `Task ← Resource` IS the equi-join key: a0's
+            // `Resource` value must equal antecedent[i]'s `Task` value. Path
+            // (b) below instead fires ONCE GLOBALLY and copies a0's raw
+            // bindings (`first_fact` → `{Resource, Status}`), so the marker
+            // is BOTH mis-keyed (carries antecedent roles, not the declared
+            // head) AND not per-tuple. This branch restores the per-a0
+            // fanout: equi-join on the RENAMED key, then project the
+            // consequent KEYED TO THE DECLARED HEAD ROLES via the computed
+            // binding (`compile_arith_expr` re-keys `Task`←`Resource`). The
+            // `extract(i, …)` wrappers preserve every antecedent literal
+            // filter (the `'X'` on ant0's Status), so the result both filters
+            // and keys correctly. Narrow by construction (identity-rename CB
+            // sourced from ant0 + head role joinable on another antecedent),
+            // so plain same-name multi-antecedent rules are untouched.
+            let cons_roles_decl: Vec<crate::types::RoleDef> =
+                data.fact_types.get(&consequent_id)
+                    .map(|ft| ft.roles.clone())
+                    .unwrap_or_default();
+            // Identity renames whose head is a declared consequent role and
+            // whose source role is carried by antecedent 0.
+            let ant0_role_names_rk: HashSet<String> = data.fact_types.get(&antecedent_ids[0])
+                .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
+                .unwrap_or_default();
+            let identity_renames: Vec<(String, String)> = rule.consequent_computed_bindings.iter()
+                .filter_map(|cb| match &cb.expr {
+                    crate::types::ArithExpr::RoleRef(src) => Some((cb.role.clone(), src.clone())),
+                    _ => None,
+                })
+                .filter(|(head, src)| cons_roles_decl.iter().any(|r| &r.noun_name == head)
+                    && ant0_role_names_rk.contains(src))
+                .collect();
+            // Applicability (≥2 FT antecedents, identity rename sourced from a0
+            // that bridges another antecedent, all consequent roles sourceable
+            // from a0, no pinned literals) is the SAME predicate the checker
+            // consults to stop warning about this shape — calling it here keeps
+            // the live trigger and the checker suppression in lockstep. The
+            // `join_roles`/`existential` conjuncts are extra ORDERING gates
+            // (paths a / a' get first refusal), not part of applicability. The
+            // locals above (`identity_renames`, `ant0_role_names_rk`,
+            // `cons_roles_decl`) drive the Func construction below.
+            if join_roles.is_empty()
+                && existential_join_roles.is_empty()
+                && identity_rename_bridge_join_applies(data, rule)
+            {
+                let ant0_ft = data.fact_types.get(&antecedent_ids[0]).cloned();
+                // Per other-antecedent equi-join check against a0. Input to
+                // each check is `<a0, <ant1_facts, ant2_facts, …>>`.
+                let n_other = antecedent_ids.len() - 1;
+                let other_extracts: Vec<Func> = antecedent_ids.iter().enumerate()
+                    .skip(1)
+                    .map(|(i, ft_id)| extract(i, ft_id))
+                    .collect();
+                // For antecedent i, collect equality predicates linking a0 to
+                // a candidate fact: (1) each identity rename whose head role
+                // is on antecedent i — candidate.head == a0.source; (2) plain
+                // shared-name roles (same noun on a0 and ant i, no rename).
+                let mut antecedent_unjoinable = false;
+                let other_checks: Vec<Func> = (0..n_other).map(|j| {
+                    let ant_idx = j + 1;
+                    let ant_ft_roles: HashSet<String> = data.fact_types.get(&antecedent_ids[ant_idx])
+                        .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
+                        .unwrap_or_default();
+                    let mut eqs: Vec<Func> = Vec::new();
+                    for (head, src) in identity_renames.iter() {
+                        if ant_ft_roles.contains(head) {
+                            // candidate.head (Selector(2)) == a0.src (Selector(1))
+                            eqs.push(Func::compose(Func::Eq, Func::construction(vec![
+                                Func::compose(role_value_by_name(head), Func::Selector(2)),
+                                Func::compose(role_value_by_name(src), Func::Selector(1)),
+                            ])));
+                        }
+                    }
+                    for rn in ant_ft_roles.iter() {
+                        // Plain shared role: same noun on a0 and ant i, and NOT
+                        // the target of a rename (those are handled above).
+                        if ant0_role_names_rk.contains(rn)
+                            && !identity_renames.iter().any(|(head, _)| head == rn)
+                        {
+                            eqs.push(Func::compose(Func::Eq, Func::construction(vec![
+                                Func::compose(role_value_by_name(rn), Func::Selector(2)),
+                                Func::compose(role_value_by_name(rn), Func::Selector(1)),
+                            ])));
+                        }
+                    }
+                    if eqs.is_empty() {
+                        // No key links this antecedent to a0 — the rename
+                        // join is not well-formed for this rule shape; bail
+                        // to (b) rather than emit an unjoined cross-product.
+                        antecedent_unjoinable = true;
+                        return Func::constant(Object::t());
+                    }
+                    let combined = eqs.into_iter()
+                        .reduce(|a, b| Func::compose(Func::And,
+                            Func::construction(vec![a, b])))
+                        .unwrap();
+                    let a0 = Func::Selector(1);
+                    let ant_j = Func::compose(Func::Selector(j + 1), Func::Selector(2));
+                    let any_match = Func::compose(
+                        Func::compose(Func::Not, Func::NullTest),
+                        Func::compose(Func::filter(combined), Func::DistL));
+                    Func::compose(any_match, Func::construction(vec![a0, ant_j]))
+                }).collect();
+                if !antecedent_unjoinable {
+                    let all_others_hold = other_checks.into_iter()
+                        .reduce(|a, b| Func::compose(Func::And,
+                            Func::construction(vec![a, b])))
+                        .unwrap_or_else(|| Func::constant(Object::t()));
+                    // Consequent bindings keyed to DECLARED head roles. A role
+                    // pinned by an identity rename takes a0's source value
+                    // (compile_arith_expr re-keys head←source); otherwise the
+                    // role's own name on a0.
+                    let pairs: Vec<Func> = cons_roles_decl.iter().map(|r| {
+                        let key = r.noun_name.clone();
+                        let value_func = rule.consequent_computed_bindings.iter()
+                            .find(|cb| cb.role == r.noun_name)
+                            .and_then(|cb| ant0_ft.as_ref().map(|ft| compile_arith_expr(&cb.expr, ft)))
+                            .unwrap_or_else(|| role_value_by_name(&r.noun_name));
+                        Func::construction(vec![
+                            Func::constant(Object::atom(&key)),
+                            Func::compose(value_func, Func::Selector(1)),   // over a0
+                        ])
+                    }).collect();
+                    let bindings_func = Func::construction(pairs);
+                    let derive_one = Func::construction(vec![
+                        consequent_id_func.clone(),
+                        consequent_reading_func.clone(),
+                        bindings_func,
+                    ]);
+                    let per_a0 = Func::condition(
+                        all_others_hold,
+                        Func::construction(vec![derive_one]),
+                        Func::constant(Object::phi()),
+                    );
+                    let other_facts_tuple = Func::construction(other_extracts);
+                    let (consequent_cell, _, _) = derivation_dep_metadata(rule);
+                    let func_rk = Func::compose(
+                        Func::Concat,
+                        Func::compose(
+                            Func::apply_to_all(per_a0),
+                            Func::compose(Func::DistR,
+                                Func::construction(vec![
+                                    extract(0, &antecedent_ids[0]),
+                                    other_facts_tuple,
+                                ])),
+                        ),
+                    );
+                    // Type the renamed head role(s) to the head noun's
+                    // population — same guard the single-antecedent identity
+                    // rename uses (bridge-identity-binding-untyped), so a
+                    // shared carrier cell can't leak a non-head entity into
+                    // the head cell.
+                    let func_rk = guard_identity_bindings_by_noun_population(data, rule, func_rk);
+                    return CompiledDerivation {
+                        id, text, kind,
+                        func: func_rk,
+                        consequent_cell,
+                        materialization: rule.materialization.clone(),
+                    };
+                }
             }
 
             // (b) Existence-check fallback. Fires when every antecedent
@@ -14615,37 +14847,41 @@ mod schema_tests {
     ///
     ///   FORM A  `… the Task is currently in Status 'in_progress' and Task has
     ///            Task Priority`  (direct role-fill, Task fills Resource)
-    ///       -> FIRES, correctly Task-keyed, but the literal 'in_progress'
-    ///          filter is DROPPED (both t1 and t2 returned). The trailing
-    ///          literal attaches to the projection FT's last role (Status), but
-    ///          when Task fills the Resource role positionally the filtered
-    ///          antecedent index and the joined one diverge, so the filter is
-    ///          inert. UNSAFE: silently over-recommends.
+    ///       -> STILL BROKEN, but for a reason DISTINCT from issue 2. Writing
+    ///          `the Task is currently in Status 'X'` fills the FT's `Resource`
+    ///          role with the noun `Task`. `resolve_fact_type` matches FTs by
+    ///          role-noun NAME (`Resource` != `Task`, and `Task` is no subtype
+    ///          of `Resource`), so the ENTIRE status clause fails to resolve:
+    ///          only `Task_has_Task_Priority` survives as an antecedent and the
+    ///          literal `'in_progress'` never reaches the IR. Both t1 and t2 are
+    ///          returned. This is a CLAUSE-RESOLUTION gap (noun-fills-differently-
+    ///          named-role), NOT the projection/keying bug -- a separate follow-up.
     ///
     ///   FORM B  `… Resource is currently in Status 'in_progress' and Task has
     ///            Task Priority and Task is Resource`  (explicit head rename)
-    ///       -> FIRES and the filter DISCRIMINATES (only t1), but the consequent
-    ///          is MIS-KEYED: the row carries the antecedent roles
-    ///          {Resource, Status} instead of the declared head {Task}. The
-    ///          multi-antecedent join path copies antecedent bindings wholesale
-    ///          and never re-keys via the `Task is Resource` head computed
-    ///          binding (arc-agi-3 issue 2). UNSAFE: the marker cell is
-    ///          un-joinable by Task.
+    ///       -> FIXED (arc-agi-3 issue 2). The rule is a 2-antecedent ModusPonens
+    ///          carrying an IDENTITY computed binding `Task <- RoleRef(Resource)`.
+    ///          Pre-fix it fell into the existence-check fallback (path b), which
+    ///          fired ONCE GLOBALLY and copied antecedent[0]'s raw bindings
+    ///          (`first_fact` -> `{Resource, Status}`) -- mis-keyed AND not
+    ///          per-tuple. The new identity-rename bridge-join branch (path a'')
+    ///          treats the rename as the equi-join key (a0.Resource == ant1.Task),
+    ///          fans per-a0, and projects the consequent KEYED TO THE DECLARED
+    ///          HEAD via `compile_arith_expr` (Task <- Resource). The `extract`
+    ///          wrappers keep ant0's literal filter, so FORM B now yields exactly
+    ///          {t1}, keyed on Task -- BOTH well-keyed AND filtering.
     ///
-    /// CONCLUSION: neither inline single-rule form is BOTH well-keyed AND
-    /// filtering. The blessed decomposition (check.rs issue-2 suggestion) is
-    /// the prescribed Phase-2 shape: a 1-ANTECEDENT Task-keyed status helper
+    /// CONCLUSION: FORM B (the issue-2 footgun) is now correct inline. FORM C's
+    /// blessed decomposition remains a valid (and still-asserted) shape, and is
+    /// still required for FORM A's direct-role-fill phrasing until the clause-
+    /// resolution gap is closed. FORM C: a 1-ANTECEDENT Task-keyed status helper
     /// `Task is in Status iff that Resource is currently in some Status and
-    /// Task is Resource` (no second antecedent -> the ModusPonens branch DOES
-    /// evaluate the head rename, so it is correctly Task-keyed), then each
-    /// consumer joins over that helper with a literal status filter. FORM C
-    /// below proves that shape fires, keys, AND filters.
+    /// Task is Resource`, then a join consumer with a literal status filter.
     ///
     /// Each form runs in its OWN isolated fixture (no shared helper FT that
-    /// could shift another form's clause resolution). FORM C -- the prescribed
-    /// shape -- is asserted rigorously; FORMS A and B are recorded as
-    /// informational evidence (their exact failure mode is not the contract,
-    /// only that NEITHER yields a correctly-keyed AND filtering marker).
+    /// could shift another form's clause resolution). FORMS B and C are asserted
+    /// rigorously (both must yield exactly {t1}, Task-keyed); FORM A is pinned as
+    /// STILL-broken with its distinct (resolution-gap) root cause documented.
     #[test]
     fn status_bridge_consumer_form_diagnostic_records_engine_behavior() {
         // Population shared by all forms: t1 in_progress/p0, t2 pending/p0. A
@@ -14719,22 +14955,104 @@ mod schema_tests {
              recommend exactly t1, Task-keyed, literal filter honored; got \
              tasks={:?} total={}", c_tasks, c_total);
 
-        // FORMS A and B are the rejected inline forms: NEITHER may produce the
-        // correct result {t1}. (Their precise failure -- filter dropped, or
-        // mis-keyed, or empty -- varies with surrounding declarations; the
-        // contract is only that they are NOT correct, which is why FORM C's
-        // explicit helper is required.) Recorded so a future engine change that
-        // makes an inline form correct trips this and prompts a simpler rewrite.
+        // arc-agi-3 issue-2 FIX: FORM B (explicit head rename) is NOW correct.
+        // The identity-rename bridge-join branch in compile_explicit_derivation
+        // (path a'') re-keys the consequent to the DECLARED head role (`Task`,
+        // via the `Task is Resource` computed binding) AND preserves the ant0
+        // literal filter (`'in_progress'`), so it yields exactly {t1} keyed on
+        // Task -- matching FORM C. (Was: mis-keyed {Resource,Status}, fired once
+        // globally.)
+        assert_eq!(b_tasks, vec!["t1".to_string()],
+            "FORM B (head rename) MUST now recommend exactly t1, Task-keyed, \
+             literal honored (arc-agi-3 issue-2 fix: computed-binding bridge \
+             join re-keys to the declared head + keeps the antecedent literal). \
+             got tasks={:?} total={}", b_tasks, b_total);
+
+        // FORM A stays BROKEN -- and its root cause is DISTINCT from the issue-2
+        // footgun. FORM A writes `the Task is currently in Status 'in_progress'`,
+        // filling the FT's `Resource` role with the noun `Task`. `resolve_fact_type`
+        // matches FTs by ROLE-NOUN NAME, and `Task` is not `Resource` (nor a
+        // subtype of it), so the whole status clause FAILS TO RESOLVE: only
+        // `Task_has_Task_Priority` survives as an antecedent, and the literal
+        // `'in_progress'` never reaches the IR. That is a CLAUSE-RESOLUTION gap
+        // (noun-fills-differently-named-role), NOT the multi-antecedent
+        // computed-head-binding projection bug this fix targets -- so FORM A is
+        // out of scope here and the blessed FORM-C decomposition remains required
+        // for the direct-role-fill phrasing.
         let a_correct = a_tasks == vec!["t1".to_string()];
-        let b_correct = b_tasks == vec!["t1".to_string()];
         assert!(!a_correct,
-            "FORM A (direct role-fill) is NOT expected to be correct; if it now \
-             yields exactly [t1] the inline form is viable -- revisit the Phase-2 \
-             rewrite. got tasks={:?} total={}", a_tasks, a_total);
-        assert!(!b_correct,
-            "FORM B (head rename) is NOT expected to be correct; if it now yields \
-             exactly [t1] the inline form is viable -- revisit the Phase-2 \
-             rewrite. got tasks={:?} total={}", b_tasks, b_total);
+            "FORM A (direct role-fill) is NOT expected to be correct (distinct \
+             root cause: the `the Task ... Status 'X'` clause fails FT resolution \
+             because `Task` cannot fill the `Resource` role by name, so the \
+             literal is lost at resolution). If it now yields exactly [t1] the \
+             resolution gap was closed -- revisit. got tasks={:?} total={}",
+            a_tasks, a_total);
+    }
+
+    /// arc-agi-3 issue-2 FOCUSED gate: a multi-antecedent rule with a computed
+    /// head-rename keys the consequent to the DECLARED head role AND preserves
+    /// an antecedent literal filter. Distinct from the FORM-A/B/C diagnostic
+    /// above (which threads the SM->Resource projection): here the bridged
+    /// antecedent is a PLAIN binary FT so the shape is minimal and the keying
+    /// contract is asserted on the emitted binding KEY itself (not just the
+    /// Task-id projection), proving the row carries {Account} -- the declared
+    /// head -- and NOT the antecedent's {Holder} role.
+    #[test]
+    fn computed_head_rename_keys_declared_head_and_keeps_literal() {
+        // Holder h1 is gold + has Account a1; h2 is silver + has Account a2.
+        // `Account is preferred iff Holder has Tier 'gold' and Account is held
+        // by Holder and Account is Holder` -- the rename `Account is Holder`
+        // bridges the Tier antecedent (keyed by Holder) to the head Account.
+        // Only the gold holder's account (a1) may be preferred, keyed on
+        // Account.
+        let src = "\
+            Holder(.id) is an entity type.\n\
+            Account(.id) is an entity type.\n\
+            Tier is a value type.\n\
+            Name is a value type.\n\
+            Holder has Tier.\n\
+              Each Holder has at most one Tier.\n\
+            Account is held by Holder.\n\
+            Account has Name.\n\
+            Account is preferred.\n\
+            Holder 'h1' has Tier 'gold'.\n\
+            Holder 'h2' has Tier 'silver'.\n\
+            Account 'a1' is held by Holder 'h1'.\n\
+            Account 'a2' is held by Holder 'h2'.\n\
+            Account 'a1' has Name 'n1'.\n\
+            Account 'a2' has Name 'n2'.\n\
+            Account is preferred iff Holder has Tier 'gold' and Account is held by Holder and Account is Holder.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("focused-gate fixture must parse");
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+        let refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d).into_iter()
+            .filter(|(n, _)| n.starts_with("derivation:rule_"))
+            .map(|(n, c)| (n.to_string(), ast::metacompose(c, &d)))
+            .collect();
+        let refs: Vec<(&str, &ast::Func)> = refs_owned.iter()
+            .map(|(n, f)| (n.as_str(), f)).collect();
+        let (new_d, _) = crate::evaluate::forward_chain_defs_state(&refs, &d);
+        let cell = ast::fetch_cell_seq("Account_is_preferred", &new_d);
+        let facts: Vec<&ast::Object> = cell.as_seq()
+            .map(|s| s.iter().collect()).unwrap_or_default();
+        // Exactly one preferred account (the gold holder's): literal honored.
+        assert_eq!(facts.len(), 1,
+            "exactly the gold holder's account may be preferred (literal 'gold' \
+             must exclude the silver holder); got {} facts: {:?}", facts.len(), cell);
+        // KEYED to the declared head `Account` = a1 -- NOT the antecedent's
+        // `Holder` role. A {Holder} key (the pre-fix mis-key) would leave
+        // `Account` absent.
+        let acct = ast::binding(facts[0], "Account");
+        let holder = ast::binding(facts[0], "Holder");
+        assert_eq!(acct, Some("a1"),
+            "the consequent must be KEYED to the declared head role Account=a1 \
+             (re-keyed via the `Account is Holder` computed binding); got \
+             Account={:?}. fact={:?}", acct, facts[0]);
+        assert_eq!(holder, None,
+            "the consequent must NOT carry the antecedent `Holder` role (pre-fix \
+             mis-key); got Holder={:?}. fact={:?}", holder, facts[0]);
     }
 
     /// status-bridge-drop (Phase 2, AGGREGATE-superlative consumer): the
