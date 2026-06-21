@@ -2693,7 +2693,24 @@ fn enrich_constraints_with_spans(
         roles_by_noun.entry(noun.to_string())
             .or_insert((ft.to_string(), pos_str.to_string()));
         let pos: usize = pos_str.parse().unwrap_or(0);
-        roles_by_ft.entry(ft.to_string()).or_default().push((pos, noun.to_string()));
+        // Dedup by (ft, position): a fact type has exactly ONE role per
+        // position, so the same (ft, position) seen twice is the
+        // dirs-compile app_noun_seed echoing the in-text role — the loader
+        // seeds each per-file parse with the full-corpus Noun + FactType +
+        // Role catalogs (cli/entry.rs), and enrich's caller concatenates
+        // `role_facts ++ extra_role_facts` (the context) with no dedup. Left
+        // un-deduped, a self-ring FT's roles double to [0,1,0,1] (len 4),
+        // and resolve_constraint_span_ft's `roles.len() == found_nouns.len()`
+        // filter then REJECTS the correct FT — dropping the constraint to the
+        // entity first-match fallback, which mis-binds a self-ring like
+        // `Element transforms to Element is symmetric` onto the entity's
+        // FIRST FT (HANDOFF-ring-constraint; the single-file path has no seed
+        // so it never saw the duplication). In-text facts come first, so
+        // first-wins keeps the local declaration.
+        let ft_roles = roles_by_ft.entry(ft.to_string()).or_default();
+        if !ft_roles.iter().any(|(p, _)| *p == pos) {
+            ft_roles.push((pos, noun.to_string()));
+        }
         declared_noun_set.insert(noun.to_string());
     }
     for roles in roles_by_ft.values_mut() {
@@ -2901,7 +2918,26 @@ fn enrich_constraints_with_spans(
             }
         }
 
-        let resolved = resolve_constraint_span_ft(text, &roles_by_ft, &readings_by_ft, &declared_nouns);
+        // ring-marker-strip: a ring trailing-marker constraint carries its
+        // marker IN `text` ("Element transforms to Element is symmetric"), so
+        // resolve_constraint_span_ft can't match the bare FT reading "Element
+        // transforms to Element" — it falls through to the ring entity-first-
+        // match fallback below, which arbitrarily picks the FIRST FT the entity
+        // plays a role in. That mis-bound "Element transforms to Element is
+        // symmetric" onto "Element has primary Aristotelian Quality" (a separate
+        // Element FT), firing spurious alethic symmetry violations that blocked
+        // ALL writes. Strip the marker so the predicate resolves to its own FT;
+        // the entity fallback then only fires when resolution genuinely can't.
+        let resolve_text = if ["IR", "AS", "AT", "SY", "IT", "TR", "AC", "RF"].contains(&kind) {
+            let bare = text.trim_end_matches('.').trim_end();
+            ["is antisymmetric", "is intransitive", "is irreflexive", "is asymmetric",
+             "is transitive", "is symmetric", "is reflexive", "is acyclic"].iter()
+                .find_map(|m| bare.strip_suffix(m).map(|s| s.trim_end()))
+                .unwrap_or(text)
+        } else {
+            text
+        };
+        let resolved = resolve_constraint_span_ft(resolve_text, &roles_by_ft, &readings_by_ft, &declared_nouns);
         // Preference 2: fall back to entity-based first-match — DENIED
         // for the rmap-structural kinds (rmap-3nf-tables Stage 3).
         // Every live span mis-attachment traced to this fallback
@@ -9047,6 +9083,177 @@ mod tests {
         // subset-side span before the superset side). This is the
         // degenerate binary case of the role-SEQUENCE encoding.
         assert_eq!(binding(&enriched[0], "setComparisonArgumentLength"), Some("1"));
+    }
+
+    #[test]
+    fn enrich_ring_constraint_binds_to_its_own_ft_not_another_ft_of_the_entity() {
+        // Live bug: "Element transforms to Element is symmetric" mis-bound to
+        // "Element has primary Aristotelian Quality" — the marker-laden text
+        // failed to resolve to the FT reading, and the ring entity-first-match
+        // fallback grabbed the FIRST Element FT. Spurious alethic symmetry
+        // violations on element->quality pairs then blocked ALL writes to the
+        // app. The fix strips the trailing ring marker so the bare predicate
+        // "Element transforms to Element" resolves to its own FT.
+        let text = "Element transforms to Element is symmetric.";
+        let sy = fact_from_pairs(&[
+            ("id", text),
+            ("kind", "SY"),
+            ("modality", "alethic"),
+            ("text", text),
+            ("entity", "Element"),
+        ]);
+        // `Element has Quality` listed FIRST so the entity-first-match fallback
+        // (roles_by_noun keeps the first insert) would mis-pick it pre-fix.
+        let role_facts = alloc::vec![
+            fact_from_pairs(&[("nounName", "Element"), ("factType", "Element_has_Quality"), ("position", "0")]),
+            fact_from_pairs(&[("nounName", "Quality"), ("factType", "Element_has_Quality"), ("position", "1")]),
+            fact_from_pairs(&[("nounName", "Element"), ("factType", "Element_transforms_to_Element"), ("position", "0")]),
+            fact_from_pairs(&[("nounName", "Element"), ("factType", "Element_transforms_to_Element"), ("position", "1")]),
+        ];
+        let ft_facts = alloc::vec![
+            fact_from_pairs(&[("id", "Element_has_Quality"), ("reading", "Element has Quality"), ("arity", "2")]),
+            fact_from_pairs(&[("id", "Element_transforms_to_Element"), ("reading", "Element transforms to Element"), ("arity", "2")]),
+        ];
+        let enriched = super::enrich_constraints_with_spans(&[sy], &role_facts, &ft_facts);
+        assert_eq!(enriched.len(), 1);
+        let span0 = binding(&enriched[0], "span0_factTypeId");
+        assert_eq!(span0, Some("Element_transforms_to_Element"),
+            "ring constraint must bind to its OWN fact type, not another FT of the entity; got {:?}", span0);
+    }
+
+    #[test]
+    fn full_parse_binds_self_ring_constraint_to_its_own_ft() {
+        // Real-pipeline check — NOT enrich-in-isolation (which already passes).
+        // "Element transforms to Element is symmetric" must bind to the transform
+        // FT, not the quality FT the entity also plays a role in. The live claude
+        // app still mis-binds this on the A1 binary (verified by the cells dump),
+        // so this isolates the question: does a FRESH parse bind correctly
+        // (=> the live mis-bind is a preserved pre-fix cell, cache) or still
+        // mis-bind (=> A1 is insufficient through the real path)?
+        let src = "## Entity Types\n\
+Element(.Element Name) is an entity type.\n\
+\n\
+## Value Types\n\
+Element Name is a value type.\n\
+Quality is a value type.\n\
+\n\
+## Fact Types\n\
+Element has primary- Quality.\n\
+Element transforms to Element.\n\
+\n\
+## Constraints\n\
+Element transforms to Element is symmetric.\n";
+        let state = super::parse_to_state_via_stage12(src).expect("parse");
+        let cc = crate::ast::fetch_or_phi("Constraint", &state);
+        let sy = crate::ast::cell_facts_iter(&cc)
+            .map(|c| c.clone())
+            .find(|c| binding(c, "kind") == Some("SY"))
+            .expect("symmetric constraint present in parsed state");
+        let span = binding(&sy, "span0_factTypeId");
+        assert_eq!(span, Some("Element_transforms_to_Element"),
+            "self-ring must bind to its OWN FT, not the entity's other FT; got {:?}", span);
+    }
+
+    #[test]
+    fn app_fold_binds_self_ring_constraint_despite_seed_role_duplication() {
+        // HANDOFF-ring-constraint — the app-compile divergence, reproduced
+        // through the REAL fold/context path (NOT enrich-in-isolation).
+        //
+        // The dirs-compile loader seeds each per-file parse with the
+        // full-corpus Noun + FactType + ROLE catalogs (cli/entry.rs
+        // app_noun_seed, ~3093-3111). So when elements.md is folded, its
+        // OWN ring FT `Element transforms to Element` arrives TWICE — once
+        // from the in-text parse, once from the seed context — and
+        // `enrich_constraints_with_spans` concatenates `role_facts ++
+        // extra_role_facts` with no dedup. `roles_by_ft` for the ring FT
+        // then holds [0,1,0,1] (len 4); `resolve_constraint_span_ft`'s
+        // `roles.len() == found_nouns.len()` (4 == 2) REJECTS it, the ring
+        // entity-first-match fallback fires, and the symmetric constraint
+        // mis-binds to the entity's FIRST FT
+        // (`Element_has_primary-_Aristotelian_Quality`) — firing spurious
+        // alethic symmetry violations that blocked ALL writes to the app.
+        //
+        // The single-file parse has no seed → no duplication → binds
+        // correctly, which is exactly why the live bug diverged from the
+        // green single-file `full_parse_binds_self_ring_constraint_to_its_own_ft`.
+        let src = "## Entity Types\n\
+Element(.Element Name) is an entity type.\n\
+Aristotelian Quality(.Quality Name) is an entity type.\n\
+\n\
+## Value Types\n\
+Element Name is a value type.\n\
+Quality Name is a value type.\n\
+\n\
+## Fact Types\n\
+Element has primary- Aristotelian Quality.\n\
+Element transforms to Element.\n\
+\n\
+## Constraints\n\
+Element transforms to Element is symmetric.\n";
+
+        // pull the SY constraint's span0 out of a parsed state.
+        fn sy_span0(state: &Object) -> Option<String> {
+            let cc = crate::ast::fetch_or_phi("Constraint", state);
+            let sy = crate::ast::cell_facts_iter(&cc)
+                .map(|c| c.clone())
+                .find(|c| binding(c, "kind") == Some("SY"))?;
+            binding(&sy, "span0_factTypeId").map(String::from)
+        }
+
+        // Single-file control: known-good (this is the green path).
+        let single = super::parse_to_state_via_stage12(src).expect("single parse");
+        assert_eq!(sy_span0(&single).as_deref(), Some("Element_transforms_to_Element"),
+            "control: single-file parse must bind the ring constraint to its own FT");
+
+        // app/merge path: build app_noun_seed (Noun+FactType+Role) exactly
+        // as cli/entry.rs does, then fold the file against it.
+        let seed = {
+            let mut m: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+            m.insert("Noun".to_string(), crate::ast::fetch_cell_seq("Noun", &single));
+            m.insert("FactType".to_string(), crate::ast::fetch_cell_seq("FactType", &single));
+            m.insert("Role".to_string(), crate::ast::fetch_cell_seq("Role", &single));
+            Object::map(m)
+        };
+        let folded = crate::parse_forml2::parse_to_state_from_in_domain(src, &seed, "elements")
+            .expect("fold parse");
+        assert_eq!(sy_span0(&folded).as_deref(), Some("Element_transforms_to_Element"),
+            "app-fold path must bind the ring constraint to its OWN FT even when the \
+             app_noun_seed duplicates its role facts; mis-binding to the entity's first \
+             FT is the HANDOFF-ring-constraint live bug");
+    }
+
+    #[test]
+    fn enrich_ring_constraint_binds_despite_duplicated_context_roles() {
+        // Tighter mechanism pin for the app-fold divergence above: feed
+        // `enrich_constraints_with_spans` the SAME duplicated role facts the
+        // fold produces (the ring FT's roles appear twice — in-text + seed),
+        // with the quality FT declared first. Pre-fix, the duplicated roles
+        // inflate `roles_by_ft` length so the correct FT fails the length
+        // filter and the entity fallback grabs the quality FT.
+        let text = "Element transforms to Element is symmetric.";
+        let sy = fact_from_pairs(&[
+            ("id", text), ("kind", "SY"), ("modality", "alethic"),
+            ("text", text), ("entity", "Element"),
+        ]);
+        let role_facts = alloc::vec![
+            // quality FT first — the entity-first-match fallback target.
+            fact_from_pairs(&[("nounName", "Element"), ("factType", "Element_has_primary-_Aristotelian_Quality"), ("position", "0")]),
+            fact_from_pairs(&[("nounName", "Aristotelian Quality"), ("factType", "Element_has_primary-_Aristotelian_Quality"), ("position", "1")]),
+            // ring FT in-text roles ...
+            fact_from_pairs(&[("nounName", "Element"), ("factType", "Element_transforms_to_Element"), ("position", "0")]),
+            fact_from_pairs(&[("nounName", "Element"), ("factType", "Element_transforms_to_Element"), ("position", "1")]),
+            // ... and the SAME ring FT roles again, from the seed context.
+            fact_from_pairs(&[("nounName", "Element"), ("factType", "Element_transforms_to_Element"), ("position", "0")]),
+            fact_from_pairs(&[("nounName", "Element"), ("factType", "Element_transforms_to_Element"), ("position", "1")]),
+        ];
+        let ft_facts = alloc::vec![
+            fact_from_pairs(&[("id", "Element_has_primary-_Aristotelian_Quality"), ("reading", "Element has primary Aristotelian Quality"), ("arity", "2")]),
+            fact_from_pairs(&[("id", "Element_transforms_to_Element"), ("reading", "Element transforms to Element"), ("arity", "2")]),
+        ];
+        let enriched = super::enrich_constraints_with_spans(&[sy], &role_facts, &ft_facts);
+        assert_eq!(binding(&enriched[0], "span0_factTypeId"), Some("Element_transforms_to_Element"),
+            "ring constraint must bind to its OWN FT even when context seeding duplicates \
+             its role facts; got {:?}", binding(&enriched[0], "span0_factTypeId"));
     }
 
     #[test]
