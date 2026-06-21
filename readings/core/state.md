@@ -170,33 +170,20 @@ Guard guards Transition.
 
 * Status1 has effective Transition1 to Status2 on Event Type iff Transition1 is from Status1 and Transition1 is to Status2 and Transition1 is triggered by Event Type.
 
-<!-- sm-retire-forml2 RULE 2 (Harel inherited edge) — NOT AUTHORABLE TODAY,
-     left disabled. VERIFIED empirically (properties.rs
-     smretire_foundation_harel_inherited_edge): the inherited edges
-     (child Status -> super-state target, e.g. Draft/Review/Approved ->
-     Archived on `archive`) are NOT produced by any authorable shape.
-
-     Root cause (parse_forml2.rs compute_ring_join_plan, ~3569-3576): the
-     subscript ring-join planner keeps only clause tokens whose BASE NOUN is
-     a declared ROLE of that antecedent's fact type. The inherited edge needs
-     `Transition1 is from State Machine Definition1` — binding a
-     State Machine Definition (a Status SUBTYPE) into the `Status`-typed
-     `from` role. `State Machine Definition` is not the role noun (`Status`)
-     of `Transition is from Status`, so the token is filtered out, the
-     clause's token count no longer matches the FT arity, the planner bails to
-     the noun-name fallback, and the rule derives nothing (confirmed: the
-     subscript form below produced 0 inherited rows; the legacy prose form
-     collapses both Status roles and pollutes).
-
-     This is a genuine ENGINE join-capability gap (subtype filler in a
-     supertype-typed role across a subscript ring-join). Authoring it would
-     require an engine change (out of scope: commit nothing / never restore
-     deleted SM logic). Until that lands, the Harel expansion in Rust
-     (compile.rs compile_state_machine:11957-12003) MUST be RETAINED — the
-     deletion of that block is BLOCKED on this rule.
-
+<!-- sm-retire-forml2 RULE 2 (Harel inherited edge), now ENABLED. State Machine
+     Definition is a subtype of Status, so a Transition whose single `from`
+     Status IS the machine super-state induces an effective transition out of
+     every child Status defined in that machine. This was previously blocked:
+     compute_ring_join_plan (parse_forml2.rs) dropped the `State Machine
+     Definition1` token (a Status subtype) from the `Transition is from Status`
+     arity count, so the ring plan bailed and the rule derived 0 inherited rows.
+     The planner now accepts a subtype filler in a supertype-typed role (the
+     supertype_chain walk), mirroring the existing subtype bridge in
+     resolve_derivation_rule, so the rule fires. Noun-scoping is intrinsic (the
+     join threads through the SMD), preserving #813 — shared status names never
+     cross-attach. The union over-emits a child's overridden edge (direct +
+     inherited); consumer-side firing precedence picks the direct row. -->
 * Status1 has effective Transition1 to Status2 on Event Type iff Transition1 is from State Machine Definition1 and Transition1 is to Status2 and Transition1 is triggered by Event Type and Status1 is defined in State Machine Definition1.
--->
 
 
 

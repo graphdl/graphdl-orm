@@ -3244,6 +3244,7 @@ fn resolve_derivation_rule(
             &rule.consequent_role_literals,
             &rule.antecedent_role_literals,
             &rule.antecedent_role_comparisons,
+            subtypes,
         ) {
             rule.kind = DerivationKind::Join;
             rule.ring_join = Some(plan);
@@ -3529,6 +3530,10 @@ fn compute_ring_join_plan(
     consequent_role_literals: &[crate::types::ConsequentRoleLiteral],
     antecedent_role_literals: &[crate::types::AntecedentRoleLiteral],
     antecedent_role_comparisons: &[crate::types::AntecedentRoleComparison],
+    // subtype → supertype chain (one parent per noun), so the role-arity gate
+    // can accept a subtype filler (state.md:8 — State Machine Definition is a
+    // subtype of Status). Threaded from resolve_derivation_rule.
+    subtypes: &HashMap<String, String>,
 ) -> Option<crate::types::RingJoinPlan> {
     let n = antecedent_sources.len();
     if n < 2 || antecedent_clauses.len() < n { return None; }
@@ -3543,6 +3548,23 @@ fn compute_ring_join_plan(
     let is_subscripted = |t: &str| -> bool {
         let (base, _) = parse_role_token(t);
         base.len() != t.len()
+    };
+    // Walk the subtype→supertype chain (nearest parent first), bounded against
+    // cyclic declarations. Mirrors the bridge in resolve_derivation_rule: a
+    // subtype filler resolves to a role typed on any of its supertypes, so the
+    // role-arity gate below must accept it.
+    let supertype_chain = |noun: &str| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut cur = noun.to_string();
+        let mut guard = 0usize;
+        while let Some(sup) = subtypes.get(&cur) {
+            if out.iter().any(|s| s == sup) { break; }
+            out.push(sup.clone());
+            cur = sup.clone();
+            guard += 1;
+            if guard > subtypes.len() + 1 { break; }
+        }
+        out
     };
 
     // token -> (antecedent_index, role_index) occurrences.
@@ -3567,7 +3589,16 @@ fn compute_ring_join_plan(
         let toks: Vec<String> = tokens_in_order(&antecedent_clauses[i]).into_iter()
             .filter(|tok| {
                 let (base, _) = parse_role_token(tok);
+                // Exact role-noun match, OR a subtype filler: a token whose base
+                // noun is a subtype of a declared role noun fills that role, since
+                // subtype instances ARE supertype instances (state.md:8 — State
+                // Machine Definition is a subtype of Status). Without this the Harel
+                // inherited-edge rule `Transition is from <SMD> …` drops its SMD
+                // token, the count breaks, and the ring plan bails to the noun-name
+                // fallback (which self-collapses same-noun roles).
                 role_nouns.iter().any(|rn| rn.eq_ignore_ascii_case(base))
+                    || supertype_chain(base).iter()
+                        .any(|sup| role_nouns.iter().any(|rn| rn.eq_ignore_ascii_case(sup.as_str())))
             })
             .collect();
         if toks.len() != role_count { return None; }

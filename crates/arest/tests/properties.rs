@@ -596,14 +596,14 @@ fn smretire_foundation_harel_inherited_edge() {
     assert!(has("Draft", "Review", "submit"), "missing direct Draft->Review; rows={:#?}", rows);
     assert!(has("Review", "Approved", "approve"), "missing direct Review->Approved");
     assert!(has("Doc", "Archived", "archive"), "missing super-state Doc->Archived direct edge");
-    // INHERITED (Harel) edges — rule 2 is NOT authorable today (see state.md
-    // RULE 2 note). Documenting the CURRENT reality: the inherited child edges
-    // are ABSENT. If a future engine change makes rule 2 authorable, flip these
-    // to asserts and re-enable rule 2.
-    assert!(!has("Draft", "Archived", "archive"),
-        "UNEXPECTED: inherited Draft->Archived appeared — rule 2 now fires; re-enable it. rows={:#?}", rows);
-    assert!(!has("Review", "Archived", "archive"), "UNEXPECTED inherited Review->Archived");
-    assert!(!has("Approved", "Archived", "archive"), "UNEXPECTED inherited Approved->Archived");
+    // INHERITED (Harel) edges — rule 2 now fires via the subtype-filler ring-join
+    // fix in compute_ring_join_plan: a State Machine Definition (a Status subtype)
+    // fills the `from` Status role, so each child Status of the Doc super-state
+    // inherits the Doc->Archived exit on `archive`.
+    assert!(has("Draft", "Archived", "archive"),
+        "missing inherited Draft->Archived (rule 2 subtype-filler ring-join); rows={:#?}", rows);
+    assert!(has("Review", "Archived", "archive"), "missing inherited Review->Archived; rows={:#?}", rows);
+    assert!(has("Approved", "Archived", "archive"), "missing inherited Approved->Archived; rows={:#?}", rows);
 }
 
 // sm-retire-forml2 FOUNDATION CHECK (temporary): prove the AUTHORED seed
