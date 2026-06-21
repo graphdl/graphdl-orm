@@ -14580,6 +14580,264 @@ mod schema_tests {
              got empty. Resource_is_currently_in_Status had {} facts; cell={:?}", s1n, cell);
     }
 
+    /// status-bridge-drop (Phase 2 PROOF): when the materialized
+    /// `Task_has_Task_Status` bridge is DROPPED, the ~10 consumer rules that
+    /// read `Task has Task Status 'X'` must be rewritten to read the generic
+    /// SM projection `Resource is currently in Status` (Resource = the Task)
+    /// instead. This pins the CORRECT FORML2 form for a Task-scoped consumer
+    /// that (a) filters the SM status by a LITERAL ('in_progress'), (b) joins
+    /// to other Task-keyed antecedents, and (c) heads a Task-keyed consequent
+    /// marker -- the exact shape `Task is recommended iff <status read> and
+    /// Task has Task Priority and Task Priority is recommended` needs.
+    ///
+    /// The trap (check.rs::check_computed_bindings_in_multi_antecedent_rules,
+    /// arc-agi-3 issue 2): a rename that targets the CONSEQUENT HEAD role
+    /// (`Task is Resource`) in a MULTI-antecedent rule is a computed binding
+    /// the join paths never evaluate -- the rule compiles clean but derives
+    /// EMPTY. So the consumer must NOT carry `Task is Resource` as a head
+    /// rename; instead the Task fills the Resource role of the projection
+    /// DIRECTLY (`the Task is currently in Status 'X'`), with the Task's head
+    /// binding coming from a real FT antecedent. This test proves that form
+    /// fires (non-empty marker) AND that the consequent is correctly keyed.
+    ///
+    /// Mirror of the live consumer (no `Task_has_Task_Status` FT anywhere in
+    /// the fixture -- only the generic projection): a `Resource is currently
+    /// in Status` cell seeded for the Task, a `Task has Task Priority` real
+    /// antecedent, and the marker. Asserts `Task_is_recommended` materializes
+    /// for the in_progress Task and is keyed to that Task.
+    ///
+    /// DIAGNOSTIC: this evaluates EACH candidate consumer form against the same
+    /// two-task population (t1 in_progress/p0, t2 pending/p0) and records, per
+    /// form: (a) does the marker materialize, (b) is it correctly Task-KEYED,
+    /// (c) does the literal status filter DISCRIMINATE (t1 in, t2 out). The
+    /// engine -- not a guess -- decides the prescribed form. Findings (recorded
+    /// here so the Phase-2 app.md rewrite cites them):
+    ///
+    ///   FORM A  `… the Task is currently in Status 'in_progress' and Task has
+    ///            Task Priority`  (direct role-fill, Task fills Resource)
+    ///       -> FIRES, correctly Task-keyed, but the literal 'in_progress'
+    ///          filter is DROPPED (both t1 and t2 returned). The trailing
+    ///          literal attaches to the projection FT's last role (Status), but
+    ///          when Task fills the Resource role positionally the filtered
+    ///          antecedent index and the joined one diverge, so the filter is
+    ///          inert. UNSAFE: silently over-recommends.
+    ///
+    ///   FORM B  `… Resource is currently in Status 'in_progress' and Task has
+    ///            Task Priority and Task is Resource`  (explicit head rename)
+    ///       -> FIRES and the filter DISCRIMINATES (only t1), but the consequent
+    ///          is MIS-KEYED: the row carries the antecedent roles
+    ///          {Resource, Status} instead of the declared head {Task}. The
+    ///          multi-antecedent join path copies antecedent bindings wholesale
+    ///          and never re-keys via the `Task is Resource` head computed
+    ///          binding (arc-agi-3 issue 2). UNSAFE: the marker cell is
+    ///          un-joinable by Task.
+    ///
+    /// CONCLUSION: neither inline single-rule form is BOTH well-keyed AND
+    /// filtering. The blessed decomposition (check.rs issue-2 suggestion) is
+    /// the prescribed Phase-2 shape: a 1-ANTECEDENT Task-keyed status helper
+    /// `Task is in Status iff that Resource is currently in some Status and
+    /// Task is Resource` (no second antecedent -> the ModusPonens branch DOES
+    /// evaluate the head rename, so it is correctly Task-keyed), then each
+    /// consumer joins over that helper with a literal status filter. FORM C
+    /// below proves that shape fires, keys, AND filters.
+    ///
+    /// Each form runs in its OWN isolated fixture (no shared helper FT that
+    /// could shift another form's clause resolution). FORM C -- the prescribed
+    /// shape -- is asserted rigorously; FORMS A and B are recorded as
+    /// informational evidence (their exact failure mode is not the contract,
+    /// only that NEITHER yields a correctly-keyed AND filtering marker).
+    #[test]
+    fn status_bridge_consumer_form_diagnostic_records_engine_behavior() {
+        // Population shared by all forms: t1 in_progress/p0, t2 pending/p0. A
+        // form is CORRECT iff Task_is_recommended = exactly {t1}, keyed on Task
+        // (the literal 'in_progress' filter must exclude pending t2).
+        let pop = "\
+            Resource(.id) is an entity type.\n\
+            Task(.id) is an entity type.\n\
+            State Machine(.id) is an entity type.\n\
+            Status is a value type.\n\
+            Task Priority is a value type.\n\
+            Name is a value type.\n\
+            State Machine is for Resource.\n\
+            State Machine is currently in Status.\n\
+            Resource is currently in Status.\n\
+            Task has Task Priority.\n\
+              Each Task has at most one Task Priority.\n\
+            Task has Name.\n\
+            Task is recommended.\n\
+            State Machine 'sm1' is for Resource 't1'.\n\
+            State Machine 'sm1' is currently in Status 'in_progress'.\n\
+            State Machine 'sm2' is for Resource 't2'.\n\
+            State Machine 'sm2' is currently in Status 'pending'.\n\
+            Task 't1' has Name 'n1'.\n\
+            Task 't1' has Task Priority 'p0'.\n\
+            Task 't2' has Name 'n2'.\n\
+            Task 't2' has Task Priority 'p0'.\n\
+            Resource is currently in Status iff some State Machine is for that Resource and that State Machine is currently in that Status.\n";
+
+        // (Task ids in Task_is_recommended by the `Task` role, total row count).
+        let run = |extra_decls: &str, rules: &str| -> (Vec<String>, usize) {
+            let src = format!("{pop}{extra_decls}{rules}");
+            let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(&src)
+                .expect("consumer fixture must parse");
+            let defs = compile_to_defs_state(&state);
+            let d = ast::defs_to_state(&defs, &state);
+            let refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d).into_iter()
+                .filter(|(n, _)| n.starts_with("derivation:rule_"))
+                .map(|(n, c)| (n.to_string(), ast::metacompose(c, &d)))
+                .collect();
+            let refs: Vec<(&str, &ast::Func)> = refs_owned.iter()
+                .map(|(n, f)| (n.as_str(), f)).collect();
+            let (new_d, _) = crate::evaluate::forward_chain_defs_state(&refs, &d);
+            let cell = ast::fetch_cell_seq("Task_is_recommended", &new_d);
+            let total = cell.as_seq().map(|s| s.len()).unwrap_or(0);
+            let by_task: Vec<String> = cell.as_seq().map(|facts| facts.iter()
+                .filter_map(|f| ast::binding(f, "Task").map(String::from))
+                .collect()).unwrap_or_default();
+            (by_task, total)
+        };
+
+        // FORM A — direct role-fill (Task fills Resource), no helper FT.
+        let (a_tasks, a_total) = run("",
+            "Task is recommended iff the Task is currently in Status 'in_progress' and Task has Task Priority.\n");
+        // FORM B — explicit head rename, no helper FT.
+        let (b_tasks, b_total) = run("",
+            "Task is recommended iff Resource is currently in Status 'in_progress' and Task has Task Priority and Task is Resource.\n");
+        // FORM C — BLESSED decomposition: a 1-antecedent Task-keyed helper FT
+        // (`Task is in Status`) projected from the SM cell, then a join consumer
+        // with the literal filter on the helper.
+        let (c_tasks, c_total) = run(
+            "Task is in Status.\n",
+            "Task is in Status iff that Resource is currently in some Status and Task is Resource.\n\
+             Task is recommended iff Task is in Status 'in_progress' and Task has Task Priority.\n");
+
+        // FORM C is the PRESCRIBED shape -- it MUST be correct (exactly t1,
+        // Task-keyed, filter honored). This is the load-bearing assertion the
+        // Phase-2 app.md rewrite depends on.
+        assert_eq!(c_tasks, vec!["t1".to_string()],
+            "FORM C (blessed 1-antecedent Task-keyed helper + join) MUST \
+             recommend exactly t1, Task-keyed, literal filter honored; got \
+             tasks={:?} total={}", c_tasks, c_total);
+
+        // FORMS A and B are the rejected inline forms: NEITHER may produce the
+        // correct result {t1}. (Their precise failure -- filter dropped, or
+        // mis-keyed, or empty -- varies with surrounding declarations; the
+        // contract is only that they are NOT correct, which is why FORM C's
+        // explicit helper is required.) Recorded so a future engine change that
+        // makes an inline form correct trips this and prompts a simpler rewrite.
+        let a_correct = a_tasks == vec!["t1".to_string()];
+        let b_correct = b_tasks == vec!["t1".to_string()];
+        assert!(!a_correct,
+            "FORM A (direct role-fill) is NOT expected to be correct; if it now \
+             yields exactly [t1] the inline form is viable -- revisit the Phase-2 \
+             rewrite. got tasks={:?} total={}", a_tasks, a_total);
+        assert!(!b_correct,
+            "FORM B (head rename) is NOT expected to be correct; if it now yields \
+             exactly [t1] the inline form is viable -- revisit the Phase-2 \
+             rewrite. got tasks={:?} total={}", b_tasks, b_total);
+    }
+
+    /// status-bridge-drop (Phase 2, AGGREGATE-superlative consumer): the
+    /// trickiest consumer family -- the `Task Priority is {fallback,last
+    /// resort} recommended iff some Task has the highest Task Priority among
+    /// Tasks that have Task Status 'X'` rules (app.md 310/323/327). The
+    /// `among … that have Task Status 'X'` clause compiles into an aggregate
+    /// SCOPE FILTER whose `filter_role` is a Task-subject attribute
+    /// (`Task Status`) -- see compile_explicit_derivation_tests
+    /// `enum_superlative_among_filter`. The SM projection
+    /// `Resource is currently in Status` is keyed on `Resource`, NOT on the
+    /// Task subject, so this test ADJUDICATES whether the aggregate-filter
+    /// grammar can read the projection at all. It records the ACTUAL engine
+    /// behavior (filter shape + materialization) so the Phase-2 design for
+    /// these three rules is evidence-based, not guessed.
+    #[test]
+    fn status_bridge_superlative_consumer_reads_projection_probe() {
+        let src = "\
+            Resource(.id) is an entity type.\n\
+            Task(.id) is an entity type.\n\
+            State Machine(.id) is an entity type.\n\
+            Status is a value type.\n\
+            Task Priority is a value type.\n\
+            Name is a value type.\n\
+            State Machine is for Resource.\n\
+            State Machine is currently in Status.\n\
+            Resource is currently in Status.\n\
+            Task has Task Priority.\n\
+              Each Task has at most one Task Priority.\n\
+            Task has Name.\n\
+            Task is in Status.\n\
+            Task Priority is fallback recommended.\n\
+            Task is fallback recommended.\n\
+            State Machine 'sm1' is for Resource 't1'.\n\
+            State Machine 'sm1' is currently in Status 'in_progress'.\n\
+            Task 't1' has Name 'n1'.\n\
+            Task 't1' has Task Priority 'p0'.\n\
+            State Machine 'sm2' is for Resource 't2'.\n\
+            State Machine 'sm2' is currently in Status 'pending'.\n\
+            Task 't2' has Name 'n2'.\n\
+            Task 't2' has Task Priority 'p2'.\n\
+            Resource is currently in Status iff some State Machine is for that Resource and that State Machine is currently in that Status.\n\
+            Task is in Status iff that Resource is currently in some Status and Task is Resource.\n\
+            Task Priority is fallback recommended iff some Task has the highest Task Priority among Tasks that are currently in Status 'pending'.\n\
+            Task is fallback recommended iff Task is in Status 'pending' and Task has Task Priority and Task Priority is fallback recommended.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("superlative-projection fixture must parse");
+
+        // Inspect the compiled aggregate rule: does the `among … that are
+        // currently in Status 'pending'` clause resolve (no unresolved
+        // clauses) and become a usable filter?
+        let data = crate::compile::cell_index_from_state(&state);
+        let ra = data.derivation_rules.iter()
+            .find(|r| r.consequent_cell.literal_id() == "Task_Priority_is_fallback_recommended");
+        // Record what the engine actually did -- this is a PROBE; the
+        // assertions below pin whichever behavior is real so the Phase-2
+        // report can cite it.
+        let agg_ok = ra.map_or(false, |r| !r.consequent_aggregates.is_empty()
+            && r.unresolved_clauses.is_empty());
+
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+        let refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d).into_iter()
+            .filter(|(n, _)| n.starts_with("derivation:rule_"))
+            .map(|(n, c)| (n.to_string(), ast::metacompose(c, &d)))
+            .collect();
+        let refs: Vec<(&str, &ast::Func)> = refs_owned.iter()
+            .map(|(n, f)| (n.as_str(), f)).collect();
+        let (new_d, _) = crate::evaluate::forward_chain_defs_state(&refs, &d);
+        let prio = ast::fetch_cell_seq("Task_Priority_is_fallback_recommended", &new_d);
+        let prio_n = prio.as_seq().map(|s| s.len()).unwrap_or(0);
+        let marker = ast::fetch_cell_seq("Task_is_fallback_recommended", &new_d);
+        let marker_n = marker.as_seq().map(|s| s.len()).unwrap_or(0);
+
+        // Population: t1 in_progress/p0, t2 pending/p2. The `among … that are
+        // currently in Status 'pending'` aggregate scope must EXCLUDE t1 (it is
+        // in_progress), so the only pending task is t2 and the top pending
+        // priority is p2 -> exactly t2 is fallback-recommended. This proves the
+        // aggregate-scope projection filter DISCRIMINATES by status (not just
+        // that it fires). The equi-join consumer uses FORM C (the Task-keyed
+        // `Task is in Status` helper), the prescribed Phase-2 shape.
+        assert!(agg_ok,
+            "the `among Tasks that are currently in Status 'pending'` clause must \
+             resolve into a clean aggregate (no unresolved clauses); \
+             rule={:?}", ra.map(|r| (&r.unresolved_clauses, r.consequent_aggregates.len())));
+        assert!(prio_n > 0,
+            "the superlative over the SM projection must derive the top pending \
+             priority; got EMPTY Task_Priority_is_fallback_recommended. \
+             cell={:?}", prio);
+        assert!(marker_n > 0,
+            "the end-to-end superlative consumer must materialize \
+             Task_is_fallback_recommended; got empty. prio={:?} marker={:?}",
+            prio, marker);
+        let recommended: Vec<String> = marker.as_seq().map(|facts| facts.iter()
+            .filter_map(|f| ast::binding(f, "Task").map(String::from))
+            .collect()).unwrap_or_default();
+        assert_eq!(recommended, vec!["t2".to_string()],
+            "only t2 (the sole PENDING task) may be fallback-recommended -- t1 is \
+             in_progress and the `among … currently in Status 'pending'` scope \
+             must exclude it; got {:?}", recommended);
+    }
+
     /// eud-valuetype-bridge-join: neutral repro of the SPD-1 Affect Region
     /// shape (apps/deriv-probe). Two single-valued entity facts joined on
     /// their shared entity (`Item`), then an objectified TERNARY mapping

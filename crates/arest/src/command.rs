@@ -14146,6 +14146,105 @@ Timestamp is a value type.
             "bob (no grants) must get an empty instance crudl; got {:?}", bob_result.crudl);
     }
 
+    /// status-bridge-drop (Phase 1 PROOF): the get-by-id path
+    /// (`Command::GetEntity` -> `get_entity_via_defs`) surfaces the entity's
+    /// CURRENT SM STATUS as the top-level `status` field, read straight from
+    /// the canonical `State_Machine_is_currently_in_Status` cell -- WITHOUT
+    /// any app-level `<Noun> has <Status>` bridge FT in the fixture.
+    ///
+    /// This is the contract Phase 2 relies on: once `apps/tasks` drops the
+    /// materialized `Task_has_Task_Status` bridge, an agent's getEntity must
+    /// still see the status. `ORDER_READINGS` declares ONLY `Order has Amount`
+    /// (no `Order has Status`), so a non-empty `status` here can come ONLY
+    /// from the SM cell via `extract_sm_status`, not from a bridge.
+    ///
+    /// Steps:
+    ///   1. Create an Order (SM seeds initial status 'Draft').
+    ///   2. getEntity -> top-level status == 'Draft', and it EQUALS the SM
+    ///      cell directly (cross-check against State_Machine_is_currently_in_Status).
+    ///   3. Fire the `place` transition (Draft -> Placed), then getEntity again
+    ///      -> status TRACKS to 'Placed' (proves it is a live read of the SM
+    ///      cell, not a stale create-time snapshot).
+    #[test]
+    fn get_entity_surfaces_sm_status_top_level_without_bridge_ft() {
+        let (def_obj, state) = setup_order_defs();
+
+        // Guard the premise: the fixture must NOT declare an `Order has Status`
+        // bridge FT. If a future edit adds one, this test would no longer prove
+        // the bridge-free path -- fail loudly instead of silently weakening.
+        assert!(!ORDER_READINGS.contains("Order has Status"),
+            "fixture must stay bridge-free for this proof; ORDER_READINGS now \
+             declares an Order-status bridge");
+
+        // Step 1: create the Order.
+        let create_cmd = Command::CreateEntity {
+            noun: "Order".to_string(),
+            domain: "".to_string(),
+            id: Some("ORD-sb".to_string()),
+            fields: {
+                let mut f = HashMap::new();
+                f.insert("amount".to_string(), "10".to_string());
+                f
+            },
+            sender: None,
+            signature: None,
+        };
+        let create_result = apply_command_defs(&def_obj, &create_cmd, &state);
+        assert!(!create_result.rejected,
+            "setup create must not reject; violations={:?}", create_result.violations);
+        let post_create = ast::merge_delta(&state, &create_result.state, None);
+        let post_create_d = ast::merge_delta(&def_obj, &create_result.state, None);
+
+        // Step 2: getEntity surfaces top-level status from the SM cell.
+        let get_cmd = Command::GetEntity {
+            noun: "Order".to_string(),
+            entity_id: "ORD-sb".to_string(),
+            sender: None,
+        };
+        let got = apply_command_defs(&post_create_d, &get_cmd, &post_create);
+        assert!(!got.rejected, "getEntity must not reject");
+        assert_eq!(got.entities.len(), 1, "must fetch exactly the one entity");
+        assert_eq!(got.status.as_deref(), Some("Draft"),
+            "getEntity must surface the SM status 'Draft' as top-level status, \
+             with no bridge FT present; got {:?}", got.status);
+
+        // Cross-check: the surfaced status EQUALS the canonical SM cell value
+        // for this entity -- same source `apply` and the get's transitions use.
+        let sm_cell = ast::fetch_cell_seq("State_Machine_is_currently_in_Status", &post_create);
+        let sm_status = sm_cell.as_seq().and_then(|facts| facts.iter()
+            .find(|f| ast::binding(f, "State Machine") == Some("ORD-sb"))
+            .and_then(|f| ast::binding(f, "Status").map(String::from)));
+        assert_eq!(sm_status.as_deref(), Some("Draft"),
+            "sanity: the SM cell must carry 'Draft' for ORD-sb; got {:?}", sm_status);
+        assert_eq!(got.status, sm_status,
+            "the top-level get status must EQUAL the SM cell value (single source \
+             of truth); get={:?} sm_cell={:?}", got.status, sm_status);
+
+        // Step 3: transition Draft -> Placed, then re-get: status must TRACK.
+        let txn = Command::Transition {
+            entity_id: "ORD-sb".to_string(),
+            event: "place".to_string(),
+            domain: "".to_string(),
+            current_status: Some("Draft".to_string()),
+            sender: None,
+            signature: None,
+        };
+        let txn_result = apply_command_defs(&post_create_d, &txn, &post_create);
+        assert!(!txn_result.rejected,
+            "place transition must not reject; violations={:?}", txn_result.violations);
+        assert_eq!(txn_result.status.as_deref(), Some("Placed"),
+            "the transition result's own top-level status must be 'Placed'; got {:?}",
+            txn_result.status);
+        let post_txn = ast::merge_delta(&post_create, &txn_result.state, None);
+        let post_txn_d = ast::merge_delta(&post_create_d, &txn_result.state, None);
+
+        let got2 = apply_command_defs(&post_txn_d, &get_cmd, &post_txn);
+        assert!(!got2.rejected, "post-transition getEntity must not reject");
+        assert_eq!(got2.status.as_deref(), Some("Placed"),
+            "getEntity status must TRACK the SM cell after a transition (live read, \
+             not a stale create-time snapshot); got {:?}", got2.status);
+    }
+
     /// task-crudl-deploy-readpath: list (collection) returns a populated crudl
     /// menu for an authorized sender. The test:
     ///   1. Sets up Order schema + SM defs.
