@@ -1282,22 +1282,72 @@ pub fn metamodel_readings() -> Vec<&'static (&'static str, &'static str)> {
 }
 
 /// view-tree-shaking discriminator (2026-06): does this app's raw readings
-/// declare a render surface? A cheap SUBSTRING scan over the un-parsed
-/// reading bodies for the `App uses Render Surface` marker fact (e.g.
+/// declare a render surface? A cheap per-LINE scan over the un-parsed reading
+/// bodies for the `App uses Render Surface` marker fact (e.g.
 /// `App 'support' uses Render Surface 'html'.`). Deliberately a text check,
-/// not a full pre-parse — the marker is the opt-in, and a false positive
-/// only costs the (idempotent) view overlay, never correctness.
+/// not a full pre-parse — the marker is the opt-in.
 ///
-/// `app_readings` is `&[(name, text)]` for ANY `Deref<Target = str>` name /
-/// text (so both `&'static (&str, &str)` slices and `Vec<(String, String)>`
-/// call sites pass without an allocation/conversion dance).
+/// COMMENTED / header lines are SKIPPED: a line whose first non-whitespace
+/// char is `#` (a Markdown header — the comment form used in readings, and the
+/// way an app temporarily DISABLES its opt-in) does NOT count, so
+/// `# App 'x' uses Render Surface 'html'.` reads as NO surface, and a prose
+/// mention of the phrase inside a `#`/`###` note can't false-trigger the
+/// overlay. A non-comment line is matched even when indented, so a fact nested
+/// under a section still counts.
+///
+/// `app_readings` is `&[(name, text)]` for ANY `AsRef<str>` name / text (so
+/// both `&'static (&str, &str)` slices and `Vec<(String, String)>` call sites
+/// pass without an allocation/conversion dance).
 #[cfg(not(feature = "no_std"))]
 pub fn declares_render_surface<N, T>(app_readings: &[(N, T)]) -> bool
 where
     N: AsRef<str>,
     T: AsRef<str>,
 {
-    app_readings.iter().any(|(_, text)| text.as_ref().contains("uses Render Surface"))
+    app_readings.iter().any(|(_, text)| {
+        text.as_ref().lines().any(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with('#') && trimmed.contains("uses Render Surface")
+        })
+    })
+}
+
+#[cfg(all(test, not(feature = "no_std")))]
+mod declares_render_surface_tests {
+    use super::declares_render_surface;
+
+    #[test]
+    fn active_fact_declares_surface() {
+        let r = [("ui", "App 'support' uses Render Surface 'html'.")];
+        assert!(declares_render_surface(&r), "an uncommented fact declares the surface");
+    }
+
+    #[test]
+    fn indented_fact_still_declares() {
+        let r = [("ui", "## Instance Facts\n\n   App 'x' uses Render Surface 'html'.\n")];
+        assert!(declares_render_surface(&r), "an indented fact still declares the surface");
+    }
+
+    #[test]
+    fn commented_fact_does_not_declare() {
+        // The opt-in commented with a leading `#` reads as NO surface, so an
+        // app disables its render surface by commenting the fact out.
+        for commented in [
+            "# App 'support' uses Render Surface 'html'.",
+            "### App 'support' uses Render Surface 'html'.",
+            "  ### note: App 'x' uses Render Surface 'html' (disabled)",
+        ] {
+            let r = [("ui", commented)];
+            assert!(!declares_render_surface(&r),
+                "a #-commented / header line must NOT declare a surface; got true for {commented:?}");
+        }
+    }
+
+    #[test]
+    fn no_mention_does_not_declare() {
+        let r = [("ui", "App 'tasks' has App Type 'agent'.\n")];
+        assert!(!declares_render_surface(&r), "no marker => no surface");
+    }
 }
 
 /// view-tree-shaking (2026-06): the base metamodel readings, PLUS the heavy
