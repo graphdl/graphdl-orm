@@ -554,7 +554,6 @@ Transition 'archive' is defined in State Machine Definition 'Doc'.
 "#;
 
 #[test]
-#[ignore = "rule 2 (Harel inherited edge): resolver layers fixed (arity filter + strict-verb); still blocked on ring-join materializer free-var binding + Status-is-defined-in under-population — owned by the ring-constraints agent"]
 fn smretire_foundation_harel_inherited_edge() {
     let all_readings: Vec<(&str, &str)> = arest::CORE_READINGS.iter().copied()
         .chain(std::iter::once(("harel", HAREL_DOMAIN)))
@@ -597,14 +596,68 @@ fn smretire_foundation_harel_inherited_edge() {
     assert!(has("Draft", "Review", "submit"), "missing direct Draft->Review; rows={:#?}", rows);
     assert!(has("Review", "Approved", "approve"), "missing direct Review->Approved");
     assert!(has("Doc", "Archived", "archive"), "missing super-state Doc->Archived direct edge");
-    // INHERITED (Harel) edges — rule 2 now fires via the subtype-filler ring-join
-    // fix in compute_ring_join_plan: a State Machine Definition (a Status subtype)
-    // fills the `from` Status role, so each child Status of the Doc super-state
-    // inherits the Doc->Archived exit on `archive`.
+    // INHERITED (Harel) edges. Three pieces conspire: (1) the subtype-filler
+    // ring-join (arity filter, compute_ring_join_plan) + (2) strict-verb
+    // resolution bind `Transition is from <SMD>` to `Transition is from Status`
+    // (SMD < Status), and (3) the `Status is defined in SMD` membership cell —
+    // populated by the SPLIT from/to rules (state.md) — supplies each child
+    // Status of the Doc super-state, so each inherits its Doc->Archived exit.
     assert!(has("Draft", "Archived", "archive"),
         "missing inherited Draft->Archived (rule 2 subtype-filler ring-join); rows={:#?}", rows);
     assert!(has("Review", "Archived", "archive"), "missing inherited Review->Archived; rows={:#?}", rows);
     assert!(has("Approved", "Archived", "archive"), "missing inherited Approved->Archived; rows={:#?}", rows);
+}
+
+// sm-retire-forml2 FOUNDATION GUARD: `Status is defined in State Machine
+// Definition` (state.md:82 transition-based + :116 initial-based) must bind the
+// FROM/TO Status of each transition, NEVER the Transition itself. This is a
+// PREREQUISITE of the harel rule-2 chain but stands on its own, so it belongs in
+// the gate (unlike the ignored rule-2 test). It catches both the long-standing
+// under-population AND d15772af's declared-head rework, which leaked the
+// Transition NAMES (submit/archive/approve) into the Status role.
+#[test]
+fn smretire_status_is_defined_in_binds_status_not_transition() {
+    let all_readings: Vec<(&str, &str)> = arest::CORE_READINGS.iter().copied()
+        .chain(std::iter::once(("harel", HAREL_DOMAIN)))
+        .collect();
+    let state = all_readings.iter().fold(ast::Object::phi(), |merged, (name, text)| {
+        let this = parse_forml2::parse_to_state_from(text, &merged)
+            .unwrap_or_else(|e| panic!("parse {}: {}", name, e));
+        let this = ast::annotate_noun_domain(&this, name);
+        let this = ast::merge_states(&this, &ast::stamp_file_domain(&this, name));
+        ast::merge_states(&merged, &this)
+    });
+    let defs = compile::compile_to_defs_state(&state);
+    let d = ast::defs_to_state(&defs, &state);
+    let deriv: Vec<(String, ast::Func)> = ast::cells_iter(&d).into_iter()
+        .filter(|(n, _)| n.starts_with("derivation:"))
+        .map(|(n, c)| (n.to_string(), ast::metacompose(c, &d)))
+        .collect();
+    let d = if deriv.is_empty() { d } else {
+        let refs: Vec<(&str, &ast::Func)> = deriv.iter().map(|(n, f)| (n.as_str(), f)).collect();
+        arest::evaluate::forward_chain_defs_state(&refs, &d).0
+    };
+    let cell = ast::fetch_cell_seq("Status_is_defined_in_State_Machine_Definition", &d);
+    let pairs: Vec<(String, String)> = cell.as_seq().map(|facts| facts.iter().filter_map(|f| {
+        let ps = f.as_seq()?;
+        let kv: Vec<(&str, &str)> = ps.iter().filter_map(|p| {
+            let it = p.as_seq()?;
+            (it.len() == 2).then(|| (it[0].as_atom(), it[1].as_atom())).and_then(|(a, b)| Some((a?, b?)))
+        }).collect();
+        let s = kv.iter().find(|(r, _)| *r == "Status").map(|(_, v)| *v)?;
+        let m = kv.iter().find(|(r, _)| *r == "State Machine Definition").map(|(_, v)| *v)?;
+        Some((s.to_string(), m.to_string()))
+    }).collect()).unwrap_or_default();
+    eprintln!("DEFINED_IN = {:?}", pairs);
+    let has = |s: &str| pairs.iter().any(|(st, m)| st == s && m == "Doc");
+    // Must hold the FROM/TO statuses of Doc's transitions:
+    assert!(has("Draft"), "Draft (submit's from) missing from `defined in Doc`; pairs={:?}", pairs);
+    assert!(has("Review"), "Review (submit's to / approve's from) missing; pairs={:?}", pairs);
+    assert!(has("Approved"), "Approved (approve's to) missing; pairs={:?}", pairs);
+    // Must NEVER hold a TRANSITION name in the Status role (the d15772af regression):
+    assert!(!has("submit"), "Transition 'submit' polluted the Status role; pairs={:?}", pairs);
+    assert!(!has("archive"), "Transition 'archive' polluted the Status role; pairs={:?}", pairs);
+    assert!(!has("approve"), "Transition 'approve' polluted the Status role; pairs={:?}", pairs);
 }
 
 // sm-retire-forml2 FOUNDATION CHECK (temporary): prove the AUTHORED seed

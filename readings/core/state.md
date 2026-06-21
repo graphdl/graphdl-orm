@@ -79,7 +79,9 @@ Guard guards Transition.
 
 ## Derivation Rules
 
-* Status is defined in State Machine Definition iff some Transition is defined in that State Machine Definition and that Transition is from that Status or that Transition is to that Status.
+* Status is defined in State Machine Definition iff some Transition is defined in that State Machine Definition and that Transition is from that Status.
+
+* Status is defined in State Machine Definition iff some Transition is defined in that State Machine Definition and that Transition is to that Status.
 
 * Status is terminal in State Machine Definition iff that Status is defined in that State Machine Definition and no Transition is defined in that State Machine Definition where that Transition is from that Status.
 
