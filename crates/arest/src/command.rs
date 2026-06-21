@@ -6681,9 +6681,20 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
     /// Parse state metamodel + order domain readings, compile to defs,
     /// return (defs_object, base_state).
     fn setup_order_defs() -> (ast::Object, ast::Object) {
-        let meta_state = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
-        let orders_state = crate::parse_forml2::parse_to_state_with_nouns(ORDER_READINGS, &meta_state).unwrap();
-        let state = ast::merge_states(&meta_state, &orders_state);
+        // sm-retire: build on the REAL embedded metamodel (CORE_READINGS) so the
+        // SM derivations (effective-Transition, effective-initial, is-defined-in)
+        // are present. The old minimal STATE_METAMODEL fixture predated them and
+        // drifted; this mirrors the production compile path.
+        let all: Vec<(&str, &str)> = crate::CORE_READINGS.iter().copied()
+            .chain(core::iter::once(("orders", ORDER_READINGS)))
+            .collect();
+        let state = all.iter().fold(ast::Object::phi(), |m, (name, text)| {
+            let this = crate::parse_forml2::parse_to_state_from(text, &m)
+                .unwrap_or_else(|e| panic!("parse {}: {}", name, e));
+            let this = ast::annotate_noun_domain(&this, name);
+            let this = ast::merge_states(&this, &ast::stamp_file_domain(&this, name));
+            ast::merge_states(&m, &this)
+        });
         let defs = crate::compile::compile_to_defs_state(&state);
         let def_obj = ast::defs_to_state(&defs, &state);
         (def_obj, state)

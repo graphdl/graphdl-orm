@@ -4389,6 +4389,20 @@ fn translate_instance_facts_with_ft_ids(
         if classifications_contains(idx, stmt_id, "Derivation Rule") {
             continue;
         }
+        // Same arbitration as the Derivation Rule skip above (#866): an
+        // Enum Values Declaration (`The possible values of X are 'a', 'b'`)
+        // carries single-quoted value literals, so the Instance Fact
+        // recognizer fires alongside the Enum Values Declaration recognizer.
+        // Without this skip the enum lands in the InstanceFact cell mis-filed
+        // under the raw verb `the possible values of`, with phantom roles
+        // substring-matched from nouns INSIDE the value literals
+        // (`'Executive-Order'` -> role Order, `'Runtime-Function'` -> role
+        // Function), which `platform_list_noun` then mints as phantom
+        // entities (`Order:, `). The canonical values are already captured by
+        // `translate_enum_values`, so emitting an instance fact is pure noise.
+        if classifications_contains(idx, stmt_id, "Enum Values Declaration") {
+            continue;
+        }
         let roles = role_refs_with_literals(idx,stmt_id);
         if roles.is_empty() { continue; }
         // parser-unquoted-numeric-object-literal (987-B census): the
