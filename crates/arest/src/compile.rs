@@ -5000,71 +5000,35 @@ pub fn reflect_schema_cells(state: &crate::ast::Object) -> Vec<(String, crate::a
             ]))
             .collect()
     };
-    // population reflection — the instance-object mirror of the schema
-    // reflections above. A fact is constituted by its role-fillings:
-    // which Resource fills which Role. That is the metamodel's own ground
-    // primitive (`Fact uses Resource for Role`, core.md), and EVERYTHING
-    // else derives from it through the metamodel's own rules —
-    // `Fact is of Fact Type` (core.md:347), `Resource is instance of
-    // Noun` (core.md:348), `Fact is of Function` / `belongs to Domain`
-    // (instances.md). So we reflect ONLY the constitutive primitive and
-    // feed the same rule layer the schema reflection feeds; no Rust-side
-    // `Fact_is_of_Fact_Type` (that would be a second, bridging mechanism).
-    // Each populated row of a fact-type cell IS one Fact, identified by the
-    // canonical content hash (`synthesize_fact_id`, below). The Role id is
-    // `{ft}#{position}`, matching `ft_has_role` above so core.md:347's
-    // `Fact uses Resource for Role` ⋈ `Fact Type has that Role` join lands. Only
-    // ENTITY-typed fillings mint Resources — value-type fillings are not
-    // Resources, the same rule `memberships` uses. Sorted + deduped.
-    let fact_uses: Vec<Object> = {
-        let entity_nouns: hashbrown::HashSet<String> =
-            fetch_cell_seq("Noun", state).as_seq()
-                .map(|rows| rows.iter()
-                    .filter_map(|n| {
-                        let name = binding(n, "name")?;
-                        (binding(n, "objectType").unwrap_or("entity") == "entity")
-                            .then(|| name.to_string())
-                    })
-                    .collect())
-                .unwrap_or_default();
+    // population reflection — the instance-object mirror of `memberships`
+    // above. Just as an entity instance reflects to `Resource is instance of
+    // Noun`, a fact instance reflects to `Fact is of Fact Type`: every
+    // populated row of a fact-type cell IS one Fact of that fact type (a fact
+    // "being of a fact type" is a populated column with a type). BOTH are
+    // BASE fact types populated here by reflection, each VALIDATED — not
+    // derived — by its `if … then …` subset constraint in core.md (Halpin:
+    // `if/then` is a subset constraint, `iff`/`*` a derivation; deriving this
+    // would conflate the two). The Fact's identity is the cell store's own
+    // canonical content hash (`synthesize_fact_id`); `fetch_cell_seq`
+    // normalizes storage shape (version-chain / Map / Seq) so we read facts,
+    // not the version wrapper. Sorted + deduped (set-replace, deterministic).
+    let facts_of_ft: Vec<Object> = {
         let ft_ids: Vec<String> = reading_by_ft.keys().cloned().collect();
-        let mut out: hashbrown::HashSet<(String, String, String)> = hashbrown::HashSet::new();
+        let mut out: hashbrown::HashSet<(String, String)> = hashbrown::HashSet::new();
         for ft in &ft_ids {
-            // fetch_cell_seq normalizes storage shape (version-chain / Map /
-            // Seq) to a clean Seq of facts. fetch_or_phi + as_map would read
-            // the version-chain WRAPPER (keyed by version number "1"), not the
-            // facts — collapsing every row onto one bogus id. Each fact's
-            // identity is the canonical content hash the cell store itself keys
-            // by (`synthesize_fact_id` = the same FNV-1a-64 the forward-chain
-            // dedup uses): STABLE, shared across a fact's role-fillings,
-            // distinct per row, and collision-free vs `{ft}#{pos}` role ids.
             let facts = fetch_cell_seq(ft, state);
             let Some(rows) = facts.as_seq() else { continue };
             for fact in rows.iter() {
-                let Some(items) = fact.as_seq() else { continue };
-                let fact_id = crate::ast::synthesize_fact_id(ft, fact);
-                for (pos, pair) in items.iter().enumerate() {
-                    let Some(kv) = pair.as_seq() else { continue };
-                    if kv.len() != 2 { continue; }
-                    let (Some(role_noun), Some(value)) = (kv[0].as_atom(), kv[1].as_atom())
-                    else { continue };
-                    if value.is_empty() || value == "φ" { continue; }
-                    if !entity_nouns.contains(role_noun) { continue; }
-                    out.insert((
-                        fact_id.clone(),
-                        value.to_string(),
-                        alloc::format!("{}#{}", ft, pos),
-                    ));
-                }
+                if fact.as_seq().map_or(true, |s| s.is_empty()) { continue; }
+                out.insert((crate::ast::synthesize_fact_id(ft, fact), ft.clone()));
             }
         }
-        let mut sorted: Vec<(String, String, String)> = out.into_iter().collect();
+        let mut sorted: Vec<(String, String)> = out.into_iter().collect();
         sorted.sort();
         sorted.into_iter()
-            .map(|(fact, resource, role)| fact_from_pairs(&[
+            .map(|(fact, ft)| fact_from_pairs(&[
                 ("Fact", fact.as_str()),
-                ("Resource", resource.as_str()),
-                ("Role", role.as_str()),
+                ("Fact Type", ft.as_str()),
             ]))
             .collect()
     };
@@ -5079,7 +5043,7 @@ pub fn reflect_schema_cells(state: &crate::ast::Object) -> Vec<(String, crate::a
         ("Role_is_used_in_Reading".to_string(), Object::Seq(role_used.into())),
         ("Reading_is_used_by_Verb".to_string(), Object::Seq(reading_verbs.into())),
         ("Resource_is_instance_of_Noun".to_string(), Object::Seq(memberships.into())),
-        ("Fact_uses_Resource_for_Role".to_string(), Object::Seq(fact_uses.into())),
+        ("Fact_is_of_Fact_Type".to_string(), Object::Seq(facts_of_ft.into())),
     ]
 }
 
@@ -5247,16 +5211,13 @@ mod reflect_schema_cells_tests {
             "value-typed roles must not mint memberships; got {rows:?}");
     }
 
-    /// Population reflection — instance-object mirror of the schema
-    /// reflections: a fact is constituted by its role-fillings, so each
-    /// populated row reflects to `Fact uses Resource for Role` (entity
-    /// fillings only). `Fact is of Fact Type`, `Resource is instance of
-    /// Noun`, etc. then DERIVE from it via the metamodel's own rules — we
-    /// reflect only the constitutive primitive, no bridging cell. Three
-    /// rows -> three distinct Facts; the value-type filling (Label) is not
-    /// a Resource.
+    /// Population reflection — instance-object mirror of `memberships`
+    /// (`Resource is instance of Noun`): every populated row of a fact-type
+    /// cell reflects to one `Fact is of Fact Type`, a BASE fact type, keyed by
+    /// the canonical content hash. Three rows -> three distinct Facts of the
+    /// same Fact Type (facts are NOT deduped by entity).
     #[test]
-    fn reflects_populated_rows_as_constitutive_role_fillings() {
+    fn reflects_populated_rows_as_facts_of_their_fact_type() {
         let src = "Widget(.id) is an entity type.\nLabel is a value type.\n\nWidget has Label.\n";
         let state = crate::parse_forml2::parse_to_state(src).expect("parse");
         let state = ast::cell_push("Widget_has_Label",
@@ -5267,20 +5228,18 @@ mod reflect_schema_cells_tests {
             ast::fact_from_pairs(&[("Widget", "w-2"), ("Label", "gamma")]), &state);
 
         let cells = reflect_schema_cells(&state);
-        let uses = cells.iter().find(|(n, _)| n == "Fact_uses_Resource_for_Role")
-            .map(|(_, c)| c.clone()).expect("Fact_uses_Resource_for_Role cell emitted");
-        let rows = uses.as_seq().expect("seq");
-        // Three distinct Facts each fill the Widget role (position 0); the
-        // Label value-type filling mints no Resource.
-        let widget_fillings: Vec<&str> = rows.iter()
-            .filter(|r| ast::binding(r, "Role") == Some("Widget_has_Label#0"))
-            .filter_map(|r| ast::binding(r, "Resource"))
+        let facts = cells.iter().find(|(n, _)| n == "Fact_is_of_Fact_Type")
+            .map(|(_, c)| c.clone()).expect("Fact_is_of_Fact_Type cell emitted");
+        let rows = facts.as_seq().expect("seq");
+        let of_wl: Vec<&str> = rows.iter()
+            .filter(|r| ast::binding(r, "Fact Type") == Some("Widget_has_Label"))
+            .filter_map(|r| ast::binding(r, "Fact"))
             .collect();
-        assert_eq!(widget_fillings.len(), 3,
-            "each populated row reflects its entity filling; got {rows:?}");
-        assert!(!rows.iter().any(|r| matches!(ast::binding(r, "Resource"),
-            Some("alpha") | Some("beta") | Some("gamma"))),
-            "value-type fillings (Label) are not Resources; got {rows:?}");
+        assert_eq!(of_wl.len(), 3,
+            "each populated row reflects to one Fact of its Fact Type; got {rows:?}");
+        // Distinct content -> distinct canonical Fact ids.
+        assert_eq!(of_wl.iter().collect::<hashbrown::HashSet<_>>().len(), 3,
+            "the three rows mint three distinct Fact ids; got {of_wl:?}");
     }
 
     /// Idempotent set-replace: reflecting twice yields identical cells.

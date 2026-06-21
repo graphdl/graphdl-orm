@@ -253,16 +253,12 @@ Guard Run has Result.
 
 * Resource belongs to Domain iff Resource is of Function and that Function belongs to Domain.
 
-<!-- population reflection (compile.rs `reflect_schema_cells`) materialises the
-     constitutive primitive `Fact uses Resource for Role` from every populated
-     fact-type cell — a fact IS its role-fillings. This derivation lifts that to
-     `Fact is of Fact Type`: a fact is of the fact type that owns a role it
-     fills. The `iff`-join form binds (the engine's `If … then … some X that
-     has that Role` consequent form does NOT — it compiles to a bindingless
-     tuple; that broken subset-constraint line in core.md is retired). This is
-     the instance-object mirror of `Resource is of Function` above. -->
-* Fact is of Fact Type iff Fact uses Resource for Role and Fact Type has that Role.
-
+<!-- `Fact is of Fact Type` is a BASE fact type, populated by population
+     reflection (compile.rs `reflect_schema_cells`) — every populated row of a
+     fact-type cell IS a Fact of that fact type, the instance-object mirror of
+     `Resource is instance of Noun`. It is VALIDATED, not derived, by the
+     subset constraint in core.md (`If some Fact uses some Resource for some
+     Role then that Fact is of some Fact Type that has that Role`). -->
 * Fact is of Function iff Fact is of Fact Type and Function is Fact Type.
 
 * Fact belongs to Domain iff Fact is of Function and that Function belongs to Domain.

@@ -344,11 +344,7 @@ For each Status, some Transition is from that Status or some Transition is to th
 ## Subset Constraints
 
 If some Role is used in some Reading where some Fact Type has that Reading then that Fact Type has that Role.
-<!-- `Fact is of Fact Type` is derived in instances.md as an iff-join over the
-     reflected `Fact uses Resource for Role` primitive. The former subset
-     constraint here (`If … then that Fact is of some Fact Type that has that
-     Role`) compiled to a bindingless tuple — the engine does not bind the
-     existential `some Fact Type that has that Role` consequent — and is retired. -->
+If some Fact uses some Resource for some Role then that Fact is of some Fact Type that has that Role.
 If some Fact uses some Resource for some Role then that Resource is instance of some Noun that plays that Role.
 If some Fact Type defines some Fact then some Resource that is that Fact is instance of some Noun that is that Fact Type.
 If some Verb references some Fact that is of some Fact Type then that Verb uses some Reading where that Fact Type has that Reading.
