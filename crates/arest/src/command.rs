@@ -6689,6 +6689,77 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         (def_obj, state)
     }
 
+    // sm-retire strangler: available transitions from `current` for `noun`,
+    // read straight from the FORML2 effective-Transition cell and SMD-scoped —
+    // the replacement for the compiled `transitions:{noun}` func. Validated to
+    // match the func below before any consumer is flipped.
+    fn available_transitions_derived(noun: &str, current: &str, chained: &ast::Object) -> Vec<(String, String, String)> {
+        let smds: hashbrown::HashSet<String> = ast::fetch_cell_seq("State_Machine_Definition_is_for_Noun", chained)
+            .as_seq().map(|fs| fs.iter().filter_map(|f|
+                (ast::binding(f, "Noun")? == noun)
+                    .then(|| ast::binding(f, "State Machine Definition").map(|s| s.to_string()))?
+            ).collect()).unwrap_or_default();
+        let txns: hashbrown::HashSet<String> = ast::fetch_cell_seq("Transition_is_defined_in_State_Machine_Definition", chained)
+            .as_seq().map(|fs| fs.iter().filter_map(|f| {
+                let smd = ast::binding(f, "State Machine Definition")?;
+                smds.contains(smd).then(|| ast::binding(f, "Transition").map(|t| t.to_string()))?
+            }).collect()).unwrap_or_default();
+        let mut out: Vec<(String, String, String)> = ast::fetch_cell_seq("Status_has_effective_Transition_to_Status_on_Event_Type", chained)
+            .as_seq().map(|fs| fs.iter().filter_map(|f| {
+                let pairs = f.as_seq()?;
+                let kv: Vec<(&str, &str)> = pairs.iter().filter_map(|p| {
+                    let it = p.as_seq()?;
+                    (it.len() == 2).then(|| (it[0].as_atom(), it[1].as_atom())).and_then(|(a, b)| Some((a?, b?)))
+                }).collect();
+                let st: Vec<&str> = kv.iter().filter(|(r, _)| *r == "Status").map(|(_, v)| *v).collect();
+                let tx = kv.iter().find(|(r, _)| *r == "Transition").map(|(_, v)| *v)?;
+                let ev = kv.iter().find(|(r, _)| *r == "Event Type").map(|(_, v)| *v)?;
+                (st.len() == 2 && st[0] == current && txns.contains(tx))
+                    .then(|| (st[0].to_string(), st[1].to_string(), ev.to_string()))
+            }).collect()).unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn derived_available_transitions_match_compiled_func() {
+        // REAL embedded metamodel (CORE_READINGS) + Order domain — not the stale
+        // minimal STATE_METAMODEL fixture, which predates these derivations.
+        let all: Vec<(&str, &str)> = crate::CORE_READINGS.iter().copied()
+            .chain(core::iter::once(("orders", ORDER_READINGS)))
+            .collect();
+        let state = all.iter().fold(ast::Object::phi(), |m, (name, text)| {
+            let this = crate::parse_forml2::parse_to_state_from(text, &m)
+                .unwrap_or_else(|e| panic!("parse {}: {}", name, e));
+            let this = ast::annotate_noun_domain(&this, name);
+            let this = ast::merge_states(&this, &ast::stamp_file_domain(&this, name));
+            ast::merge_states(&m, &this)
+        });
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_map = ast::defs_to_state(&defs, &state);
+        let deriv: Vec<(String, ast::Func)> = ast::cells_iter(&def_map).into_iter()
+            .filter(|(n, _)| n.starts_with("derivation:"))
+            .map(|(n, c)| (n.to_string(), ast::metacompose(c, &def_map)))
+            .collect();
+        let chained = if deriv.is_empty() { def_map.clone() } else {
+            let refs: Vec<(&str, &ast::Func)> = deriv.iter().map(|(n, f)| (n.as_str(), f)).collect();
+            crate::evaluate::forward_chain_defs_state(&refs, &def_map).0
+        };
+        let eff = ast::fetch_cell_seq("Status_has_effective_Transition_to_Status_on_Event_Type", &chained)
+            .as_seq().map(|f| f.len()).unwrap_or(0);
+        assert!(eff > 0, "effective-Transition cell empty under the real metamodel");
+        for status in ["In Cart", "Placed", "Shipped", "Delivered", "Cancelled"] {
+            let func_out = ast::apply(&ast::Func::Def("transitions:Order".to_string()), &ast::Object::atom(status), &chained);
+            let mut func_triples: Vec<(String, String, String)> = func_out.as_seq().map(|ts| ts.iter().filter_map(|t| {
+                let it = t.as_seq()?;
+                Some((it.get(0)?.as_atom()?.to_string(), it.get(1)?.as_atom()?.to_string(), it.get(2)?.as_atom()?.to_string()))
+            }).collect()).unwrap_or_default();
+            func_triples.sort();
+            let derived = available_transitions_derived("Order", status, &chained);
+            assert_eq!(derived, func_triples, "mismatch at status '{}'", status);
+        }
+    }
+
     #[test]
     fn create_entity_initializes_state_machine() {
         let (def_map, state) = setup_order_defs();
