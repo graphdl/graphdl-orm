@@ -1705,22 +1705,27 @@ fn resolve_derivation_rule(
 
         // rho-lookup: try with verb first, then noun set only
         let verb_opt = (!verb.is_empty()).then_some(verb);
-        catalog.resolve(&role_refs, verb_opt)
-            .or_else(|| catalog.resolve(&role_refs, None))
-            // #963: objectified-pivot abbreviation. A 4-role objectified FT
-            // (`X pivots A is implemented by B at C`) is referenced in rule
-            // bodies by its abbreviated 3-role reading with the trailing
-            // `at C` dropped. Both exact lookups above miss on the 3-vs-4
-            // noun-set mismatch, so the binding never forms; fall back to a
-            // superset-by-one reading-prefix match.
-            .or_else(|| catalog.resolve_objectified_abbrev(&role_refs, &cleaned))
+        // VERB-STRICT first (exact-verb / inverse-voice; NO unique-entry
+        // fallback) so a verb mismatch on a noun-set carrying a single FT falls
+        // THROUGH to the subtype bridge below instead of binding that lone
+        // different-verb FT (e.g. `Transition is from <SMD>` must not grab
+        // `Transition is defined in State Machine Definition`).
+        verb_opt.and_then(|v| catalog.resolve_verb_strict(&role_refs, v))
             // subtype-join → supertype FT: a clause keyed on a SUBTYPE noun
             // (`that Noun belongs to Domain`, Noun < Function) resolves to a
             // fact type declared on the SUPERTYPE (`Function belongs to
-            // Domain`). The lookups above miss because the catalog keys on
+            // Domain`). The exact lookup misses because the catalog keys on
             // the supertype noun set. Subtype instances ARE supertype
             // instances, so substitute each clause noun with one of its
             // supertypes (one role at a time) and retry the rho-lookup.
+            //
+            // ORDER: this VERB-SPECIFIC bridge MUST precede the verb-AGNOSTIC
+            // role-set fallback below. Else a clause `Transition is from <SMD>`
+            // (SMD a Status subtype) is mis-resolved by noun-set collision —
+            // the agnostic fallback matches the same-noun-set `Transition is
+            // defined in <SMD>` (a DIFFERENT verb) before the correct same-verb
+            // `Transition is from Status` bridge runs, so the Harel
+            // inherited-edge rule binds the wrong FT and never fires.
             //
             // Walk the WHOLE chain and prefer the FARTHEST (most-general /
             // root-most) supertype that resolves: a base relation is
@@ -1751,6 +1756,14 @@ fn resolve_derivation_rule(
                 }
                 best
             })
+            .or_else(|| catalog.resolve(&role_refs, None))
+            // #963: objectified-pivot abbreviation. A 4-role objectified FT
+            // (`X pivots A is implemented by B at C`) is referenced in rule
+            // bodies by its abbreviated 3-role reading with the trailing
+            // `at C` dropped. Both exact lookups above miss on the 3-vs-4
+            // noun-set mismatch, so the binding never forms; fall back to a
+            // superset-by-one reading-prefix match.
+            .or_else(|| catalog.resolve_objectified_abbrev(&role_refs, &cleaned))
     };
 
     // A derivation CONSEQUENT must name a fact type that actually exists.
@@ -3878,6 +3891,29 @@ impl SchemaCatalog {
                 // Unique entry for this noun set (binary+ only)
                 (allow_unique_fallback && entries.len() == 1).then(|| &entries[0])
             )
+            .map(|(id, _, _)| id.clone())
+    }
+
+    /// STRICTLY verb-specific resolve: exact-verb (step 1) or verb-in-reading
+    /// (step 2, inverse voice) ONLY — NO unique-entry fallback. A clause whose
+    /// verb does not match the single FT on its noun set returns None here, so
+    /// the caller can try the subtype→supertype bridge BEFORE the verb-agnostic
+    /// unique fallback. Without this, `Transition is from <SMD>` (noun set
+    /// [Transition, SMD], whose ONLY FT is the different-verb `Transition is
+    /// defined in State Machine Definition`) is grabbed by the unique fallback
+    /// and never reaches the bridge that would correctly bind `Transition is
+    /// from Status` (SMD < Status).
+    fn resolve_verb_strict(&self, role_nouns: &[&str], verb: &str) -> Option<String> {
+        let mut key: Vec<String> = role_nouns.iter().map(|n| {
+            let (base, _) = parse_role_token(n);
+            base.to_lowercase()
+        }).collect();
+        key.sort();
+        let entries = self.by_noun_set.get(&key)?;
+        let vb = verb.to_lowercase();
+        entries.iter()
+            .find(|(_, v, _)| *v == vb)
+            .or_else(|| entries.iter().find(|(_, _, reading)| reading.contains(vb.as_str())))
             .map(|(id, _, _)| id.clone())
     }
 
