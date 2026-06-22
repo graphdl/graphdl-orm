@@ -302,6 +302,17 @@ name = "aggregate_min_over_recursive_closure_e2e"
 path = "tests/aggregate_min_over_recursive_closure_e2e.rs"
 required-features = ["test-bins"]
 
+# SP1 "build-once libraries" — Task 0: cold-vs-warm equivalence harness.
+# Provides `compile_app_to_state` and `assert_states_equivalent` helpers
+# plus a `cold_compile_is_self_consistent` sanity test. These are used by
+# every later SP1 task to verify "cold compile == warm compile" correctness.
+# Gated on `test-bins` so it follows the same CI opt-in as the other
+# integration tests.
+[[test]]
+name = "sp1_equivalence"
+path = "tests/sp1_equivalence.rs"
+required-features = ["test-bins"]
+
 [features]
 # `test-bins` (#684/#650a) — opt-in flag that lets each integration
 # `[[test]]` entry compile. Off by default so `cargo test --lib`
