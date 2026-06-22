@@ -291,23 +291,40 @@ fn check_ring_validity(state: &Object) -> Vec<ReadingDiagnostic> {
             .filter(|c| is_ring_kind(binding(c, "kind").unwrap_or("")))
             .filter_map(|c| {
                 let span_ft = binding(c, "span0_factTypeId")?;
-                let role_nouns: hashbrown::HashSet<&str> = role_cell.as_seq()
-                    .map(|rs| rs.iter()
-                        .filter(|r| binding(r, "factType") == Some(span_ft))
-                        .filter_map(|r| binding(r, "nounName"))
-                        .collect())
-                    .unwrap_or_default();
-                match role_nouns.len() > 1 {
+                // Count this span FT's roles per noun. A ring is INVALID only
+                // when it spans >1 distinct noun AND no noun fills >=2 roles
+                // (no same-noun pair). This is the historic `distinct > 1` rule
+                // refined with `&& !has_self_pair` to admit n-ary rings: e.g.
+                // `Admin merges Support Request into Support Request` — SR fills
+                // 2 of 3 roles, a valid IR ring on SR despite the third Admin
+                // role. Empty / single-noun spans (incl. the role-cell-empty
+                // metamodel FTs App_extends_App / Domain_depends_on_Domain /
+                // Directory_has_parent_Directory, whose role lookup is empty
+                // here) stay VALID exactly as the original check left them — the
+                // refinement strictly narrows what the old rule rejected.
+                let mut counts: hashbrown::HashMap<&str, usize> = hashbrown::HashMap::new();
+                if let Some(rs) = role_cell.as_seq() {
+                    for r in rs {
+                        if binding(r, "factType") == Some(span_ft) {
+                            if let Some(n) = binding(r, "nounName") {
+                                *counts.entry(n).or_default() += 1;
+                            }
+                        }
+                    }
+                }
+                let has_self_pair = counts.values().any(|&n| n >= 2);
+                match counts.len() > 1 && !has_self_pair {
                     true => Some(ReadingDiagnostic {
                         line: 0,
                         reading: binding(c, "text").unwrap_or("").to_string(),
                         level: Level::Error,
                         source: Source::Deontic,
                         message: format!(
-                            "ring constraint `{}` on fact type `{}` spans roles of different nouns ({:?}) — ring constraints require the same noun on both sides",
-                            binding(c, "kind").unwrap_or(""), span_ft, role_nouns,
+                            "ring constraint `{}` on fact type `{}` spans roles of multiple nouns ({:?}) with no same-noun pair — a ring constraint requires the same noun to fill two of the fact type's roles",
+                            binding(c, "kind").unwrap_or(""), span_ft,
+                            counts.keys().collect::<Vec<_>>(),
                         ),
-                        suggestion: Some("either drop the ring constraint or restructure the fact type so both roles share a noun".to_string()),
+                        suggestion: Some("either drop the ring constraint or restructure the fact type so the same noun fills two roles".to_string()),
                     }),
                     false => None,
                 }

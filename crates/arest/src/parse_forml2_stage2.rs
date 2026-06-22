@@ -3028,6 +3028,31 @@ fn enrich_constraints_with_spans(
                 let pos = roles.iter().find(|(_, n)| n == entity).map(|(p, _)| *p)?;
                 return Some((ft_id.clone(), alloc::format!("{}", pos)));
             }
+            // ring-subtype-misbind (residual 3c7dc574): a ring constraint's
+            // true FT is a SELF-relation — the ring noun fills >= 2 of its
+            // roles (e.g. the ternary `Admin merges SR into SR`, SR in 2 of 3
+            // roles). The generic entity-first-match below grabs the FIRST FT
+            // merely CONTAINING the noun in ONE role; when that noun is also a
+            // subtype's subtype-role, the `<Sup>_is_a_<Sub>` FT sorts ahead and
+            // wins, then the ring check rejects it (support.auto.dev: IR `No
+            // Support Request is merged into itself` mis-bound onto
+            // `Agent_Chat_is_a_Support_Request`). Bind the FT where the ring
+            // noun fills >= 2 roles, span on its first such role; NONE => emit
+            // span-less (inert), never the entity-first-match. A subtype `is a`
+            // FT (noun in ONE role) can never win.
+            if ["IR", "AS", "AT", "SY", "IT", "TR", "AC", "RF"].contains(&kind) {
+                let mut ring: Vec<(&String, usize)> = roles_by_ft.iter()
+                    .filter_map(|(ft, roles)| {
+                        if roles.iter().filter(|(_, n)| n == entity).count() < 2 {
+                            return None;
+                        }
+                        let pos = roles.iter().find(|(_, n)| n == entity).map(|(p, _)| *p)?;
+                        Some((ft, pos))
+                    })
+                    .collect();
+                ring.sort();
+                return ring.first().map(|(ft, pos)| ((*ft).clone(), alloc::format!("{}", pos)));
+            }
             roles_by_noun.get(entity).cloned()
         };
         let (ft_id, pos) = match resolved.or_else(fallback) {
