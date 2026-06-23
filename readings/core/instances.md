@@ -249,9 +249,11 @@ Guard Run has Result.
      and retire the bridge; until then the bridge is the readings-only form
      that materialises the single-sourced domain. -->
 
-* Resource is of Function iff Resource is instance of Noun and Function is Noun.
+<!-- DISABLED (convergence-cycle test 2026-06-22; root: absorbed-Function self-reference, see task derivation-subtype-join-resolution):
+* Resource is of Function iff Resource is instance of Noun and Function is Noun. -->
 
-* Resource belongs to Domain iff Resource is of Function and that Function belongs to Domain.
+<!-- DISABLED (convergence-cycle test 2026-06-22):
+* Resource belongs to Domain iff Resource is of Function and that Function belongs to Domain. -->
 
 <!-- `Fact is of Fact Type` is a BASE fact type, populated by population
      reflection (compile.rs `reflect_schema_cells`) — every populated row of a
@@ -259,9 +261,11 @@ Guard Run has Result.
      `Resource is instance of Noun`. It is VALIDATED, not derived, by the
      subset constraint in core.md (`If some Fact uses some Resource for some
      Role then that Fact is of some Fact Type that has that Role`). -->
-* Fact is of Function iff Fact is of Fact Type and Function is Fact Type.
+<!-- DISABLED (convergence-cycle test 2026-06-22):
+* Fact is of Function iff Fact is of Fact Type and Function is Fact Type. -->
 
-* Fact belongs to Domain iff Fact is of Function and that Function belongs to Domain.
+<!-- DISABLED (convergence-cycle test 2026-06-22):
+* Fact belongs to Domain iff Fact is of Function and that Function belongs to Domain. -->
 
 <!-- sm-retire-forml2: SM/Resource status projections lifted from imperative
      Rust into reading-level derivations.
