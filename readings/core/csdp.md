@@ -68,6 +68,7 @@ Schema Design passes final checks.
 
 State Machine Definition 'CSDP' is for Noun 'Schema Design'.
 Status 'step1-elementary-facts' is initial in State Machine Definition 'CSDP'.
+Status 'designed' is terminal in State Machine Definition 'CSDP'.
 
 Transition 'advance-to-step2' is defined in State Machine Definition 'CSDP'.
 Transition 'advance-to-step2' is from Status 'step1-elementary-facts'.
@@ -142,6 +143,7 @@ Relational Mapping groups functional fact types.
 
 State Machine Definition 'Rmap' is for Noun 'Relational Mapping'.
 Status 'step0-absorb-subtypes' is initial in State Machine Definition 'Rmap'.
+Status 'mapped' is terminal in State Machine Definition 'Rmap'.
 
 Transition 'advance-to-rmap1' is defined in State Machine Definition 'Rmap'.
 Transition 'advance-to-rmap1' is from Status 'step0-absorb-subtypes'.

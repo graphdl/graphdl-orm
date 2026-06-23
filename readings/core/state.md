@@ -39,7 +39,17 @@ Verb is performed during Transition.
 Status is initial in State Machine Definition.
   Each State Machine Definition has at most one initial Status.
 Status is defined in State Machine Definition. *
-Status is terminal in State Machine Definition. *
+Status is terminal in State Machine Definition.
+<!-- ASSERTED, not derived (CSDP). "Terminal" means "no outgoing Transition",
+     which is a NEGATION; per CSDP discipline a derivation rule asserts only
+     positive facts and closed-world negation is the validation layer's
+     concern. So the modeler DECLARES each SM's sink Status(es) (exactly like
+     `initial`). Completeness is validated by the existing `at least one
+     terminal Status` obligation below; the consistency check (terminal => no
+     outgoing Transition) belongs to the validation layer as a deontic
+     constraint (follow-up — needs a join-safe phrasing). The behavioral
+     "a sink affords nothing" already follows from the transition graph
+     (has_outgoing), independent of this cell. -->
 Status is rooted in State Machine Definition. *
 Status is effective initial in State Machine Definition. *
 <!-- sm-retire-forml2: the resolved seed status of a machine. The cardinality
@@ -83,7 +93,16 @@ Guard guards Transition.
 
 * Status is defined in State Machine Definition iff some Transition is defined in that State Machine Definition and that Transition is to that Status.
 
-* Status is terminal in State Machine Definition iff that Status is defined in that State Machine Definition and no Transition is defined in that State Machine Definition where that Transition is from that Status.
+<!-- `Status is terminal` was derived by `… and no Transition is defined in
+     that State Machine Definition where that Transition is from that Status`.
+     The parser strips the leading `no` + trailing `where …` (AbsenceOf
+     detection removed 2026-05-19, parse_forml2.rs) and falls back to the bare
+     FT, so the rule compiled to `terminal == defined` — EVERY defined Status
+     was flagged terminal (verified live: 32/32). Remodeled to an ASSERTED
+     base fact per CSDP (declared per SM in the app readings, like `initial`);
+     the negation now lives in the exclusion constraint below. No engine
+     change: the parser limitation is sidestepped, not worked around. -->
+
 
 <!--
   #759 / Audit MC3b-a: normalized SM derivation rules covering Pass 1

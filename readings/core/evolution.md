@@ -88,6 +88,8 @@ It is forbidden that a Domain Change targeting Domain 'ethics' is applied withou
 
 State Machine Definition 'Domain Change' is for Noun 'Domain Change'.
 Status 'Proposed' is initial in State Machine Definition 'Domain Change'.
+Status 'Applied' is terminal in State Machine Definition 'Domain Change'.
+Status 'Rejected' is terminal in State Machine Definition 'Domain Change'.
 
 Transition 'review' is defined in State Machine Definition 'Domain Change'.
 Transition 'review' is from Status 'Proposed'.
