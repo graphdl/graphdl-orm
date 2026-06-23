@@ -1123,7 +1123,7 @@ mod derived_wipe_set_tests {
 /// binary hashing itself is f(code) exactly; ~10ms once per process
 /// via OnceLock.
 #[cfg(feature = "local")]
-fn binary_self_hash() -> u64 {
+pub(crate) fn binary_self_hash() -> u64 {
     static HASH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *HASH.get_or_init(|| {
         let bytes = std::env::current_exe().ok()
@@ -1139,7 +1139,7 @@ fn binary_self_hash() -> u64 {
 /// binary self-hash — the cache key. A parse cache is a function of
 /// (readings, parser); either changing must miss.
 #[cfg(feature = "local")]
-fn metamodel_readings_signature() -> u64 {
+pub(crate) fn metamodel_readings_signature() -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for entry in crate::metamodel_readings() {
         for b in entry.0.bytes() { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
@@ -3343,8 +3343,12 @@ pub fn main_entry() {
                 // drop + tree-shake above — it's a fresh, whole-corpus map
                 // rebuilt every compile, never persisted population.
                 let state = ast::store("Provenance", provenance_cell, &state);
+                let _sp1_t_defs = std::time::Instant::now();
                 let compile_defs = crate::compile::compile_to_defs_state(&state);
                 let d = ast::defs_to_state(&compile_defs, &d);
+                if std::env::var("AREST_SP1_DIAG").is_ok() {
+                    eprintln!("[sp1timing] compile_to_defs_state+overlay: {:?}", _sp1_t_defs.elapsed());
+                }
 
                 // task-984 part B (arc-agi-3 issue 10): enforce alethic
                 // UCs on the LOAD path. The cor:closure merge dedupes
@@ -3596,11 +3600,59 @@ pub fn main_entry() {
                 // and `forward_chain_stratified_n(positive, [], …)` reduces
                 // to a single `forward_chain_defs_state` over the positive
                 // rules (see evaluate.rs:683-684). Call that directly.
+                let _sp1_t_chain = std::time::Instant::now();
                 let (d, chain_converged) = if stratum1.is_empty() || inputs_unchanged {
                     // delta-lfp-noop-skip: nothing to derive (no rules) OR inputs
                     // unchanged → the kept derived cells are the valid LFP. Treat
                     // as converged so the input sig is (re)persisted below.
                     (d, true)
+                } else if crate::sp1::lib_cache_enabled() {
+                    // ── SP1 build-once libraries: WARM delta-derive (OPT-IN) ──
+                    // Instead of re-deriving the metamodel's self-derived cells
+                    // (the `Function` supertype-union reconstitution storm), LOAD
+                    // the pre-built metamodel library (content+binary cached) and
+                    // delta-derive ONLY the app's additions. `cli_warm_derive`
+                    // restores the library's derived cells as the warm prior,
+                    // scopes the `#836` drop to app-owned cells, and runs the
+                    // seeded-delta semi-naive chain over the app delta.
+                    // Identity-equal to the cold full recompile below — proven by
+                    // the cold==warm gate (tests/sp1_equivalence.rs). `d` here has
+                    // taken the same parse→defs→reconcile→reflect-pre→#836-drop
+                    // spine the gate's COLD path takes, so the gate-proven
+                    // invariant carries.
+                    //
+                    // OPT-IN (`AREST_LIB_CACHE=1`): post-convergence-fix the chain
+                    // is no longer the compile bottleneck, so warm yields no win
+                    // (and its cache-decode/restore overhead slightly regresses)
+                    // on current readings — see `sp1::lib_cache_enabled`. Kept
+                    // available for workloads whose metamodel derivation IS
+                    // expensive, and as the SP2/SP3 foundation.
+                    eprintln!("[load] SP1: warm-loading metamodel library + \
+                               delta-deriving app additions (opt-in via \
+                               AREST_LIB_CACHE=1; AREST_NO_LIB_CACHE=1 to force cold)");
+                    // SP1 Task 3: when there are dependency dirs (every dir but
+                    // the last/app), build the chained dependency prior from
+                    // them; otherwise fall back to the metamodel-only prior.
+                    let dep_layers: Vec<Vec<(String, String)>> = if dirs.len() > 1 {
+                        dirs[..dirs.len() - 1].iter()
+                            .map(|dir| read_readings(std::slice::from_ref(dir)))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let (new_d, converged) = if dep_layers.is_empty() {
+                        crate::sp1::cli_warm_derive(&d)
+                    } else {
+                        crate::sp1::cli_warm_derive_chained(&d, &dep_layers)
+                    };
+                    if !converged {
+                        eprintln!("[load] WARNING: SP1 warm forward-chain did NOT \
+                            converge (aborted on its time budget); persisting a \
+                            PARTIAL fixpoint.");
+                    }
+                    eprintln!("[load] SP1 warm delta-derive complete ({} rules in pack)",
+                        stratum1.len());
+                    (new_d, converged)
                 } else {
                     // perf-chain-seminaive: run the full-compile chain through
                     // the SEMI-NAIVE chainer (the apply path already does this —
@@ -3650,6 +3702,9 @@ pub fn main_entry() {
                         stratum1.len(), derived.len());
                     (new_d, !aborted)
                 };
+                if std::env::var("AREST_SP1_DIAG").is_ok() {
+                    eprintln!("[sp1timing] drop+chain decision phase: {:?}", _sp1_t_chain.elapsed());
+                }
                 // delta-lfp-noop-skip: persist the input sig so a FUTURE no-op
                 // recompile can skip — but ONLY after a COMPLETE LFP (converged),
                 // never after a partial/aborted chain (so the next compile
@@ -3712,8 +3767,12 @@ pub fn main_entry() {
                 };
 
                 // Persist state to SQLite (tables + triggers).
+                let _sp1_t_persist = std::time::Instant::now();
                 db::apply_ddl(&conn, &d);
                 db::persist_state(&conn, &d);
+                if std::env::var("AREST_SP1_DIAG").is_ok() {
+                    eprintln!("[sp1timing] apply_ddl+persist+project: {:?}", _sp1_t_persist.elapsed());
+                }
 
                 eprintln!("Compiled {} readings into {}", compiled, &db_path);
             }

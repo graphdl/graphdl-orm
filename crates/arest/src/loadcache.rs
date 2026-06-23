@@ -77,6 +77,87 @@ pub(crate) fn store(db_path: &Path, key: u64, state: &Object) {
     let _ = std::fs::remove_file(&tmp);
 }
 
+// =========================================================================
+// SP1 build-once libraries: derived-LFP cache.
+//
+// The metamodel parse-cache (cli/entry.rs) caches the PARSE of the
+// metamodel readings — but every app compile still re-derives the
+// metamodel's self-derived cells from scratch (the `Function`
+// supertype-union reconstitution storm: ~595 re-derives per 25s window,
+// a trivial 1-entity app failing to converge in 90s — root cause
+// `supertype-union-reconstitution`). SP1 pays each library's derivation
+// LFP ONCE per (content, binary) and warm-loads it on app compile, so app
+// compiles delta-derive only their own additions.
+//
+// This is a CONTENT-ADDRESSED sidecar (same discipline as the metamodel
+// parse cache and the per-db loadcache above): the key is FNV(readings
+// content + dep keys + binary self-hash); the filename encodes the key, so
+// a present, populated file IS by construction the derived LFP of the
+// current (content, binary). Any readings or binary change moves the key →
+// a miss → rebuild. Stored as the same length-prefixed binary tree the
+// loadcache codec emits (no SQLite round-trip — this caches the derived
+// cell graph directly, decoded with no tokenization). Reuses the atomic
+// temp+rename write so concurrent compilers (different apps, same binary)
+// never observe a torn file; the content is a deterministic function of
+// (readings, binary), so racing writers emit byte-identical files.
+//
+// `AREST_NO_LIB_CACHE=1` bypasses this cache entirely (the "cold"
+// reference for the cold==warm equivalence gate) — honoured by the caller
+// in `crate::sp1`, not here.
+// =========================================================================
+
+const DERIVED_MAGIC: &[u8; 8] = b"ARESTLD1";
+
+/// Sidecar path for a derived-LFP cache keyed by `sig`: a file in the
+/// system temp dir named `arest-lib-derived-{sig:016x}.bin`.
+#[cfg(feature = "local")]
+pub(crate) fn derived_cache_path(sig: u64) -> PathBuf {
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("arest-lib-derived-{:016x}.bin", sig));
+    dir
+}
+
+/// Read the derived-LFP sidecar for `sig`; `Some(state)` only when the
+/// magic and key match and the whole tree decodes cleanly with no trailing
+/// garbage. The signature is encoded in the filename AND stored inline, so
+/// a present, well-formed file is by construction the derived LFP of the
+/// signature's (content, binary). Returns `None` on any read/decode failure
+/// → caller rebuilds.
+#[cfg(feature = "local")]
+pub(crate) fn load_derived(sig: u64) -> Option<Object> {
+    let bytes = std::fs::read(derived_cache_path(sig)).ok()?;
+    if bytes.len() < 16 || &bytes[..8] != DERIVED_MAGIC {
+        return None;
+    }
+    let stored_key = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
+    if stored_key != sig {
+        return None;
+    }
+    let mut pos = 16usize;
+    let tree = decode(&bytes, &mut pos)?;
+    (pos == bytes.len()).then_some(tree)
+}
+
+/// Write the derived-LFP sidecar for `sig` atomically (per-process temp +
+/// rename). Failures are silent — the cache is an accelerator, never
+/// load-bearing.
+#[cfg(feature = "local")]
+pub(crate) fn store_derived(sig: u64, state: &Object) {
+    let path = derived_cache_path(sig);
+    let tmp = path.with_extension(format!("bin.tmp{}", std::process::id()));
+    let mut buf: Vec<u8> = Vec::with_capacity(1 << 20);
+    buf.extend_from_slice(DERIVED_MAGIC);
+    buf.extend_from_slice(&sig.to_le_bytes());
+    encode(state, &mut buf);
+    let ok = std::fs::File::create(&tmp)
+        .and_then(|mut f| f.write_all(&buf).and_then(|_| f.sync_all()))
+        .is_ok();
+    if ok {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+    let _ = std::fs::remove_file(&tmp);
+}
+
 fn encode(obj: &Object, out: &mut Vec<u8>) {
     match obj {
         Object::Bottom => out.push(0),

@@ -311,7 +311,10 @@ required-features = ["test-bins"]
 [[test]]
 name = "sp1_equivalence"
 path = "tests/sp1_equivalence.rs"
-required-features = ["test-bins"]
+# `local` (rusqlite) gates the SP1 module (`crate::sp1`) this suite drives
+# (the build-once-library cache + warm/cold compile pipeline); `test-bins`
+# follows the same CI opt-in as the other integration tests.
+required-features = ["test-bins", "local"]
 
 [features]
 # `test-bins` (#684/#650a) — opt-in flag that lets each integration

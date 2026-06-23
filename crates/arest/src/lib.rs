@@ -396,6 +396,15 @@ pub mod cloudflare_entropy;
 // in the kernel build.
 mod parse_intercept;
 
+// SP1 build-once libraries (2026-06-22): warm-base app compilation. Pays
+// each library's derivation LFP once per (content, binary) and warm-loads
+// it on app compile, so app compiles delta-derive only their own
+// additions — eliminating the per-app `Function` supertype-union
+// reconstitution storm. std-only (filesystem cache + bundled readings);
+// the module gates itself on `feature = "local"`.
+#[cfg(all(not(feature = "no_std"), feature = "local"))]
+pub mod sp1;
+
 // wasm-safe `Instant` shim — see time_shim.rs for the why
 // (std::time::Instant panics on wasm32-unknown-unknown). Every
 // stage-2 timing call site refers to `crate::time_shim::Instant`
