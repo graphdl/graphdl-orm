@@ -377,6 +377,15 @@ mod db {
             None => crate::rmap::projection_plan(d),
         };
 
+        // #15 fix: null a dangling NULLABLE FK rather than cascade-drop the
+        // child row. Index TableDefs by name for column metadata; lazily
+        // cache each referenced parent's PK-id set, loaded AFTER the parent
+        // is inserted (Kahn order = parents before children).
+        let tdef_by_name: hashbrown::HashMap<&str, &crate::rmap::TableDef> =
+            plan.tables.iter().map(|t| (t.name.as_str(), t)).collect();
+        let mut parent_pk_ids: hashbrown::HashMap<String, Option<hashbrown::HashSet<String>>> =
+            hashbrown::HashMap::new();
+
         for name in plan.order.iter().rev() {
             // DELETE only the scoped tables — unscoped tables keep
             // their rows (their cells did not change).
@@ -400,6 +409,24 @@ mod db {
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
                 params![name], |r| r.get::<_, i64>(0)).map(|n| n > 0).unwrap_or(false);
             if !exists { continue; }
+            // #15 fix: load PK-id sets for THIS table's NULLABLE-FK parents.
+            // Kahn order guarantees those parents are already inserted, so the
+            // set reflects exactly which referents will exist. Self-referential
+            // FKs are skipped (the rows are being inserted now); composite/unknown
+            // PK parents yield None → not checked (pre-fix behavior).
+            let tdef = tdef_by_name.get(name.as_str()).copied();
+            if let Some(td) = tdef {
+                for col in &td.columns {
+                    if col.nullable {
+                        if let Some(parent) = col.references.as_deref() {
+                            if parent != name.as_str() && !parent_pk_ids.contains_key(parent) {
+                                let set = load_pk_id_set(conn, &tdef_by_name, parent);
+                                parent_pk_ids.insert(parent.to_string(), set);
+                            }
+                        }
+                    }
+                }
+            }
             // diag-ungated-eprintln-cost: aggregate per-row projection failures
             // into ONE summary line per table. The per-row eprintln fired
             // unconditionally O(failing rows) times — ~80-100 lines on a single
@@ -408,10 +435,30 @@ mod db {
             // + first error preserve the operational signal at O(tables) cost.
             let mut projection_failures = 0usize;
             let mut first_projection_err: Option<String> = None;
+            let mut nulled_fks = 0usize;
             for row in rows {
                 let mut names: Vec<String> = Vec::new();
                 let mut values: Vec<&String> = Vec::new();
                 for (k, v) in row.iter() {
+                    // #15 fix: a NULLABLE FK whose value is absent from its
+                    // parent table dangles — OMIT the column (→ NULL) instead
+                    // of letting the whole row's INSERT fail under FK
+                    // enforcement and cascade-dropping otherwise-valid children.
+                    // NOT-NULL FKs (the id PK, mandatory roles) are untouched
+                    // and still drop. Self-refs / composite-PK parents skip.
+                    let dangles = tdef
+                        .and_then(|td| td.columns.iter()
+                            .find(|c| c.name.as_str() == k.as_str()))
+                        .filter(|c| c.nullable)
+                        .and_then(|c| c.references.as_deref())
+                        .filter(|parent| *parent != name.as_str())
+                        .and_then(|parent| parent_pk_ids.get(parent))
+                        .and_then(|opt| opt.as_ref())
+                        .map_or(false, |ids| !ids.contains(v.as_str()));
+                    if dangles {
+                        nulled_fks += 1;
+                        continue; // omit → column defaults to NULL
+                    }
                     names.push(format!("\"{}\"", k.replace('"', "")));
                     values.push(v);
                 }
@@ -427,6 +474,11 @@ mod db {
                     }
                 }
             }
+            if nulled_fks > 0 {
+                eprintln!("Note: {} dangling nullable FK value(s) nulled for {} \
+                           (referent absent from its parent table; row kept)",
+                    nulled_fks, name);
+            }
             if projection_failures > 0 {
                 eprintln!("Warning: {} row(s) failed projection for {} (first: {})",
                     projection_failures, name,
@@ -434,6 +486,28 @@ mod db {
             }
         }
         true
+    }
+
+    /// #15 fix helper: the set of single-column PK values currently in
+    /// `parent`'s 3NF table — used to detect dangling nullable FKs during
+    /// projection. Returns None when the parent has no table, a
+    /// composite/empty PK, or the read fails; callers then leave the FK
+    /// untouched (the pre-fix behavior).
+    fn load_pk_id_set(
+        conn: &Connection,
+        tdef_by_name: &hashbrown::HashMap<&str, &crate::rmap::TableDef>,
+        parent: &str,
+    ) -> Option<hashbrown::HashSet<String>> {
+        let pk = tdef_by_name.get(parent).map(|t| t.primary_key.clone())?;
+        if pk.len() != 1 { return None; }
+        let q = format!("SELECT \"{}\" FROM \"{}\"",
+            pk[0].replace('"', ""), parent.replace('"', ""));
+        let mut stmt = conn.prepare(&q).ok()?;
+        let set: hashbrown::HashSet<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0)).ok()?
+            .filter_map(|r| r.ok())
+            .collect();
+        Some(set)
     }
 
     /// Load state D from SQLite.
@@ -641,6 +715,134 @@ mod db {
             ).expect("def count after replacement");
             assert_eq!(cell_count, 0);
             assert_eq!(def_count, 0);
+        }
+
+        /// #15 de-confound (cron 2026-06-23): does a FULL persist drop a
+        /// valid parent entity that has a unary child FK-referencing it,
+        /// across a 2-level subtype chain? The live claude DB showed
+        /// `noun_is_instantiable` rows dropped because their `noun` parent
+        /// row was absent while the SAME ids were present in `function`
+        /// (function ⊃ noun) — yet those nouns (User, Stripe*) are fully
+        /// valid entities. That was the original (WRONG) staleness
+        /// hypothesis — the ACTUAL live cause is a NOT-NULL-ancestor cascade
+        /// (see the closing note). This
+        /// reproduces the shape (Grandparent ⊃ Parent; `Parent is active`
+        /// → parent_is_active(parent_id REFERENCES parent)) through the real
+        /// compile+persist path and asserts BOTH the parent and the child
+        /// rows land. A PASS confirms the projection is correct (live drop =
+        /// staleness); a FAIL would mean a genuine cascade-projection bug.
+        #[test]
+        fn full_persist_projects_child_across_subtype_parent_chain() {
+            let conn = Connection::open_in_memory().expect("in-memory sqlite");
+            ensure_meta_tables(&conn);
+            let corpus = "\
+## Entity Types\n\
+Grandparent(.id) is an entity type.\n\
+Parent(.id) is an entity type.\n\
+Parent is a subtype of Grandparent.\n\
+## Value Types\n\
+Color is a value type.\n\
+## Fact Types\n\
+Parent has Color.\n\
+  Each Parent has exactly one Color.\n\
+Parent is active.\n\
+## Instance Facts\n\
+Parent 'P1' has Color 'blue'.\n\
+Parent 'P1' is active.\n";
+            let parsed = crate::parse_forml2::parse_to_state_from(
+                corpus, &crate::ast::Object::phi()).expect("corpus parses");
+            let compile_defs = crate::compile::compile_to_defs_state(&parsed);
+            let d = crate::ast::defs_to_state(&compile_defs, &parsed);
+            apply_ddl(&conn, &d);
+            persist_state(&conn, &d);
+            // Parent P1 carries its own Color absorption, so Phase-1 builds
+            // its row directly; the parent_is_active child references it, and
+            // the Parent⊂Grandparent subtype makes parent.id REFERENCE
+            // grandparent (Phase-2 must fill grandparent with P1).
+            let parent_rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM parent WHERE id='P1'", [], |r| r.get(0))
+                .expect("parent table must exist");
+            let gp_rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM grandparent WHERE id='P1'", [], |r| r.get(0))
+                .expect("grandparent table must exist");
+            let child_rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM parent_is_active WHERE parent_id='P1'", [], |r| r.get(0))
+                .expect("parent_is_active table must exist");
+            assert_eq!(parent_rows, 1,
+                "parent P1 must project — it has its own Color absorption");
+            assert_eq!(gp_rows, 1,
+                "grandparent P1 must be parent-filled (parent.id REFERENCES grandparent)");
+            assert_eq!(child_rows, 1,
+                "the child (parent_is_active) row must SURVIVE — its FK to parent is satisfied");
+            // NOTE (corrected): a PASS only proves full-persist handles the
+            // CLEAN chain. The actual #15 live drop is a NOT-NULL-ANCESTOR
+            // cascade: 10 nouns backed by an external system drop because
+            // external_system.url is NOT NULL but those systems have no URL
+            // fact → external_system table empties → noun.external_system_id
+            // FK fails → noun + noun_is_instantiable drop. It reproduces on a
+            // full persist; this clean-chain test stays a valid regression.
+            // See task15 / lesson projection-fk-drop-is-notnull-ancestor-cascade.
+        }
+
+        /// #15 fix (cron 2026-06-23): a dangling NULLABLE child FK must be
+        /// NULLED, not cause the whole child row (and any cascade) to drop.
+        /// Reproduces the live mechanism minimally: a Backer with a mandatory
+        /// (NOT NULL) Url but no Url fact correctly drops from the backer
+        /// table; a Parent backed by it (nullable parent.backer_id) and a
+        /// child `Parent is active` must then SURVIVE — Parent with backer_id
+        /// NULL, child intact. Before the fix, FK enforcement drops Parent
+        /// (dangling backer_id) and cascades to parent_is_active. A NOT-NULL
+        /// dangling FK (e.g. the id PK) still drops — unchanged.
+        #[test]
+        fn dangling_nullable_fk_is_nulled_not_cascade_dropped() {
+            let conn = Connection::open_in_memory().expect("in-memory sqlite");
+            ensure_meta_tables(&conn);
+            let corpus = "\
+## Entity Types\n\
+Backer(.id) is an entity type.\n\
+Parent(.id) is an entity type.\n\
+## Value Types\n\
+Url is a value type.\n\
+## Fact Types\n\
+Backer has Url.\n\
+  Each Backer has exactly one Url.\n\
+Parent is backed by Backer.\n\
+  Each Parent is backed by at most one Backer.\n\
+Parent is active.\n\
+## Instance Facts\n\
+Parent 'P1' is backed by Backer 'b1'.\n\
+Parent 'P1' is active.\n";
+            let parsed = crate::parse_forml2::parse_to_state_from(
+                corpus, &crate::ast::Object::phi()).expect("corpus parses");
+            let compile_defs = crate::compile::compile_to_defs_state(&parsed);
+            let d = crate::ast::defs_to_state(&compile_defs, &parsed);
+            apply_ddl(&conn, &d);
+            persist_state(&conn, &d);
+            // Backer b1 has no Url (url is NOT NULL) → it correctly does NOT
+            // project.
+            let backer_rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM backer", [], |r| r.get(0))
+                .expect("backer table exists");
+            assert_eq!(backer_rows, 0,
+                "backer b1 correctly drops — Url is mandatory and absent");
+            // Parent P1's backer_id is NULLABLE, so P1 must SURVIVE with a
+            // nulled dangling FK rather than be dropped.
+            let parent_rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM parent WHERE id='P1'", [], |r| r.get(0))
+                .expect("parent table exists");
+            assert_eq!(parent_rows, 1,
+                "Parent P1 must SURVIVE with a nulled dangling backer_id, not drop");
+            let backer_id_null: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM parent WHERE id='P1' AND backer_id IS NULL", [], |r| r.get(0))
+                .expect("query");
+            assert_eq!(backer_id_null, 1,
+                "the dangling nullable FK must be NULL, not the absent 'b1'");
+            // And the grandchild must survive — no cascade from the nulled FK.
+            let child_rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM parent_is_active WHERE parent_id='P1'", [], |r| r.get(0))
+                .expect("parent_is_active table exists");
+            assert_eq!(child_rows, 1,
+                "the child must SURVIVE — no cascade once the dangling FK is nulled");
         }
 
         /// 987-A increment 1: the per-file signature registry round-trips
