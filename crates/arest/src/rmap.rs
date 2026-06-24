@@ -1722,6 +1722,10 @@ fn namespaced_name(flat: &str, table_domain: &HashMap<String, String>) -> String
 pub fn namespace_tables(tables: Vec<TableDef>, table_domain: &HashMap<String, String>) -> Vec<TableDef> {
     tables.into_iter().map(|mut t| {
         t.name = namespaced_name(&t.name, table_domain);
+        // #23: under namespacing the domain IS the table-name prefix, so the
+        // inline domain-membership column (the Function_belongs_to_Domain
+        // absorption, e.g. function.domain_id) is subsumed -> drop it.
+        t.columns.retain(|c| c.source_cell.as_deref() != Some("Function_belongs_to_Domain"));
         for col in t.columns.iter_mut() {
             if let Some(parent) = col.references.clone() {
                 col.references = Some(namespaced_name(&parent, table_domain));
@@ -1736,9 +1740,24 @@ pub fn namespace_tables(tables: Vec<TableDef>, table_domain: &HashMap<String, St
 /// -- so every occurrence of a table name moves to its domain namespace
 /// together. The chokepoint the std persist/DDL path applies (flag-gated).
 pub fn namespace_plan(plan: ProjectionPlan, table_domain: &HashMap<String, String>) -> ProjectionPlan {
+    // #23: the domain-membership absorption columns that namespace_tables drops
+    // (Function_belongs_to_Domain, e.g. function.domain_id) must also be stripped
+    // from the projected rows, else the INSERT references a now-absent column.
+    let drop_cols: HashSet<String> = plan.tables.iter()
+        .flat_map(|t| t.columns.iter())
+        .filter(|c| c.source_cell.as_deref() == Some("Function_belongs_to_Domain"))
+        .map(|c| c.name.clone())
+        .collect();
     let tables = namespace_tables(plan.tables, table_domain);
     let rows = plan.rows.into_iter()
-        .map(|(name, r)| (namespaced_name(&name, table_domain), r))
+        .map(|(name, mut rs)| {
+            if !drop_cols.is_empty() {
+                for r in rs.iter_mut() {
+                    for c in &drop_cols { r.remove(c); }
+                }
+            }
+            (namespaced_name(&name, table_domain), rs)
+        })
         .collect();
     let order = plan.order.iter().map(|n| namespaced_name(n, table_domain)).collect();
     ProjectionPlan { tables, rows, order }
@@ -1854,6 +1873,56 @@ mod tests {
             "noun name -> snaked table name -> domain; got {:?}", m);
         assert_eq!(m.get("hexagram").map(|s| s.as_str()), Some("i-ching.md"),
             "raw domain preserved (sanitization happens in namespaced_name); got {:?}", m);
+    }
+
+    /// #23: under namespacing the domain-membership column (the
+    /// Function_belongs_to_Domain absorption) is subsumed by the table's
+    /// namespace and dropped from the DDL.
+    #[test]
+    fn namespace_tables_drops_domain_membership_column() {
+        let t = TableDef {
+            name: "function".to_string(),
+            columns: vec![
+                TableColumn { name: "id".to_string(), col_type: "TEXT".to_string(), nullable: false, references: None, ..Default::default() },
+                TableColumn { name: "domain_id".to_string(), col_type: "TEXT".to_string(), nullable: true, references: Some("domain".to_string()), source_cell: Some("Function_belongs_to_Domain".to_string()), ..Default::default() },
+            ],
+            primary_key: vec!["id".to_string()], checks: None, unique_constraints: None, ref_value_column: None,
+        };
+        let mut td: HashMap<String, String> = HashMap::new();
+        td.insert("function".to_string(), "core".to_string());
+        let out = namespace_tables(vec![t], &td);
+        let f = out.iter().find(|t| t.name == "core__function").unwrap();
+        assert!(!f.columns.iter().any(|c| c.name == "domain_id"),
+            "domain-membership column dropped under namespacing; got {:?}",
+            f.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>());
+        assert!(f.columns.iter().any(|c| c.name == "id"), "id column kept");
+    }
+
+    /// #23: namespace_plan strips the dropped domain-membership column from the
+    /// projected rows so the INSERT matches the namespaced DDL.
+    #[test]
+    fn namespace_plan_strips_domain_membership_from_rows() {
+        let t = TableDef {
+            name: "function".to_string(),
+            columns: vec![
+                TableColumn { name: "id".to_string(), col_type: "TEXT".to_string(), nullable: false, references: None, ..Default::default() },
+                TableColumn { name: "domain_id".to_string(), col_type: "TEXT".to_string(), nullable: true, references: Some("domain".to_string()), source_cell: Some("Function_belongs_to_Domain".to_string()), ..Default::default() },
+            ],
+            primary_key: vec!["id".to_string()], checks: None, unique_constraints: None, ref_value_column: None,
+        };
+        let mut row = ProjectedRow::new();
+        row.insert("id".to_string(), "f1".to_string());
+        row.insert("domain_id".to_string(), "core".to_string());
+        let mut rows: HashMap<String, Vec<ProjectedRow>> = HashMap::new();
+        rows.insert("function".to_string(), vec![row]);
+        let plan = ProjectionPlan { tables: vec![t], rows, order: vec!["function".to_string()] };
+        let mut td: HashMap<String, String> = HashMap::new();
+        td.insert("function".to_string(), "core".to_string());
+        let out = namespace_plan(plan, &td);
+        let r = &out.rows.get("core__function").unwrap()[0];
+        assert!(!r.contains_key("domain_id"),
+            "domain_id stripped from row; got keys {:?}", r.keys().collect::<Vec<_>>());
+        assert_eq!(r.get("id").map(|s| s.as_str()), Some("f1"), "id value kept");
     }
 
     /// rmap-3nf-tables, NORMA two-phase column naming: two functional
