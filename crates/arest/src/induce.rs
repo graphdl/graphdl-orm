@@ -335,13 +335,67 @@ pub fn candidate_passes_constraints(
     // Selector(4) / `extract_facts_func`) see the candidate alongside
     // the existing observations. `defs` carries the compiled Func
     // table — including `validate` itself — built once by the caller.
-    let ctx = crate::ast::encode_eval_context_state("", None, &state_prime);
+    //
+    // induce-gate-absolute-vs-delta: the admissibility test is whether
+    // the candidate INTRODUCES a violation — NOT whether the resulting
+    // state is globally violation-free. A real loaded app's base state
+    // is rarely clean: the bundled metamodel carries mandatory-role
+    // constraints (`Each Noun has some Object Type`, `… World
+    // Assumption`, …) that fire against internal nouns the app never
+    // populates, so `validate` over arc-stack's loaded state surfaces
+    // ~33k PRE-EXISTING violations with or without any candidate. The
+    // old `decode_violations(...).is_empty()` absolute check therefore
+    // rejected EVERY candidate (the search loop emitted `[]`, blocking
+    // the whole inductive layer) even though the candidate added ZERO
+    // new violations. Compare against the BASELINE (the same `validate`
+    // over `state` WITHOUT the candidate) and reject only on a genuinely
+    // new violation. Mirrors the baseline-delta discipline the readings
+    // compile/load paths already use for pre-existing alethic violations
+    // (lib.rs format-on-CDT delta, load_reading_core post-rejection
+    // baseline snapshot). Count-based (multiset) so a UC that flips a
+    // role from 1→2 occupants — same `detail` text, one MORE occurrence
+    // — still counts as new.
+    let baseline = violations_multiset(state, defs);
+    let with_candidate = violations_multiset(&state_prime, defs);
+    !has_new_violation(&baseline, &with_candidate)
+}
+
+/// Count-keyed multiset of a state's `validate` violations, keyed by
+/// `(constraint_id, constraint_text, detail)`. Used by
+/// `candidate_passes_constraints` to compare a candidate-augmented
+/// state against its baseline so only NEWLY-introduced violations gate a
+/// candidate (pre-existing, candidate-independent violations — typical
+/// of a real loaded app's metamodel — are ignored).
+fn violations_multiset(
+    state: &Object,
+    defs: &Object,
+) -> alloc::collections::BTreeMap<(String, String, String), usize> {
+    let ctx = crate::ast::encode_eval_context_state("", None, state);
     let violations_obj = crate::ast::apply(
         &crate::ast::Func::Def("validate".to_string()),
         &ctx,
         defs,
     );
-    crate::ast::decode_violations(&violations_obj).is_empty()
+    let mut counts: alloc::collections::BTreeMap<(String, String, String), usize> =
+        alloc::collections::BTreeMap::new();
+    for v in crate::ast::decode_violations(&violations_obj) {
+        let key = (v.constraint_id, v.constraint_text, v.detail);
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// True iff `with_candidate` carries a violation occurrence that the
+/// `baseline` does not (a strictly higher count for some key, or a key
+/// absent from the baseline). Pre-existing baseline violations — even
+/// many — never trip this; only the delta the candidate introduces does.
+fn has_new_violation(
+    baseline: &alloc::collections::BTreeMap<(String, String, String), usize>,
+    with_candidate: &alloc::collections::BTreeMap<(String, String, String), usize>,
+) -> bool {
+    with_candidate.iter().any(|(key, &n)| {
+        n > baseline.get(key).copied().unwrap_or(0)
+    })
 }
 
 /// #849 — Per-candidate forward-chain check. Build state' = observations
@@ -1379,6 +1433,147 @@ mod tests {
             "candidate <x1, Foo b> on top of observation <x1, Foo a> violates \
              UC `Each X has at most one Foo` (count = 2); gate must return false"
         );
+    }
+
+    /// Regression (induce-gate-absolute-vs-delta): the constraint gate
+    /// must admit a candidate that introduces NO NEW violation EVEN WHEN
+    /// the base state already carries pre-existing, candidate-independent
+    /// violations. This is the real-app shape the live arc-stack induce
+    /// hit: the loaded state surfaced ~33k pre-existing metamodel
+    /// mandatory-role violations (`Each Noun has some Object Type`, …)
+    /// that fire with OR without any candidate, so the old absolute
+    /// `decode_violations(...).is_empty()` check rejected every one of
+    /// the 6 valid `Action causes Shift` candidates → `run_search`
+    /// returned `[]` and the entire inductive layer was dead.
+    ///
+    /// Fixture: a guaranteed BASELINE violation (`Each Foo has at least
+    /// one Bar` MC over a Foo with no Bar — the proven shape from
+    /// compile.rs `state_missing_mandatory_bar`) PLUS a clean,
+    /// constraint-free non-functional FT `Action causes Shift`. The
+    /// candidate enumerates over `Action × Shift` and must pass the gate
+    /// because pushing `<Action, Shift>` into its own cell leaves the
+    /// unrelated `Foo has Bar` mandatory count untouched — zero NEW
+    /// violations relative to the (already non-empty) baseline.
+    fn state_preexisting_mc_violation_plus_clean_nonfunctional_ft() -> Object {
+        use alloc::collections::BTreeMap;
+        use crate::types::{ConstraintDef, SpanDef};
+        let mut cells: BTreeMap<String, Vec<Object>> = BTreeMap::new();
+
+        // Nouns.
+        for (n, t) in [("Foo", "entity"), ("Bar", "entity"), ("Label", "value"),
+                       ("Action", "entity"), ("Shift", "value")] {
+            cells.entry("Noun".into()).or_default()
+                .push(fact_from_pairs(&[("name", n), ("objectType", t)]));
+        }
+
+        // FT: Foo has Bar (mandatory role 0 → baseline violation).
+        cells.entry("FactType".into()).or_default().push(fact_from_pairs(&[
+            ("id", "ft_has_bar"), ("reading", "Foo has Bar"), ("arity", "2")]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "ft_has_bar"), ("nounName", "Foo"), ("position", "0")]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "ft_has_bar"), ("nounName", "Bar"), ("position", "1")]));
+
+        // FT: Foo has Label — seeds a Foo instance without a Bar.
+        cells.entry("FactType".into()).or_default().push(fact_from_pairs(&[
+            ("id", "ft_has_label"), ("reading", "Foo has Label"), ("arity", "2")]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "ft_has_label"), ("nounName", "Foo"), ("position", "0")]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "ft_has_label"), ("nounName", "Label"), ("position", "1")]));
+
+        // FT: Action causes Shift — the candidate FT. NON-functional, no
+        // constraint, mirrors arc-stack's `Action causes Shift.`.
+        cells.entry("FactType".into()).or_default().push(fact_from_pairs(&[
+            ("id", "Action_causes_Shift"), ("reading", "Action causes Shift"),
+            ("arity", "2")]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "Action_causes_Shift"), ("nounName", "Action"), ("position", "0")]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "Action_causes_Shift"), ("nounName", "Shift"), ("position", "1")]));
+
+        // Shift enum domain.
+        cells.entry("EnumValues".into()).or_default().push(fact_from_pairs(&[
+            ("noun", "Shift"), ("value0", "-5"), ("value1", "0"), ("value2", "5")]));
+
+        // MC alethic over ft_has_bar role 0 → Foo with no Bar violates.
+        let mc = ConstraintDef {
+            id: "mc_foo_bar".into(),
+            kind: "MC".into(),
+            modality: "alethic".into(),
+            text: "Each Foo has at least one Bar".into(),
+            spans: vec![SpanDef {
+                fact_type_id: "ft_has_bar".into(),
+                role_index: 0,
+                subset_autofill: None,
+            }],
+            ..Default::default()
+        };
+        cells.entry("Constraint".into()).or_default()
+            .push(crate::parse_forml2::constraint_to_fact_test(&mc));
+
+        // Population: one Foo (foo1) via ft_has_label — NO Bar, so the MC
+        // fires in the baseline regardless of any induce candidate.
+        cells.entry("ft_has_label".into()).or_default().push(Object::seq(vec![
+            Object::seq(vec![Object::atom("Foo"), Object::atom("foo1")]),
+            Object::seq(vec![Object::atom("Label"), Object::atom("greeting")]),
+        ]));
+        // One Action instance ACTION1 (raw InstanceFact subjectNoun keying)
+        // so the entity-side domain for the candidate FT's role 0 is
+        // non-empty.
+        cells.entry("InstanceFact".into()).or_default().push(fact_from_pairs(&[
+            ("subjectNoun", "Action"), ("subjectValue", "ACTION1"),
+            ("fieldName", "Action_exists"), ("objectNoun", ""), ("objectValue", "")]));
+
+        Object::Map(cells.into_iter()
+            .map(|(k, v)| (k, Object::Seq(v.into())))
+            .collect::<hashbrown::HashMap<_, _>>().into())
+    }
+
+    #[test]
+    fn candidate_passes_despite_preexisting_baseline_violations() {
+        let state = state_preexisting_mc_violation_plus_clean_nonfunctional_ft();
+        let defs_vec = crate::compile::compile_to_defs_state(&state);
+        let d = crate::ast::defs_to_state(&defs_vec, &state);
+
+        // Sanity 1: the BASELINE (no candidate) is NOT violation-free —
+        // the MC fires. This is the precondition that broke the old gate.
+        let ctx = crate::ast::encode_eval_context_state("", None, &state);
+        let baseline = crate::ast::decode_violations(&crate::ast::apply(
+            &crate::ast::Func::Def("validate".to_string()), &ctx, &d));
+        assert!(!baseline.is_empty(),
+            "fixture precondition: base state must carry ≥1 pre-existing \
+             violation (the `Each Foo has at least one Bar` MC) so the test \
+             actually exercises the absolute-vs-delta gate; got none");
+
+        // Sanity 2: enumeration still yields the 3 Action×Shift candidates.
+        let candidates =
+            enumerate_candidates_for_fact_type(&d, "Action_causes_Shift");
+        assert_eq!(candidates.len(), 3,
+            "expected ACTION1 × {{-5,0,5}} = 3 candidates; got {:?}", candidates);
+
+        // The fix: each candidate introduces NO NEW violation (it touches
+        // only Action_causes_Shift, leaving the Foo-has-Bar mandatory
+        // count untouched), so the gate must ADMIT all 3 despite the
+        // non-empty baseline. Pre-fix this returned false for every one.
+        for c in candidates.iter() {
+            assert!(
+                candidate_passes_constraints(&d, &d, c),
+                "candidate {:?} adds no new violation (only the pre-existing \
+                 `Each Foo has at least one Bar` MC remains); the gate must \
+                 return true — pre-fix the absolute is_empty() check rejected \
+                 it purely because of the candidate-independent baseline \
+                 violation",
+                c);
+        }
+
+        // And run_search end-to-end now emits one Hypothesis Candidate per
+        // surviving candidate (open-ended search, no to_explain) instead of
+        // the empty list the absolute gate produced.
+        let hyps = run_search(&d, &d, "Action_causes_Shift", &[]);
+        assert_eq!(hyps.len(), 3,
+            "run_search must emit one hypothesis per admissible candidate \
+             (3) now that the gate diffs against the baseline; got {}", hyps.len());
     }
 
     // ─── #849 candidate_derives ───────────────────────────────────────
