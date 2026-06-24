@@ -1698,11 +1698,163 @@ fn projection_plan_inner(
     ProjectionPlan { tables, rows: collected, order }
 }
 
+/// #23 Stage 1 (domain-as-namespace RMAP): the namespaced name `<domain>__<flat>`
+/// for a flat table name, or the flat name unchanged when the table has no
+/// domain mapping (NULL-domain fallback). The domain segment is sanitized to
+/// `[A-Za-z0-9_]` so file-stamped domains like `i-ching.md` become `i_ching_md`.
+fn namespaced_name(flat: &str, table_domain: &HashMap<String, String>) -> String {
+    match table_domain.get(flat) {
+        Some(d) => {
+            let dom: String = d.chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+                .collect();
+            format!("{}__{}", dom, flat)
+        }
+        None => flat.to_string(),
+    }
+}
+
+/// #23 Stage 1: rewrite each table name to its domain namespace and rewrite
+/// every FK `references` to the namespaced parent (keyed by the PARENT's own
+/// domain, so cross-domain FKs resolve). PK / UC / ref_value_column hold COLUMN
+/// names (not table names) and are left untouched. Pure + no_std; the std caller
+/// gates this on `AREST_DOMAIN_NAMESPACES` so the flat path is byte-identical off.
+pub fn namespace_tables(tables: Vec<TableDef>, table_domain: &HashMap<String, String>) -> Vec<TableDef> {
+    tables.into_iter().map(|mut t| {
+        t.name = namespaced_name(&t.name, table_domain);
+        for col in t.columns.iter_mut() {
+            if let Some(parent) = col.references.clone() {
+                col.references = Some(namespaced_name(&parent, table_domain));
+            }
+        }
+        t
+    }).collect()
+}
+
+/// #23 Stage 1: namespace an entire ProjectionPlan in lockstep -- the TableDefs
+/// (via namespace_tables), the per-table `rows` map keys, and the `order` list
+/// -- so every occurrence of a table name moves to its domain namespace
+/// together. The chokepoint the std persist/DDL path applies (flag-gated).
+pub fn namespace_plan(plan: ProjectionPlan, table_domain: &HashMap<String, String>) -> ProjectionPlan {
+    let tables = namespace_tables(plan.tables, table_domain);
+    let rows = plan.rows.into_iter()
+        .map(|(name, r)| (namespaced_name(&name, table_domain), r))
+        .collect();
+    let order = plan.order.iter().map(|n| namespaced_name(n, table_domain)).collect();
+    ProjectionPlan { tables, rows, order }
+}
+
+/// #23 Stage 1: build the flat-table-name -> domain map from the
+/// `Function_belongs_to_Domain` cell, keyed by `to_snake(function-id)` (a
+/// noun's snaked name IS its entity table name). Junctions whose compound
+/// table name equals `to_snake(ft-id)` are covered too; any not covered stay
+/// flat (their FK references still namespace via the parent lookup, so there
+/// is no broken reference). Extra entries for absorbed-column FTs are harmless
+/// (namespace_plan only looks up table names that actually exist). no_std.
+pub fn build_table_domain(state: &crate::ast::Object) -> HashMap<String, String> {
+    let cell = crate::ast::fetch_or_phi("Function_belongs_to_Domain", state);
+    let mut m: HashMap<String, String> = HashMap::new();
+    for f in crate::ast::cell_facts_iter(&cell) {
+        if let (Some(func), Some(dom)) =
+            (crate::ast::binding(f, "Function"), crate::ast::binding(f, "Domain"))
+        {
+            m.insert(to_snake(func), dom.to_string());
+        }
+    }
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ast::{self, Object, fact_from_pairs};
     use crate::types::*;
+
+    /// #23 Stage 1: namespace_tables prefixes each table by its domain and
+    /// rewrites cross-domain FK references to the namespaced parent.
+    #[test]
+    fn namespace_tables_prefixes_names_and_rewrites_references() {
+        let mk = |name: &str, refs: Option<&str>| TableDef {
+            name: name.to_string(),
+            columns: vec![TableColumn {
+                name: "id".to_string(), col_type: "TEXT".to_string(),
+                nullable: false, references: refs.map(|s| s.to_string()),
+                ..Default::default()
+            }],
+            primary_key: vec!["id".to_string()],
+            checks: None, unique_constraints: None, ref_value_column: None,
+        };
+        let tables = vec![mk("function", None), mk("stripe_customer", Some("function"))];
+        let mut table_domain: HashMap<String, String> = HashMap::new();
+        table_domain.insert("function".to_string(), "core".to_string());
+        table_domain.insert("stripe_customer".to_string(), "organizations".to_string());
+        let out = namespace_tables(tables, &table_domain);
+        let names: HashSet<String> = out.iter().map(|t| t.name.clone()).collect();
+        assert!(names.contains("core__function"),
+            "entity table must be prefixed by its domain; got {:?}", names);
+        assert!(names.contains("organizations__stripe_customer"), "got {:?}", names);
+        let sc = out.iter().find(|t| t.name == "organizations__stripe_customer").unwrap();
+        let id_ref = sc.columns.iter().find(|c| c.name == "id").unwrap().references.as_deref();
+        assert_eq!(id_ref, Some("core__function"),
+            "cross-domain FK must rewrite to the parent's namespace");
+    }
+
+    /// #23 Stage 1: file-stamped domains (i-ching.md) sanitize to a valid
+    /// SQL identifier segment; an unmapped table keeps its flat name.
+    #[test]
+    fn namespace_tables_sanitizes_domain_and_leaves_unmapped_flat() {
+        let mk = |name: &str| TableDef {
+            name: name.to_string(), columns: Vec::new(),
+            primary_key: vec!["id".to_string()],
+            checks: None, unique_constraints: None, ref_value_column: None,
+        };
+        let mut table_domain: HashMap<String, String> = HashMap::new();
+        table_domain.insert("hexagram".to_string(), "i-ching.md".to_string());
+        let out = namespace_tables(vec![mk("hexagram"), mk("orphan")], &table_domain);
+        let names: HashSet<String> = out.iter().map(|t| t.name.clone()).collect();
+        assert!(names.contains("i_ching_md__hexagram"),
+            "dotted/dashed domain must sanitize to [A-Za-z0-9_]; got {:?}", names);
+        assert!(names.contains("orphan"),
+            "no domain mapping -> flat name preserved; got {:?}", names);
+    }
+
+    /// #23 Stage 1: namespace_plan rewrites table defs, rows-map keys, and the
+    /// order list together (every occurrence of a name moves in lockstep).
+    #[test]
+    fn namespace_plan_rewrites_tables_rows_keys_and_order() {
+        let t = TableDef {
+            name: "stripe_customer".to_string(), columns: Vec::new(),
+            primary_key: vec!["id".to_string()],
+            checks: None, unique_constraints: None, ref_value_column: None,
+        };
+        let mut rows: HashMap<String, Vec<ProjectedRow>> = HashMap::new();
+        rows.insert("stripe_customer".to_string(), Vec::new());
+        let plan = ProjectionPlan { tables: vec![t], rows, order: vec!["stripe_customer".to_string()] };
+        let mut table_domain: HashMap<String, String> = HashMap::new();
+        table_domain.insert("stripe_customer".to_string(), "organizations".to_string());
+        let out = namespace_plan(plan, &table_domain);
+        assert_eq!(out.tables[0].name, "organizations__stripe_customer");
+        assert!(out.rows.contains_key("organizations__stripe_customer"),
+            "rows key namespaced; got {:?}", out.rows.keys().collect::<Vec<_>>());
+        assert!(!out.rows.contains_key("stripe_customer"), "old flat rows key gone");
+        assert_eq!(out.order, vec!["organizations__stripe_customer".to_string()]);
+    }
+
+    /// #23 Stage 1: build_table_domain reads Function_belongs_to_Domain and
+    /// keys the map by the snaked function-id (== entity table name).
+    #[test]
+    fn build_table_domain_maps_snaked_function_to_domain() {
+        let cell = Object::seq(vec![
+            fact_from_pairs(&[("Function", "API Product"), ("Domain", "organizations")]),
+            fact_from_pairs(&[("Function", "Hexagram"), ("Domain", "i-ching.md")]),
+        ]);
+        let state = ast::store("Function_belongs_to_Domain", cell, &Object::phi());
+        let m = build_table_domain(&state);
+        assert_eq!(m.get("api_product").map(|s| s.as_str()), Some("organizations"),
+            "noun name -> snaked table name -> domain; got {:?}", m);
+        assert_eq!(m.get("hexagram").map(|s| s.as_str()), Some("i-ching.md"),
+            "raw domain preserved (sanitization happens in namespaced_name); got {:?}", m);
+    }
 
     /// rmap-3nf-tables, NORMA two-phase column naming: two functional
     /// FTs absorbing the SAME target into one table (`is from Status` /

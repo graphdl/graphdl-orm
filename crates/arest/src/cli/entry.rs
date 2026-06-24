@@ -113,6 +113,15 @@ mod db {
         // role). The projection plan's Kahn order gives both
         // directions.
         let plan = crate::rmap::projection_plan(d);
+        // #23 Stage 1 (flag-gated): namespace the plan by domain so the DDL
+        // creates `<domain>__<noun>` tables. project_population_rows_inner
+        // namespaces the SAME way (same build_table_domain(d)), so created and
+        // populated names match. Off by default -> flat DDL unchanged.
+        let plan = if domain_namespaces_enabled() {
+            crate::rmap::namespace_plan(plan, &crate::rmap::build_table_domain(d))
+        } else {
+            plan
+        };
         let plan_by_name: hashbrown::HashMap<&str, &crate::rmap::TableDef> =
             plan.tables.iter().map(|t| (t.name.as_str(), t)).collect();
         // DDL reshaping must not be hostage to FK enforcement or
@@ -178,15 +187,20 @@ mod db {
             }
         }
         let _ = conn.execute_batch("PRAGMA foreign_keys=ON;");
-        // CREATE TABLE from sql:sqlite:* cells
-        ast::cells_iter(d).into_iter()
-            .filter(|(name, _)| name.starts_with("sql:sqlite:"))
-            .filter_map(|(_, contents)| ddl_of(contents))
-            .for_each(|ddl| {
-                conn.execute_batch(&ddl).unwrap_or_else(|e| {
-                    eprintln!("Warning: DDL failed: {}", e);
+        // CREATE TABLE from sql:sqlite:* cells. #23 Stage 1: under domain
+        // namespaces the rmap plan above is the SOLE DDL authority (its tables
+        // are namespaced); the flat sql:sqlite:* generated DDL would create
+        // duplicate FLAT tables alongside, so skip it when the flag is on.
+        if !domain_namespaces_enabled() {
+            ast::cells_iter(d).into_iter()
+                .filter(|(name, _)| name.starts_with("sql:sqlite:"))
+                .filter_map(|(_, contents)| ddl_of(contents))
+                .for_each(|ddl| {
+                    conn.execute_batch(&ddl).unwrap_or_else(|e| {
+                        eprintln!("Warning: DDL failed: {}", e);
+                    });
                 });
-            });
+        }
         // CREATE TRIGGER from sql:trigger:* cells
         ast::cells_iter(d).into_iter()
             .filter(|(name, _)| name.starts_with("sql:trigger:"))
@@ -196,6 +210,15 @@ mod db {
                     eprintln!("Warning: Trigger failed: {}", e);
                 });
             });
+    }
+
+    /// #23 Stage 1: AREST_DOMAIN_NAMESPACES=1 routes the relational projection
+    /// into per-domain namespaces (`<domain>__<noun>` tables). OFF by default
+    /// -- like the AREST_DELTA_JOINS gate -- so the flat path stays
+    /// byte-identical until the full namespaced path (DDL + persist + read
+    /// consumers) agrees and we flip it on.
+    pub fn domain_namespaces_enabled() -> bool {
+        std::env::var("AREST_DOMAIN_NAMESPACES").map(|v| v == "1").unwrap_or(false)
     }
 
     /// Persist the full state D to SQLite.
@@ -375,6 +398,14 @@ mod db {
         let plan = match only {
             Some(o) => crate::rmap::projection_plan_scoped(d, o),
             None => crate::rmap::projection_plan(d),
+        };
+        // #23 Stage 1 (flag-gated): namespace the plan by domain so projected
+        // rows land in the `<domain>__<noun>` tables apply_ddl created. Off by
+        // default -> flat path unchanged.
+        let plan = if domain_namespaces_enabled() {
+            crate::rmap::namespace_plan(plan, &crate::rmap::build_table_domain(d))
+        } else {
+            plan
         };
 
         // #15 fix: null a dangling NULLABLE FK rather than cascade-drop the
@@ -843,6 +874,55 @@ Parent 'P1' is active.\n";
                 .expect("parent_is_active table exists");
             assert_eq!(child_rows, 1,
                 "the child must SURVIVE — no cascade once the dangling FK is nulled");
+        }
+
+        /// #23 Stage 1 integration: build_table_domain + namespace_plan +
+        /// create_table_sql compose over a REAL compiled 2-domain state to emit
+        /// valid namespaced SQLite tables with cross-domain FKs resolved. This
+        /// verifies the flag-ON projection end-to-end without an env-flag race
+        /// (the flag is only a trivial 1-line gate in apply_ddl/project/sql).
+        #[test]
+        fn namespaced_plan_emits_valid_cross_domain_sqlite() {
+            let corpus = "\
+## Entity Types\n\
+Foo(.id) is an entity type.\n\
+Bar(.id) is an entity type.\n\
+## Value Types\n\
+Tag is a value type.\n\
+## Fact Types\n\
+Foo has Tag.\n\
+  Each Foo has exactly one Tag.\n\
+Bar refers to Foo.\n\
+  Each Bar refers to at most one Foo.\n";
+            let parsed = crate::parse_forml2::parse_to_state_from(
+                corpus, &crate::ast::Object::phi()).expect("corpus parses");
+            let compile_defs = crate::compile::compile_to_defs_state(&parsed);
+            let d = crate::ast::defs_to_state(&compile_defs, &parsed);
+            // Domain attribution (file-stamping is a dirs-path concern; supply
+            // it directly here): Foo in domain 'a', Bar in domain 'b'.
+            let fbd = crate::ast::Object::seq(vec![
+                crate::ast::fact_from_pairs(&[("Function", "Foo"), ("Domain", "a")]),
+                crate::ast::fact_from_pairs(&[("Function", "Bar"), ("Domain", "b")]),
+            ]);
+            let d = crate::ast::store("Function_belongs_to_Domain", fbd, &d);
+
+            let plan = crate::rmap::namespace_plan(
+                crate::rmap::projection_plan(&d), &crate::rmap::build_table_domain(&d));
+            let names: std::collections::HashSet<String> =
+                plan.tables.iter().map(|t| t.name.clone()).collect();
+            assert!(names.contains("a__foo"), "Foo -> a__foo; got {:?}", names);
+            assert!(names.contains("b__bar"), "Bar -> b__bar; got {:?}", names);
+            assert!(!names.contains("foo"), "no flat foo under namespacing; got {:?}", names);
+            let bar = plan.tables.iter().find(|t| t.name == "b__bar").unwrap();
+            let bar_ddl = crate::rmap::create_table_sql(bar);
+            assert!(bar_ddl.contains("a__foo"),
+                "cross-domain FK must reference the namespaced parent a__foo; got: {}", bar_ddl);
+            // The namespaced DDL must be valid SQLite (creates cleanly, FK on).
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+            let foo = plan.tables.iter().find(|t| t.name == "a__foo").unwrap();
+            conn.execute_batch(&crate::rmap::create_table_sql(foo)).expect("create a__foo");
+            conn.execute_batch(&bar_ddl).expect("create b__bar (valid namespaced DDL + FK)");
         }
 
         /// 987-A increment 1: the per-file signature registry round-trips

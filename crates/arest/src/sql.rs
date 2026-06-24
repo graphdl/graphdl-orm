@@ -83,6 +83,15 @@ use crate::rmap::{create_table_sql, qid};
 
 fn materialize_3nf_tables(conn: &Connection, state: &Object) -> rusqlite::Result<()> {
     let plan = crate::rmap::projection_plan(state);
+    // #23 Stage 1 (flag-gated; mirrors entry::db::domain_namespaces_enabled):
+    // under AREST_DOMAIN_NAMESPACES the :memory: tables are namespaced so the
+    // sql verb matches the persisted namespaced 3NF tables (user SQL then uses
+    // `<domain>__<noun>` names). Off by default -> flat path byte-identical.
+    let plan = if std::env::var("AREST_DOMAIN_NAMESPACES").map(|v| v == "1").unwrap_or(false) {
+        crate::rmap::namespace_plan(plan, &crate::rmap::build_table_domain(state))
+    } else {
+        plan
+    };
     let by_name: std::collections::HashMap<&str, &crate::rmap::TableDef> =
         plan.tables.iter().map(|t| (t.name.as_str(), t)).collect();
 
