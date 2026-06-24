@@ -8,22 +8,11 @@ Domain(.Slug) is an entity type.
 External System(.Name) is an entity type.
 Generator(.Name) is an entity type.
 
-<!-- Connector-registry nouns (rmap-3nf-tables Stage 3 / arc issue 8
-     gate 2): the Instance Facts below assert Noun_has_URI /
-     Noun_is_backed_by_External_System facts about these nouns, but
-     they were never DECLARED — undeclared, they minted Noun-role
-     values with no Object Type, and `Each Noun has exactly one
-     Object Type` fired on every full-scope validate. External ids
-     are the reference scheme. -->
-API Product(.id) is an entity type.
-Stripe Customer(.id) is an entity type.
-Stripe Subscription(.id) is an entity type.
-Stripe Invoice(.id) is an entity type.
-Stripe Charge(.id) is an entity type.
-Stripe Payment Method(.id) is an entity type.
-Stripe Price(.id) is an entity type.
-Stripe Product(.id) is an entity type.
-Stripe Payment Intent(.id) is an entity type.
+<!-- Connector-registry business nouns (API Product, Stripe *) and their
+     External-System backings were moved OUT of the baked metamodel into the
+     non-metamodel `connectors` library (apps/connectors) on 2026-06-24, so the
+     base no longer bleeds business connectors into every app (#23). Apps that
+     integrate those services depend on `file:../connectors`. -->
 
 ## Value Types
 
@@ -137,25 +126,3 @@ App uses Generator 'ilayer' if that App contains some Domain and some Noun is de
 ## Instance Facts
 
 Domain 'organizations' has Access 'public'.
-
-Noun 'User' is backed by External System 'auth.vin'.
-Noun 'User' has URI '/users'.
-
-Noun 'API Product' is backed by External System 'auto.dev'.
-
-Noun 'Stripe Customer' is backed by External System 'stripe'.
-Noun 'Stripe Customer' has URI '/customers'.
-Noun 'Stripe Subscription' is backed by External System 'stripe'.
-Noun 'Stripe Subscription' has URI '/subscriptions'.
-Noun 'Stripe Invoice' is backed by External System 'stripe'.
-Noun 'Stripe Invoice' has URI '/invoices'.
-Noun 'Stripe Charge' is backed by External System 'stripe'.
-Noun 'Stripe Charge' has URI '/charges'.
-Noun 'Stripe Payment Method' is backed by External System 'stripe'.
-Noun 'Stripe Payment Method' has URI '/payment_methods'.
-Noun 'Stripe Price' is backed by External System 'stripe'.
-Noun 'Stripe Price' has URI '/prices'.
-Noun 'Stripe Product' is backed by External System 'stripe'.
-Noun 'Stripe Product' has URI '/products'.
-Noun 'Stripe Payment Intent' is backed by External System 'stripe'.
-Noun 'Stripe Payment Intent' has URI '/payment_intents'.
