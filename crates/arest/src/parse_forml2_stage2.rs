@@ -3196,13 +3196,25 @@ fn resolve_constraint_span_ft(
         .collect();
     // Deterministic regardless of HashMap iteration order.
     candidates.sort_by(|a, b| a.0.cmp(b.0));
+    // Same-signature disambiguation by PREDICATE TEXT, shared with the
+    // SS/EQ role-sequence resolver (`resolve_constraint_span_seq`): the FT
+    // whose reading verb tokens all appear in the clause wins. Word-level
+    // (not contiguous-segment) matching so a quantifier interposed between
+    // the verb and a role adjective — `has at most one secondary- ProbeTag`
+    // — still matches the `secondary-` reading, distinguishing it from the
+    // `primary-` sibling. (A contiguous-segment check looked for the
+    // literal `has secondary-`, which the quantifier splits, so both
+    // candidates failed and the constraint mis-attributed to candidates[0].)
+    let clause_lc = text.to_lowercase();
     let (ft_id, roles) = match candidates.len() {
         0 => return None,
         1 => candidates[0],
         _ => *candidates.iter()
             .find(|(ft_id, _)| readings_by_ft.get(ft_id.as_str())
-                .map_or(false, |reading|
-                    reading_segments_contained(reading, &found_nouns, text)))
+                .map_or(false, |reading| {
+                    let verb = reading_verb_tokens(reading, sorted_nouns_longest_first);
+                    !verb.is_empty() && verb.iter().all(|w| clause_lc.contains(w.as_str()))
+                }))
             .unwrap_or(&candidates[0]),
     };
     let first = found_nouns[0].as_str();
@@ -3211,30 +3223,6 @@ fn resolve_constraint_span_ft(
         .map(|(p, _)| *p)
         .unwrap_or(0);
     Some((ft_id.clone(), alloc::format!("{}", role_index)))
-}
-
-/// Split `reading` on the player nouns in order; every non-empty text
-/// segment between/around them must appear verbatim in `clause`. The
-/// same-signature disambiguator for `resolve_constraint_span_ft` —
-/// "Transition is from Status" segments to ["is from"], which the
-/// clause "Each Transition is from exactly one Status" contains and
-/// the is-to clause does not.
-fn reading_segments_contained(reading: &str, players: &[String], clause: &str) -> bool {
-    let mut rest = reading;
-    let mut segments: Vec<&str> = Vec::new();
-    for p in players {
-        match rest.find(p.as_str()) {
-            Some(idx) => {
-                let seg = rest[..idx].trim();
-                if !seg.is_empty() { segments.push(seg); }
-                rest = &rest[idx + p.len()..];
-            }
-            None => return false,
-        }
-    }
-    let tail = rest.trim();
-    if !tail.is_empty() { segments.push(tail); }
-    !segments.is_empty() && segments.iter().all(|seg| clause.contains(seg))
 }
 
 /// Shared text-normalisation for constraint-clause resolution: strip
@@ -9330,6 +9318,41 @@ Element transforms to Element is symmetric.\n";
         assert_eq!(binding(&enriched[0], "span0_factTypeId"), Some("Element_transforms_to_Element"),
             "ring constraint must bind to its OWN FT even when context seeding duplicates \
              its role facts; got {:?}", binding(&enriched[0], "span0_factTypeId"));
+    }
+
+    #[test]
+    fn enrich_uc_span_disambiguates_adjective_distinguished_same_target_fts() {
+        // Two single-valued FTs from one subject to the SAME target,
+        // distinguished ONLY by hyphen-bound adjectives. The UC "Each X
+        // has at most one secondary- Y" must bind to the secondary- FT,
+        // not fall back to the first (primary-) FT. Pre-fix, the tiebreak
+        // (reading_segments_contained) required the CONTIGUOUS segment
+        // "has secondary-" in the clause, but the quantifier "at most one"
+        // splits it ("has at most one secondary-"), so BOTH candidates
+        // failed the verbatim check and it fell back to candidates[0] =
+        // primary. Downstream rmap then absorbed the primary role twice,
+        // shadowing secondary's value out of the 3NF table. The fix shares
+        // resolve_constraint_span_seq's word-level reading_verb_tokens
+        // disambiguator, which matches "secondary-" regardless of the
+        // interposed quantifier.
+        let text = "Each RmapProbe has at most one secondary- ProbeTag.";
+        let uc = fact_from_pairs(&[
+            ("id", text), ("kind", "UC"), ("modality", "alethic"), ("text", text),
+        ]);
+        let role_facts = alloc::vec![
+            fact_from_pairs(&[("nounName", "RmapProbe"), ("factType", "RmapProbe_has_primary-_ProbeTag"), ("position", "0")]),
+            fact_from_pairs(&[("nounName", "ProbeTag"), ("factType", "RmapProbe_has_primary-_ProbeTag"), ("position", "1")]),
+            fact_from_pairs(&[("nounName", "RmapProbe"), ("factType", "RmapProbe_has_secondary-_ProbeTag"), ("position", "0")]),
+            fact_from_pairs(&[("nounName", "ProbeTag"), ("factType", "RmapProbe_has_secondary-_ProbeTag"), ("position", "1")]),
+        ];
+        let ft_facts = alloc::vec![
+            fact_from_pairs(&[("id", "RmapProbe_has_primary-_ProbeTag"), ("reading", "RmapProbe has primary- ProbeTag"), ("arity", "2")]),
+            fact_from_pairs(&[("id", "RmapProbe_has_secondary-_ProbeTag"), ("reading", "RmapProbe has secondary- ProbeTag"), ("arity", "2")]),
+        ];
+        let enriched = super::enrich_constraints_with_spans(&[uc], &role_facts, &ft_facts);
+        assert_eq!(binding(&enriched[0], "span0_factTypeId"), Some("RmapProbe_has_secondary-_ProbeTag"),
+            "UC on 'secondary- ProbeTag' must bind to the secondary- FT, not fall back to \
+             primary-; got {:?}", binding(&enriched[0], "span0_factTypeId"));
     }
 
     #[test]
