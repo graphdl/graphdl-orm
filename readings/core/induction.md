@@ -2,10 +2,15 @@
 
 ## Description
 Vocabulary for the induce Func (#846-#852). The engine's search loop
-populates Hypothesis Candidate facts; Scoring Rule facts (declared
-per-app in domain readings) determine the ranking. Whitepaper §3 +
-Theorem 4: induce is a ρ-application over P that returns candidate
-populations as facts in P.
+populates Hypothesis Candidate facts; ranking is AUTOMATED and domain-
+agnostic (forward-chain COVERAGE of the observed facts (the gate) plus
+SIMPLICITY/MDL [fewest hidden facts; Occam/Solomonoff]) NOT hand-
+declared per-app. Per Halpin, rulemaking is itself automatable, so the
+ranking meta-rule is INDUCED (CSDP applied at the meta level), the
+inductive complement of deduction, not a user knob. A Scoring Rule, when
+present, is a derived/induced fact, never a hand-tuned per-domain heuristic.
+Whitepaper §3 + Theorem 4: induce is a ρ-application over P that returns
+candidate populations as facts in P.
 
 ## Entity Types
 Hypothesis Candidate(.id) is an entity type.

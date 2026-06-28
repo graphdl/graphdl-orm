@@ -10,7 +10,7 @@ The design builds on [John Backus](https://en.wikipedia.org/wiki/John_Backus) (F
 
 Write this as `readings/orders.md`:
 
-```
+```markdown
 ## Entity Types
 
 Order(.Order Id) is an entity type.
@@ -56,7 +56,7 @@ That is the full setup. The schema, the uniqueness constraint, the three-state m
 ## What readings compile into
 
 | FORML 2 construct | Compiled artifact |
-|---|---|
+| --- | --- |
 | Entity type | A relation plus its primary key (RMAP Ch. 10). |
 | Fact type | A column, foreign key, or junction table, absorbed via the UC. |
 | Constraint | A restriction `Filter(p) : P`, per the restrict equation. |
@@ -102,6 +102,7 @@ The engine exposes a v1.0 verb set to agents via MCP.
 **Evolution:** `propose` creates a Domain Change for governed review, and `compile` performs immediate self-modification per Corollary 5.
 
 **LLM bridge using client sampling via MCP `createMessage`:**
+
 - `ask` translates a natural-language question into a projection spec and executes the resulting query.
 - `synthesize` takes facts plus their forward-chained derivations and produces prose.
 - `validate` takes raw text, has the LLM extract facts, and runs a constraint check on them.
@@ -114,7 +115,7 @@ Every framework primitive (Noun, Fact Type, Constraint, Derivation Rule, State M
 
 Declare an external system as a populating function:
 
-```
+```markdown
 External System 'stripe' has URL 'https://api.stripe.com/v1'.
 External System 'stripe' has Header 'Authorization'.
 External System 'stripe' has Prefix 'Bearer'.
@@ -129,7 +130,7 @@ Federated nouns are resolved by ρ at evaluation time. Constraints and derivatio
 At 102 entity types, 100 fact types, and 10,000 instance facts (414 KB of readings), a release build performs as follows.
 
 | Phase | Time |
-|---|---|
+| --- | --- |
 | parse | 575 ms |
 | domain_to_state | 20 ms (O(n) confirmed) |
 | compile_to_defs_state | 53 ms (2,024 defs produced) |
@@ -154,7 +155,7 @@ flowchart LR
 ```
 
 | Paper | Implementation |
-|---|---|
+| --- | --- |
 | D (state) | A sequence or map of cells. `Object::Map(HashMap)` gives O(1) fetch. |
 | P (population) | The named set of elementary facts. One cell per RMAP table. |
 | S (schema) | The compiled objects in DEFS: fact types, constraints, derivation rules, and state machines. |
@@ -186,7 +187,7 @@ yarn typecheck
 The [whitepaper](AREST.pdf) proves five properties:
 
 1. **Grammar Unambiguity.** Each FORML 2 sentence has exactly one parse.
-2. **Specification Equivalence.** Parse and compile are both injective, so the reading IS the executable.
+2. **Specification Equivalence.** Surface readings may vary, but readings with the same compiled object are the same spec. The compiler computes a canonical reading for that object, and the object is the executable.
 3. **Completeness of State Transfer.** Every create reaches the least fixed point and collects every violation.
 4. **HATEOAS as Projection.** Every link in the representation is a θ₁ operation on P and S.
 5. **Derivability.** Every value in the representation is a ρ-application.

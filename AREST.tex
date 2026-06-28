@@ -33,21 +33,13 @@
 \maketitle
 
 \begin{abstract}
-Domain knowledge enters software as natural language requirements, is re-encoded as schemas, validation logic, state machines, and API routes, and drifts out of sync in production. The informal layer between specification and execution is where bugs live and where automated agents hallucinate. We show that a single set of FORML\,2 declarations can define a database schema, constraint rules, state machine workflows, and a REST API with hypermedia navigation, producing a complete application from domain facts alone. We formalize this as AREST, a Backus AST system~\cite{backus78} whose definitions are compiled FORML\,2 readings~\cite{halpin10} and whose state is Codd's named set~\cite{codd70} of ORM\,2 elementary facts~\cite{halpin01}. REST endpoints are applications of a single system function. Ingesting new readings is self-modification. Five theorems establish that the grammar is unambiguous, that specifications and executables are the same object up to a computable canonical form, that state transfer is complete, that HATEOAS links are projections of the population, and that every value in the API is derived from facts. Together they do not eliminate informality so much as corner it: everything informal is localized to the registered platform layer, an enumerable surface that is itself a queryable fact set.
+A single set of FORML\,2 declarations can define a database schema, state machine workflows, and a REST API with hypermedia navigation, producing a complete application from domain facts alone. We formalize this as AREST, a Backus AST system~\cite{backus78} whose definitions are FORML\,2 readings~\cite{halpin10} that are compiled to a named set~\cite{codd70}. REST endpoints are applications of a single system function. Ingesting new readings is self-modification. Five theorems establish that the grammar is unambiguous, that specifications and executables are the same object up to a computable canonical form, that state transfer is complete, that HATEOAS links are projections of the population, and that every value in the API is derived from facts. Together, they localize informality to the registered platform layer, an enumerable surface that is itself a queryable fact set.
 \end{abstract}
 
 
-\section{Introduction}
-
-Software is increasingly written and consumed by agents. An LLM writing code produces a specification it cannot verify against the resulting executable; an LLM reading an API navigates documentation that may have drifted from the endpoints. In both cases the informal layer between specification and execution is where the agent hallucinates. The rest of this paper shows how that layer is cornered: compiled out of the domain entirely, and localized at the platform boundary to a surface the system itself enumerates.
-
-Domain knowledge begins in someone's head. It is re-encoded as schemas, validation logic, state machines, and API routes. When these are distinct artifacts, their equivalence is not preserved by construction.
-
-AREST identifies what was never separate to begin with. A FORML\,2 reading is compiled to an FFP object that is both a relational schema and a resource definition. The compiler does not translate between representations. It recognizes a single object that already occupies all four roles.
-
 \section{Terminology}
 
-Three terms carry overloaded abbreviations. \emph{AST} follows Backus's usage (Applicative State Transition, 1978), not the compiler term. \emph{ORM} follows Halpin's usage (Object-Role Modeling, 2001), not the persistence pattern. \emph{FP} follows Backus's usage (Function-level Programming), not the broader tradition. \emph{FFP} is Backus's extension of FP with named definitions and a representation function $\rho$ that maps objects to the functions they denote~\cite[Sec.\,13]{backus78}.
+Three terms carry overloaded abbreviations. \emph{AST} follows Backus's usage (Applicative State Transition, 1978), not the compiler term. \emph{ORM} follows Halpin's usage (Object-Role Modeling, 2001), not the persistence pattern. \emph{FP} follows Backus's usage (Function-level Programming), not the broader tradition. \emph{FFP} is Backus's extension of FP with a representation function $\rho$ that maps objects to the functions they denote~\cite[Sec.\,13]{backus78}. This paper assumes comfort with the cited formalisms. The motivating examples are included to identify the construction, not to replace the references.
 
 
 \section{Definition}
@@ -69,7 +61,6 @@ An order domain is declared in FORML\,2:
 Order(.OrderId) is an entity type.
 Customer(.Name) is an entity type.
 Order is placed by Customer
-  / Customer places Order.
   Each Order is placed by exactly one
   Customer.
 Customer ships Order.
@@ -101,7 +92,7 @@ Transition 'ship' is triggered by
 \end{align*}
 The result is the set of Orders with more than one Customer in $\mathit{placedBy}$. An empty set means the constraint holds.
 
-\texttt{POST /orders \{"customer":"acme"\}} applies $\mathit{SYSTEM}\!:\!x$ where the addressed entity is $\mathit{orders}$ and the operation is $\mathit{create}$. The pipeline produces:
+The operation \texttt{POST /orders \{"customer":"acme"\}} applies $\mathit{SYSTEM}\!:\!x$ where the addressed entity is $\mathit{orders}$ and the operation is $\mathit{create}$. The pipeline produces:
 \begin{align*}
 P' = P \cup \{&\mathit{Order}(\texttt{ord\text{-}1}),\;
 \mathit{placedBy}(\texttt{ord\text{-}1}, \texttt{acme}),\\
@@ -124,7 +115,7 @@ The constraint, the state machine, the API response, and the HATEOAS links above
 \begin{align}
 (\rho\langle x_1, \ldots, x_n\rangle)\!:\!y = (\rho\,x_1)\!:\!\langle\langle x_1, \ldots, x_n\rangle, y\rangle \label{eq:metacomp}
 \end{align}
-The fact is a function: $\lambda f.\, f(o_1, \ldots, o_n)$, accepting an operation and applying it to its own objects. The constraint reading, the state machine transition, and the API response above are all $\rho$-applications over the same facts. The sections that follow show why they cannot be anything else.
+The fact is a function: $\lambda f.\, f(o_1, \ldots, o_n)$, accepting an operation and applying it to its own objects. The constraint reading, the state machine transition, and the API response above are all $\rho$-applications over the same facts.
 
 
 \section{The System Function}
