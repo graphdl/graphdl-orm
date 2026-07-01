@@ -1,3 +1,4 @@
-from .objects import (
-    Atom, Seq, BOTTOM, PHI, T, F, DEFAULT, seq, is_atom, is_seq, is_bottom,
-)
+from . import lam
+from .objects import atom, sym, seq, PHI, reify, DEFAULT
+from . import genesis          # installs the base functions into DEFS
+from .reduce import meaning, apply

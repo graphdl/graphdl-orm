@@ -1,82 +1,58 @@
-"""The object domain O (Backus §11.2.1): atom | sequence | ⊥."""
-from __future__ import annotations
+"""Objects as self-dispatching lambdas (Scott encoding); atom identity is a
+Church numeral. Branching is application — an object takes one handler per case
+and applies its own. No `if`, no `isinstance`.
+
+    object = λ on_atom. λ on_seq. λ on_app. λ on_bottom. λ on_prim. <selects>
+
+  atom : carries a Church numeral (its identity — the characteristica
+         universalis, the I Ching's binary: an atom *is* a number)
+  seq  : carries a Church list of objects (walking it is a fold)
+  app  : carries operator and operand — an application (o:x), reduced by μ
+  ⊥    : selects on_bottom
+  prim : wraps a host primitive λ, so primitives live in DEFS like everything else
+"""
+from functools import reduce as _fold
+from . import lam as L
+
+atom = lambda a: lambda oa: lambda os: lambda op: lambda ob: lambda opr: oa(a)
+sq = lambda s: lambda oa: lambda os: lambda op: lambda ob: lambda opr: os(s)
+app = lambda o: lambda x: lambda oa: lambda os: lambda op: lambda ob: lambda opr: op(o)(x)
+bot = lambda oa: lambda os: lambda op: lambda ob: lambda opr: ob
+prim = lambda g: lambda oa: lambda os: lambda op: lambda ob: lambda opr: opr(g)
+
+NIL = L.NIL
+
+# --- the reader: intern surface names to numeral-tagged atoms (host boundary) ---
+_id = {}
+_nm = {}
+_nat = lambda i: _fold(lambda n, _k: L.SUCC(n), range(i), L.ZERO)
 
 
-class Bottom:
-    """⊥ — bottom / undefined. Unique singleton."""
-    _inst = None
-
-    def __new__(cls):
-        if cls._inst is None:
-            cls._inst = super().__new__(cls)
-        return cls._inst
-
-    def __repr__(self):
-        return "⊥"
+def sym(name):
+    """Intern a surface name to a numeral-identified atom (reader boundary)."""
+    i = _id.setdefault(name, len(_id))
+    _nm[i] = name
+    return atom(_nat(i))
 
 
-BOTTOM = Bottom()
+# sequence objects — folds, not loops
+seq = lambda *xs: sq(_fold(lambda t, h: L.CONS(h)(t), reversed(xs), L.NIL))
+seq2 = lambda a: lambda b: sq(L.CONS(a)(L.CONS(b)(L.NIL)))
+PHI = sq(L.NIL)
 
+# extract an atom's numeral identity by dispatch (non-atoms → 0)
+numeral_of = lambda o: o(lambda p: p)(lambda s: L.ZERO)(lambda f: lambda x: L.ZERO)(L.ZERO)(lambda g: L.ZERO)
 
-class Atom:
-    """An atom: a symbol (str) or a number (int/float)."""
-    __slots__ = ("value",)
+DEFAULT = sym("#")                       # fetch's "not found" (Backus §13.3.4)
+_HASH = numeral_of(DEFAULT)
+# is this object the atom # ?  (Church boolean, by dispatch — only atoms can be)
+is_default = lambda o: o(lambda p: L.EQ(p)(_HASH))(lambda s: L.FALSE)(lambda f: lambda x: L.FALSE)(L.FALSE)(lambda g: L.FALSE)
 
-    def __init__(self, value):
-        self.value = value
-
-    def __eq__(self, other):
-        return (
-            isinstance(other, Atom)
-            and type(other.value) is type(self.value)
-            and other.value == self.value
-        )
-
-    def __hash__(self):
-        return hash(("A", type(self.value).__name__, self.value))
-
-    def __repr__(self):
-        return str(self.value)
-
-
-class Seq:
-    """A sequence ⟨x1,...,xn⟩ of objects, held as an immutable tuple."""
-    __slots__ = ("items",)
-
-    def __init__(self, items):
-        self.items = tuple(items)
-
-    def __eq__(self, other):
-        return isinstance(other, Seq) and other.items == self.items
-
-    def __hash__(self):
-        return hash(("S", self.items))
-
-    def __repr__(self):
-        return "⟨" + ", ".join(map(repr, self.items)) + "⟩"
-
-
-PHI = Seq(())          # the empty sequence — both atom and sequence
-T = Atom("T")
-F = Atom("F")
-DEFAULT = Atom("#")    # fetch default (Backus §13.3.4)
-
-
-def seq(*items):
-    """⊥-preserving sequence constructor (Backus §11.2.1)."""
-    for x in items:
-        if x is BOTTOM:
-            return BOTTOM
-    return Seq(items)
-
-
-def is_bottom(x):
-    return x is BOTTOM
-
-
-def is_seq(x):
-    return isinstance(x, Seq)
-
-
-def is_atom(x):
-    return isinstance(x, Atom) or x == PHI   # φ is both
+# --- reify: object → host data for tests (recursion by Z, branch by dispatch) ---
+_toi = lambda n: n(lambda k: k + 1)(0)
+reify = L.Z(lambda self: lambda o: o
+            (lambda a: _nm[_toi(a)])                                   # atom → name
+            (lambda s: s(lambda h: lambda acc: (self(h),) + acc)(()))  # seq  → tuple
+            (lambda f: lambda x: ("app", self(f), self(x)))            # app
+            ("⊥")                                                      # ⊥
+            (lambda g: "prim"))                                        # prim
