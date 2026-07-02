@@ -25,6 +25,7 @@ def _S(*xs):
 _COMP, _CONS, _CONST, _COND = A("COMP"), A("CONS"), A("CONST"), A("COND")
 _ALPHA, _INSERT, _WHILE = A("ALPHA"), A("INSERT"), A("WHILE")
 _ID, _1, _2, _APNDL = A("id"), A(1), A(2), A("apndl")
+_EQ, _DISTR, _CAT = A("eq"), A("distr"), A("cat")
 
 # --- default (minimal) stages, as compiled defs ---
 define("resolve", _APNDL)                                    # ⟨I,P⟩ → ⟨I, …P⟩  (add the input fact)
@@ -87,3 +88,34 @@ def resolve_minting(col):
     minted = _S(_COMP, mint_next(col), _2)                   # ⟨I,P⟩ → the fresh id (from P)
     fact = _S(_COMP, _APNDL, _S(_CONS, minted, _1))          # ⟨id, …I⟩
     return _S(_COMP, _APNDL, _S(_CONS, fact, _2))            # ⟨fact, …P⟩
+
+
+# --- emit: HATEOAS — the representation carries its own links (Thm. hateoas) ---
+# links(e) = nav(e) ∪ transitions(status(e)): the related resources plus the actions available
+# from the entity's current state. Both are theta1 selections — nav over P, transitions over a
+# state machine value; the representation is self-describing, no link table maintained.
+def nav_of(key_pos):
+    """nav(e): the facts of P sharing the affected entity's key (role `key_pos` of the head fact).
+        α(1) ∘ Filter(key(f) = headKey) ∘ distr ∘ [id, key∘1]"""
+    key = A(key_pos)
+    keyed = _S(_CONS, _ID, _S(_COMP, key, _1))               # ⟨P, key(head)⟩
+    match = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, key, _1), _2))  # key(f) = headKey?
+    return _S(_COMP, _S(_ALPHA, _1), T.Filter(match), _DISTR, keyed)
+
+
+def transitions_of(sm, status_pos):
+    """transitions(status(e)): the state-machine transitions available from the head fact's
+    status. `sm` is a value ⟨⟨from, trigger, to⟩…⟩; a transition fires when from = status(head).
+        α(1) ∘ Filter(from(t) = status) ∘ distr ∘ [sm̄, status∘1]"""
+    keyed = _S(_CONS, _S(_CONST, sm), _S(_COMP, A(status_pos), _1))   # ⟨sm, status(head)⟩
+    match = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, _1, _1), _2))          # from(t) = status?
+    return _S(_COMP, _S(_ALPHA, _1), T.Filter(match), _DISTR, keyed)
+
+
+def links_of(key_pos, sm=None, status_pos=None):
+    """links(e) = nav(e) ∪ transitions(status(e))  (Thm. hateoas). Without a state machine,
+    the links are just the navigation."""
+    nav = nav_of(key_pos)
+    if sm is None:
+        return nav
+    return _S(_COMP, _CAT, _S(_CONS, nav, transitions_of(sm, status_pos)))  # nav ∪ transitions

@@ -51,7 +51,7 @@ def Store(name):
     return _S(_COMP, _APNDL, _S(_CONS, make, _S(_COMP, purge, _2)))
 
 
-def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_obj=None):
+def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_obj=None, links_obj=None):
     """The transition create_cell:⟨I, D⟩ → ⟨⟨P'',V⟩, D'⟩ over one cell, wired with a schema's
     validate (and optionally its resolve/derive). It touches only `cell_name`, so distinct
     entities' handlers are isolated. Commits P'' iff the alethic flag is false."""
@@ -64,16 +64,18 @@ def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_o
     valD = _S(_CONS, _S(_COMP, validate_obj, derived), _2)   # ⟨⟨P'',V,flag⟩, D⟩
     P2 = _S(_COMP, _1, _1)                                   # P''  from ⟨val,D⟩
     V = _S(_COMP, _2, _1)                                    # V    from ⟨val,D⟩
-    o = _S(_CONS, P2, V)                                     # o = ⟨P'', V⟩
+    parts = [P2, V] if links_obj is None else [P2, V, _S(_COMP, links_obj, P2)]
+    o = _S(_CONS, *parts)                                    # o = ⟨P'', V⟩ or ⟨P'', V, links⟩ (hateoas)
     commit = _S(_COMP, Store(cell_name), _S(_CONS, P2, _2))  # ↓cell:⟨P'', D⟩
     d_new = _S(_COND, _S(_COMP, _3, _1), _2, commit)         # alethic offender? D : commit
     return _S(_COMP, _S(_CONS, o, d_new), valD)
 
 
-def run(input_fact, D, validate_obj=None, cell_name="FILE", resolve_obj=None, derive_obj=None):
-    """One AST transition: mu(create_cell:⟨input, D⟩) = ⟨⟨P'', V⟩, D'⟩. Without a validate it
-    commits (V = φ); with validate_of(constraints) it refuses to commit on an alethic violation."""
-    handler = build_system(validate_obj, cell_name, resolve_obj, derive_obj)
+def run(input_fact, D, validate_obj=None, cell_name="FILE", resolve_obj=None, derive_obj=None, links_obj=None):
+    """One AST transition: mu(create_cell:⟨input, D⟩) = ⟨o, D'⟩. Without a validate it commits
+    (V = φ); with validate_of it refuses to commit on an alethic violation; with links_obj the
+    representation o carries its HATEOAS links (Thm. hateoas)."""
+    handler = build_system(validate_obj, cell_name, resolve_obj, derive_obj, links_obj)
     return apply(handler, _S(input_fact, D))
 
 
