@@ -66,6 +66,12 @@ _CLASSIFY = [
     ("sm_trigger", re.compile(r"^Transition '(.+)' is triggered by Fact Type '(.+)'\.$")),
     ("value_constraint", re.compile(r"^[Tt]he possible values? of (.+?) (?:are|is) (.+)\.$")),
     ("spanning_uc", re.compile(r"^[Ii]n each population of (.+), each (.+) combination occurs at most once\.$")),
+    # Halpin §7.2: frequency generalizes the spanning form from 'once' to bounded counts
+    ("frequency", re.compile(r"^[Ii]n each population of (.+), each (.+) combination occurs (at most|at least|exactly) (\d+) times?\.$")),
+    # Halpin §7.3 ring constraints, as the corpus grammar's trailing markers on a reading
+    ("ring", re.compile(r"^(.+?) is (acyclic|asymmetric|antisymmetric|intransitive|irreflexive|symmetric)\.$")),
+    # subtyping (corpus trailing marker 'is a subtype of'; RMAP step 0 absorbs to the top)
+    ("subtype_of", re.compile(r"^(.+) is a subtype of (.+)\.$")),
     ("objectification", re.compile(r"^[Tt]his association with (.+) provides the preferred identification scheme for (.+)\.$")),
     ("set_comparison", re.compile(r"^[Ff]or each (.+?), (exactly|at most) one of the following holds: (.+)\.$")),
     # negative forms (constraint verbalization paper): map to the SAME constraint as the positive twin
@@ -307,6 +313,36 @@ def _h_spanning(g, k, m):
     ftn = g[0].replace(" ", "_")
     return [("constraint", (ftn + "_uc", "spanning_uniqueness", ftn, m))], [(ftn + "_uc", C.uniqueness([1, 2]))]
 
+
+def _h_frequency(g, k, m):
+    template, rtypes = _reading(g[0], k)                       # resolve the population's reading
+    ftn = _ftid_from(template, rtypes)
+    names = [s.strip() for s in g[1].split(",")]
+    roles = [rtypes.index(nm) + 1 for nm in names if nm in rtypes] or [1]
+    n = int(g[3])
+    lo, hi = {"at most": (None, n), "at least": (n, None), "exactly": (n, n)}[g[2]]
+    cid = ftn + "_freq"
+    return [("constraint", (cid, "frequency", ftn, m))], [(cid, C.frequency(roles, lo, hi))]
+
+
+_RING_BUILDERS = {"irreflexive": C.ring_irreflexive, "symmetric": C.ring_symmetric,
+                  "asymmetric": C.ring_asymmetric, "antisymmetric": C.ring_antisymmetric,
+                  "intransitive": C.ring_intransitive, "acyclic": C.ring_acyclic}
+
+
+def _h_ring(g, k, m):
+    ft, facts = _fact_type(g[0], k)
+    cid = ft + "_ring_" + g[1]
+    return facts + [("constraint", (cid, "ring_" + g[1], ft, m))], [(cid, _RING_BUILDERS[g[1]]())]
+
+
+def _h_subtype(g, k, m):
+    sub, sup = g[0].strip(), g[1].strip()
+    cid = _slug(sub) + "_sub_" + _slug(sup)
+    return [("instanceOf", (sub, "ObjectType")), ("instanceOf", (sup, "ObjectType")),
+            ("subtype", (sub, sup)),
+            ("constraint", (cid, "subtype", sub, sup, m))], [(cid, C.scoped_subset(sup))]
+
 _QUANT = re.compile(r"\b(some|that|each|no|an|a) ")
 
 
@@ -404,6 +440,7 @@ _PLAN = {
     "objectification": _h_objectification, "data_type": _h_meta("data_type"), "ref_mode": _h_meta("ref_mode"),
     "value_constraint": _h_value_constraint, "uniqueness": _h_uniqueness, "mandatory": _h_mandatory,
     "neg_uniqueness": _h_neg_uniqueness, "neg_mandatory": _h_neg_mandatory, "spanning_uc": _h_spanning,
+    "frequency": _h_frequency, "ring": _h_ring, "subtype_of": _h_subtype,
     "set_comparison": _h_set_comparison, "disjunctive_mandatory": _h_disjunctive,
     "subset": _h_subset, "equality": _h_equality, "derivation_rule": _h_derivation_rule,
     "negation": _h_negation, "possibility": _h_possibility, "inverse_uc": _h_inverse_uc,
@@ -463,8 +500,15 @@ def _cells(D, name):
 _ATTACH = {
     "uniqueness":            lambda f, ft: [(f[0], True)] if f[2] == ft else [],
     "spanning_uniqueness":   lambda f, ft: [(f[0], True)] if f[2] == ft else [],
+    "frequency":             lambda f, ft: [(f[0], True)] if f[2] == ft else [],
     "ring_irreflexive":      lambda f, ft: [(f[0], True)] if f[2] == ft else [],
     "ring_symmetric":        lambda f, ft: [(f[0], True)] if f[2] == ft else [],
+    "ring_asymmetric":       lambda f, ft: [(f[0], True)] if f[2] == ft else [],
+    "ring_antisymmetric":    lambda f, ft: [(f[0], True)] if f[2] == ft else [],
+    "ring_intransitive":     lambda f, ft: [(f[0], True)] if f[2] == ft else [],
+    "ring_acyclic":          lambda f, ft: [(f[0], True)] if f[2] == ft else [],
+    "subtype":               lambda f, ft: [(f[0], False)] if f[2] == ft else [],
+    "external_uniqueness":   lambda f, ft: [(f[0], False)] if f[2] == ft else [],
     "value":                 lambda f, ft: [(f[0], True)] if f[2] == ft else [],
     "mandatory":             lambda f, ft: ([(f[0], False)] if f[2] == ft else [])
                                          + ([(f[0] + "_e", False)] if f[3] == ft else []),

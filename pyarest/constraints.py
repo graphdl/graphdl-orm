@@ -62,6 +62,66 @@ def ring_symmetric(roles=(1, 2)):
     return _S(_COMP, _S(_ALPHA, _1), T.Filter(viol), _DISTR, _S(_CONS, _ID, _ID))
 
 
+def ring_asymmetric(roles=(1, 2)):
+    """Asymmetric ring (Halpin §7.3): xRy → ¬yRx, with x and y not necessarily distinct,
+    so reflexive pairs violate too (asymmetric = antisymmetric + irreflexive). V = the
+    facts whose swap is also in P."""
+    r1, r2 = A(roles[0]), A(roles[1])
+    fx, fy = _S(_COMP, r1, _1), _S(_COMP, r2, _1)
+    swap = _S(_CONS, fy, fx)
+    viol = _S(_COMP, T.member, _S(_CONS, swap, _2))
+    return _S(_COMP, _S(_ALPHA, _1), T.Filter(viol), _DISTR, _S(_CONS, _ID, _ID))
+
+
+def ring_antisymmetric(roles=(1, 2)):
+    """Antisymmetric ring (§7.3): x ≠ y & xRy → ¬yRx. Reflexive pairs are allowed."""
+    r1, r2 = A(roles[0]), A(roles[1])
+    fx, fy = _S(_COMP, r1, _1), _S(_COMP, r2, _1)
+    swap_in = _S(_COMP, T.member, _S(_CONS, _S(_CONS, fy, fx), _2))
+    neq = _S(_COMP, _NOT, _EQ, _S(_CONS, fx, fy))
+    viol = _S(_COMP, _AND, _S(_CONS, neq, swap_in))
+    return _S(_COMP, _S(_ALPHA, _1), T.Filter(viol), _DISTR, _S(_CONS, _ID, _ID))
+
+
+def ring_intransitive(roles=(1, 2)):
+    """Intransitive ring (§7.3): xRy & yRz → ¬xRz. V = the facts of P that complete a
+    two-step chain, i.e. P ∩ π₁₃(P ⋈ P)."""
+    chains = _S(_COMP, T.Project([1, 3]), T.NatJoin(2), _S(_CONS, _ID, _ID))
+    in_chains = _S(_COMP, T.member, _S(_CONS, _1, _2))       # ⟨t, chains⟩ → t ∈ chains
+    return _S(_COMP, _S(_ALPHA, _1), T.Filter(in_chains), _DISTR, _S(_CONS, _ID, chains))
+
+
+def ring_acyclic(roles=(1, 2)):
+    """Acyclic ring (§7.3): "no path via the relation from an object back to itself".
+    V = the reflexive pairs of the transitive closure, the closure computed by the same
+    derive lfp that serves derivation rules (per Mapping ORM to Datalog)."""
+    from . import system as _sys
+    tc = _sys.derive_of([_sys.join_rule(2, [1, 3])])
+    return _S(_COMP, T.Filter(_S(_COMP, _EQ, _S(_CONS, _1, _2))), tc)
+
+
+def frequency(roles, lo=None, hi=None):
+    """Occurrence frequency (§7.2): "each member of pop(roles) occurs there exactly n
+    times", generalized to [lo, hi]; a local constraint on the role population, not the
+    object type, so unplayed members are fine. V = the facts whose key count is out of
+    bounds."""
+    key = _key(roles)
+    same = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, key, A(1)), _S(_COMP, key, A(2))))
+    cnt = _S(_COMP, A("length"), T.Filter(same), _DISTL)     # ⟨t,P⟩ → t's key count
+    parts = []
+    if lo is not None:
+        parts.append(_S(_COMP, _LT, _S(_CONS, cnt, _S(_CONST, A(lo)))))
+    if hi is not None:
+        parts.append(_S(_COMP, _GT, _S(_CONS, cnt, _S(_CONST, A(hi)))))
+    if len(parts) == 2:
+        viol = _S(_COMP, _OR, _S(_CONS, parts[0], parts[1]))
+    elif parts:
+        viol = parts[0]
+    else:
+        viol = _S(_CONST, A("F"))
+    return _S(_COMP, _S(_ALPHA, A(1)), T.Filter(viol), _DISTR, _S(_CONS, _ID, _ID))
+
+
 _LE, _GE = A("le"), A("ge")
 
 
@@ -207,6 +267,16 @@ def scoped_exclusive_or(subject_cell, clause_fts, target_ft):
     universe being the subject type's own instance cell."""
     pair = _S(_CONS, _pop_of(subject_cell), _participation(clause_fts, target_ft))
     return _S(_COMP, exclusive_or(), pair)
+
+
+def scoped_external_uniqueness(other_ft, cols):
+    """External uniqueness over two fact types (Halpin §10.3, Fig. 10.21 verbatim:
+    "equivalent to an internal uniqueness constraint spanning [the columns] in the
+    natural join of the two tables"). ⟨P, D⟩: join the target population with the
+    sibling cell on the shared key (role 1 = role 1), then the internal UC over `cols`
+    of the joined tuples."""
+    join = _S(_COMP, T.NatJoin(1), _S(_CONS, _P, _pop_of(other_ft)))
+    return _S(_COMP, uniqueness(cols), join)
 
 
 def scoped_inclusive_or(subject_cell, clause_fts, target_ft):

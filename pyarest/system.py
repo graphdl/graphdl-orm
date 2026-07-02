@@ -220,7 +220,16 @@ def rmap_partition(D):
     cons = _pop_rows(D, "constraint")
     spanning = {c[2] for c in cons if len(c) >= 3 and c[1] == "spanning_uniqueness"}
     functional = {c[2] for c in cons if len(c) >= 3 and c[1] == "uniqueness"}
-    subject = {r[1]: r[3] for r in reversed(_pop_rows(D, "role")) if r[2] == 1}
+    subs = {r[0]: r[1] for r in _pop_rows(D, "subtype")}
+
+    def _top(o):                                             # RMAP step 0 (§10.3 verbatim):
+        seen = set()                                         # "Absorb subtypes into their
+        while o in subs and o not in seen:                   # top supertype"
+            seen.add(o)
+            o = subs[o]
+        return o
+
+    subject = {r[1]: _top(r[3]) for r in reversed(_pop_rows(D, "role")) if r[2] == 1}
     triples = tuple((ft, subject.get(ft, ft),
                      "functional" if (ft in functional and ft not in spanning) else "spanning")
                     for ft in fts)
