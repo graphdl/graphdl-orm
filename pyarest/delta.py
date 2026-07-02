@@ -232,6 +232,8 @@ def _make_mu(store, step_defs):
     def mu(e):
         # a value is its own meaning; an application node ⟨APP, f, x⟩ reduces (metacomposition)
         if type(e) is tuple and len(e) == 3 and e[0] is APP_D:
+            if not _defs_mod.consume_fuel():                         # supervision: exhausted
+                return BOT_D                                         # fuel bottoms the step
             f = mu(e[1]); x = mu(e[2])                               # reduce operator, then operand (cbv)
             if f is BOT_D or x is BOT_D:                             # §13.3.1: ρ⊥ = ⊥ and every
                 return BOT_D                                         # function is ⊥-preserving

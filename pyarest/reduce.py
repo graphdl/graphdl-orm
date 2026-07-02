@@ -35,6 +35,8 @@ def make_mu(store_fn):
     def tau(mu):
         def step(e):
             def reduce_app():
+                if not defs.consume_fuel():                  # supervision: exhaustion bottoms
+                    return L.BOT
                 fr = mu(_op(e))                              # reduce the operator (via mu)
                 x = mu(_arg(e))                              # reduce the operand once (call-by-value):
                 #   the metacomposition pass below hands x to a controlling operator as DATA, where

@@ -449,6 +449,22 @@ def install_entity_cells(D, noun, rows):
     return D
 
 
+def process_table(D, noun):
+    """The run queue as a VIEW (nothing is managed host-side): each state-machine
+    instance whose status has outgoing transitions is a WAITING process, keyed to the
+    trigger fact types it awaits (a subscription is a ρ-application not yet evaluated,
+    Cor. stream); an instance whose status has none has terminated and leaves the table
+    (links = φ, the paper's logical deletion)."""
+    triples = sm_triples(D)
+    out = {}
+    for row in _pop_rows(D, f"{noun}_status"):
+        e, s = row[0], row[1]
+        awaits = tuple(tr for (f, tr, _t) in triples if f == s)
+        if awaits:
+            out[(e, s)] = awaits
+    return out
+
+
 def sm_step(pairs, entity_role):
     """The live machine step (Prop. onestep) as one FFP object: ⟨statusPop, P″⟩ → statusPop′.
     An entity advances iff a trigger fact naming it (at `entity_role`) entered P″ and a

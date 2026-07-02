@@ -97,9 +97,13 @@ def _cells_of(D):
 
 
 class step:
-    """Bind D for one AST step: `with defs.step(D): …` — nestable, restored on exit."""
-    def __init__(self, D):
-        self._frame = (_cells_of(D), {"native": None}, D)
+    """Bind D for one AST step: `with defs.step(D): …` — nestable, restored on exit.
+    `fuel` bounds the step's reductions (supervision at the decidability frontier: a
+    compiled step terminates by Lemma finiteness, so fuel only fires on a violated
+    hypothesis or a runaway registered call; exhaustion bottoms the reduction and the
+    §14.3.1 transition rule answers ⟨ERROR, unchanged D⟩)."""
+    def __init__(self, D, fuel=None):
+        self._frame = (_cells_of(D), {"native": None}, D, {"fuel": fuel})
 
     def __enter__(self):
         global _step_frame
@@ -120,6 +124,17 @@ def step_get(key):
 def step_D():
     """The step's whole state, for the DEFS accessor (§14.3.3), else None."""
     return _step_frame[2] if _step_frame is not None else None
+
+
+def consume_fuel():
+    """False when the step's fuel is exhausted; True when unbounded or remaining."""
+    if _step_frame is None:
+        return True
+    slot = _step_frame[3]
+    if slot["fuel"] is None:
+        return True
+    slot["fuel"] -= 1
+    return slot["fuel"] > 0
 
 
 def step_native(conv):

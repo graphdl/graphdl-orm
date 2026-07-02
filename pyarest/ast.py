@@ -134,8 +134,27 @@ def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_o
     return _S(_COMP, _S(_CONS, o, d_new), valDI)
 
 
+def step_input(x, D, fuel=None):
+    """The plain transition on an input: μ(SYSTEM:x) under D's own definitions, the
+    transition rules applied (§14.3.1), optionally fuel-supervised."""
+    from . import defs
+    with defs.step(D, fuel):
+        return _transition(apply(A("SYSTEM"), x), D)
+
+
+def reset(x, D):
+    """§14.3.2 verbatim: the system accepts ⟨RESET, x⟩ at any time. (a) If SYSTEM is
+    defined in the current state D, it 'aborts its current computation without altering
+    D' and treats x as a new normal input. (b) If SYSTEM is not defined, x is appended
+    to D as its first element — the bootstrap of §14.4.3."""
+    from . import defs
+    if defs._cells_of(D).get("SYSTEM") is not None:
+        return step_input(x, D)
+    return L.SEQ(L.CONS(x)(L._list(D)))
+
+
 def run(input_fact, D, validate_obj=None, cell_name="FILE", resolve_obj=None, derive_obj=None, links_obj=None,
-        machine=None):
+        machine=None, fuel=None):
     """One AST transition: mu(create_cell:⟨input, D⟩) = ⟨o, D'⟩, with D's OWN definitions in
     scope for the whole step (defs.step — frozen, Backus §14.6). Without a validate it commits
     (V = φ); with validate_of it refuses to commit on an alethic violation; with links_obj the
@@ -145,7 +164,7 @@ def run(input_fact, D, validate_obj=None, cell_name="FILE", resolve_obj=None, de
     the returned representation offers exactly the next actions (§1: ship, no longer place)."""
     from . import defs
     handler = build_system(validate_obj, cell_name, resolve_obj, derive_obj, links_obj, machine)
-    with defs.step(D):
+    with defs.step(D, fuel):
         return _transition(apply(handler, _S(input_fact, D)), D)
 
 
