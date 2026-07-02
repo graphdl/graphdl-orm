@@ -99,7 +99,7 @@ P \;\subseteq\; \textstyle\bigcup_{f\in F}\,\{f\}\times\mathit{Val}^{\mathit{ari
 with finite \emph{active domain} $\mathit{adom}(P)$, the set of values occurring in $P$. A ground fact $g$ is \emph{true} in $P$ if $g\in P$, \emph{false} if its paired negation fact is in $P$, and \emph{unknown} otherwise; under the closed-world assumption on a noun, unknown collapses to false. Membership is the characteristic function of $P$, so $g\in P$ and $P\,g$ are one act.
 \end{definition}
 
-\noindent Entity and fact types populate $\mathit{FILE}$, while constraints and derivations are relational restrictions and compositions over $P$, and the retrieval operators are Codd's adequate $\theta_1$: projection, natural join, tie, and restriction $\mathit{Filter}(p)\!:\!X$, the elements of a relation $X$ satisfying a predicate $p$~\cite[Sec.\,2.2]{codd70}. ORM elementary facts are in fifth normal form by construction~\cite{halpin08}, so the named relations are the cells themselves and navigation needs no separate query language. Each leg of the map is now discharged by the formalism it instantiates.
+\noindent Entity and fact types populate $\mathit{FILE}$, while constraints and derivations are relational restrictions and compositions over $P$, and the retrieval operators are Codd's adequate $\theta_1$: projection, natural join, tie, and restriction~\cite[Sec.\,2.2]{codd70}. We write restriction as $\mathit{Filter}(p)\!:\!X$, the elements of a relation $X$ satisfying a predicate $p$; this is Codd's $\theta$-restriction~\cite[Sec.\,2.3.5]{codd72}, with constants entering as literal relations. The equality patterns used below, compositions of $\mathit{eq}$ with selectors and constants, reduce to the restriction of $\theta_1$, while value ranges take the inequality~$\theta$. ORM elementary facts are in fifth normal form by construction~\cite{halpin08}, so the named relations are the cells themselves and navigation needs no separate query language. Each leg of the map is now discharged by the formalism it instantiates.
 
 \begin{definition}[Fragment]\label{def:fragment}
 $R$ is the set of FORML\,2 readings that declare the constructs of Definition~\ref{def:schema}: object-type and reference-scheme declarations, elementary fact-type readings, the listed constraints, projective derivation readings (Definition~\ref{def:derive}), and state-machine readings whose trigger is an elementary fact type. Pronoun-correlated clauses and nested objectification lie outside $R$ and are rejected.
@@ -172,7 +172,7 @@ For an entity $e$, call a control \emph{valid} iff it is an outgoing transition 
 is a $\theta_1$ expression over $P$ and $S$, and it is \emph{complete}: it contains every valid control and only valid controls.
 \end{theorem}
 \begin{proof}
-$\mathit{transitions}(s)$ projects the transition facts restricted to $s$, and $\mathit{nav}(e)$ projects, for each fact type on $e$, the peer control (spanning unique constraint), the child controls (a non-spanning constraint makes the remaining roles children of the constrained key), and the related collections. Each is a projection over a restriction composing $\mathit{eq}$ with selectors and constants, hence within Codd's $\theta_1$~\cite[Sec.\,2.2]{codd70}. The validity criterion above is exactly the generation rule, so a control is emitted iff it is valid, which is completeness.
+$\mathit{transitions}(s)$ projects the transition facts restricted to $s$, and $\mathit{nav}(e)$ projects, for each fact type on $e$, the peer control (spanning unique constraint), the child controls (a non-spanning constraint makes the remaining roles children of the constrained key), and the related collections. Each is a projection over a restriction composing $\mathit{eq}$ with selectors and constants, an equality $\theta$-restriction~\cite[Sec.\,2.3.5]{codd72}, hence within Codd's $\theta_1$~\cite[Sec.\,2.2]{codd70}. The validity criterion above is exactly the generation rule, so a control is emitted iff it is valid, which is completeness.
 \end{proof}
 
 \noindent \emph{Generating} this set is the novel step. Fielding~\cite{fielding00} fixed hypermedia as a constraint but left the controls for the server author to write by hand, and prior formal treatments model the \emph{client}'s traversal as a machine over the representations it receives~\cite{zuzak11}. Equation~(\ref{eq:links}) works the other side of the wire: the set is complete and current as a function of $P$ and $S$, there are no hand-written links and no undocumented endpoints, and so a client, or an agent reading the API, has no undocumented affordance to hallucinate.
@@ -292,6 +292,9 @@ J. Backus, ``Can Programming Be Liberated from the von Neumann Style? A Function
 
 \bibitem{codd70}
 E.F. Codd, ``A Relational Model of Data for Large Shared Data Banks,'' \emph{Commun.\ ACM}, 13(6):377--387, 1970.
+
+\bibitem{codd72}
+E.F. Codd, ``Relational Completeness of Data Base Sublanguages,'' in \emph{Data Base Systems}, Courant Computer Science Symposia 6, Prentice-Hall, 1972, pp.~65--98.
 
 \bibitem{halpin08}
 T. Halpin and T. Morgan, \emph{Information Modeling and Relational Databases}, 2nd ed., Morgan Kaufmann, 2008.
