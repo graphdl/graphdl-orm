@@ -1,37 +1,39 @@
-"""The self-capturing metamodel M: describes its own constructs as FFP facts, reflected
-back by rho, and validated by its own constraint objects."""
-from pyarest import from_lam, to_lam, apply
+"""The metamodel layer reads everything off the store (Phase 3 step: no module-constant
+mirrors): instance extents by θ₁ selection over the instanceOf cell, and the
+recomputation frontier off the constraint/ruleReads/ruleDerives cells that ingestion
+itself wrote when it parsed the schema."""
 import pyarest.prims  # noqa: F401
-from pyarest import meta as M
+from pyarest import forml, meta
 
 
-def test_object_type_is_an_object_type():
-    # self-capture fixpoint: ObjectType occurs among the instances of ObjectType
-    ots = from_lam(M.instances_of(M.OBJECTTYPE))
-    assert ("ObjectType", "ObjectType") in ots
-    assert ("FactType", "ObjectType") in ots               # and the other meta types
-
-def test_M_satisfies_its_own_role_constraint():
-    # "each Role is in exactly one FactType" holds of M's own Role population -> no violation
-    assert from_lam(M.validate_roles()) == ()
-
-def test_M_can_catch_a_violation_of_its_own_constraint():
-    # corrupt M: put one role in two fact types -> the same constraint object flags it
-    bad = (("r_dup", "FT_a", 1), ("r_dup", "FT_b", 1), ("r_ok", "FT_c", 1))
-    v = from_lam(M.validate_roles(to_lam(bad)))
-    assert set(v) == {("r_dup", "FT_a", 1), ("r_dup", "FT_b", 1)}
+MODEL = """Person is an entity type.
+Car is an entity type.
+Name is a value type.
+Person has Name.
+Each Person has at most one Name.
+*Each FastCarDriver is some Person who drives some Car that is fast.
+"""
 
 
-def test_recompute_frontier_is_bounded_by_the_fact_type():
-    # a change to Role_in_FactType re-checks ONLY its constraint and re-fires ONLY the rule
-    # that reads it — not the constraint scoped to a different fact type (the streaming bound)
-    fr = M.recompute_frontier("Role_in_FactType")
-    assert fr["constraints"] == ("uc_role_in_ft",)     # not uc_name (a different scope)
-    assert fr["rules"] == ("r_inherit",)
-    assert fr["derives"] == ("Inherited_Role",)         # what feeds the next incremental round
+def test_instances_of_reads_the_store():
+    D, rep = forml.compile_model(MODEL)
+    assert rep["unparsed"] == []
+    assert {"Person", "Car"} <= meta.instances_of(D, "ObjectType")
+    assert "Name" in meta.instances_of(D, "ValueType")
 
-def test_frontier_excludes_unrelated_fact_types():
-    # a change to ObjectType_has_Name touches its own constraint and no rules
-    fr = M.recompute_frontier("ObjectType_has_Name")
-    assert fr["constraints"] == ("uc_name",)
-    assert fr["rules"] == () and fr["derives"] == ()
+
+def test_frontier_constraints_read_off_the_constraint_cell():
+    D, _ = forml.compile_model(MODEL)
+    assert "Person_has_Name_uc" in meta.affected_constraints(D, "Person_has_Name")
+    assert meta.affected_constraints(D, "Person_drives_Car") == ()
+
+
+def test_frontier_rules_read_off_the_rule_cells():
+    D, _ = forml.compile_model(MODEL)
+    # the parsed role path reads Person-drives-Car and Car-is-fast, and derives the subtype
+    assert meta.affected_rules(D, "Person_drives_Car") == ("FastCarDriver_rule",)
+    assert meta.affected_rules(D, "Car_is_fast") == ("FastCarDriver_rule",)
+    assert meta.affected_rules(D, "Person_has_Name") == ()
+    fr = meta.recompute_frontier(D, "Person_drives_Car")
+    assert fr["rules"] == ("FastCarDriver_rule",)
+    assert fr["derives"] == ("FastCarDriver",)                # feeds the next incremental round

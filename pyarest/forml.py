@@ -428,7 +428,13 @@ def _h_derivation_rule(g, k, m):
     hops = _role_path(body)                                    # the role path from the root
     rule_cid = _slug(derived) + "_rule"
     A = [("instanceOf", (derived, "ObjectType")), ("derivation", (_slug(derived), "fully-derived")),
-         ("derivationRule", (_slug(derived), root, len(hops)))]
+         ("derivationRule", (_slug(derived), root, len(hops))),
+         ("ruleDerives", (rule_cid, _slug(derived)))]          # frontier: what the rule feeds
+    prev = root
+    for verb, target in hops:                                  # frontier: what the rule reads
+        reading = f"{prev} {verb} {target}" if target else f"{prev} {verb}"
+        A.append(("ruleReads", (rule_cid, _clause_ft(reading, k))))
+        prev = target or prev
     # a two-hop linear path (root -V1-> T, T -V2-> ...) is a join on the shared type projecting the
     # root: rule:⟨hop1, hop2⟩ = NatJoin(2) then Project([1]) (infosci ORM->Datalog).
     cons = [(rule_cid, _sys.join_rule2(2, [1]))] if len(hops) == 2 else []
