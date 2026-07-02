@@ -695,6 +695,78 @@ def create(D, fact_type, fact, fuel=None):
     return ast.run(fact, D, cell_name=fact_type, machine=machine, mealy_obj=mealy, fuel=fuel)
 
 
+def subscribe(D, sub_id, cells, def_name):
+    """Cor. stream: a subscription IS a ρ-application that has not yet been evaluated
+    against the current D — `def_name` names an ordinary definition (a cell, §13.3.5);
+    the subscription facts record which cells it reads. The pending set is data."""
+    from . import ast
+    from .reduce import apply as _ap
+    from .lam import to_lam
+    rows = tuple(tuple(r) for r in _pop_rows(D, "subscription")) + \
+        tuple((sub_id, c, def_name) for c in cells)
+    return _ap(ast.Store("subscription"), _S(to_lam(rows), D))
+
+
+def _changed_closure(D, changed):
+    """`changed` closed transitively through the rule graph: a changed cell wakes what
+    reads it, and what those rules derive changes in turn (the frontier's derives hop,
+    iterated). A sound over-approximation: waking a subscription whose cell did not in
+    fact change merely re-evaluates the deferred ρ-application, which is its meaning."""
+    reads = [(r[0], r[1]) for r in _pop_rows(D, "ruleReads") if len(r) >= 2]
+    derives = {}
+    for r in _pop_rows(D, "ruleDerives"):
+        if len(r) >= 2:
+            derives.setdefault(r[0], set()).add(r[1])
+    out = set(changed)
+    while True:
+        grown = set(out)
+        for (rule, ft) in reads:
+            if ft in grown:
+                grown |= derives.get(rule, set())
+        if grown == out:
+            return out
+        out = grown
+
+
+def wake(D, changed):
+    """Evaluate every subscription due on `changed` (transitively through the rule
+    graph): the deferred ρ-applications, now applied to the current D. Returns
+    {subscription id: value}."""
+    from . import defs
+    from .reduce import apply as _ap
+    from .lam import from_lam, atom as _A
+    cl = _changed_closure(D, changed)
+    due = {}
+    for r in _pop_rows(D, "subscription"):
+        if len(r) >= 3 and r[1] in cl:
+            due[r[0]] = r[2]
+    out = {}
+    with defs.step(D):
+        for sid, dname in due.items():
+            out[sid] = from_lam(_ap(_A(dname), D))
+    return out
+
+
+def step_and_wake(D, fact_type, fact):
+    """The commit path, wired (Cor. stream): one ORM-level create, the semi-naive
+    derivation of the affected fragment, then the subscriptions due on what changed.
+    Returns (⟨o, D′⟩, wakes); a refused step (ERROR) derives and wakes nothing."""
+    from . import defs as _d
+    from .lam import from_lam
+    import pyarest.lam as L
+    res = create(D, fact_type, fact)
+    o, D2 = _d._items(L._list(res))
+    if from_lam(o) == "ERROR":
+        return res, {}
+    changed = {fact_type}
+    if any(r[1] == fact_type for r in _pop_rows(D2, "smTrigger")):
+        noun = _governed_player(D2, fact_type)
+        if noun is not None:
+            changed.add(noun + "_status")
+    D2 = run_rules(D2, changed=changed)
+    return _S(o, D2), wake(D2, changed)
+
+
 def finality_modality(D, noun, depth):
     """The writer model's hardening rule, read off M's finality facts: below the noun's
     declared depth k a violation reports DEONTICALLY (optimistic acceptance, V as the
