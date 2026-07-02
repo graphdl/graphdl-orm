@@ -752,6 +752,104 @@ def compile(stmt, D, known=()):
     return D, kind
 
 
+# ---- self-host gate two: classification by the ingested RULES, dispatch by the
+# ingested Classification-has-Translator table; Stage-1 (the regex productions) only
+# extracts fields. Generic classifications yield to specific ones, mirroring the
+# grammar file's own arbitration-rule values. ----
+_GENERIC_CLASSIFICATIONS = {"Fact Type Reading", "Instance Fact"}
+
+_KINDS_BY_TRANSLATOR = {
+    "translate_nouns": ["entity_type", "value_type", "subtype_of", "brace_subtypes"],
+    "translate_subtypes": ["subtype_of", "brace_subtypes"],
+    "translate_enum_values": ["value_constraint"],
+    "translate_data_types": ["data_type"],
+    "translate_instance_facts": ["fact_type_reading"],
+    "translate_fact_types": ["fact_type_reading"],
+    "translate_derivation_mode_facts": ["fact_type_reading"],
+    "translate_derivation_rules": ["rule_if", "derivation_rule", "class_rule"],
+    "translate_cardinality_constraints": ["uniqueness", "inverse_uc", "spanning_uc",
+                                          "frequency", "neg_uniqueness", "mandatory",
+                                          "neg_mandatory"],
+    "translate_ring_constraints": ["ring"],
+    "translate_set_constraints": ["set_comparison", "subset", "equality",
+                                  "disjunctive_mandatory"],
+    "translate_value_constraints": ["value_constraint"],
+    "translate_state_machines": ["sm_def", "sm_initial", "sm_from", "sm_to",
+                                 "sm_trigger", "sm_guard", "sm_emit", "sm_moore"],
+    "translate_finality": ["finality"],
+    "translate_negation": ["neg_pair", "negation"],
+}
+
+_GRAMMAR_CACHE = {}
+
+
+def grammar_D():
+    """The ingested grammar (pyarest/readings/forml2-grammar.md — 'the parser is this
+    file'), cached per process."""
+    if "D" not in _GRAMMAR_CACHE:
+        import os
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "readings", "forml2-grammar.md")
+        _GRAMMAR_CACHE["D"] = compile_model(open(p, encoding="utf-8").read())[0]
+    return _GRAMMAR_CACHE["D"]
+
+
+def compile_model_selfhost(text, D=None):
+    """Gate two of the self-host: per statement, tokenize (Stage-1, the bootstrap
+    kernel) → classify via the RULES (run_rules over the ingested grammar) → dispatch
+    via the ingested Classification-has-Translator table → translate (Stage-1 field
+    extraction feeding the handler). Statements the rules do not classify are reported
+    unclassified — the rules, not the regex order, are the classifier. Asserts are
+    idempotent, so co-firing translators are harmless by construction."""
+    from . import meta, system as _sys
+    from .reduce import apply as _apply
+    from .lam import atom as _A
+    gD = grammar_D()
+    dispatch = {}
+    for r in _sys._pop_rows(gD, "Classification_has_Translator"):
+        if len(r) >= 2:
+            dispatch.setdefault(r[0], []).append(r[1])
+    pats = {}
+    for kind, pat in _CLASSIFY:
+        pats.setdefault(kind, []).append(pat)
+    stmts = statements(text)
+    known = _known(stmts)
+    if D is None:
+        D = meta.initial_D()
+    unclassified = []
+    for stmt in stmts:
+        mod, sign, inner = _split_modality(stmt)
+        if sign == "possibility":
+            continue
+        cls = classify_via_M(gD, inner, nouns=known)
+        specific = cls - _GENERIC_CLASSIFICATIONS
+        cls = specific or cls
+        translators = []
+        for c in sorted(cls):
+            for t in dispatch.get(c, []):
+                if t not in translators:
+                    translators.append(t)
+        if not translators:
+            unclassified.append(stmt)
+            continue
+        done = set()
+        for t in translators:
+            for kind in _KINDS_BY_TRANSLATOR.get(t, ()):
+                if kind in done:
+                    break
+                mm = next((p.match(inner) for p in pats.get(kind, ()) if p.match(inner)), None)
+                if mm is None:
+                    continue
+                done.add(kind)
+                asserts, objs = _plan(kind, mm.groups(), known, mod)
+                for cell, fact in asserts:
+                    D = _apply(_A(2), ast.run(to_lam(fact), D, cell_name=cell))
+                for name, obj in objs:
+                    D = _apply(ast.DefineIn(name, obj), D)
+                break
+    return D, {"unclassified": unclassified}
+
+
 def compile_model(text, D=None):
     """Fold `compile` over a whole NORMA verbalization into M (two-pass). Returns (D, report)."""
     from . import meta

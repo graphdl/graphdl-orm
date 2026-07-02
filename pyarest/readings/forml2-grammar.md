@@ -279,3 +279,25 @@ Statement has Classification 'Value Constraint' iff Statement has Classification
 Statement has Classification 'Deontic Constraint' iff Statement has Deontic Operator 'obligatory'.
 Statement has Classification 'Deontic Constraint' iff Statement has Deontic Operator 'forbidden'.
 Statement has Classification 'Deontic Constraint' iff Statement has Deontic Operator 'permitted'.
+
+## pyarest extensions — classifications for the engine's own reading forms
+
+Classification 'State Machine Reading' is a Classification.
+Classification 'Finality Declaration' is a Classification.
+Classification 'Negation Reading' is a Classification.
+
+Classification 'State Machine Reading' has Translator 'translate_state_machines'.
+Classification 'Finality Declaration' has Translator 'translate_finality'.
+Classification 'Negation Reading' has Translator 'translate_negation'.
+
+Statement has Classification 'State Machine Reading' iff Statement has Verb 'is for Noun'.
+Statement has Classification 'State Machine Reading' iff Statement has Verb 'is initial in State Machine Definition'.
+Statement has Classification 'State Machine Reading' iff Statement has Verb 'is from Status'.
+Statement has Classification 'State Machine Reading' iff Statement has Verb 'is to Status'.
+Statement has Classification 'State Machine Reading' iff Statement has Verb 'is triggered by Fact Type'.
+Statement has Classification 'State Machine Reading' iff Statement has Verb 'is guarded by Fact Type'.
+Statement has Classification 'State Machine Reading' iff Statement has Verb 'emits'.
+Statement has Classification 'Finality Declaration' iff Statement has Verb 'becomes final at depth'.
+Statement has Classification 'Negation Reading' iff Statement has Verb 'does not'.
+Statement has Classification 'Negation Reading' iff Statement has Verb 'is not'.
+Statement has Classification 'Subtype Declaration' iff Statement has Verb 'are mutually exclusive subtypes of'.
