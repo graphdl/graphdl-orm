@@ -550,10 +550,59 @@ def parse(reading):
     return kind, g
 
 
+# ---- verbalize / nf (Prop. spec): each kind renders its own canonical sentence, and the
+# modal prefix is re-emitted from the parsed modality and sign. Cross-form normalization
+# (negative twin -> positive primary) is the kernel quotient ~ and lives in compile, not
+# here, so parse(nf(r)) keeps r's kind. ----
+_RENDER = {
+    "entity_type": lambda g: f"{g[0]} is an entity type",
+    "value_type": lambda g: f"{g[0]} is a value type",
+    "ref_scheme": lambda g: f"Reference Scheme: {g[0]} has {g[1]}",
+    "ref_mode": lambda g: f"Reference Mode: {g[0]}",
+    "data_type": lambda g: f"Data Type: {g[0]}",
+    "value_constraint": lambda g: f"The possible values of {g[0]} are {g[1]}",
+    "spanning_uc": lambda g: f"In each population of {g[0]}, each {g[1]} combination occurs at most once",
+    "frequency": lambda g: f"In each population of {g[0]}, each {g[1]} combination occurs {g[2]} {g[3]} times",
+    "ring": lambda g: f"{g[0]} is {g[1]}",
+    "subtype_of": lambda g: f"{g[0]} is a subtype of {g[1]}",
+    "objectification": lambda g: f"This association with {g[0]} provides the preferred identification scheme for {g[1]}",
+    "set_comparison": lambda g: f"For each {g[0]}, {g[1]} one of the following holds: {g[2]}",
+    "disjunctive_mandatory": lambda g: (f"For each {g[0]}, {g[1]}" if len(g) == 2 else f"Each {g[0]}"),
+    "subset": lambda g: f"If {g[0]} then {g[1]}",
+    "equality": lambda g: f"{g[0]} if and only if {g[1]}",
+    "derivation_rule": lambda g: f"*Each {g[0]} is some {g[1]} who {g[2]}",
+    "negation": lambda g: f"{g[0]} ~{g[1]}",
+    "uniqueness": lambda g: f"Each {g[0]} {g[1]} {g[2]}",
+    "mandatory": lambda g: f"Each {g[0]} some {g[1]}",
+    "neg_uniqueness": lambda g: ("any {0} more than one {1}".format(*g) if len(g) == 2 else
+                                 "For each {0}, it is impossible that that {0} {1} more than one {2}".format(*g)),
+    "neg_mandatory": lambda g: ("any {0} no {1}".format(*g) if len(g) == 2 else
+                                "For each {0}, it is impossible that that {0} {1} no {2}".format(*g)),
+    "inverse_uc": lambda g: f"For each {g[0]}, at most one {g[1]} that applies",
+    "fact_type_reading": lambda g: g[0],
+    "sm_def": lambda g: f"State Machine Definition '{g[0]}' is for Noun '{g[1]}'",
+    "sm_initial": lambda g: f"Status '{g[0]}' is initial in State Machine Definition '{g[1]}'",
+    "sm_from": lambda g: f"Transition '{g[0]}' is from Status '{g[1]}'",
+    "sm_to": lambda g: f"Transition '{g[0]}' is to Status '{g[1]}'",
+    "sm_trigger": lambda g: f"Transition '{g[0]}' is triggered by Fact Type '{g[1]}'",
+}
+
+_PREFIX = {("alethic", "positive"): "", ("deontic", "positive"): "It is obligatory that ",
+           ("deontic", "negative"): "It is forbidden that ",
+           ("alethic", "negative"): "It is impossible that "}
+
+
 def nf(reading):
-    kind, g = parse(reading)
-    if kind == "entity_type":
-        return f"{g[0]} is an entity type"
-    if kind == "value_type":
-        return f"{g[0]} is a value type"
-    raise ValueError(f"no normal form for {reading!r}")
+    """nf = verbalize ∘ compile ∘ parse (Prop. spec, conformance gate 1): the canonical
+    sentence of the reading's construct. Idempotent by construction: the renderer emits a
+    sentence its own kind's recognizer accepts with the same groups."""
+    stmt = reading.strip()
+    stmt = stmt if stmt.endswith(".") else stmt + "."
+    mod, sign, _inner = _split_modality(stmt)
+    kind, g = classify(stmt)
+    if kind == "UNPARSED":
+        raise ValueError(f"reading outside the fragment R: {reading!r}")
+    if kind == "possibility":
+        prefix = "It is permitted that " if mod == "deontic" else "It is possible that "
+        return prefix + g[0] + "."
+    return _PREFIX[(mod, sign)] + _RENDER[kind](g) + "."

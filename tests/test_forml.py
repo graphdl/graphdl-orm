@@ -44,5 +44,7 @@ def test_compile_model_small_returns_D_and_report():
 
 
 def test_nf_idempotent():
+    # the canonical form is a sentence of R, so it carries the terminating period
     for r in ("Person is an entity type", "Name is a value type"):
-        assert forml.nf(r) == r
+        assert forml.nf(r) == r + "."
+        assert forml.nf(forml.nf(r)) == forml.nf(r)
