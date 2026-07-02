@@ -35,12 +35,21 @@ def _named(name):
 
 
 def Fetch(name):
-    """↑name — contents (role 3) of the first cell named `name`, else φ (a fresh cell)."""
+    """↑name — contents (role 3) of the first cell named `name`, else # (Backus §13.3.4)."""
     from .theta import Filter
     found = Filter(_named(name))
     return _S(_COND, _S(_COMP, _NULL, found),
-              _S(_CONST, PHI),                               # no such cell ⇒ empty population
+              _S(_CONST, DEFAULT),                           # no such cell ⇒ # (unaddressable)
               _S(_COMP, _3, _1, found))                      # else contents of the first match
+
+
+def FetchPop(name):
+    """The create pipeline's view of a cell as a POPULATION: ↑name, with an absent cell an
+    empty population — the fresh-cell default is the pipeline's explicit choice (a COND on
+    #), never a change to ↑'s meaning."""
+    f = Fetch(name)
+    is_absent = _S(_COMP, _EQ, _S(_CONS, f, _S(_CONST, DEFAULT)))
+    return _S(_COND, is_absent, _S(_CONST, PHI), f)
 
 
 def Store(name):
@@ -58,7 +67,7 @@ def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_o
     validate_obj = validate_obj if validate_obj is not None else _STUB_VALIDATE
     resolve_stage = resolve_obj if resolve_obj is not None else _APNDL
     derive_stage = derive_obj if derive_obj is not None else A("id")
-    P = _S(_COMP, Fetch(cell_name), _2)                      # ⟨I,D⟩ → the cell's population
+    P = _S(_COMP, FetchPop(cell_name), _2)                   # ⟨I,D⟩ → the cell's population
     resolved = _S(_COMP, resolve_stage, _S(_CONS, _1, P))    # resolve:⟨I, P⟩ = P'
     derived = _S(_COMP, derive_stage, resolved)              # derive:P' = P''
     valD = _S(_CONS, _S(_COMP, validate_obj, derived), _2)   # ⟨⟨P'',V,flag⟩, D⟩
