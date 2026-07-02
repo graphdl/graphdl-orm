@@ -406,8 +406,18 @@ def _h_inverse_uc(g, k, m):
     a, _r = _subject(g[0], k)
     return [("constraint", (_slug(a) + "_inv_uc", "uniqueness", a, m))], []
 
+_QUOTED = re.compile(r"'([^']*)'")
+
+
 def _h_fact(g, k, m):
     kind, reading = _strip_derivation(g[0])                    # NORMA */**/+/++ derivation-storage marker
+    if "'" in reading:
+        # an INSTANCE fact (the corpus's dominant form): quoted ids fill the declared
+        # roles; the row lands in the fact type's own cell, the population runtime reads
+        ids = tuple(_QUOTED.findall(reading))
+        dequoted = re.sub(r"\s+", " ", _QUOTED.sub("", reading)).strip()
+        ft, _decl = _fact_type(dequoted, k)
+        return [(ft, ids)], []
     ft, facts = _fact_type(reading, k)                         # mixfix template + ordered roles
     deriv = [("derivation", (ft, kind))] if kind else []      # link the fact type to its derivation/storage
     return facts + deriv, []
