@@ -2,9 +2,12 @@
 
 A machine is not code — it IS its transition relation, a value. There is one runner, `run`,
 an FFP object that folds a transition value over a sequence of inputs from an initial state,
-applying the transition with the `apply` primitive (membership is application). RMAP and CSDP
-are two such values passed into that same one lambda; the runner does not know which machine
-it runs. That is the whole thing "expressible as values passed into one lambda."
+applying the transition with the `apply` primitive (membership is application). The `rmap`
+and `csdp` values below are Stage-1 SEEDS demonstrating that shape — rmap carries only the
+two grouping rules over pre-classified fact-type facts, csdp only the populate step. The
+full RMAP (six steps over M, driving D's cell layout) and CSDP (the seven design-filter
+checks at ingestion) are Phases 4 and 6 of the roadmap, to be authored as M-resident
+processes run by this same fold.
 """
 from . import lam as L
 from .lam import atom as A

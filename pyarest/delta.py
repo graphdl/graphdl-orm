@@ -1,12 +1,19 @@
-"""The delta fast-path (spec §4.2 / D5): a native tagged representation the runtime evaluates
-for speed, OBSERVATIONALLY EQUAL to the lambda/Scott encoding in lam.py + reduce.py. The lambda
-kernel remains the ground truth that establishes mu = lfp tau; nothing in the definitions
-references this path (the FFP objects are the same sequences of atoms). It exists only to remove
-the per-operation closure overhead and the O(n) store walk.
+"""The delta fast-path (spec §4.2 / D5, amendment §3.1.2): a native tagged representation the
+runtime evaluates for speed. The lambda kernel remains the ground truth that establishes
+mu = lfp tau; this path is held observationally equal to it BY THE DIFFERENTIAL ORACLE
+(tests/test_oracle.py — seeded metamorphic sweep over the base, the ⊥ edges, theta1 and the
+constraint algebra; plus test_bottom/test_boundary regression pins). Nothing in the
+definitions references this path (the FFP objects are the same sequences of atoms). Any new
+primitive must land in BOTH paths and in the oracle's leaf set.
 
-Native object: a scalar IS an atom (its ORM-typed value), a Python tuple IS a sequence, BOT_D is
-bottom, APP_D heads an application node ⟨APP, f, x⟩. Every primitive is a native tuple/scalar op;
-the store is a dict (O(1) fetch); metacomposition is the only mechanism, as in the ground truth.
+Native object: a scalar IS an atom (its ORM-typed value), a Python tuple IS a sequence, BOT_D
+is bottom (a non-sequence singleton — it can never be indexed or iterated as data), APP_D
+heads an application node ⟨APP, f, x⟩ and is SHARED with the λ kernel (lam.APPTAG) so App
+nodes survive Scott↔native conversion. Every primitive is a native tuple/scalar op guarded to
+⊥ outside its stated shape; the store is a dict (O(1) fetch) merging the native base, the
+compiled defs, and BRIDGED registered defs (the enumerable boundary works on both paths);
+the step's DEFS-in-D binding resolves first. Metacomposition is the only mechanism, as in
+the ground truth.
 """
 from . import lam as L
 from . import defs as _defs_mod
