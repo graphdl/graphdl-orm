@@ -695,6 +695,35 @@ def create(D, fact_type, fact, fuel=None):
     return ast.run(fact, D, cell_name=fact_type, machine=machine, mealy_obj=mealy, fuel=fuel)
 
 
+def create_stamped(D, ft, fact, tx):
+    """Bitemporal τ (Halpin §13.6): transaction time is when the SYSTEM records the fact
+    — ⟨tx, …fact⟩ enters the ft@tx log beside the base fact; valid time is ordinary UoD
+    data inside the fact itself. The platform's stream sequencer supplies tx: arrival
+    order at a stream IS transaction time (writer model); the engine holds no clock."""
+    from . import ast, defs as _d
+    from .reduce import apply as _ap
+    from .lam import to_lam, from_lam
+    import pyarest.lam as L
+    res = create(D, ft, fact)
+    o, D2 = _d._items(L._list(res))
+    if from_lam(o) == "ERROR":
+        return D2
+    rows = tuple(tuple(r) for r in _pop_rows(D2, ft + "@tx")) + \
+        ((tx,) + tuple(from_lam(fact)),)
+    return _ap(ast.Store(ft + "@tx"), _S(to_lam(rows), D2))
+
+
+def as_of(D, ft, tx):
+    """The population as of transaction time `tx`, reconstructed from the τ log —
+    Prop. onestep's order_τ audit view: Filter(tx′ ≤ tx), then project the fact."""
+    from . import ast
+    from .reduce import apply as _ap
+    from .lam import from_lam
+    keep = T.Filter(_S(_COMP, A("le"), _S(_CONS, _1, _S(_CONST, A(tx)))))
+    expr = _S(_COMP, _S(_ALPHA, A("tl")), keep, ast.FetchPop(ft + "@tx"))
+    return {tuple(r) for r in from_lam(_ap(expr, D))}
+
+
 def subscribe(D, sub_id, cells, def_name):
     """Cor. stream: a subscription IS a ρ-application that has not yet been evaluated
     against the current D — `def_name` names an ordinary definition (a cell, §13.3.5);

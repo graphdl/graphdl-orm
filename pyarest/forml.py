@@ -86,6 +86,8 @@ _CLASSIFY = [
     ("ring", re.compile(r"^(.+?) is (acyclic|asymmetric|antisymmetric|intransitive|irreflexive|symmetric)\.$")),
     # subtyping (corpus trailing marker 'is a subtype of'; RMAP step 0 absorbs to the top)
     ("subtype_of", re.compile(r"^(.+) is a subtype of (.+)\.$")),
+    # the corpus's brace subtype family (9 occurrences): each link plus pairwise exclusion
+    ("brace_subtypes", re.compile(r"^\{(.+)\} are (mutually exclusive )?subtypes of (.+)\.$")),
     ("objectification", re.compile(r"^[Tt]his association with (.+) provides the preferred identification scheme for (.+)\.$")),
     ("set_comparison", re.compile(r"^[Ff]or each (.+?), (exactly|at most) one of the following holds: (.+)\.$")),
     # negative forms (constraint verbalization paper): map to the SAME constraint as the positive twin
@@ -371,6 +373,25 @@ def _h_subtype(g, k, m):
             ("subtype", (sub, sup)),
             ("constraint", (cid, "subtype", sub, sup, m))], [(cid, C.scoped_subset(sup))]
 
+
+def _h_brace_subtypes(g, k, m):
+    """The corpus's brace family: '{A, B} are mutually exclusive subtypes of X.' is each
+    subtype link (through _h_subtype, so RMAP step 0 and the governedBy closure see them
+    like any other) plus, when marked, the pairwise exclusion between the subtype
+    populations."""
+    subs = tuple(s.strip() for s in g[0].split(","))
+    A_, objs = [], []
+    for s in subs:
+        a, o = _h_subtype((s, g[2]), k, m)
+        A_ += a
+        objs += o
+    if g[1]:
+        cid = "sxc_" + _slug("_".join(subs))[:40]
+        A_.append(("constraint", (cid, "exclusion", subs[0], subs, m)))
+        objs += [(cid, C.exclusion())] + \
+                [(cid + "@" + s, C.scoped_exclusion(subs, s)) for s in subs]
+    return A_, objs
+
 _QUANT = re.compile(r"\b(some|that|each|no|an|a) ")
 
 
@@ -590,6 +611,7 @@ _PLAN = {
     "value_constraint": _h_value_constraint, "uniqueness": _h_uniqueness, "mandatory": _h_mandatory,
     "neg_uniqueness": _h_neg_uniqueness, "neg_mandatory": _h_neg_mandatory, "spanning_uc": _h_spanning,
     "frequency": _h_frequency, "ring": _h_ring, "subtype_of": _h_subtype,
+    "brace_subtypes": _h_brace_subtypes,
     "set_comparison": _h_set_comparison, "disjunctive_mandatory": _h_disjunctive,
     "subset": _h_subset, "equality": _h_equality, "derivation_rule": _h_derivation_rule,
     "rule_if": _h_rule_if,
@@ -732,6 +754,7 @@ _RENDER = {
     "negation": lambda g: f"{g[0]} ~{g[1]}",
     "neg_pair": lambda g: f"{g[0]} {g[1]} {g[2]}",
     "finality": lambda g: f"{g[0]} becomes final at depth {g[1]}",
+    "brace_subtypes": lambda g: "{%s} are %ssubtypes of %s" % (g[0], g[1] or "", g[2]),
     "uniqueness": lambda g: f"Each {g[0]} {g[1]} {g[2]}",
     "mandatory": lambda g: f"Each {g[0]} some {g[1]}",
     "neg_uniqueness": lambda g: ("any {0} more than one {1}".format(*g) if len(g) == 2 else
