@@ -176,6 +176,24 @@ def _fact_type(reading, known):
     return ft, [("factType", (ft, template))] + _role_facts(ft, roles)
 
 
+# NORMA derivation-storage markers (ORMCore.dsl / ORMDiagram.resx: '{0} *' etc.), trailing a fact
+# type / object type name. They link the fact type to its derivation and storage methods:
+#   *  Derived                     — population from derive (lfp F_S) on demand; nothing stored
+#   ** DerivedAndStored            — derive materializes into the cell (kept in sync)
+#   +  PartiallyDerived            — asserted facts augmented by derive on demand (semiderived)
+#   ++ PartiallyDerivedAndStored   — asserted + derived, materialized
+_DERIVATION = [(" **", "derived-and-stored"), (" ++", "partially-derived-and-stored"),
+               (" *", "fully-derived"), (" +", "semi-derived")]
+
+
+def _strip_derivation(text):
+    """(derivation-storage kind, name-without-marker) — None if the name carries no marker."""
+    for mark, kind in _DERIVATION:
+        if text.endswith(mark):
+            return kind, text[:-len(mark)].strip()
+    return None, text
+
+
 # NORMA value specs → a value constraint object over role 1. A pattern table (regex is the string
 # boundary); the first match's builder wins, else an enumeration. No if/elif dispatch.
 _VALUE_SPECS = [
@@ -281,8 +299,10 @@ def _h_inverse_uc(g, k, m):
     return [("constraint", (_slug(a) + "_inv_uc", "uniqueness", a, m))], []
 
 def _h_fact(g, k, m):
-    _ft, facts = _fact_type(g[0], k)                           # mixfix template + ordered roles
-    return facts, []
+    kind, reading = _strip_derivation(g[0])                    # NORMA */**/+/++ derivation-storage marker
+    ft, facts = _fact_type(reading, k)                         # mixfix template + ordered roles
+    deriv = [("derivation", (ft, kind))] if kind else []      # link the fact type to its derivation/storage
+    return facts + deriv, []
 
 
 _PLAN = {
