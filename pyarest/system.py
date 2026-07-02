@@ -169,6 +169,31 @@ def links_of(key_pos, sm=None, status_pos=None):
     return _S(_COMP, _CAT, _S(_CONS, nav, transitions_of(sm, status_pos)))  # nav ∪ transitions
 
 
+# --- S1: membership is application, as a construction (Def. pop / eq. (1)) ---
+def typed_fact(ft, values):
+    """A fact carrying its type as its first element (the paper's ⟨CONS, s₁…sₙ⟩ shape),
+    so the fact 'is resolved by looking up its type' (eq. 1)."""
+    from .lam import to_lam
+    return to_lam((ft,) + tuple(values))
+
+
+def typed_population(ft, rows):
+    """A population of typed facts: applying it metacomposes down to the TYPE's
+    definition, which computes membership — P:g = T iff g ∈ P, one act."""
+    from .lam import to_lam
+    return to_lam(tuple((ft,) + tuple(r) for r in rows))
+
+
+def membership_def():
+    """The fact type's definition as an operator: metacomposition hands it ⟨f₁, ⟨P, g⟩⟩
+    (eq. 1 twice: once on the population, once on the fact), and member:⟨g, P⟩ answers.
+    Define this under the fact type's name and the population IS its characteristic
+    function, with no new mechanism."""
+    g = _S(_COMP, _2, _2)
+    P = _S(_COMP, _1, _2)
+    return _S(_COMP, T.member, _S(_CONS, g, P))
+
+
 # --- the book's rule form compiled (Halpin ch.2 ex.4): linear chain join over D ---
 def compile_rule(atom_fts, head_positions):
     """A rule's body as one FFP object over D: the populations of the clause fact types,
@@ -184,20 +209,28 @@ def compile_rule(atom_fts, head_positions):
     return _S(_COMP, T.Project(head_positions), expr)
 
 
-def run_rules(D):
-    """Cross-cell derivation to the least fixed point: apply every compiled rule against D
-    (the rule name resolves through D's own DEFS — ρ within the step), union new heads
-    into the head fact type's cell, repeat until no cell changes. The rules are positive,
-    so the iteration is monotone and Knaster–Tarski gives the lfp; finiteness bounds the
-    rounds (Lemma finiteness)."""
+def run_rules(D, changed=None):
+    """Cross-cell derivation to the least fixed point, BOUNDED by the frontier
+    (Cor. streaming): with `changed` given, only rules whose ruleReads intersect the
+    changed cells fire, and each round's newly derived heads become the next round's
+    frontier; with changed=None every rule fires in round one. Sound because rules are
+    positive and monotone: a rule reading no changed cell derives nothing new. Rule
+    names resolve through D's own DEFS (ρ within the step); Knaster–Tarski gives the
+    lfp and finiteness bounds the rounds."""
     from . import ast, defs
     from .reduce import apply as _ap
     from .lam import to_lam, from_lam, atom as _A
+    reads = {}
+    for r in _pop_rows(D, "ruleReads"):
+        if len(r) >= 2:
+            reads.setdefault(r[0], set()).add(r[1])
     rules = [(r[0], r[1]) for r in _pop_rows(D, "ruleDerives")]
-    changed = True
-    while changed:
-        changed = False
+    frontier = None if changed is None else set(changed)
+    while True:
+        fired, next_frontier = False, set()
         for rule_cid, head in rules:
+            if frontier is not None and not (reads.get(rule_cid, set()) & frontier):
+                continue
             with defs.step(D):
                 new = from_lam(_ap(_A(rule_cid), D))
             if not isinstance(new, tuple):
@@ -206,8 +239,11 @@ def run_rules(D):
             merged = old | {tuple(r) for r in new if isinstance(r, tuple)}
             if merged != old:
                 D = _ap(ast.Store(head), _S(to_lam(tuple(sorted(merged))), D))
-                changed = True
-    return D
+                fired = True
+                next_frontier.add(head)
+        if not fired:
+            return D
+        frontier = next_frontier
 
 
 # --- the state machine read off M (whitepaper §1): a machine IS a set of facts ---

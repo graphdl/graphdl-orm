@@ -621,12 +621,22 @@ def validate_for(fact_type, D):
     the step's D (Cor. closure). Every parsed family enforces — local ones over the target
     population, scoped ones over ⟨P, D⟩."""
     from .lam import atom as _A
+    spans = {}
+    for r in _cells(D, "spans"):
+        if len(r) == 2:
+            spans.setdefault(r[0], []).append(r[1])
     local, scoped = [], []
     for f in _cells(D, "constraint"):
         if len(f) < 3:
             continue
         for name, is_local in _ATTACH.get(f[1], lambda f, ft: [])(f, fact_type):
-            (local if is_local else scoped).append((_A(name), f[-1]))
+            # spec §4.3: the constraint FACT selects the family expression and binds the
+            # role sequence — for the spans-driven families the object is CONSTRUCTED
+            # from M's spans facts at validate time, so M is load-bearing, not decorative
+            if is_local and f[1] in ("uniqueness", "spanning_uniqueness") and name in spans:
+                local.append((C.uniqueness(sorted(spans[name])), f[-1]))
+            else:
+                (local if is_local else scoped).append((_A(name), f[-1]))
     return system.validate_modal(local, scoped)
 
 
