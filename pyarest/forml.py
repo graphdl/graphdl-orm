@@ -72,6 +72,12 @@ _CLASSIFY = [
     ("sm_from", re.compile(r"^Transition '(.+)' is from Status '(.+)'\.$")),
     ("sm_to", re.compile(r"^Transition '(.+)' is to Status '(.+)'\.$")),
     ("sm_trigger", re.compile(r"^Transition '(.+)' is triggered by Fact Type '(.+)'\.$")),
+    # the process completion of the §1 shape: guards and Mealy/Moore output functions,
+    # all M-facts; a guard is a (possibly derived) fact type, hence positive, so the
+    # groundedness condition on state transitions holds by construction
+    ("sm_guard", re.compile(r"^Transition '(.+)' is guarded by Fact Type '(.+)'\.$")),
+    ("sm_emit", re.compile(r"^Transition '(.+)' emits '(.+)'\.$")),
+    ("sm_moore", re.compile(r"^Status '(.+)' emits '(.+)'\.$")),
     ("value_constraint", re.compile(r"^[Tt]he possible values? of (.+?) (?:are|is) (.+)\.$")),
     ("spanning_uc", re.compile(r"^[Ii]n each population of (.+), each (.+) combination occurs at most once\.$")),
     # Halpin §7.2: frequency generalizes the spanning form from 'once' to bounded counts
@@ -450,6 +456,15 @@ def _h_sm_to(g, k, m):
 def _h_sm_trigger(g, k, m):
     return [("smTrigger", (g[0], _clause_ft(g[1], k)))], []   # ⟨transition, trigger fact type⟩
 
+def _h_sm_guard(g, k, m):
+    return [("smGuard", (g[0], _clause_ft(g[1], k)))], []     # ⟨transition, guard fact type⟩
+
+def _h_sm_emit(g, k, m):
+    return [("smEmit", (g[0], g[1]))], []                     # ⟨transition, Mealy def name⟩
+
+def _h_sm_moore(g, k, m):
+    return [("smMoore", (g[0], g[1]))], []                    # ⟨status, Moore def name⟩
+
 _VARTOK = re.compile(r"^(\w+)(\d+)$")
 _SOME = re.compile(r"\b(some|that) ")                          # existentials only: the article
                                                                # 'a' is predicate text ('is a
@@ -539,6 +554,7 @@ _PLAN = {
     "negation": _h_negation, "possibility": _h_possibility, "inverse_uc": _h_inverse_uc,
     "sm_def": _h_sm_def, "sm_initial": _h_sm_initial, "sm_from": _h_sm_from,
     "sm_to": _h_sm_to, "sm_trigger": _h_sm_trigger,
+    "sm_guard": _h_sm_guard, "sm_emit": _h_sm_emit, "sm_moore": _h_sm_moore,
     "fact_type_reading": _h_fact,
 }
 
@@ -683,6 +699,9 @@ _RENDER = {
     "sm_from": lambda g: f"Transition '{g[0]}' is from Status '{g[1]}'",
     "sm_to": lambda g: f"Transition '{g[0]}' is to Status '{g[1]}'",
     "sm_trigger": lambda g: f"Transition '{g[0]}' is triggered by Fact Type '{g[1]}'",
+    "sm_guard": lambda g: f"Transition '{g[0]}' is guarded by Fact Type '{g[1]}'",
+    "sm_emit": lambda g: f"Transition '{g[0]}' emits '{g[1]}'",
+    "sm_moore": lambda g: f"Status '{g[0]}' emits '{g[1]}'",
 }
 
 _PREFIX = {("alethic", "positive"): "", ("deontic", "positive"): "It is obligatory that ",

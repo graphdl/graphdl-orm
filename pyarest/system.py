@@ -265,13 +265,45 @@ def sm_triples(D):
     return tuple(from_lam(_ap(_sm_join(), pops)))
 
 
-def machine_wiring(D, trigger_ft, noun):
-    """Read `trigger_ft`'s wiring off M: the (from, to) pairs of the transitions it fires,
-    and the addressed noun's role position in the trigger fact type (from M's role facts)."""
+def _sm_join_named():
+    j1 = _S(_COMP, T.NatJoin(1), _S(_CONS, _1, _2))          # ⟨t, from, trigger⟩
+    return _S(_COMP, T.NatJoin(1), _S(_CONS, j1, A(3)))      # ⟨t, from, trigger, to⟩
+
+
+def sm_triples_named(D):
+    """⟨transition, from, trigger, to⟩ — the named form, so per-transition facts
+    (guards, Mealy emissions) can key in."""
     from . import ast
     from .reduce import apply as _ap
     from .lam import from_lam
-    pairs = tuple((f, t) for (f, tr, t) in sm_triples(D) if tr == trigger_ft)
+    pops = _S(*[_ap(ast.FetchPop(n), D) for n in ("smFrom", "smTrigger", "smTo")])
+    return tuple(from_lam(_ap(_sm_join_named(), pops)))
+
+
+def machine_for(D, noun):
+    """The State Machine Definition governing `noun`: bound directly, or through the
+    subtype chain to a bound supertype (a machine tied to a resource SUPERTYPE governs
+    its subtypes' instances). None when no machine binds."""
+    bound = {r[1]: r[0] for r in _pop_rows(D, "smDef")}
+    subs = {r[0]: r[1] for r in _pop_rows(D, "subtype")}
+    n, seen = noun, set()
+    while n not in bound and n in subs and n not in seen:
+        seen.add(n)
+        n = subs[n]
+    return bound.get(n)
+
+
+def machine_wiring(D, trigger_ft, noun):
+    """Read `trigger_ft`'s wiring off M: (from, to, guard) triples of the transitions it
+    fires (guard = the transition's guard fact type, or '#' for unguarded — a guard is a
+    possibly-derived fact type, so it is positive and the groundedness condition holds by
+    construction), and the addressed noun's role position in the trigger fact type."""
+    from . import ast
+    from .reduce import apply as _ap
+    from .lam import from_lam
+    guards = {r[0]: r[1] for r in _pop_rows(D, "smGuard")}
+    pairs = tuple((f, t, guards.get(name, "#"))
+                  for (name, f, tr, t) in sm_triples_named(D) if tr == trigger_ft)
     roles = from_lam(_ap(ast.FetchPop("role"), D))
     pos = next((p for (_rid, ft, p, otype) in roles if ft == trigger_ft and otype == noun), 1)
     return pairs, pos
@@ -449,6 +481,23 @@ def install_entity_cells(D, noun, rows):
     return D
 
 
+def moore_view(D, noun):
+    """The Moore output function as a view: for each live instance whose status carries an
+    emission, the ρ-application of the named definition to ⟨entity, status⟩ (outputs are
+    ρ-applications; the definition resolves through D's own DEFS)."""
+    from . import defs as _d
+    from .reduce import apply as _ap
+    from .lam import to_lam, from_lam, atom as _A
+    moore = {r[0]: r[1] for r in _pop_rows(D, "smMoore")}
+    out = {}
+    for row in _pop_rows(D, f"{noun}_status"):
+        e, s = row[0], row[1]
+        if s in moore:
+            with _d.step(D):
+                out[(e, s)] = from_lam(_ap(_A(moore[s]), to_lam((e, s))))
+    return out
+
+
 def process_table(D, noun):
     """The run queue as a VIEW (nothing is managed host-side): each state-machine
     instance whose status has outgoing transitions is a WAITING process, keyed to the
@@ -466,20 +515,34 @@ def process_table(D, noun):
 
 
 def sm_step(pairs, entity_role):
-    """The live machine step (Prop. onestep) as one FFP object: ⟨statusPop, P″⟩ → statusPop′.
-    An entity advances iff a trigger fact naming it (at `entity_role`) entered P″ and a
-    transition leaves its current status; everything else is unchanged. `pairs` are this
-    trigger fact type's (from, to) pairs, quoted as data."""
+    """The live machine step (Prop. onestep) as one FFP object: ⟨statusPop, P″, D⟩ →
+    statusPop′. An entity advances iff a trigger fact naming it (at `entity_role`)
+    entered P″, a transition leaves its current status, AND the transition's guard is
+    satisfied: the guard is a fact type ('#' when unguarded), and satisfaction is the
+    entity's membership in role 1 of the guard's population fetched from the frozen D.
+    A guard on a DERIVED fact type gives guards full rule power while staying positive."""
     from .lam import to_lam
-    trs = _S(_CONST, to_lam(tuple(pairs)))
-    e = _S(_COMP, _1, _1)                                    # of ⟨⟨e,s⟩, P″⟩
+    from . import ast
+    norm = tuple((p[0], p[1], p[2] if len(p) > 2 else "#") for p in pairs)
+    trs = _S(_CONST, to_lam(norm))
+    pairsD = _S(_COMP, _DISTR, _S(_CONS, _1, _S(_CONS, _2, A(3))))   # ⟨⟨es, ⟨P″,D⟩⟩ …⟩
+    e = _S(_COMP, _1, _1)                                    # of ⟨⟨e,s⟩, ⟨P″,D⟩⟩
     s = _S(_COMP, _2, _1)
+    P = _S(_COMP, _1, _2)
+    Dd = _S(_COMP, _2, _2)
     fact_names_e = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, A(entity_role), _1), _2))   # ⟨fact,e⟩
-    fired = _S(_COMP, A("not"), A("null"), T.Filter(fact_names_e), _DISTR, _S(_CONS, _2, e))
-    from_is_s = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, _1, _1), _2))                  # ⟨⟨f,t⟩,s⟩
+    fired = _S(_COMP, A("not"), A("null"), T.Filter(fact_names_e), _DISTR, _S(_CONS, P, e))
+    from_is_s = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, _1, _1), _2))                  # ⟨⟨f,t,g⟩,s⟩
     nexts = _S(_COMP, _S(_ALPHA, _1), T.Filter(from_is_s), _DISTR, _S(_CONS, trs, s))
+    first = _S(_COMP, _1, nexts)
+    to = _S(_COMP, A(2), first)
+    gname = _S(_COMP, A(3), first)
+    gpop = _S(_COMP, ast.DynFetch(), _S(_CONS, gname, Dd))   # the guard population, or #
+    unguarded = _S(_COMP, _EQ, _S(_CONS, gname, _S(_CONST, A("#"))))
+    satisfied = _S(_COMP, T.member, _S(_CONS, e, _S(_COMP, _S(_ALPHA, A(1)), gpop)))
+    okg = _S(_COND, unguarded, _S(_CONST, A("T")),
+             _S(_COND, _S(_COMP, A("atom"), gpop), _S(_CONST, A("F")), satisfied))
     hasnext = _S(_COMP, A("not"), A("null"), nexts)
-    to = _S(_COMP, A(2), _1, nexts)                          # the first matching pair's to
     both = _S(_COMP, A("and"), _S(_CONS, fired, hasnext))
-    upd = _S(_COND, both, _S(_CONS, e, to), _1)              # ⟨e,to⟩, else the old ⟨e,s⟩
-    return _S(_COMP, _S(_ALPHA, upd), _DISTR)                # over each ⟨⟨e,s⟩, P″⟩
+    upd = _S(_COND, both, _S(_COND, okg, _S(_CONS, e, to), _1), _1)
+    return _S(_COMP, _S(_ALPHA, upd), pairsD)                # over each ⟨⟨e,s⟩, ⟨P″,D⟩⟩

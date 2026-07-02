@@ -59,7 +59,7 @@ def test_sm_readings_populate_M():
 def test_machine_wiring_reads_the_sm_off_M():
     D, _ = forml.compile_model(MODEL)
     pairs, pos = system.machine_wiring(D, "Customer_places_Order", "Order")
-    assert pairs == (("In Cart", "Placed"),)                  # place: In Cart -> Placed
+    assert pairs == (("In Cart", "Placed", "#"),)             # place: In Cart -> Placed, unguarded
     assert pos == 2                                           # Order plays role 2 of the trigger
 
 

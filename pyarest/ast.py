@@ -110,10 +110,10 @@ def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_o
     V = _S(_COMP, _2, _1)                                    # V    from ⟨val,D,I⟩
     snew = entity_role = None
     if machine is not None:                                  # the machine advances in the SAME step:
-        status_cell, sm_obj, *rest = machine                 # status′ = sm:⟨status, P''⟩, committed
-        entity_role = rest[0] if rest else None              # with the fact — or neither (atomic)
-        spop = _S(_COMP, FetchPop(status_cell), _2)
-        snew = _S(_COMP, sm_obj, _S(_CONS, spop, P2))
+        status_cell, sm_obj, *rest = machine                 # status′ = sm:⟨status, P″, D⟩, committed
+        entity_role = rest[0] if rest else None              # with the fact — or neither (atomic);
+        spop = _S(_COMP, FetchPop(status_cell), _2)          # D rides along so GUARDS can fetch
+        snew = _S(_COMP, sm_obj, _S(_CONS, spop, P2, _2))    # their (possibly derived) fact type
     if links_obj is None:
         parts = [P2, V]
     else:
