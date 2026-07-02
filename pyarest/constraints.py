@@ -207,9 +207,13 @@ def exclusive_or():
 # and must come from P, while sibling cells are untouched by this step (Def. iso).
 
 def _pop_of(cell_name):
-    """⟨P,D⟩ → the population of a SIBLING cell, fetched from the frozen D."""
+    """⟨P,D⟩ → the population of a SIBLING cell, fetched from the frozen D. A non-string
+    argument is taken as a ready population EXPRESSION over D (the RMAP view seam:
+    an absorbed fact type's population reassembled through the index), composed the
+    same way."""
     from . import ast
-    return _S(_COMP, ast.FetchPop(cell_name), _2)
+    src = ast.FetchPop(cell_name) if isinstance(cell_name, str) else cell_name
+    return _S(_COMP, src, _2)
 
 
 _P = _1                                                       # ⟨P,D⟩ → the target population
@@ -245,27 +249,28 @@ def scoped_equality_side(other_cell):
     return _S(_COMP, _CAT, _S(_CONS, ab, ba))
 
 
-def _participation(clause_fts, target_ft):
+def _participation(clause_fts, target_ft, pops=None):
     """⟨P,D⟩ → ⟨⟨entity, clause⟩ …⟩ over ALL clause cells: the target clause reads from P,
-    the sibling clauses from D. Each row is tagged with its clause's fact-type id."""
+    the sibling clauses from D. Each row is tagged with its clause's fact-type id. `pops`
+    overrides a clause's population with an expression over D (the RMAP view seam)."""
     parts = []
     for ft in clause_fts:
-        src = _P if ft == target_ft else _pop_of(ft)
+        src = _P if ft == target_ft else _pop_of((pops or {}).get(ft, ft))
         tag = _S(_ALPHA, _S(_CONS, _1, _S(_CONST, A(ft))))    # row → ⟨entity, clause⟩
         parts.append(_S(_COMP, tag, src))
     return _S(_COMP, T.flatten, _S(_CONS, *parts))
 
 
-def scoped_exclusion(clause_fts, target_ft):
+def scoped_exclusion(clause_fts, target_ft, pops=None):
     """Exclusion over clause fact types, attached to `target_ft`'s cell: at most one clause
     per entity — uniqueness on the entity role of the participation."""
-    return _S(_COMP, exclusion(), _participation(clause_fts, target_ft))
+    return _S(_COMP, exclusion(), _participation(clause_fts, target_ft, pops))
 
 
-def scoped_exclusive_or(subject_cell, clause_fts, target_ft):
+def scoped_exclusive_or(subject_cell, clause_fts, target_ft, pops=None):
     """Exactly one clause per entity: exclusive_or over ⟨universe, participation⟩, the
     universe being the subject type's own instance cell."""
-    pair = _S(_CONS, _pop_of(subject_cell), _participation(clause_fts, target_ft))
+    pair = _S(_CONS, _pop_of(subject_cell), _participation(clause_fts, target_ft, pops))
     return _S(_COMP, exclusive_or(), pair)
 
 
@@ -279,9 +284,9 @@ def scoped_external_uniqueness(other_ft, cols):
     return _S(_COMP, uniqueness(cols), join)
 
 
-def scoped_inclusive_or(subject_cell, clause_fts, target_ft):
+def scoped_inclusive_or(subject_cell, clause_fts, target_ft, pops=None):
     """At least one clause per entity (disjunctive mandatory): universe ∖ players."""
-    players = _S(_COMP, T.Project([1]), _participation(clause_fts, target_ft))
+    players = _S(_COMP, T.Project([1]), _participation(clause_fts, target_ft, pops))
     pair = _S(_CONS, _S(_COMP, T.Project([1]), _pop_of(subject_cell)), players)
     return _S(_COMP, T.setminus, pair)
 

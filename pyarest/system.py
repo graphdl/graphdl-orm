@@ -721,16 +721,24 @@ def create(D, fact_type, fact, fuel=None):
     row_col = None
     if table != fact_type:
         row_col = 2 + table_columns(part, table).index(fact_type)
-    machine = mealy = None
+    machine = mealy = links = None
     if any(r[1] == fact_type for r in _pop_rows(D, "smTrigger")):
         noun = _governed_player(D, fact_type)
         if noun is not None:
-            machine = (noun + "_status", machine_step(fact_type, row_col))
+            role_pos = next((r[2] for r in _pop_rows(D, "role")
+                             if len(r) >= 4 and r[1] == fact_type and r[3] == noun), None)
+            machine = (noun + "_status", machine_step(fact_type, row_col), role_pos)
             mealy = mealy_step(fact_type, row_col)
+            if table == fact_type and role_pos is not None:
+                # Thm. hateoas at the ORM level: the representation offers exactly the
+                # next transitions from the POST-step status, no caller wiring
+                from .lam import to_lam
+                links = transitions_of(to_lam(sm_triples(D)), 2)
     if table != fact_type:
         return create_routed(D, fact_type, fact, part, machine=machine, mealy_obj=mealy,
                              validate_obj=row_validate(D, fact_type, part))
-    return ast.run(fact, D, cell_name=fact_type, machine=machine, mealy_obj=mealy, fuel=fuel)
+    return ast.run(fact, D, cell_name=fact_type, machine=machine, mealy_obj=mealy,
+                   links_obj=links, fuel=fuel)
 
 
 def create_stamped(D, ft, fact, tx):
@@ -832,6 +840,29 @@ def step_and_wake(D, fact_type, fact):
             changed.add(noun + "_status")
     D2 = run_rules(D2, changed=changed)
     return _S(o, D2), wake(D2, changed)
+
+
+def ftpop_expr(ft, partition):
+    """The fact type's population as one FFP expression over D, whatever the layout:
+    an own-table fact type reads its cell; an absorbed one reassembles ⟨key, value⟩
+    through the index and the dynamic fetch (ft_view's expression, composed over D).
+    The seam the RMAP plan recorded: scoped constraints read through the VIEW."""
+    from . import ast
+    table = partition.get(ft, ft)
+    if table == ft:
+        return ast.FetchPop(ft)
+    col = 2 + table_columns(partition, table).index(ft)
+    key = _S(_COMP, _1, _1)
+    hole = _S(_CONST, A("#"))
+    name = _S(_COMP, A("cellkey"), _S(_CONS, _S(_CONST, A(table)), key))
+    row = _S(_COMP, ast.DynFetch(), _S(_CONS, name, _2))
+    # an index entry whose entity cell is absent contributes a hole (outer-join style),
+    # which the filter drops — never ⊥, since validate runs over arbitrary D
+    pair = _S(_COND, _S(_COMP, A("atom"), row), _S(_CONS, key, hole),
+              _S(_CONS, key, _S(_COMP, A(col), row)))
+    nonhole = _S(_COMP, A("not"), _EQ, _S(_CONS, A(2), hole))
+    inner = _S(_COMP, T.Filter(nonhole), _S(_ALPHA, pair), _DISTR)
+    return _S(_COMP, inner, _S(_CONS, ast.FetchPop(table), _ID))
 
 
 def row_validate(D, ft, partition):

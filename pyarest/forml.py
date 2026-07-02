@@ -902,13 +902,46 @@ _ATTACH = {
 }
 
 
-def validate_for(fact_type, D):
+def validate_for(fact_type, D, partition=None):
     """Build `fact_type`'s validate from M's constraint facts, respecting modality: alethic
     constraints block commit, deontic ones only flag (AREST Def. Violation). Attachment is
     read off M by kind (_ATTACH); the constraint names reflect to their objects via rho within
     the step's D (Cor. closure). Every parsed family enforces — local ones over the target
-    population, scoped ones over ⟨P, D⟩."""
+    population, scoped ones over ⟨P, D⟩. With a `partition`, a scoped constraint whose read
+    fact type is ABSORBED is rebuilt over the VIEW (ftpop_expr: index + dynamic fetch), the
+    seam the RMAP plan recorded — like the spans-driven families, M is load-bearing and the
+    object is constructed at validate time."""
     from .lam import atom as _A
+
+    def _absorbed(ft):
+        return partition is not None and isinstance(ft, str) and partition.get(ft, ft) != ft
+
+    def _vp(ft):
+        return system.ftpop_expr(ft, partition) if _absorbed(ft) else ft
+
+    def _rebuilt(f, name):
+        kind = f[1]
+        if kind in ("subtype", "subset") and name == f[0] and _absorbed(f[3]):
+            return C.scoped_subset(_vp(f[3]))
+        if kind == "equality":
+            if name == f[0] + "_a" and _absorbed(f[3]):
+                return C.scoped_equality_side(_vp(f[3]))
+            if name == f[0] + "_b" and _absorbed(f[2]):
+                return C.scoped_equality_side(_vp(f[2]))
+        if kind == "mandatory" and name == f[0] + "_e" and _absorbed(f[2]):
+            return C.scoped_mandatory_facts(_vp(f[2]))
+        if kind in ("exclusion", "exclusive_or", "disjunctive_mandatory") and "@" in name:
+            clauses = tuple(f[3])
+            if any(_absorbed(c) for c in clauses):
+                pops = {c: system.ftpop_expr(c, partition) for c in clauses if _absorbed(c)}
+                target = name.split("@", 1)[1]
+                if kind == "exclusion":
+                    return C.scoped_exclusion(clauses, target, pops)
+                if kind == "exclusive_or":
+                    return C.scoped_exclusive_or(f[2], clauses, target, pops)
+                return C.scoped_inclusive_or(f[2], clauses, target, pops)
+        return None
+
     spans = {}
     for r in _cells(D, "spans"):
         if len(r) == 2:
@@ -923,6 +956,10 @@ def validate_for(fact_type, D):
             # from M's spans facts at validate time, so M is load-bearing, not decorative
             if is_local and f[1] in ("uniqueness", "spanning_uniqueness") and name in spans:
                 local.append((C.uniqueness(sorted(spans[name])), f[-1]))
+                continue
+            fresh = None if is_local else _rebuilt(f, name)
+            if fresh is not None:
+                scoped.append((fresh, f[-1]))
             else:
                 (local if is_local else scoped).append((_A(name), f[-1]))
     return system.validate_modal(local, scoped)

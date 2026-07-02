@@ -79,6 +79,23 @@ def _rows(Dpy, name):
     return ()
 
 
+FLOW = MODEL + """Customer ships Order.
+Transition 'ship' is from Status 'Placed'.
+Transition 'ship' is to Status 'Shipped'.
+Transition 'ship' is triggered by Fact Type 'Customer ships Order'.
+"""
+
+
+def test_create_carries_the_links_with_no_caller_wiring():
+    # Thm. hateoas at the ORM level: the representation offers exactly the next
+    # transitions from the entity's POST-step status — no links argument anywhere
+    D, _ = forml.compile_model(FLOW)
+    D = _with_pop(D, "Order_status", (("o1", "In Cart"),))
+    (o, _Dp) = from_lam(system.create(D, "Customer_places_Order", to_lam(("c1", "o1"))))
+    links = o[2]
+    assert {t[1] for t in links} == {"Customer_ships_Order"}  # ship offered, place gone
+
+
 def test_reasserting_a_fact_is_the_identity_on_D():
     # fact-as-function: a population is a set, so re-assertion is the identity. This is
     # the ground case of the schema-derived failure model: at-least-once delivery is
