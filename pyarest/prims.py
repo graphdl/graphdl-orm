@@ -77,6 +77,9 @@ def _cmp(rel):
 _add, _sub, _mul = _binnum(lambda a, b: a + b), _binnum(lambda a, b: a - b), _binnum(lambda a, b: a * b)
 _ge, _gt = _cmp(lambda a, b: a >= b), _cmp(lambda a, b: a > b)
 _le, _lt = _cmp(lambda a, b: a <= b), _cmp(lambda a, b: a < b)
+# apply:⟨f, x⟩ = f:x = mu(f : x) — membership is application; the one operation eq. sys performs,
+# and what lets a VALUE (a transition relation, a handler) be fed into the one mu.
+_apply = lambda mu: lambda o: mu(mkapp(_1(o))(_2(o)))
 
 # ---- controlling operators (§13.3.2): impl(mu)(⟨⟨OP, params⟩, y⟩) ----
 # COMP  f1∘..∘fn : y = f1:(f2:(..(fn:y)))        right fold of application
@@ -126,6 +129,7 @@ def register_base():
              "length": _len, "reverse": _rev, "cat": _cat,
              "not": _not, "and": _and, "or": _or, "1r": _1r, "tlr": _tlr,
              "+": _add, "-": _sub, "*": _mul, "ge": _ge, "gt": _gt, "le": _le, "lt": _lt,
+             "apply": _apply,
              "COMP": _comp, "CONS": _cons, "CONST": _const, "ALPHA": _alpha,
              "COND": _cond, "INSERT": _insert, "WHILE": _while}
     for name, fn in prims.items():
