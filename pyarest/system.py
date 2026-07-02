@@ -81,6 +81,25 @@ def derive_of(rules):
     return _S(_WHILE, grows, F)
 
 
+# --- role-path -> F_S: a derivation rule is a Datalog rule q(..) <- p1(..), .., pm(..) (ORM ->
+# Datalog): a conjunctive query whose body atoms join on shared variables and project to the head
+# (the role path). A recursive head (ancestor <- link ; link, ancestor) is resolved by derive_of's
+# least fixed point. Each compiled rule is an FFP object P -> its derived head facts. ---
+def join_rule(join_role, head_cols):
+    """A two-atom SELF-referential role-path rule over one fact type: join the fact type to itself
+    on `join_role` (R.join_role = R'.1) and project to `head_cols`. This is the recursive body,
+    e.g. ancestor(x,z) <- link(x,y), ancestor(y,z) with head_cols=[1,3], join_role=2 — feed it to
+    derive_of for the least fixed point (transitive closure). rule:P = Project ∘ NatJoin ∘ [id,id]."""
+    return _S(_COMP, T.Project(head_cols), T.NatJoin(join_role), _S(_CONS, _ID, _ID))
+
+
+def join_rule2(join_role, head_cols):
+    """A two-atom role-path rule over two fact types: input ⟨A, B⟩; join A.join_role = B.1 and
+    project to head_cols over the combined tuple (e.g. FastCarDriver(x) <- drives(x,y), isFast(y)).
+    rule:⟨A,B⟩ = Project ∘ NatJoin."""
+    return _S(_COMP, T.Project(head_cols), T.NatJoin(join_role))
+
+
 # --- resolve with auto-counter minting (Def. Command: mint iff the ref scheme auto-generates) ---
 _max2 = _S(_COND, _S(_COMP, A("ge"), _S(_CONS, _1, _2)), _1, _2)   # the larger of a pair
 
