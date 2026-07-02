@@ -36,29 +36,36 @@ define("create", _S(_COMP, A("emit"), A("validate"), A("derive"), A("resolve")))
 
 
 # --- validate: V = ⋃_c (rho c):P, with the alethic commit guard ---
-def _violations(constraints):
-    """P ↦ ⋃_c (rho c):P — flatten the per-constraint violation sets ⟨V_c1..V_cn⟩."""
-    if not constraints:
+def _violations(exprs):
+    """X ↦ ⋃_c (rho c):X — flatten the per-constraint violation sets ⟨V_c1..V_cn⟩."""
+    if not exprs:
         return _S(_CONST, PHI)
-    return _S(_COMP, T.flatten, _S(_CONS, *constraints))
+    return _S(_COMP, T.flatten, _S(_CONS, *exprs))
 
 
-def validate_of(constraints, alethic=None):
-    """validate_S : P ↦ ⟨P, V, alethicViolated⟩ (Def. Command / Violation). `alethic` is the
-    subset that blocks commit (default: all)."""
-    ac = constraints if alethic is None else alethic
-    flag = _S(_COMP, A("not"), A("null"), _violations(ac))   # any alethic offender?
-    return _S(_CONS, _ID, _violations(constraints), flag)
+def validate_of(constraints, alethic=None, scoped=(), scoped_alethic=None):
+    """validate_S : ⟨P, D⟩ ↦ ⟨P, V, alethicViolated⟩ (Def. Command / Violation). `constraints`
+    consume the target population P (cell-local — composed with the selector); `scoped` consume
+    ⟨P, D⟩ whole (cross-cell — they fetch sibling cells from the frozen D). `alethic` /
+    `scoped_alethic` are the commit-blocking subsets (default: all of each)."""
+    local = [_S(_COMP, c, _1) for c in constraints]
+    la = local if alethic is None else [_S(_COMP, c, _1) for c in alethic]
+    sc = list(scoped)
+    sa = sc if scoped_alethic is None else list(scoped_alethic)
+    flag = _S(_COMP, A("not"), A("null"), _violations(la + sa))   # any alethic offender?
+    return _S(_CONS, _1, _violations(local + sc), flag)
 
 
-def validate_modal(pairs):
-    """validate over constraints tagged with modality: pairs = [(constraint_obj, modality)]. V is
-    the union of ALL violations, but only the ALETHIC ones set the block-commit flag (AREST Def.
-    Violation / eq. create). A deontic violation is reported in V yet never blocks commit —
-    'ought to be obeyed but may be violated' (the constraint verbalization paper's deontic o)."""
-    objs = [o for o, _m in pairs]
-    alethic = [o for o, m in pairs if m == "alethic"]
-    return validate_of(objs, alethic=alethic)
+def validate_modal(pairs, scoped_pairs=()):
+    """validate over constraints tagged with modality: pairs = [(obj, modality)] cell-local,
+    scoped_pairs likewise for ⟨P,D⟩ consumers. V is the union of ALL violations, but only the
+    ALETHIC ones set the block-commit flag (AREST Def. Violation / eq. create). A deontic
+    violation is reported in V yet never blocks commit — 'ought to be obeyed but may be
+    violated' (the constraint verbalization paper's deontic o)."""
+    return validate_of([o for o, _m in pairs],
+                       alethic=[o for o, m in pairs if m == "alethic"],
+                       scoped=[o for o, _m in scoped_pairs],
+                       scoped_alethic=[o for o, m in scoped_pairs if m == "alethic"])
 
 
 # --- derive = lfp(F_S): the immediate-consequence operator iterated to a fixed point ---

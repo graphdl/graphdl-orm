@@ -253,17 +253,30 @@ def _h_meta(cell):
     return lambda g, k, m: ([(cell, (g[0],))], [])             # data_type / ref_mode metadata
 
 def _h_value_constraint(g, k, m):
-    return [("valueConstraint", (g[0], g[1], m))], [(g[0] + "_vc", _value_constraint(g[1]))]
+    # enforced BOTH as a named object and on the value type's own cell (validate_for kind 'value')
+    return [("valueConstraint", (g[0], g[1], m)), ("constraint", (g[0] + "_vc", "value", g[0], m))], \
+        [(g[0] + "_vc", _value_constraint(g[1]))]
+
+
+def _mandatory_parts(ft, subject, m):
+    """The M-fact + the two attachment objects of one mandatory constraint: fact-side
+    (entities read from the subject type's cell) and entity-side (facts read from ft)."""
+    cid = ft + "_mand"
+    return [("constraint", (cid, "mandatory", ft, subject, m))], \
+        [(cid, C.scoped_mandatory_entities(subject)), (cid + "_e", C.scoped_mandatory_facts(ft))]
+
 
 def _h_uniqueness(g, k, m):
     ft, facts = _fact_type(g[0] + " " + g[2], k)               # mixfix template + roles
-    also = {"exactly one": [("constraint", (ft + "_mand", "mandatory", ft, m))]}.get(g[1], [])
+    subject = _subject(g[0], k)[0]
+    also, aobjs = _mandatory_parts(ft, subject, m) if g[1] == "exactly one" else ([], [])
     return facts + [("constraint", (ft + "_uc", "uniqueness", ft, m))] + also, \
-        [(ft + "_uc", C.uniqueness([1]))]                      # the 'Each A' role is unique
+        [(ft + "_uc", C.uniqueness([1]))] + aobjs              # the 'Each A' role is unique
 
 def _h_mandatory(g, k, m):
     ft, facts = _fact_type(g[0] + " " + g[1], k)
-    return facts + [("constraint", (ft + "_mand", "mandatory", ft, m))], []
+    mfacts, mobjs = _mandatory_parts(ft, _subject(g[0], k)[0], m)
+    return facts + mfacts, mobjs
 
 def _h_neg_uniqueness(g, k, m):
     ft, facts = _fact_type(" ".join(g), k)                     # reconstruct the reading; same constraint
@@ -271,35 +284,57 @@ def _h_neg_uniqueness(g, k, m):
 
 def _h_neg_mandatory(g, k, m):
     ft, facts = _fact_type(" ".join(g), k)
-    return facts + [("constraint", (ft + "_mand", "mandatory", ft, m))], []
+    mfacts, mobjs = _mandatory_parts(ft, _subject(g[0], k)[0], m)
+    return facts + mfacts, mobjs
 
 def _h_spanning(g, k, m):
     ftn = g[0].replace(" ", "_")
     return [("constraint", (ftn + "_uc", "spanning_uniqueness", ftn, m))], [(ftn + "_uc", C.uniqueness([1, 2]))]
 
+_QUANT = re.compile(r"\b(some|that|each|no|an|a) ")
+
+
+def _clause_ft(text, known):
+    """A constraint clause (quantified reading text) → the fact-type id it references:
+    strip the quantifier words, then resolve as a fact-type reading. The string boundary
+    of set-comparison/subset clause resolution (full RolePath unification is Stage 2)."""
+    ft, _facts = _fact_type(_QUANT.sub("", text.strip()).strip(), known)
+    return ft
+
+
 def _h_set_comparison(g, k, m):
     subj, mode, body = g
-    n = len([c for c in body.split(";") if c.strip()])
+    clauses = tuple(_clause_ft(c, k) for c in body.split(";") if c.strip())
     kind = {"exactly": "exclusive_or", "at most": "exclusion"}[mode]
     cid = _slug(subj) + {"exactly": "_xor", "at most": "_excl"}[mode]
-    obj = {"exactly": C.exclusive_or, "at most": C.exclusion}[mode]()
-    return [("constraint", (cid, kind, subj, n, m))], [(cid, obj)]
+    scoped = {"exactly": lambda ft: C.scoped_exclusive_or(subj, clauses, ft),
+              "at most": lambda ft: C.scoped_exclusion(clauses, ft)}[mode]
+    objs = [(cid, {"exactly": C.exclusive_or, "at most": C.exclusion}[mode]())] + \
+           [(cid + "@" + ft, scoped(ft)) for ft in clauses]    # one attachment per clause cell
+    return [("constraint", (cid, kind, subj, clauses, m))], objs
 
 def _h_disjunctive(g, k, m):
     body = g[-1]
-    n = len([d for d in body.split(" or ") if d.strip()])
-    cid = "ior_" + _slug(g[0] if len(g) > 1 else body)[:40]
-    return [("constraint", (cid, "disjunctive_mandatory", n, m))], [(cid, C.inclusive_or())]
+    subj, rest = _subject(body, k) if len(g) == 1 else (_subject(g[0], k)[0], body)
+    clauses = tuple(_clause_ft(subj + " " + c, k) for c in rest.split(" or ") if c.strip())
+    cid = "ior_" + _slug(subj)[:40]
+    objs = [(cid, C.inclusive_or())] + \
+           [(cid + "@" + ft, C.scoped_inclusive_or(subj, clauses, ft)) for ft in clauses]
+    return [("constraint", (cid, "disjunctive_mandatory", subj, clauses, m))], objs
 
 def _h_subset(g, k, m):
     ante, cons_txt = g
     conseq, _, _where = cons_txt.partition(" where ")         # a 'where' join condition, if present
+    ft_a, ft_b = _clause_ft(ante, k), _clause_ft(conseq, k)
     cid = "subset_" + _slug(ante)[:40]
-    return [("constraint", (cid, "subset", ante[:60], conseq[:60], m))], [(cid, C.subset())]
+    return [("constraint", (cid, "subset", ft_a, ft_b, m))], \
+        [(cid, C.scoped_subset(ft_b))]                         # attached to the antecedent cell
 
 def _h_equality(g, k, m):
+    ft_a, ft_b = _clause_ft(g[0], k), _clause_ft(g[1], k)
     cid = "eq_" + _slug(g[0])[:40]
-    return [("constraint", (cid, "equality", g[0][:60], g[1][:60], m))], [(cid, C.equality())]
+    return [("constraint", (cid, "equality", ft_a, ft_b, m))], \
+        [(cid + "_a", C.scoped_equality_side(ft_b)), (cid + "_b", C.scoped_equality_side(ft_a))]
 
 def _h_negation(g, k, m):
     a, pred = _subject(g[0], k)
@@ -379,11 +414,6 @@ def compile_model(text, D=None):
     return D, {"total": len(stmts), "kinds": dict(report), "unparsed": unparsed}
 
 
-# constraint kinds compiled to a single-population violation object (enforceable on a fact type's
-# own population); mandatory/subset/set-comparison need other inputs and are excluded here.
-_ENFORCEABLE = {"uniqueness", "spanning_uniqueness", "ring_irreflexive", "ring_symmetric"}
-
-
 def _cells(D, name):
     for c in from_lam(D):
         if isinstance(c, tuple) and len(c) == 3 and c[:2] == ("CELL", name):
@@ -391,14 +421,41 @@ def _cells(D, name):
     return []
 
 
+# How each constraint KIND attaches to a cell's validate: fact (cid, kind, …scope…, modality) +
+# the target cell → the (name, local?) attachments. A local attachment consumes the target
+# population P; a scoped one consumes ⟨P, D⟩ and fetches sibling cells (audit C3 — every parsed
+# family enforces; nothing drops silently).
+_ATTACH = {
+    "uniqueness":            lambda f, ft: [(f[0], True)] if f[2] == ft else [],
+    "spanning_uniqueness":   lambda f, ft: [(f[0], True)] if f[2] == ft else [],
+    "ring_irreflexive":      lambda f, ft: [(f[0], True)] if f[2] == ft else [],
+    "ring_symmetric":        lambda f, ft: [(f[0], True)] if f[2] == ft else [],
+    "value":                 lambda f, ft: [(f[0], True)] if f[2] == ft else [],
+    "mandatory":             lambda f, ft: ([(f[0], False)] if f[2] == ft else [])
+                                         + ([(f[0] + "_e", False)] if f[3] == ft else []),
+    "subset":                lambda f, ft: [(f[0], False)] if f[2] == ft else [],
+    "equality":              lambda f, ft: ([(f[0] + "_a", False)] if f[2] == ft else [])
+                                         + ([(f[0] + "_b", False)] if f[3] == ft else []),
+    "exclusion":             lambda f, ft: [(f[0] + "@" + ft, False)] if ft in f[3] else [],
+    "exclusive_or":          lambda f, ft: [(f[0] + "@" + ft, False)] if ft in f[3] else [],
+    "disjunctive_mandatory": lambda f, ft: [(f[0] + "@" + ft, False)] if ft in f[3] else [],
+}
+
+
 def validate_for(fact_type, D):
     """Build `fact_type`'s validate from M's constraint facts, respecting modality: alethic
-    constraints block commit, deontic ones only flag (AREST Def. Violation). The guard is read
-    off M — the constraint names reflect to their objects via rho (Cor. closure), no host table."""
+    constraints block commit, deontic ones only flag (AREST Def. Violation). Attachment is
+    read off M by kind (_ATTACH); the constraint names reflect to their objects via rho within
+    the step's D (Cor. closure). Every parsed family enforces — local ones over the target
+    population, scoped ones over ⟨P, D⟩."""
     from .lam import atom as _A
-    pairs = [(_A(f[0]), f[-1]) for f in _cells(D, "constraint")
-             if len(f) >= 4 and f[2] == fact_type and f[1] in _ENFORCEABLE]
-    return system.validate_modal(pairs)
+    local, scoped = [], []
+    for f in _cells(D, "constraint"):
+        if len(f) < 3:
+            continue
+        for name, is_local in _ATTACH.get(f[1], lambda f, ft: [])(f, fact_type):
+            (local if is_local else scoped).append((_A(name), f[-1]))
+    return system.validate_modal(local, scoped)
 
 
 def parse(reading):

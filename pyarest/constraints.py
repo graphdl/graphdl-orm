@@ -140,6 +140,82 @@ def exclusive_or():
     return _S(_COMP, _CAT, _S(_CONS, none, many))                 # none ∪ many
 
 
+# ============================ scoped (cross-cell) families ====================
+# A scoped violation expression consumes ⟨P, D⟩: P is the TARGET cell's post-derive
+# population (the cell this commit writes), and every sibling population is fetched from
+# the frozen D — validate runs before the commit, so the target cell's copy in D is stale
+# and must come from P, while sibling cells are untouched by this step (Def. iso).
+
+def _pop_of(cell_name):
+    """⟨P,D⟩ → the population of a SIBLING cell, fetched from the frozen D."""
+    from . import ast
+    return _S(_COMP, ast.FetchPop(cell_name), _2)
+
+
+_P = _1                                                       # ⟨P,D⟩ → the target population
+
+
+def scoped_mandatory_entities(entity_cell):
+    """Mandatory, attached to the FACT-TYPE cell (P = the fact population): the instances
+    in the entity type's own cell that play no fact. V = π1(entities) ∖ π1(P)."""
+    ents = _S(_COMP, T.Project([1]), _pop_of(entity_cell))
+    players = _S(_COMP, T.Project([1]), _P)
+    return _S(_COMP, T.setminus, _S(_CONS, ents, players))
+
+
+def scoped_mandatory_facts(ft_cell):
+    """Mandatory, attached to the ENTITY cell (P = the entity population): the entities of
+    P that play no fact in the fact-type cell. V = π1(P) ∖ π1(↑ft)."""
+    ents = _S(_COMP, T.Project([1]), _P)
+    players = _S(_COMP, T.Project([1]), _pop_of(ft_cell))
+    return _S(_COMP, T.setminus, _S(_CONS, ents, players))
+
+
+def scoped_subset(consequent_cell):
+    """Subset A ⊆ B, attached to the antecedent cell (P = A): V = P ∖ ↑B, tuple-wise —
+    the clause readings resolve to fact types whose role order matches (modus ponens)."""
+    return _S(_COMP, T.setminus, _S(_CONS, _P, _pop_of(consequent_cell)))
+
+
+def scoped_equality_side(other_cell):
+    """Equality A = B, attached to ONE side (P = this side): the symmetric difference
+    (P ∖ ↑other) ∪ (↑other ∖ P)."""
+    ab = _S(_COMP, T.setminus, _S(_CONS, _P, _pop_of(other_cell)))
+    ba = _S(_COMP, T.setminus, _S(_CONS, _pop_of(other_cell), _P))
+    return _S(_COMP, _CAT, _S(_CONS, ab, ba))
+
+
+def _participation(clause_fts, target_ft):
+    """⟨P,D⟩ → ⟨⟨entity, clause⟩ …⟩ over ALL clause cells: the target clause reads from P,
+    the sibling clauses from D. Each row is tagged with its clause's fact-type id."""
+    parts = []
+    for ft in clause_fts:
+        src = _P if ft == target_ft else _pop_of(ft)
+        tag = _S(_ALPHA, _S(_CONS, _1, _S(_CONST, A(ft))))    # row → ⟨entity, clause⟩
+        parts.append(_S(_COMP, tag, src))
+    return _S(_COMP, T.flatten, _S(_CONS, *parts))
+
+
+def scoped_exclusion(clause_fts, target_ft):
+    """Exclusion over clause fact types, attached to `target_ft`'s cell: at most one clause
+    per entity — uniqueness on the entity role of the participation."""
+    return _S(_COMP, exclusion(), _participation(clause_fts, target_ft))
+
+
+def scoped_exclusive_or(subject_cell, clause_fts, target_ft):
+    """Exactly one clause per entity: exclusive_or over ⟨universe, participation⟩, the
+    universe being the subject type's own instance cell."""
+    pair = _S(_CONS, _pop_of(subject_cell), _participation(clause_fts, target_ft))
+    return _S(_COMP, exclusive_or(), pair)
+
+
+def scoped_inclusive_or(subject_cell, clause_fts, target_ft):
+    """At least one clause per entity (disjunctive mandatory): universe ∖ players."""
+    players = _S(_COMP, T.Project([1]), _participation(clause_fts, target_ft))
+    pair = _S(_CONS, _S(_COMP, T.Project([1]), _pop_of(subject_cell)), players)
+    return _S(_COMP, T.setminus, pair)
+
+
 def violations(constraint_obj, population):
     """(rho c) : P — reduce the violation object against a population (an FFP object)."""
     return apply(constraint_obj, population)

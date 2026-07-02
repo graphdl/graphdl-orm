@@ -20,8 +20,8 @@ DEFAULT = A("#")                                             # ↑ of an absent 
 _COMP, _CONS, _CONST, _COND = A("COMP"), A("CONS"), A("CONST"), A("COND")
 _1, _2, _3 = A(1), A(2), A(3)
 _APNDL, _NULL, _NOT, _EQ, _APPLY, _DISTR = A("apndl"), A("null"), A("not"), A("eq"), A("apply"), A("distr")
-# a validate that always commits: ⟨P, φ, F⟩ — empty violations, alethic flag false
-_STUB_VALIDATE = _S(_CONS, A("id"), _S(_CONST, PHI), _S(_CONST, A("F")))
+# a validate that always commits: ⟨P,D⟩ → ⟨P, φ, F⟩ — empty violations, alethic flag false
+_STUB_VALIDATE = _S(_CONS, _1, _S(_CONST, PHI), _S(_CONST, A("F")))
 
 
 def cell(name, contents):
@@ -80,7 +80,9 @@ def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_o
     P = _S(_COMP, FetchPop(cell_name), _2)                   # ⟨I,D⟩ → the cell's population
     resolved = _S(_COMP, resolve_stage, _S(_CONS, _1, P))    # resolve:⟨I, P⟩ = P'
     derived = _S(_COMP, derive_stage, resolved)              # derive:P' = P''
-    valD = _S(_CONS, _S(_COMP, validate_obj, derived), _2)   # ⟨⟨P'',V,flag⟩, D⟩
+    # validate sees ⟨P'', D⟩: cell-local constraints read P''; scoped (cross-cell) ones
+    # fetch sibling cells from the frozen D (audit C3 — no family drops from enforcement)
+    valD = _S(_CONS, _S(_COMP, validate_obj, _S(_CONS, derived, _2)), _2)   # ⟨⟨P'',V,flag⟩, D⟩
     P2 = _S(_COMP, _1, _1)                                   # P''  from ⟨val,D⟩
     V = _S(_COMP, _2, _1)                                    # V    from ⟨val,D⟩
     parts = [P2, V] if links_obj is None else [P2, V, _S(_COMP, links_obj, P2)]

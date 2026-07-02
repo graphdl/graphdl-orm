@@ -65,12 +65,16 @@ def test_value_open_range():
 # ---- modality read off M governs a compiled model's enforcement (Cor. closure) ----
 def test_validate_for_reads_modality_from_M():
     from pyarest import defs
+
+    def _pd(p, D):                                            # validate consumes ⟨P, D⟩
+        return L.SEQ(L.CONS(p)(L.CONS(D)(L.NIL)))
+
     viol = to_lam((("s1", "a"), ("s1", "b")))                 # s1 has two Emails -> uniqueness violation
     Dd, _ = forml.compile_model("It is obligatory that each Student has at most one Email.")
     with defs.step(Dd):                                       # constraint objects live in Dd's DEFS
-        _p, v, flag = from_lam(apply(forml.validate_for("Student_has_Email", Dd), viol))
+        _p, v, flag = from_lam(apply(forml.validate_for("Student_has_Email", Dd), _pd(viol, Dd)))
     assert set(v) == {("s1", "a"), ("s1", "b")} and flag == "F"   # deontic -> reported, would commit
     Da, _ = forml.compile_model("Each Student has at most one Email.")
     with defs.step(Da):
-        _p, v, flag = from_lam(apply(forml.validate_for("Student_has_Email", Da), viol))
+        _p, v, flag = from_lam(apply(forml.validate_for("Student_has_Email", Da), _pd(viol, Da)))
     assert flag == "T"                                        # alethic -> would block commit
