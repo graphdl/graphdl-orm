@@ -80,24 +80,40 @@ def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_o
     validate_obj = validate_obj if validate_obj is not None else _STUB_VALIDATE
     resolve_stage = resolve_obj if resolve_obj is not None else _APNDL
     derive_stage = derive_obj if derive_obj is not None else A("id")
+    from .theta import Filter
     P = _S(_COMP, FetchPop(cell_name), _2)                   # ⟨I,D⟩ → the cell's population
     resolved = _S(_COMP, resolve_stage, _S(_CONS, _1, P))    # resolve:⟨I, P⟩ = P'
     derived = _S(_COMP, derive_stage, resolved)              # derive:P' = P''
     # validate sees ⟨P'', D⟩: cell-local constraints read P''; scoped (cross-cell) ones
-    # fetch sibling cells from the frozen D (audit C3 — no family drops from enforcement)
-    valD = _S(_CONS, _S(_COMP, validate_obj, _S(_CONS, derived, _2)), _2)   # ⟨⟨P'',V,flag⟩, D⟩
-    P2 = _S(_COMP, _1, _1)                                   # P''  from ⟨val,D⟩
-    V = _S(_COMP, _2, _1)                                    # V    from ⟨val,D⟩
-    parts = [P2, V] if links_obj is None else [P2, V, _S(_COMP, links_obj, P2)]
+    # fetch sibling cells from the frozen D (audit C3 — no family drops from enforcement).
+    # I rides along so links can address the entity the input names (Thm. hateoas).
+    valDI = _S(_CONS, _S(_COMP, validate_obj, _S(_CONS, derived, _2)), _2, _1)  # ⟨⟨P'',V,flag⟩, D, I⟩
+    P2 = _S(_COMP, _1, _1)                                   # P''  from ⟨val,D,I⟩
+    V = _S(_COMP, _2, _1)                                    # V    from ⟨val,D,I⟩
+    snew = entity_role = None
+    if machine is not None:                                  # the machine advances in the SAME step:
+        status_cell, sm_obj, *rest = machine                 # status′ = sm:⟨status, P''⟩, committed
+        entity_role = rest[0] if rest else None              # with the fact — or neither (atomic)
+        spop = _S(_COMP, FetchPop(status_cell), _2)
+        snew = _S(_COMP, sm_obj, _S(_CONS, spop, P2))
+    if links_obj is None:
+        parts = [P2, V]
+    else:
+        links_in = P2
+        if snew is not None and entity_role is not None:
+            # the representation's controls come from the entity's POST-step status: the
+            # σ(1 = e)(status′) singleton, e named by the input fact at entity_role —
+            # "after which the representation offers ship and no longer place" (§1)
+            e = _S(_COMP, A(entity_role), _3)                # the addressed entity, from I
+            match_e = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, _1, _1), _2))    # ⟨⟨e?,s⟩, e⟩
+            links_in = _S(_COMP, _S(A("ALPHA"), _1), Filter(match_e), _DISTR, _S(_CONS, snew, e))
+        parts = [P2, V, _S(_COMP, links_obj, links_in)]
     o = _S(_CONS, *parts)                                    # o = ⟨P'', V⟩ or ⟨P'', V, links⟩ (hateoas)
     commit = _S(_COMP, Store(cell_name), _S(_CONS, P2, _2))  # ↓cell:⟨P'', D⟩
-    if machine is not None:                                  # the machine advances in the SAME step:
-        status_cell, sm_obj = machine                        # status′ = sm:⟨status, P''⟩, committed
-        spop = _S(_COMP, FetchPop(status_cell), _2)          # with the fact — or neither (atomic)
-        snew = _S(_COMP, sm_obj, _S(_CONS, spop, P2))
-        commit = _S(_COMP, Store(status_cell), _S(_CONS, snew, commit))
+    if snew is not None:
+        commit = _S(_COMP, Store(machine[0]), _S(_CONS, snew, commit))
     d_new = _S(_COND, _S(_COMP, _3, _1), _2, commit)         # alethic offender? D : commit
-    return _S(_COMP, _S(_CONS, o, d_new), valD)
+    return _S(_COMP, _S(_CONS, o, d_new), valDI)
 
 
 def run(input_fact, D, validate_obj=None, cell_name="FILE", resolve_obj=None, derive_obj=None, links_obj=None,
@@ -105,8 +121,10 @@ def run(input_fact, D, validate_obj=None, cell_name="FILE", resolve_obj=None, de
     """One AST transition: mu(create_cell:⟨input, D⟩) = ⟨o, D'⟩, with D's OWN definitions in
     scope for the whole step (defs.step — frozen, Backus §14.6). Without a validate it commits
     (V = φ); with validate_of it refuses to commit on an alethic violation; with links_obj the
-    representation o carries its HATEOAS links (Thm. hateoas); with machine=(status_cell, sm_obj)
-    the trigger fact advances the noun's machine in this same step (Prop. onestep)."""
+    representation o carries its HATEOAS links (Thm. hateoas); with machine=(status_cell, sm_obj
+    [, entity_role]) the trigger fact advances the noun's machine in this same step (Prop.
+    onestep) — and given the entity_role, links_obj is fed the entity's POST-step status, so
+    the returned representation offers exactly the next actions (§1: ship, no longer place)."""
     from . import defs
     handler = build_system(validate_obj, cell_name, resolve_obj, derive_obj, links_obj, machine)
     with defs.step(D):

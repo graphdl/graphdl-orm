@@ -91,3 +91,33 @@ def test_place_then_ship_advances_the_machine_with_correct_links():
     D = apply(A(2), ast.run(to_lam(("c1", "o1")), D, cell_name="Customer_ships_Order",
                             machine=("Order_status", system.sm_step(pairs2, pos2))))
     assert _cell(from_lam(D), "Order_status") == {("o1", "Shipped")}
+
+
+def test_the_representation_itself_carries_the_changed_links():
+    # §1: "following the place action advances the machine to Placed, after which THE
+    # REPRESENTATION offers ship and no longer place" — o = ⟨P″, V, links(e)⟩ where the
+    # links are computed from the entity's POST-step status, in the same reduction.
+    D, _ = forml.compile_model(MODEL)
+    D = _with_pop(D, "Order_status", (("o1", "In Cart"),))
+    trans_of = system.transitions_of(to_lam(system.sm_triples(D)), 2)
+
+    pairs, pos = system.machine_wiring(D, "Customer_places_Order", "Order")
+    (o, Dp) = from_lam(ast.run(to_lam(("c1", "o1")), D, cell_name="Customer_places_Order",
+                               machine=("Order_status", system.sm_step(pairs, pos), pos),
+                               links_obj=trans_of))
+    _p2, _v, links = o
+    assert {t[1] for t in links} == {"Customer_ships_Order"}  # ship offered, place gone
+
+    # ship reaches Shipped — no outgoing transitions, so links(e) = φ: the paper's
+    # logical deletion ("an entity that reaches a status with no outgoing transitions")
+    D2 = _rebuild(Dp)
+    pairs2, pos2 = system.machine_wiring(D2, "Customer_ships_Order", "Order")
+    (o2, _D3) = from_lam(ast.run(to_lam(("c1", "o1")), D2, cell_name="Customer_ships_Order",
+                                 machine=("Order_status", system.sm_step(pairs2, pos2), pos2),
+                                 links_obj=trans_of))
+    assert o2[2] == ()                                        # links(e) = φ — nothing left to do
+
+
+def _rebuild(Dpy):
+    """Scott D back from its from_lam projection (test convenience)."""
+    return to_lam(Dpy)
