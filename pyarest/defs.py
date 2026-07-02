@@ -82,27 +82,24 @@ def _items(l):
     return out
 
 
-def _defs_cell_of(D):
-    """The {name: compiled-object} view of D's first DEFS cell (first match wins, and the
-    newest ⟨name, obj⟩ pair within the cell shadows older ones)."""
+def _cells_of(D):
+    """The {name: contents} view of D's cells, first match winning (Backus §13.3.5: a cell
+    ⟨CELL, n, c⟩ is the definition Def n ≡ ρc; §14.3: data and function names share the
+    one namespace, and usage disambiguates)."""
+    d = {}
     for c in _items(L._list(D)):
         it = _items(L._list(c))
-        if len(it) == 3 and _aval(it[0]) == "CELL" and _aval(it[1]) == "DEFS":
-            d = {}
-            for p in _items(L._list(it[2])):
-                pit = _items(L._list(p))
-                if len(pit) == 2:
-                    k = _aval(pit[0])
-                    if k is not None and k not in d:          # newest-first: keep the first
-                        d[k] = pit[1]
-            return d
-    return {}
+        if len(it) == 3 and _aval(it[0]) == "CELL":
+            k = _aval(it[1])
+            if k is not None and k not in d:                  # first match wins
+                d[k] = it[2]
+    return d
 
 
 class step:
     """Bind D for one AST step: `with defs.step(D): …` — nestable, restored on exit."""
     def __init__(self, D):
-        self._frame = (_defs_cell_of(D), {"native": None})
+        self._frame = (_cells_of(D), {"native": None}, D)
 
     def __enter__(self):
         global _step_frame
@@ -116,8 +113,13 @@ class step:
 
 
 def step_get(key):
-    """The compiled object bound to `key` in the current step's DEFS cell, else None."""
+    """The contents of the first cell of the step's D named `key`, else None."""
     return _step_frame[0].get(key) if _step_frame is not None else None
+
+
+def step_D():
+    """The step's whole state, for the DEFS accessor (§14.3.3), else None."""
+    return _step_frame[2] if _step_frame is not None else None
 
 
 def step_native(conv):
@@ -132,3 +134,10 @@ def step_native(conv):
 def boundary():
     """Cor. boundary: the registered definitions — the informal surface of the system."""
     return list(_registered)
+
+
+# §14.3.3: "Our FFP subsystem is required to have one new primitive function, defs, named
+# DEFS such that for any object x ≠ ⊥, defs:x = ρDEFS:x = D" — program access to the whole
+# state, including "the essential [purpose] of computing the successor state". Outside a
+# step there is no state, so the accessor is ⊥ there.
+register("DEFS", lambda mu: lambda o: step_D() if _step_frame is not None else L.BOT)

@@ -81,13 +81,11 @@ def Store(name):
 
 
 def DefineIn(name, obj):
-    """D → D′ with ⟨name, obj⟩ prepended to D's DEFS cell (Def. AREST / Cor. closure):
-    a compiled definition is a fact stored INTO the state by an ordinary ↓, so it travels
-    with the store — self-modification is a step, and a tenant's DEFS is its own. mu
-    resolves the name only within steps bound to this store (Prop. tenant)."""
-    pair = _S(A(name), obj)
-    add = _S(_COMP, _APNDL, _S(_CONS, _S(_CONST, pair), FetchPop("DEFS")))   # D → new DEFS pop
-    return _S(_COMP, Store("DEFS"), _S(_CONS, add, A("id")))                 # D → D′
+    """D → D′ with the definition stored as an ORDINARY cell ⟨CELL, name, obj⟩ of D by ↓name
+    (Backus §13.3.5: such a cell has the same effect as Def name ≡ ρobj). Definitions travel
+    with the store: self-modification is a step, a tenant's DEFS is its own, and mu resolves
+    the name only within steps bound to this store (Prop. tenant / Cor. closure)."""
+    return _S(_COMP, Store(name), _S(_CONS, _S(_CONST, obj), A("id")))       # D → ↓name:⟨obj, D⟩
 
 
 def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_obj=None, links_obj=None,

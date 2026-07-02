@@ -200,6 +200,67 @@ def machine_wiring(D, trigger_ft, noun):
     return pairs, pos
 
 
+# --- Phase 4 opening: RMAP read off M, driving D's layout (spec §4.4; §Cells) ---
+def _pop_rows(D, name):
+    from . import ast
+    from .reduce import apply as _ap
+    from .lam import from_lam
+    rows = from_lam(_ap(ast.FetchPop(name), D))
+    return list(rows) if isinstance(rows, tuple) else []
+
+
+def rmap_partition(D):
+    """M-facts → the cell partition {fact type: table key}, by the RMAP grouping rules run
+    as the one machine fold. The kind of each fact type is READ OFF M's constraint facts:
+    a spanning UC (or no UC at all, the m:n case) gives the fact type its own table (rule 1);
+    a single-role UC makes it functional, absorbed into its role-1 player's table (rule 2)."""
+    from .machine import rmap as rmap_value, run_machine
+    from .lam import to_lam, from_lam
+    fts = [f[0] for f in reversed(_pop_rows(D, "factType"))]          # declaration order
+    cons = _pop_rows(D, "constraint")
+    spanning = {c[2] for c in cons if len(c) >= 3 and c[1] == "spanning_uniqueness"}
+    functional = {c[2] for c in cons if len(c) >= 3 and c[1] == "uniqueness"}
+    subject = {r[1]: r[3] for r in reversed(_pop_rows(D, "role")) if r[2] == 1}
+    triples = tuple((ft, subject.get(ft, ft),
+                     "functional" if (ft in functional and ft not in spanning) else "spanning")
+                    for ft in fts)
+    pairs = from_lam(run_machine(rmap_value, to_lam(()), to_lam(triples)))
+    return {ft: key for (key, ft) in pairs}
+
+
+def absorb_rows(D, table_key, partition):
+    """The 3NF row population of one RMAP table: the θ₁ natural join on the key (role 1)
+    of the fact types absorbed into `table_key` (spec §4.4: functional roles on the same
+    object type give one cell keyed on its id). Entities missing a functional fact drop
+    from the joined rows; the optional-column (outer join) refinement is a later step."""
+    from . import theta as T
+    from .reduce import apply as _ap
+    from .lam import to_lam, from_lam
+    import pyarest.lam as L
+    fts = [ft for ft, key in partition.items() if key == table_key and ft != table_key]
+    if not fts:
+        return []
+    acc = to_lam(tuple(tuple(r) for r in _pop_rows(D, fts[0])))
+    for ft in fts[1:]:
+        nxt = to_lam(tuple(tuple(r) for r in _pop_rows(D, ft)))
+        acc = _ap(T.NatJoin(1), L.SEQ(L.CONS(acc)(L.CONS(nxt)(L.NIL))))
+    return list(from_lam(acc))
+
+
+def install_entity_cells(D, noun, rows):
+    """Each entity its own cell (whitepaper §Cells; the TS engine's one-DO-per-cell):
+    ⟨CELL, noun:id, row⟩ per 3NF row, addressed as the reference engine addresses it and
+    the write unit Def. iso isolates."""
+    from . import ast
+    from .reduce import apply as _ap
+    from .lam import to_lam
+    import pyarest.lam as L
+    for row in rows:
+        key = f"{noun}:{row[0]}"
+        D = _ap(ast.Store(key), L.SEQ(L.CONS(to_lam(tuple(row)))(L.CONS(D)(L.NIL))))
+    return D
+
+
 def sm_step(pairs, entity_role):
     """The live machine step (Prop. onestep) as one FFP object: ⟨statusPop, P″⟩ → statusPop′.
     An entity advances iff a trigger fact naming it (at `entity_role`) entered P″ and a

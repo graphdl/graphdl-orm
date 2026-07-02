@@ -224,7 +224,7 @@ def _make_mu(store, step_defs):
             if f is BOT_D or x is BOT_D:                             # §13.3.1: ρ⊥ = ⊥ and every
                 return BOT_D                                         # function is ⊥-preserving
             if _isseq(f):                                            # seq operator -> metacomposition
-                return mu((APP_D, f[0], (f, x)))
+                return mu((APP_D, f[0], (f, x))) if f else BOT_D     # (φ as operator is ⊥)
             sd = step_defs.get(f)
             if sd is not None:                                       # the step's DEFS cell first
                 return mu((APP_D, sd, x))                            # (Def. AREST / Cor. closure)
