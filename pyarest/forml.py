@@ -106,6 +106,8 @@ _CLASSIFY = [
     ("disjunctive_mandatory", re.compile(r"^[Ee]ach (.+ or .+)\.$")),         # inclusive-or / disjunctive mandatory
     ("uniqueness", re.compile(r"^[Ee]ach (.+?) (at most one|exactly one) (.+)\.$")),
     ("mandatory", re.compile(r"^[Ee]ach (.+?) some (.+)\.$")),
+    # finality depth: where optimistic acceptance hardens deontic→alethic (writer model)
+    ("finality", re.compile(r"^(\S+) becomes final at depth (\d+)\.$")),
     # NORMA's unary negation pattern: the reading creates the PAIRED negation fact type
     ("neg_pair", re.compile(r"^(\S+) (does not|is not) (\S.*)\.$")),
     ("negation", re.compile(r"^(.+) ~(.+)\.$")),
@@ -592,6 +594,7 @@ _PLAN = {
     "subset": _h_subset, "equality": _h_equality, "derivation_rule": _h_derivation_rule,
     "rule_if": _h_rule_if,
     "negation": _h_negation, "neg_pair": _h_neg_pair,
+    "finality": lambda g, k, m: ([("finality", (g[0], int(g[1])))], []),
     "possibility": _h_possibility, "inverse_uc": _h_inverse_uc,
     "sm_def": _h_sm_def, "sm_initial": _h_sm_initial, "sm_from": _h_sm_from,
     "sm_to": _h_sm_to, "sm_trigger": _h_sm_trigger,
@@ -728,6 +731,7 @@ _RENDER = {
     "rule_if": lambda g: f"{g[0]} if {g[1]}",
     "negation": lambda g: f"{g[0]} ~{g[1]}",
     "neg_pair": lambda g: f"{g[0]} {g[1]} {g[2]}",
+    "finality": lambda g: f"{g[0]} becomes final at depth {g[1]}",
     "uniqueness": lambda g: f"Each {g[0]} {g[1]} {g[2]}",
     "mandatory": lambda g: f"Each {g[0]} some {g[1]}",
     "neg_uniqueness": lambda g: ("any {0} more than one {1}".format(*g) if len(g) == 2 else

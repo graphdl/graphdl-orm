@@ -695,6 +695,16 @@ def create(D, fact_type, fact, fuel=None):
     return ast.run(fact, D, cell_name=fact_type, machine=machine, mealy_obj=mealy, fuel=fuel)
 
 
+def finality_modality(D, noun, depth):
+    """The writer model's hardening rule, read off M's finality facts: below the noun's
+    declared depth k a violation reports DEONTICALLY (optimistic acceptance, V as the
+    repair obligation); at or beyond k it refuses ALETHICALLY. An undeclared noun is
+    final immediately. Nakamoto §11 quantifies any chosen k."""
+    ks = {r[0]: r[1] for r in _pop_rows(D, "finality") if len(r) == 2}
+    k = ks.get(noun, 0)
+    return "deontic" if depth < k else "alethic"
+
+
 def declare_sig(D, name, dom, cod):
     """Def. reg's ⟨dom, cod⟩ as M facts: defSig rows ⟨name, position, objectType⟩ with
     cod at position 0 — DatalogLB-style typed-predicate constraints on the boundary."""
