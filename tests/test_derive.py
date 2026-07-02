@@ -30,3 +30,22 @@ def test_recursive_transitive_closure():
     links = (("a", "b"), ("b", "c"), ("c", "d"))
     assert set(ev(derive, links)) == {("a", "b"), ("b", "c"), ("c", "d"),
                                        ("a", "c"), ("b", "d"), ("a", "d")}   # full transitive closure
+
+
+def test_derived_fact_type_via_create_pipeline():
+    # a semiderived (+) fact type: base links are asserted; the create pipeline runs the rule as its
+    # `derive` stage, so the committed population is the transitive closure (asserted ∪ derived).
+    from pyarest import ast
+    from pyarest.lam import atom as A
+    import pyarest.lam as L
+    derive = system.derive_of([system.join_rule(2, [1, 3])])
+    D = L.SEQ(L.CONS(ast.cell("anc", to_lam(())))(L.NIL))
+    for link in (("a", "b"), ("b", "c"), ("c", "d")):
+        D = apply(A(2), ast.run(to_lam(link), D, derive_obj=derive, cell_name="anc"))   # thread D'
+    anc = [c for c in from_lam(D) if isinstance(c, tuple) and c[:2] == ("CELL", "anc")][0][2]
+    assert set(anc) == {("a", "b"), ("b", "c"), ("c", "d"), ("a", "c"), ("b", "d"), ("a", "d")}
+
+
+def test_marker_storage_method():
+    assert system.materialize("derived-and-stored") and system.materialize("partially-derived-and-stored")
+    assert not system.materialize("fully-derived") and not system.materialize("semi-derived")

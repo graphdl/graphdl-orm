@@ -100,6 +100,18 @@ def join_rule2(join_role, head_cols):
     return _S(_COMP, T.Project(head_cols), T.NatJoin(join_role))
 
 
+# the storage half of a NORMA */**/+/++ marker: whether the derived facts are materialized (stored)
+# vs recomputed on demand. (* and + recompute; ** and ++ store.) The derivation half is the rule
+# above, fed to derive_of; the create pipeline runs it as the `derive` stage over the fact's cell.
+_MATERIALIZE = {"fully-derived": False, "derived-and-stored": True,
+                "semi-derived": False, "partially-derived-and-stored": True}
+
+
+def materialize(marker):
+    """True if the marker means store the derived facts (** / ++), False if compute on demand (* / +)."""
+    return _MATERIALIZE.get(marker, False)
+
+
 # --- resolve with auto-counter minting (Def. Command: mint iff the ref scheme auto-generates) ---
 _max2 = _S(_COND, _S(_COMP, A("ge"), _S(_CONS, _1, _2)), _1, _2)   # the larger of a pair
 
