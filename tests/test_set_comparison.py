@@ -44,10 +44,12 @@ def test_exclusive_or_exactly_one_clause():
 
 
 def test_compile_set_comparison_defines_enforceable_object():
+    from pyarest import defs
     model = ("For each Message, at most one of the following holds: "
              "that Message is with some external Phone; that Message is with some internal Email.")
-    _D, rep = forml.compile_model(model)
+    D, rep = forml.compile_model(model)
     assert rep["unparsed"] == []
     part = (("m1", "phone"), ("m1", "email"), ("m2", "phone"))   # m1 in both clauses
-    v = from_lam(apply(A("Message_excl"), to_lam(part)))
+    with defs.step(D):                                       # the object lives in D's DEFS
+        v = from_lam(apply(A("Message_excl"), to_lam(part)))
     assert set(v) == {("m1", "phone"), ("m1", "email")}      # exclusion violation, straight from compile

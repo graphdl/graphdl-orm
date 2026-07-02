@@ -39,14 +39,18 @@ def make_mu(store_fn):
                 x = mu(_arg(e))                              # reduce the operand once (call-by-value):
                 #   the metacomposition pass below hands x to a controlling operator as DATA, where
                 #   mu would not otherwise descend — so it must already be a value, not an App node.
-                on_atom = lambda a: (lambda res:
-                    L.IF(L.FST(res))                         # DEFS has a cell for atom a?
-                      (lambda: (lambda cell:
-                          L.IF(L.HEAD(cell))                 # tag TRUE = registered host lambda
-                            (lambda: mu(L.HEAD(L.TAIL(cell))(mu)(x)))       # impl(mu)(reduced operand)
-                            (lambda: mu(mkapp(L.HEAD(L.TAIL(cell)))(x))))(  # compiled: mu(o : x)
-                          L.SND(res)))
-                      (lambda: L.BOT))(defs.FETCH(a)(store_fn()))
+                def on_atom(a):
+                    sd = defs.step_get(a)                    # the step's DEFS cell first: a
+                    if sd is not None:                       # compiled def riding in D itself
+                        return mu(mkapp(sd)(x))              # (Def. AREST / Cor. closure)
+                    return (lambda res:
+                        L.IF(L.FST(res))                     # then the process store
+                          (lambda: (lambda cell:
+                              L.IF(L.HEAD(cell))             # tag TRUE = registered host lambda
+                                (lambda: mu(L.HEAD(L.TAIL(cell))(mu)(x)))       # impl(mu)(reduced operand)
+                                (lambda: mu(mkapp(L.HEAD(L.TAIL(cell)))(x))))(  # compiled: mu(o : x)
+                              L.SND(res)))
+                          (lambda: L.BOT))(defs.FETCH(a)(store_fn()))
                 on_seq = lambda l: mu(mkapp(L.HEAD(l))(       # metacomposition on the head
                     L.SEQ(L.CONS(fr)(L.CONS(x)(L.NIL)))))
                 # §11.2.1/§13.3.1: every function is ⊥-preserving — a ⊥ operand short-circuits

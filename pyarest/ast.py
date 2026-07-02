@@ -60,6 +60,16 @@ def Store(name):
     return _S(_COMP, _APNDL, _S(_CONS, make, _S(_COMP, purge, _2)))
 
 
+def DefineIn(name, obj):
+    """D → D′ with ⟨name, obj⟩ prepended to D's DEFS cell (Def. AREST / Cor. closure):
+    a compiled definition is a fact stored INTO the state by an ordinary ↓, so it travels
+    with the store — self-modification is a step, and a tenant's DEFS is its own. mu
+    resolves the name only within steps bound to this store (Prop. tenant)."""
+    pair = _S(A(name), obj)
+    add = _S(_COMP, _APNDL, _S(_CONS, _S(_CONST, pair), FetchPop("DEFS")))   # D → new DEFS pop
+    return _S(_COMP, Store("DEFS"), _S(_CONS, add, A("id")))                 # D → D′
+
+
 def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_obj=None, links_obj=None):
     """The transition create_cell:⟨I, D⟩ → ⟨⟨P'',V⟩, D'⟩ over one cell, wired with a schema's
     validate (and optionally its resolve/derive). It touches only `cell_name`, so distinct
@@ -81,11 +91,14 @@ def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_o
 
 
 def run(input_fact, D, validate_obj=None, cell_name="FILE", resolve_obj=None, derive_obj=None, links_obj=None):
-    """One AST transition: mu(create_cell:⟨input, D⟩) = ⟨o, D'⟩. Without a validate it commits
+    """One AST transition: mu(create_cell:⟨input, D⟩) = ⟨o, D'⟩, with D's OWN definitions in
+    scope for the whole step (defs.step — frozen, Backus §14.6). Without a validate it commits
     (V = φ); with validate_of it refuses to commit on an alethic violation; with links_obj the
     representation o carries its HATEOAS links (Thm. hateoas)."""
+    from . import defs
     handler = build_system(validate_obj, cell_name, resolve_obj, derive_obj, links_obj)
-    return apply(handler, _S(input_fact, D))
+    with defs.step(D):
+        return apply(handler, _S(input_fact, D))
 
 
 # ============================ eq. sys — the whole system as one lambda =========
@@ -118,5 +131,8 @@ SYSTEM = _SYSTEM()
 
 def dispatch(entity, op, D):
     """One eq. sys step: route `op` to the handler that D holds for `entity`, applied to ⟨op, D⟩.
-    mu(SYSTEM:⟨⟨entity, op⟩, D⟩). An unknown entity fetches # and reduces to ⊥ (Prop. tenant)."""
-    return apply(SYSTEM, _S(_S(A(entity), op), D))
+    mu(SYSTEM:⟨⟨entity, op⟩, D⟩), with D's own DEFS in scope (defs.step). An unknown entity
+    fetches # and reduces to ⊥ (Prop. tenant)."""
+    from . import defs
+    with defs.step(D):
+        return apply(SYSTEM, _S(_S(A(entity), op), D))

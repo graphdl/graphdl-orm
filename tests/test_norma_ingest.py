@@ -36,7 +36,9 @@ def test_schema_extracted_matches_the_model():
 
 
 def test_dropped_in_constraint_enforces():
-    forml.compile_model(open(SAMPLE, encoding="utf-8").read())   # defines the constraint objects
+    from pyarest import defs
+    D, _rep = forml.compile_model(open(SAMPLE, encoding="utf-8").read())   # defines into D's DEFS
     pop = to_lam((("s1", "a@x"), ("s1", "b@x")))             # s1 has two Emails
-    v = from_lam(apply(atom("Student_has_Email_uc"), pop))
+    with defs.step(D):                                       # resolution is per-store (Cor. closure)
+        v = from_lam(apply(atom("Student_has_Email_uc"), pop))
     assert set(v) == {("s1", "a@x"), ("s1", "b@x")}          # (rho c):P = V_c, from the parsed schema

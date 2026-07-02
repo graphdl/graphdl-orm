@@ -54,10 +54,11 @@ def test_marker_storage_method():
 def test_derivation_rule_reading_compiles_and_computes():
     # NORMA's role-path verbalization (infosci ORM->Datalog) parses to the join rule and computes:
     # FastCarDriver(x) <- drives(x,y), isFast(y)
-    from pyarest import forml
+    from pyarest import forml, defs
     from pyarest.lam import atom as A
-    _D, rep = forml.compile_model("*Each FastCarDriver is some Person who drives some Car that is fast.")
+    D, rep = forml.compile_model("*Each FastCarDriver is some Person who drives some Car that is fast.")
     assert rep["unparsed"] == []
     drives, is_fast = (("alice", "car1"), ("bob", "car2")), (("car1",),)
-    v = from_lam(apply(A("FastCarDriver_rule"), to_lam((drives, is_fast))))
+    with defs.step(D):                                        # the rule lives in D's DEFS
+        v = from_lam(apply(A("FastCarDriver_rule"), to_lam((drives, is_fast))))
     assert set(v) == {("alice",)}                             # alice drives a fast car; bob doesn't

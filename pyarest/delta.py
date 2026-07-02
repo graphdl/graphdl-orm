@@ -209,7 +209,7 @@ def _store():
     return _cache["defs"]
 
 
-def _make_mu(store):
+def _make_mu(store, step_defs):
     def mu(e):
         # a value is its own meaning; an application node ⟨APP, f, x⟩ reduces (metacomposition)
         if type(e) is tuple and len(e) == 3 and e[0] is APP_D:
@@ -218,6 +218,9 @@ def _make_mu(store):
                 return BOT_D                                         # function is ⊥-preserving
             if _isseq(f):                                            # seq operator -> metacomposition
                 return mu((APP_D, f[0], (f, x)))
+            sd = step_defs.get(f)
+            if sd is not None:                                       # the step's DEFS cell first
+                return mu((APP_D, sd, x))                            # (Def. AREST / Cor. closure)
             hit = store.get(f)
             if hit is None:
                 return BOT_D
@@ -230,11 +233,11 @@ def _make_mu(store):
 def apply(f, x):
     """The fast-path FFP application: convert operands to native, reduce, convert the result back
     to a Scott object (so callers/from_lam are unchanged). Observationally equal to reduce.apply."""
-    mu = _make_mu(_store())
+    mu = _make_mu(_store(), _defs_mod.step_native(scott_to_native))
     return native_to_scott(mu((APP_D, scott_to_native(f), scott_to_native(x))))
 
 
 def meaning(e):
     """mu e on the fast path — reduce an FFP expression to its normal form (Scott object out)."""
-    mu = _make_mu(_store())
+    mu = _make_mu(_store(), _defs_mod.step_native(scott_to_native))
     return native_to_scott(mu(scott_to_native(e)))

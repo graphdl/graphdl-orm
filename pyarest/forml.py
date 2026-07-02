@@ -349,7 +349,6 @@ def _plan(kind, g, known, modality="alethic"):
 
 
 def compile(stmt, D, known=()):
-    from .defs import define
     from .reduce import apply as _apply
     from .lam import atom as _A
     kind, g, modality = analyze(stmt)
@@ -357,7 +356,9 @@ def compile(stmt, D, known=()):
     for cell, fact in asserts:
         D = _apply(_A(2), ast.run(to_lam(fact), D, cell_name=cell))
     for name, obj in cons:
-        define(name, obj)
+        # a compiled definition is stored INTO the schema's own D, not the process seed
+        # (Def. AREST / Cor. closure): ingestion mutates only the store being ingested into
+        D = _apply(ast.DefineIn(name, obj), D)
     return D, kind
 
 

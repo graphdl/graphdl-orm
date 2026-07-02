@@ -56,6 +56,79 @@ FETCH = L.Y(lambda rec: lambda key: lambda d:
         (lambda: rec(key)(t))))
 
 
+# ============================ the step binding (Def. AREST / Cor. closure) ====
+# COMPILED definitions live in a DEFS cell of the transitioned store D, so they travel with
+# the state: self-modification is a store into D, and a tenant's DEFS is its own. Registered
+# (host) impls cannot live in a pure object store — they remain the process registry, which
+# is exactly the enumerable boundary (Def. reg). run/dispatch bind the step's D here; mu
+# resolves an atom FIRST against this binding, then the process store. The binding is fixed
+# for the whole reduction — Backus §14.6, the state is frozen during evaluation. The walk
+# below is host machinery of the trusted base (like the mirrors above), not a definition.
+
+_step_frame = None        # (host {name: scott_obj}, {"native": dict|None}) | None
+
+
+def _aval(o):
+    box = []
+    o(lambda v: box.append(v))(lambda l: None)(None)
+    return box[0] if box else None
+
+
+def _items(l):
+    out = []
+    while not L._is_nil(l):
+        out.append(L.HEAD(l))
+        l = L.TAIL(l)
+    return out
+
+
+def _defs_cell_of(D):
+    """The {name: compiled-object} view of D's first DEFS cell (first match wins, and the
+    newest ⟨name, obj⟩ pair within the cell shadows older ones)."""
+    for c in _items(L._list(D)):
+        it = _items(L._list(c))
+        if len(it) == 3 and _aval(it[0]) == "CELL" and _aval(it[1]) == "DEFS":
+            d = {}
+            for p in _items(L._list(it[2])):
+                pit = _items(L._list(p))
+                if len(pit) == 2:
+                    k = _aval(pit[0])
+                    if k is not None and k not in d:          # newest-first: keep the first
+                        d[k] = pit[1]
+            return d
+    return {}
+
+
+class step:
+    """Bind D for one AST step: `with defs.step(D): …` — nestable, restored on exit."""
+    def __init__(self, D):
+        self._frame = (_defs_cell_of(D), {"native": None})
+
+    def __enter__(self):
+        global _step_frame
+        self._prev, _step_frame = _step_frame, self._frame
+        return self
+
+    def __exit__(self, *exc):
+        global _step_frame
+        _step_frame = self._prev
+        return False
+
+
+def step_get(key):
+    """The compiled object bound to `key` in the current step's DEFS cell, else None."""
+    return _step_frame[0].get(key) if _step_frame is not None else None
+
+
+def step_native(conv):
+    """The step's DEFS as native objects (converted once per binding via `conv`)."""
+    if _step_frame is None:
+        return {}
+    if _step_frame[1]["native"] is None:
+        _step_frame[1]["native"] = {k: conv(v) for k, v in _step_frame[0].items()}
+    return _step_frame[1]["native"]
+
+
 def boundary():
     """Cor. boundary: the registered definitions — the informal surface of the system."""
     return list(_registered)
