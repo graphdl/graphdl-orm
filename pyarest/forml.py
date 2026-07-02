@@ -106,6 +106,8 @@ _CLASSIFY = [
     ("disjunctive_mandatory", re.compile(r"^[Ee]ach (.+ or .+)\.$")),         # inclusive-or / disjunctive mandatory
     ("uniqueness", re.compile(r"^[Ee]ach (.+?) (at most one|exactly one) (.+)\.$")),
     ("mandatory", re.compile(r"^[Ee]ach (.+?) some (.+)\.$")),
+    # NORMA's unary negation pattern: the reading creates the PAIRED negation fact type
+    ("neg_pair", re.compile(r"^(\S+) (does not|is not) (\S.*)\.$")),
     ("negation", re.compile(r"^(.+) ~(.+)\.$")),
     ("fact_type_reading", re.compile(r"^(.+)\.$")),
 ]
@@ -416,6 +418,36 @@ def _h_negation(g, k, m):
     a, pred = _subject(g[0], k)
     return [("negation", (a, pred + " " + g[1]))], []
 
+
+def _conj(rest):
+    """'does not smoke' pairs with 'smokes': naive third-person conjugation of the first
+    word (the fragment's boundary; NORMA conjugates properly)."""
+    head, _, tail = rest.partition(" ")
+    head = head + ("es" if head.endswith(("s", "x", "z", "ch", "sh")) else "s")
+    return head + ((" " + tail) if tail else "")
+
+
+def _h_neg_pair(g, k, m):
+    """NORMA's unary negation pattern (UnaryValuePattern.Negation, FactType.cs): 'X is
+    not R.' / 'X does not R.' creates the PAIRED positive-shaped negation fact type,
+    linked by negOf, with the pair exclusion auto-asserted (nothing is both). Negative
+    information is stored as ordinary monotone facts, so the substrate stays CALM; the
+    closed world is the ordinary disjunctive-mandatory over the pair, and defaults are
+    read-time (docs/2026-07-02-negation-model.md)."""
+    subj, mode, rest = g
+    if subj not in k:
+        return _h_fact((f"{subj} {mode} {rest}",), k, m)      # unknown subject: plain reading
+    pos_read = f"{subj} is {rest}" if mode == "is not" else f"{subj} {_conj(rest)}"
+    pos, decl_p = _fact_type(pos_read, k)
+    neg, decl_n = _fact_type(f"{subj} {mode} {rest}", k)
+    cid = "negx_" + neg[:40]
+    pair = (pos, neg)
+    A_ = decl_p + decl_n + [("negOf", (neg, pos)),
+                            ("constraint", (cid, "exclusion", neg, pair, "alethic"))]
+    objs = [(cid, C.exclusion())] + \
+           [(cid + "@" + ft, C.scoped_exclusion(pair, ft)) for ft in pair]
+    return A_, objs
+
 def _h_possibility(g, k, m):
     return [("possibility", (g[0][:80], m))], []
 
@@ -559,7 +591,8 @@ _PLAN = {
     "set_comparison": _h_set_comparison, "disjunctive_mandatory": _h_disjunctive,
     "subset": _h_subset, "equality": _h_equality, "derivation_rule": _h_derivation_rule,
     "rule_if": _h_rule_if,
-    "negation": _h_negation, "possibility": _h_possibility, "inverse_uc": _h_inverse_uc,
+    "negation": _h_negation, "neg_pair": _h_neg_pair,
+    "possibility": _h_possibility, "inverse_uc": _h_inverse_uc,
     "sm_def": _h_sm_def, "sm_initial": _h_sm_initial, "sm_from": _h_sm_from,
     "sm_to": _h_sm_to, "sm_trigger": _h_sm_trigger,
     "sm_guard": _h_sm_guard, "sm_emit": _h_sm_emit, "sm_moore": _h_sm_moore,
@@ -694,6 +727,7 @@ _RENDER = {
     "derivation_rule": lambda g: f"*Each {g[0]} is some {g[1]} who {g[2]}",
     "rule_if": lambda g: f"{g[0]} if {g[1]}",
     "negation": lambda g: f"{g[0]} ~{g[1]}",
+    "neg_pair": lambda g: f"{g[0]} {g[1]} {g[2]}",
     "uniqueness": lambda g: f"Each {g[0]} {g[1]} {g[2]}",
     "mandatory": lambda g: f"Each {g[0]} some {g[1]}",
     "neg_uniqueness": lambda g: ("any {0} more than one {1}".format(*g) if len(g) == 2 else
