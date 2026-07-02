@@ -85,7 +85,7 @@ def _binnum(f):
             a, b = _pv(_1(o)), _pv(_2(o))
             return L.atom(f(a, b)) if _numeric(a, b) else L.BOT        # int/float are one numeric domain
         return g
-    return prim
+    return _shaped(_pair_b, prim)                                      # defined on ⟨x,y⟩ exactly
 def _cmp(rel):
     def prim(mu):
         def g(o):
@@ -93,18 +93,18 @@ def _cmp(rel):
             ok = a is not _NA and b is not _NA and (_numeric(a, b) or type(a) is type(b))
             return (aT if rel(a, b) else aF) if ok else L.BOT         # numeric ordering across int/float
         return g
-    return prim
+    return _shaped(_pair_b, prim)                                      # defined on ⟨x,y⟩ exactly
 _add, _sub, _mul = _binnum(lambda a, b: a + b), _binnum(lambda a, b: a - b), _binnum(lambda a, b: a * b)
 _ge, _gt = _cmp(lambda a, b: a >= b), _cmp(lambda a, b: a > b)
 _le, _lt = _cmp(lambda a, b: a <= b), _cmp(lambda a, b: a < b)
-_div   = lambda mu: lambda o: (lambda a, b: L.atom(a / b) if (_numeric(a, b) and b != 0)
-            else L.BOT)(_pv(_1(o)), _pv(_2(o)))                                # ÷ (÷0 = ⊥)
+_div   = _shaped(_pair_b, lambda mu: lambda o: (lambda a, b: L.atom(a / b)
+            if (_numeric(a, b) and b != 0) else L.BOT)(_pv(_1(o)), _pv(_2(o))))  # ÷ (÷0 = ⊥)
 _trans = lambda mu: lambda o: L.TRANS(o)
 _rotl  = lambda mu: lambda o: L.ROTL(o)
 _rotr  = lambda mu: lambda o: L.ROTR(o)
 # apply:⟨f, x⟩ = f:x = mu(f : x) — membership is application; the one operation eq. sys performs,
 # and what lets a VALUE (a transition relation, a handler) be fed into the one mu.
-_apply = lambda mu: lambda o: mu(mkapp(_1(o))(_2(o)))
+_apply = _shaped(_pair_b, lambda mu: lambda o: mu(mkapp(_1(o))(_2(o))))
 
 # ---- controlling operators (§13.3.2): impl(mu)(⟨⟨OP, params⟩, y⟩) ----
 # COMP  f1∘..∘fn : y = f1:(f2:(..(fn:y)))        right fold of application
