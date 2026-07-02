@@ -247,6 +247,108 @@ def absorb_rows(D, table_key, partition):
     return list(from_lam(acc))
 
 
+# The cell-naming boundary op, as the reference TS engine computes it in the worker
+# (12-physical-mapping.md: cellKey('Order','org-1') gives 'Order:org-1'). Strings are
+# outside the algebra, so joining a name is a registered value op (spec D5).
+def _cellkey_impl(mu):
+    from . import defs as _d
+    import pyarest.lam as L
+
+    def g(o):
+        it = _d._items(L._list(o))
+        if len(it) != 2:
+            return L.BOT
+        a, b = _d._aval(it[0]), _d._aval(it[1])
+        if a is None or b is None or isinstance(a, tuple) or isinstance(b, tuple):
+            return L.BOT
+        return L.atom(f"{a}:{b}")
+    return g
+
+
+def _register_cellkey():
+    from .defs import register
+    register("cellkey", _cellkey_impl)
+
+
+_register_cellkey()
+
+
+def table_columns(partition, table):
+    """The fact types absorbed into `table`, in declaration order; column j of the 3NF row
+    ⟨key, v1, v2, …⟩ holds the (1+j)th entry's value."""
+    return [ft for ft, key in partition.items() if key == table and ft != table]
+
+
+def row_resolve(col, width):
+    """resolve for an entity-cell write: ⟨I, row⟩ → row′, where I = ⟨key, value⟩ and the
+    cell holds the entity's 3NF row (a fresh entity gets holes, the default object #). A
+    conflicting functional write makes the column ⊥, the row collapses (§11.2.1), and the
+    step's transition rule refuses it atomically: absorption makes the UC structural."""
+    key, val = _S(_COMP, _1, _1), _S(_COMP, _2, _1)
+    hole = _S(_CONST, A("#"))
+    bot = _S(_COMP, _1, _S(_CONST, A("x")))                  # a selector on an atom is ⊥
+    fresh = _S(_CONS, key, *[val if j == col else hole for j in range(2, width + 1)])
+    old = _S(_COMP, A(col), _2)
+    ok = _S(_COMP, A("or"), _S(_CONS,
+             _S(_COMP, _EQ, _S(_CONS, old, hole)),
+             _S(_COMP, _EQ, _S(_CONS, old, val))))
+    upd = _S(_CONS, _S(_COMP, A(1), _2),
+             *[_S(_COND, ok, val, bot) if j == col else _S(_COMP, A(j), _2)
+               for j in range(2, width + 1)])
+    return _S(_COND, _S(_COMP, A("null"), _2), fresh, upd)
+
+
+def create_routed(D, ft, fact, partition):
+    """Route a create through the RMAP partition (spec §4.4: the partition IS the layout).
+    An absorbed fact type writes the entity's own cell `table:key`, the write unit of
+    Def. iso, updating its column of the row; an own-table fact type creates into its
+    per-fact-type cell unchanged. After a commit the table's index cell (named by the
+    noun, the RegistryDB analog of the TS engine) records the key."""
+    from . import ast
+    from .reduce import apply as _ap
+    from .lam import to_lam, from_lam
+    from . import defs as _d
+    import pyarest.lam as L
+    table = partition.get(ft, ft)
+    if table == ft:
+        return ast.run(fact, D, cell_name=ft)
+    cols = table_columns(partition, table)
+    col = 2 + cols.index(ft)
+    key = from_lam(fact)[0]
+    res = ast.run(fact, D, cell_name=f"{table}:{key}",
+                  resolve_obj=row_resolve(col, 1 + len(cols)))
+    o, D2 = _d._items(L._list(res))
+    if from_lam(o) != "ERROR":
+        idx = from_lam(_ap(ast.FetchPop(table), D2))
+        if (key,) not in idx:
+            newidx = _ap(A("apndl"), _S(to_lam((key,)), to_lam(tuple(idx))))
+            D2 = _ap(ast.Store(table), _S(newidx, D2))
+    return _S(o, D2)
+
+
+def ft_view(D, ft, partition):
+    """Reassemble an absorbed fact type's ⟨key, value⟩ population from the entity cells:
+    a θ₁ expression over ⟨index, D⟩ pairing each key with its row's column through the
+    dynamic fetch and the cellkey op, then dropping the # holes. An own-table fact type
+    reads its own cell."""
+    from . import ast
+    from .reduce import apply as _ap
+    from .lam import from_lam
+    from . import theta as T
+    table = partition.get(ft, ft)
+    if table == ft:
+        return set(from_lam(_ap(ast.FetchPop(ft), D)))
+    col = 2 + table_columns(partition, table).index(ft)
+    key = _S(_COMP, _1, _1)                                  # of ⟨⟨key⟩, D⟩: the key scalar
+    name = _S(_COMP, A("cellkey"), _S(_CONS, _S(_CONST, A(table)), key))
+    row = _S(_COMP, ast.DynFetch(), _S(_CONS, name, _2))
+    pair = _S(_CONS, key, _S(_COMP, A(col), row))
+    nonhole = _S(_COMP, A("not"), _EQ, _S(_CONS, A(2), _S(_CONST, A("#"))))
+    expr = _S(_COMP, T.Filter(nonhole), _S(_ALPHA, pair), _DISTR)
+    idx = _ap(ast.FetchPop(table), D)
+    return set(from_lam(_ap(expr, _S(idx, D))))
+
+
 def install_entity_cells(D, noun, rows):
     """Each entity its own cell (whitepaper §Cells; the TS engine's one-DO-per-cell):
     ⟨CELL, noun:id, row⟩ per 3NF row, addressed as the reference engine addresses it and

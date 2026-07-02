@@ -131,9 +131,31 @@ def step_native(conv):
     return _step_frame[1]["native"]
 
 
+def boundary_population():
+    """The ⟨name, origin⟩ view of the process DEFS: Def. reg's tuple less impl (a host
+    callable cannot be an object) and less the unused dom/cod (open ledger item). This is
+    the fact set eq. (boundary) filters."""
+    return L.to_lam(tuple((n, kind) for n, (kind, _impl) in latest.items()))
+
+
 def boundary():
-    """Cor. boundary: the registered definitions — the informal surface of the system."""
-    return list(_registered)
+    """Cor. boundary as the ρ-application of eq. (boundary): Filter(eq∘[s_origin,
+    registered̄]) over the DEFS view, reduced by the one mu, with the names projected out
+    by α(1). The informal surface of the system is a decidable fact set the algebra
+    itself computes."""
+    from . import theta as T
+    from .reduce import apply as _ap
+
+    def _s(*xs):
+        l = L.NIL
+        for x in reversed(xs):
+            l = L.CONS(x)(l)
+        return L.SEQ(l)
+
+    a = L.atom
+    pred = _s(a("COMP"), a("eq"), _s(a("CONS"), a(2), _s(a("CONST"), a("registered"))))
+    expr = _s(a("COMP"), _s(a("ALPHA"), a(1)), T.Filter(pred))
+    return list(L.from_lam(_ap(expr, boundary_population())))
 
 
 # §14.3.3: "Our FFP subsystem is required to have one new primitive function, defs, named

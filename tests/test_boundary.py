@@ -37,3 +37,16 @@ def test_boundary_query_lists_registered_only():
     b = defs.boundary()
     assert "effect#t" in b and "tl" in b                         # registered = the boundary
     assert "run" not in b                                        # compiled defs are above it
+
+
+def test_boundary_is_the_rho_application_of_eq_boundary():
+    # eq. (boundary): Filter(eq∘[s_origin, registered̄]) : DEFS — the informal surface is a
+    # decidable fact set computed BY the algebra, not a host list. The population view
+    # carries ⟨name, origin⟩ rows and the filter runs through the one mu.
+    defs.define("compiled#t", L.atom("body"))
+    pop = from_lam(defs.boundary_population())
+    assert ("tl", "registered") in pop
+    assert ("compiled#t", "compiled") in pop                     # in DEFS, above the boundary
+    b = defs.boundary()
+    assert set(b) == {n for (n, o) in pop if o == "registered"}
+    assert "compiled#t" not in b

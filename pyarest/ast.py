@@ -169,6 +169,12 @@ def _DynFetch():
               _S(_CONST, DEFAULT),                           # no such cell ⇒ # (unaddressable)
               _S(_COMP, _3, _1, _1, hits))                   # else contents of the first match's cell
 
+def DynFetch():
+    """The dynamic fetch expression over ⟨name, D⟩: contents of the first cell of D whose
+    name equals the runtime value `name`, else # (the public form of eq. sys's fetch)."""
+    return _DynFetch()
+
+
 # SYSTEM : ⟨⟨entity, op⟩, D⟩ → apply:⟨↑entity:D, ⟨op, D⟩⟩
 def _SYSTEM():
     handler = _S(_COMP, _DynFetch(), _S(_CONS, _S(_COMP, _1, _1), _2))   # ↑entity:D
