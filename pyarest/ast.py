@@ -70,10 +70,13 @@ def DefineIn(name, obj):
     return _S(_COMP, Store("DEFS"), _S(_CONS, add, A("id")))                 # D → D′
 
 
-def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_obj=None, links_obj=None):
+def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_obj=None, links_obj=None,
+                 machine=None):
     """The transition create_cell:⟨I, D⟩ → ⟨⟨P'',V⟩, D'⟩ over one cell, wired with a schema's
-    validate (and optionally its resolve/derive). It touches only `cell_name`, so distinct
-    entities' handlers are isolated. Commits P'' iff the alethic flag is false."""
+    validate (and optionally its resolve/derive). It touches only `cell_name` — plus, when
+    `machine=(status_cell, sm_obj)` is wired, the noun's status cell: the trigger fact entering
+    P advances the machine within the SAME step (Prop. onestep), atomically with the commit.
+    Commits iff the alethic flag is false."""
     validate_obj = validate_obj if validate_obj is not None else _STUB_VALIDATE
     resolve_stage = resolve_obj if resolve_obj is not None else _APNDL
     derive_stage = derive_obj if derive_obj is not None else A("id")
@@ -88,17 +91,24 @@ def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_o
     parts = [P2, V] if links_obj is None else [P2, V, _S(_COMP, links_obj, P2)]
     o = _S(_CONS, *parts)                                    # o = ⟨P'', V⟩ or ⟨P'', V, links⟩ (hateoas)
     commit = _S(_COMP, Store(cell_name), _S(_CONS, P2, _2))  # ↓cell:⟨P'', D⟩
+    if machine is not None:                                  # the machine advances in the SAME step:
+        status_cell, sm_obj = machine                        # status′ = sm:⟨status, P''⟩, committed
+        spop = _S(_COMP, FetchPop(status_cell), _2)          # with the fact — or neither (atomic)
+        snew = _S(_COMP, sm_obj, _S(_CONS, spop, P2))
+        commit = _S(_COMP, Store(status_cell), _S(_CONS, snew, commit))
     d_new = _S(_COND, _S(_COMP, _3, _1), _2, commit)         # alethic offender? D : commit
     return _S(_COMP, _S(_CONS, o, d_new), valD)
 
 
-def run(input_fact, D, validate_obj=None, cell_name="FILE", resolve_obj=None, derive_obj=None, links_obj=None):
+def run(input_fact, D, validate_obj=None, cell_name="FILE", resolve_obj=None, derive_obj=None, links_obj=None,
+        machine=None):
     """One AST transition: mu(create_cell:⟨input, D⟩) = ⟨o, D'⟩, with D's OWN definitions in
     scope for the whole step (defs.step — frozen, Backus §14.6). Without a validate it commits
     (V = φ); with validate_of it refuses to commit on an alethic violation; with links_obj the
-    representation o carries its HATEOAS links (Thm. hateoas)."""
+    representation o carries its HATEOAS links (Thm. hateoas); with machine=(status_cell, sm_obj)
+    the trigger fact advances the noun's machine in this same step (Prop. onestep)."""
     from . import defs
-    handler = build_system(validate_obj, cell_name, resolve_obj, derive_obj, links_obj)
+    handler = build_system(validate_obj, cell_name, resolve_obj, derive_obj, links_obj, machine)
     with defs.step(D):
         return apply(handler, _S(input_fact, D))
 

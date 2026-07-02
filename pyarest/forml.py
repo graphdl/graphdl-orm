@@ -58,6 +58,12 @@ _CLASSIFY = [
     ("ref_scheme", re.compile(r"^Reference Scheme: (.+) has (.+)\.$")),
     ("ref_mode", re.compile(r"^Reference Mode: (.+)\.$")),
     ("data_type", re.compile(r"^Data Type: (.+)\.$")),
+    # the state-machine readings of the whitepaper §1 listing: a machine is a set of facts
+    ("sm_def", re.compile(r"^State Machine Definition '(.+)' is for Noun '(.+)'\.$")),
+    ("sm_initial", re.compile(r"^Status '(.+)' is initial in State Machine Definition '(.+)'\.$")),
+    ("sm_from", re.compile(r"^Transition '(.+)' is from Status '(.+)'\.$")),
+    ("sm_to", re.compile(r"^Transition '(.+)' is to Status '(.+)'\.$")),
+    ("sm_trigger", re.compile(r"^Transition '(.+)' is triggered by Fact Type '(.+)'\.$")),
     ("value_constraint", re.compile(r"^[Tt]he possible values? of (.+?) (?:are|is) (.+)\.$")),
     ("spanning_uc", re.compile(r"^[Ii]n each population of (.+), each (.+) combination occurs at most once\.$")),
     ("objectification", re.compile(r"^[Tt]his association with (.+) provides the preferred identification scheme for (.+)\.$")),
@@ -106,7 +112,7 @@ def _known(stmts):
     for s in stmts:
         k, g = classify(s)
         if k in ("entity_type", "value_type"):
-            names.add(g[0])
+            names.add(_name_refmode(g[0])[0])                 # strip a (.RefMode) parenthetical
         elif k == "ref_scheme":
             names.add(g[0]); names.add(g[1])
         elif k == "objectification":
@@ -236,11 +242,21 @@ def _value_constraint(spec):
 _slug = lambda s: re.sub(r"[^0-9A-Za-z]+", "_", s).strip("_")
 
 
+_REFMODE = re.compile(r"^(.+?)\(\.(.+)\)$")                   # Name(.RefMode), per the whitepaper
+
+
+def _name_refmode(text):
+    m2 = _REFMODE.match(text.strip())
+    return (m2.group(1), m2.group(2)) if m2 else (text.strip(), None)
+
+
 def _h_entity(g, k, m):
-    return [("instanceOf", (g[0], "ObjectType"))], []
+    name, rm = _name_refmode(g[0])
+    return [("instanceOf", (name, "ObjectType"))] + ([("refMode", (name, rm))] if rm else []), []
 
 def _h_value(g, k, m):
-    return [("instanceOf", (g[0], "ValueType"))], []
+    name, rm = _name_refmode(g[0])
+    return [("instanceOf", (name, "ValueType"))] + ([("refMode", (name, rm))] if rm else []), []
 
 def _h_ref_scheme(g, k, m):
     return [("instanceOf", (g[0], "ObjectType")), ("instanceOf", (g[1], "ValueType")),
@@ -353,6 +369,23 @@ def _h_fact(g, k, m):
     deriv = [("derivation", (ft, kind))] if kind else []      # link the fact type to its derivation/storage
     return facts + deriv, []
 
+
+# ---- the state-machine readings (whitepaper §1): a machine is a SET OF FACTS in M ----
+def _h_sm_def(g, k, m):
+    return [("smDef", (g[0], g[1]))], []
+
+def _h_sm_initial(g, k, m):
+    return [("smStatus", (g[1], g[0], "initial"))], []        # ⟨sm, status, initial⟩
+
+def _h_sm_from(g, k, m):
+    return [("smFrom", (g[0], g[1]))], []                     # ⟨transition, from-status⟩
+
+def _h_sm_to(g, k, m):
+    return [("smTo", (g[0], g[1]))], []                       # ⟨transition, to-status⟩
+
+def _h_sm_trigger(g, k, m):
+    return [("smTrigger", (g[0], _clause_ft(g[1], k)))], []   # ⟨transition, trigger fact type⟩
+
 def _h_derivation_rule(g, k, m):
     from . import system as _sys
     derived, root, body = g
@@ -374,6 +407,8 @@ _PLAN = {
     "set_comparison": _h_set_comparison, "disjunctive_mandatory": _h_disjunctive,
     "subset": _h_subset, "equality": _h_equality, "derivation_rule": _h_derivation_rule,
     "negation": _h_negation, "possibility": _h_possibility, "inverse_uc": _h_inverse_uc,
+    "sm_def": _h_sm_def, "sm_initial": _h_sm_initial, "sm_from": _h_sm_from,
+    "sm_to": _h_sm_to, "sm_trigger": _h_sm_trigger,
     "fact_type_reading": _h_fact,
 }
 

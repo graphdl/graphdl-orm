@@ -167,3 +167,54 @@ def links_of(key_pos, sm=None, status_pos=None):
     if sm is None:
         return nav
     return _S(_COMP, _CAT, _S(_CONS, nav, transitions_of(sm, status_pos)))  # nav ∪ transitions
+
+
+# --- the state machine read off M (whitepaper §1): a machine IS a set of facts ---
+# smFrom ⟨t, from⟩ ⋈ smTrigger ⟨t, trigger⟩ ⋈ smTo ⟨t, to⟩, projected to ⟨from, trigger, to⟩ —
+# assembling the machine is a theta1 join over M's cells, not a second interpreter.
+def _sm_join():
+    j1 = _S(_COMP, T.NatJoin(1), _S(_CONS, _1, _2))          # ⟨t, from, trigger⟩
+    j2 = _S(_COMP, T.NatJoin(1), _S(_CONS, j1, A(3)))        # ⟨t, from, trigger, to⟩
+    return _S(_COMP, T.Project([2, 3, 4]), j2)
+
+
+def sm_triples(D):
+    """The machine's ⟨from, trigger, to⟩ triples, joined from M's smFrom/smTrigger/smTo
+    cells by the theta1 expression above (host code only fetches and converts)."""
+    from . import ast
+    from .reduce import apply as _ap
+    from .lam import from_lam
+    pops = _S(*[_ap(ast.FetchPop(n), D) for n in ("smFrom", "smTrigger", "smTo")])
+    return tuple(from_lam(_ap(_sm_join(), pops)))
+
+
+def machine_wiring(D, trigger_ft, noun):
+    """Read `trigger_ft`'s wiring off M: the (from, to) pairs of the transitions it fires,
+    and the addressed noun's role position in the trigger fact type (from M's role facts)."""
+    from . import ast
+    from .reduce import apply as _ap
+    from .lam import from_lam
+    pairs = tuple((f, t) for (f, tr, t) in sm_triples(D) if tr == trigger_ft)
+    roles = from_lam(_ap(ast.FetchPop("role"), D))
+    pos = next((p for (_rid, ft, p, otype) in roles if ft == trigger_ft and otype == noun), 1)
+    return pairs, pos
+
+
+def sm_step(pairs, entity_role):
+    """The live machine step (Prop. onestep) as one FFP object: ⟨statusPop, P″⟩ → statusPop′.
+    An entity advances iff a trigger fact naming it (at `entity_role`) entered P″ and a
+    transition leaves its current status; everything else is unchanged. `pairs` are this
+    trigger fact type's (from, to) pairs, quoted as data."""
+    from .lam import to_lam
+    trs = _S(_CONST, to_lam(tuple(pairs)))
+    e = _S(_COMP, _1, _1)                                    # of ⟨⟨e,s⟩, P″⟩
+    s = _S(_COMP, _2, _1)
+    fact_names_e = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, A(entity_role), _1), _2))   # ⟨fact,e⟩
+    fired = _S(_COMP, A("not"), A("null"), T.Filter(fact_names_e), _DISTR, _S(_CONS, _2, e))
+    from_is_s = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, _1, _1), _2))                  # ⟨⟨f,t⟩,s⟩
+    nexts = _S(_COMP, _S(_ALPHA, _1), T.Filter(from_is_s), _DISTR, _S(_CONS, trs, s))
+    hasnext = _S(_COMP, A("not"), A("null"), nexts)
+    to = _S(_COMP, A(2), _1, nexts)                          # the first matching pair's to
+    both = _S(_COMP, A("and"), _S(_CONS, fired, hasnext))
+    upd = _S(_COND, both, _S(_CONS, e, to), _1)              # ⟨e,to⟩, else the old ⟨e,s⟩
+    return _S(_COMP, _S(_ALPHA, upd), _DISTR)                # over each ⟨⟨e,s⟩, P″⟩
