@@ -454,12 +454,13 @@ def row_resolve(col, width):
     return _S(_COND, _S(_COMP, A("null"), _2), fresh, upd)
 
 
-def create_routed(D, ft, fact, partition):
+def create_routed(D, ft, fact, partition, machine=None, mealy_obj=None):
     """Route a create through the RMAP partition (spec §4.4: the partition IS the layout).
     An absorbed fact type writes the entity's own cell `table:key`, the write unit of
     Def. iso, updating its column of the row; an own-table fact type creates into its
     per-fact-type cell unchanged. After a commit the table's index cell (named by the
-    noun, the RegistryDB analog of the TS engine) records the key."""
+    noun, the RegistryDB analog of the TS engine) records the key. A machine (the row
+    form: machine_step(ft, row_col=...)) advances within the routed step."""
     from . import ast
     from .reduce import apply as _ap
     from .lam import to_lam, from_lam
@@ -467,12 +468,13 @@ def create_routed(D, ft, fact, partition):
     import pyarest.lam as L
     table = partition.get(ft, ft)
     if table == ft:
-        return ast.run(fact, D, cell_name=ft)
+        return ast.run(fact, D, cell_name=ft, machine=machine, mealy_obj=mealy_obj)
     cols = table_columns(partition, table)
     col = 2 + cols.index(ft)
     key = from_lam(fact)[0]
     res = ast.run(fact, D, cell_name=f"{table}:{key}",
-                  resolve_obj=row_resolve(col, 1 + len(cols)))
+                  resolve_obj=row_resolve(col, 1 + len(cols)),
+                  machine=machine, mealy_obj=mealy_obj)
     o, D2 = _d._items(L._list(res))
     if from_lam(o) != "ERROR":
         idx = from_lam(_ap(ast.FetchPop(table), D2))
@@ -552,12 +554,15 @@ def process_table(D, noun):
     return out
 
 
-def _machine_exprs(trigger_ft):
+def _machine_exprs(trigger_ft, row_col=None):
     """The shared in-step expressions of the M-driven machine, over ⟨statusPop, P″, D⟩:
     the transition rows ⟨from, to, guard-or-#, emit-or-#⟩ joined from M in-reduction,
     the governed player's role position, and the per-entity pieces (fired, guard
     verdict, target) over pairs ⟨⟨e,s⟩, ⟨P″, trs, pos, D⟩⟩. machine_step and mealy_step
-    are two projections of this one machine."""
+    are two projections of this one machine. With `row_col`, P″ is an ABSORBED entity's
+    3NF row instead of a fact population: fired means the trigger's column went non-hole
+    and the addressed entity is the row's key (or the column's value when the governed
+    noun plays role 2 — the position still read from M in-step)."""
     from . import ast
     trig = _S(_CONST, A(trigger_ft))
     hash_ = _S(_CONST, A("#"))
@@ -593,10 +598,17 @@ def _machine_exprs(trigger_ft):
     trs = _S(_COMP, _2, _2)
     posv = _S(_COMP, A(3), _2)
     Dd = _S(_COMP, A(4), _2)
-    fmatch = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, A("apply"), _S(_CONS, _S(_COMP, _2, _2), _1)),
-                               _S(_COMP, _1, _2)))           # fact[pos] = e, dynamically
-    fired = _S(_COMP, A("not"), A("null"), T.Filter(fmatch), _DISTR,
-               _S(_CONS, P, _S(_CONS, e, posv)))
+    if row_col is None:
+        fmatch = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, A("apply"), _S(_CONS, _S(_COMP, _2, _2), _1)),
+                                   _S(_COMP, _1, _2)))       # fact[pos] = e, dynamically
+        fired = _S(_COMP, A("not"), A("null"), T.Filter(fmatch), _DISTR,
+                   _S(_CONS, P, _S(_CONS, e, posv)))
+    else:
+        e_addr = _S(_COND, _S(_COMP, _EQ, _S(_CONS, posv, _S(_CONST, A(1)))),
+                    _S(_COMP, A(1), P), _S(_COMP, A(row_col), P))
+        nonhole = _S(_COMP, A("not"), _EQ, _S(_CONS, _S(_COMP, A(row_col), P), hash_))
+        fired = _S(_COMP, A("and"), _S(_CONS,
+                   _S(_COMP, _EQ, _S(_CONS, e, e_addr)), nonhole))
     from_is_s = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, _1, _1), _2))
     nexts = _S(_COMP, _S(_ALPHA, _1), T.Filter(from_is_s), _DISTR, _S(_CONS, trs, s))
     first = _S(_COMP, _1, nexts)
@@ -613,7 +625,7 @@ def _machine_exprs(trigger_ft):
     return dict(ctx=ctx, e=e, s=s, to=to, em=em, okg=okg, both=both, hash_=hash_, Dd=Dd)
 
 
-def machine_step(trigger_ft):
+def machine_step(trigger_ft, row_col=None):
     """The machine that runs IS the M-facts: one FFP object over ⟨statusPop, P″, D⟩ that
     reads the transitions (smFrom ⋈ smTrigger ⋈ smTo), the guards (smGuard), and the
     addressed entity's role position (role facts joined with the governed nouns, smDef
@@ -621,20 +633,21 @@ def machine_step(trigger_ft):
     entity whose trigger fact entered P″ with its guard satisfied. Numbers are selectors,
     so the runtime role position selects dynamically via the apply primitive. Editing M
     redirects this step with no rewiring; `trigger_ft` is the handler's compile-time
-    identity, exactly as cell_name is for build_system."""
-    x = _machine_exprs(trigger_ft)
+    identity, exactly as cell_name is for build_system. `row_col` selects the absorbed
+    (3NF-row) fired form."""
+    x = _machine_exprs(trigger_ft, row_col)
     upd = _S(_COND, x["both"], _S(_COND, x["okg"], _S(_CONS, x["e"], x["to"]), _1), _1)
     return _S(_COMP, _S(_ALPHA, upd), _DISTR, _S(_CONS, _1, x["ctx"]))
 
 
-def mealy_step(trigger_ft):
+def mealy_step(trigger_ft, row_col=None):
     """Mealy output on the SAME step: for each entity whose transition fires, the
     transition's named definition (smEmit, read from M in-step like everything else) is
     resolved by ρ from D's own cells (definitions are ordinary cells, §13.3.5) and
     applied to ⟨e, from, to⟩; the emissions ⟨⟨e, result⟩ …⟩ join the representation o.
     Silent transitions, absent definitions, and unfired machines emit nothing."""
     from . import ast
-    x = _machine_exprs(trigger_ft)
+    x = _machine_exprs(trigger_ft, row_col)
     dcell = _S(_COMP, ast.DynFetch(), _S(_CONS, x["em"], x["Dd"]))
     has_em = _S(_COMP, A("not"), _EQ, _S(_CONS, x["em"], x["hash_"]))
     has_def = _S(_COMP, A("not"), A("atom"), dcell)
@@ -663,17 +676,22 @@ def create(D, fact_type, fact, fuel=None):
     closure), the M-driven machine step and its Mealy emissions are attached to that
     player's status cell; how it runs is the AST layer's (Prop. onestep: the one
     transition, the trigger fact entering P IS the firing). Absorbed fact types route to
-    their RMAP table (machines on absorbed triggers: pending)."""
+    their RMAP table, the machine taking the row form (fired = the trigger's column went
+    non-hole on the addressed entity's own 3NF row)."""
     from . import ast
     part = rmap_partition(D)
-    if part.get(fact_type, fact_type) != fact_type:
-        return create_routed(D, fact_type, fact, part)
+    table = part.get(fact_type, fact_type)
+    row_col = None
+    if table != fact_type:
+        row_col = 2 + table_columns(part, table).index(fact_type)
     machine = mealy = None
     if any(r[1] == fact_type for r in _pop_rows(D, "smTrigger")):
         noun = _governed_player(D, fact_type)
         if noun is not None:
-            machine = (noun + "_status", machine_step(fact_type))
-            mealy = mealy_step(fact_type)
+            machine = (noun + "_status", machine_step(fact_type, row_col))
+            mealy = mealy_step(fact_type, row_col)
+    if table != fact_type:
+        return create_routed(D, fact_type, fact, part, machine=machine, mealy_obj=mealy)
     return ast.run(fact, D, cell_name=fact_type, machine=machine, mealy_obj=mealy, fuel=fuel)
 
 
