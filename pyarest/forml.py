@@ -520,7 +520,15 @@ def _h_rule_if(g, k, m):
                 cols.setdefault(v, len(cols) + 1)
     if ok and all(v in cols for v in hvars):
         obj = _sys.compile_rule([a[0] for a in atoms], [cols[v] for v in hvars])
-    return A_, ([(rule_cid, obj)] if obj is not None else [])
+    if obj is None:
+        return A_, []
+    # semi-naive: the atom list as M-facts, and one ~d delta variant per atom position
+    out = [(rule_cid, obj)]
+    for i, (aft, _av) in enumerate(atoms):
+        A_.append(("ruleAtom", (rule_cid, i + 1, aft)))
+        out.append((f"{rule_cid}~d{i + 1}",
+                    _sys.compile_rule_delta([a[0] for a in atoms], [cols[v] for v in hvars], i)))
+    return A_, out
 
 
 def _h_derivation_rule(g, k, m):

@@ -209,41 +209,95 @@ def compile_rule(atom_fts, head_positions):
     return _S(_COMP, T.Project(head_positions), expr)
 
 
-def run_rules(D, changed=None):
-    """Cross-cell derivation to the least fixed point, BOUNDED by the frontier
-    (Cor. streaming): with `changed` given, only rules whose ruleReads intersect the
-    changed cells fire, and each round's newly derived heads become the next round's
-    frontier; with changed=None every rule fires in round one. Sound because rules are
-    positive and monotone: a rule reading no changed cell derives nothing new. Rule
-    names resolve through D's own DEFS (ρ within the step); Knaster–Tarski gives the
-    lfp and finiteness bounds the rounds."""
+def compile_rule_delta(atom_fts, head_positions, delta_at):
+    """The rule body with atom `delta_at` (0-based) reading the round's DELTA instead of
+    its cell: an FFP object over ⟨Δ, D⟩ — semi-naive evaluation's inner join
+    (Bancilhon–Ramakrishnan 1986). Same join shape as compile_rule; only the substituted
+    atom differs."""
+    from . import ast
+
+    def pop(j, ftn):
+        return _1 if j == delta_at else _S(_COMP, ast.FetchPop(ftn), _2)
+
+    expr = pop(0, atom_fts[0])
+    width = 2
+    for j, ftn in enumerate(atom_fts[1:], start=1):
+        expr = _S(_COMP, T.NatJoin(width), _S(_CONS, expr, pop(j, ftn)))
+        width += 1
+    return _S(_COMP, T.Project(head_positions), expr)
+
+
+def run_rules(D, changed=None, stats=None):
+    """Cross-cell derivation to the least fixed point, semi-naive (Bancilhon–
+    Ramakrishnan 1986): round one evaluates full bodies, BOUNDED by the frontier
+    (Cor. streaming — with `changed` given, only rules whose ruleReads intersect fire);
+    every later round joins only each head's per-round delta through the stored ~d
+    variants (one per atom position, from M's ruleAtom facts), so the join input shrinks
+    as the fixpoint nears. Sound and complete because rules are positive and monotone
+    and every genuinely new tuple uses at least one new row. Rules without atom facts
+    fall back to full evaluation when their reads changed. Rule names resolve through
+    D's own DEFS (ρ within the step); Knaster–Tarski gives the lfp and Lemma finiteness
+    bounds the rounds. `stats`, when a list, collects per-evaluation records."""
     from . import ast, defs
     from .reduce import apply as _ap
     from .lam import to_lam, from_lam, atom as _A
-    reads = {}
+    reads, atomsof = {}, {}
     for r in _pop_rows(D, "ruleReads"):
         if len(r) >= 2:
             reads.setdefault(r[0], set()).add(r[1])
+    for r in _pop_rows(D, "ruleAtom"):
+        if len(r) >= 3:
+            atomsof.setdefault(r[0], []).append((r[1], r[2]))
     rules = [(r[0], r[1]) for r in _pop_rows(D, "ruleDerives")]
     frontier = None if changed is None else set(changed)
+    delta, rnd = None, 0
     while True:
-        fired, next_frontier = False, set()
+        rnd += 1
+        fired, next_delta = False, {}
         for rule_cid, head in rules:
-            if frontier is not None and not (reads.get(rule_cid, set()) & frontier):
-                continue
-            with defs.step(D):
-                new = from_lam(_ap(_A(rule_cid), D))
-            if not isinstance(new, tuple):
-                continue                                     # rule not compiled (M-facts only)
+            if delta is None:                                # round one: full bodies
+                if frontier is not None and not (reads.get(rule_cid, set()) & frontier):
+                    continue
+                with defs.step(D):
+                    outs = from_lam(_ap(_A(rule_cid), D))
+                if not isinstance(outs, tuple):
+                    continue                                 # rule not compiled (M-facts only)
+                new_rows = {tuple(r) for r in outs if isinstance(r, tuple)}
+                if stats is not None:
+                    stats.append({"round": rnd, "rule": rule_cid, "mode": "full"})
+            else:
+                hits = [(p, ft) for (p, ft) in atomsof.get(rule_cid, ()) if ft in delta]
+                if hits:
+                    new_rows = set()
+                    for (p, ft) in hits:
+                        drows = tuple(sorted(delta[ft]))
+                        with defs.step(D):
+                            o = from_lam(_ap(_A(f"{rule_cid}~d{p}"), _S(to_lam(drows), D)))
+                        if isinstance(o, tuple):
+                            new_rows |= {tuple(r) for r in o if isinstance(r, tuple)}
+                        if stats is not None:
+                            stats.append({"round": rnd, "rule": rule_cid, "mode": "delta",
+                                          "pos": p, "in": len(drows),
+                                          "base": len(_pop_rows(D, ft))})
+                elif rule_cid not in atomsof and (reads.get(rule_cid, set()) & set(delta)):
+                    with defs.step(D):                       # legacy rule: full fallback
+                        outs = from_lam(_ap(_A(rule_cid), D))
+                    if not isinstance(outs, tuple):
+                        continue
+                    new_rows = {tuple(r) for r in outs if isinstance(r, tuple)}
+                    if stats is not None:
+                        stats.append({"round": rnd, "rule": rule_cid, "mode": "full"})
+                else:
+                    continue
             old = {tuple(r) for r in _pop_rows(D, head)}
-            merged = old | {tuple(r) for r in new if isinstance(r, tuple)}
-            if merged != old:
-                D = _ap(ast.Store(head), _S(to_lam(tuple(sorted(merged))), D))
+            add = new_rows - old
+            if add:
+                D = _ap(ast.Store(head), _S(to_lam(tuple(sorted(old | add))), D))
                 fired = True
-                next_frontier.add(head)
+                next_delta.setdefault(head, set()).update(add)
         if not fired:
             return D
-        frontier = next_frontier
+        delta = next_delta
 
 
 # --- the state machine read off M (whitepaper §1): a machine IS a set of facts ---
@@ -684,14 +738,22 @@ def governance_rules(D):
     from . import ast
     from .reduce import apply as _ap
     from .lam import to_lam
-    D = _ap(ast.DefineIn("governedBy_rule_base", compile_rule(["smDef"], [2, 1])), D)
-    D = _ap(ast.DefineIn("governedBy_rule_step", compile_rule(["subtype", "governedBy"], [1, 3])), D)
+    plans = (("governedBy_rule_base", ["smDef"], [2, 1]),
+             ("governedBy_rule_step", ["subtype", "governedBy"], [1, 3]))
+    atoms = []
+    for (name, fts, head) in plans:
+        D = _ap(ast.DefineIn(name, compile_rule(fts, head)), D)
+        for i, ft in enumerate(fts):                         # semi-naive ~d variants
+            D = _ap(ast.DefineIn(f"{name}~d{i + 1}", compile_rule_delta(fts, head, i)), D)
+            atoms.append((name, i + 1, ft))
     derives = tuple(tuple(r) for r in _pop_rows(D, "ruleDerives")) + \
         (("governedBy_rule_base", "governedBy"), ("governedBy_rule_step", "governedBy"))
     D = _ap(ast.Store("ruleDerives"), _S(to_lam(derives), D))
     reads = tuple(tuple(r) for r in _pop_rows(D, "ruleReads")) + \
         (("governedBy_rule_base", "smDef"), ("governedBy_rule_step", "subtype"),
          ("governedBy_rule_step", "governedBy"))
-    return _ap(ast.Store("ruleReads"), _S(to_lam(reads), D))
+    D = _ap(ast.Store("ruleReads"), _S(to_lam(reads), D))
+    rows = tuple(tuple(r) for r in _pop_rows(D, "ruleAtom")) + tuple(atoms)
+    return _ap(ast.Store("ruleAtom"), _S(to_lam(rows), D))
 
 
