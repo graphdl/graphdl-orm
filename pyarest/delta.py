@@ -72,14 +72,21 @@ def _eqobj(a, b):
 
 _num = lambda a, b: isinstance(a, (int, float)) and isinstance(b, (int, float)) \
     and not isinstance(a, bool) and not isinstance(b, bool)
+# operand-shape guards (§11.2.3): a primitive outside its stated shape is ⊥
+_pair = lambda o: _isseq(o) and len(o) == 2                  # ⟨x, y⟩
+_pair_xs = lambda o: _pair(o) and _isseq(o[1])               # ⟨x, ⟨…⟩⟩
+_pair_sx = lambda o: _pair(o) and _isseq(o[0])               # ⟨⟨…⟩, x⟩
+_pair_ss = lambda o: _pair(o) and _isseq(o[0]) and _isseq(o[1])
 
 def _binop(f):
-    return lambda mu, o: f(o[0], o[1]) if _num(o[0], o[1]) else BOT_D
+    return lambda mu, o: f(o[0], o[1]) if (_pair(o) and _num(o[0], o[1])) else BOT_D
 
 def _cmp(rel):
     def g(mu, o):
+        if not _pair(o):
+            return BOT_D
         a, b = o[0], o[1]
-        ok = a is not BOT_D and b is not BOT_D and (_num(a, b) or type(a) is type(b))
+        ok = not _isseq(a) and not _isseq(b) and (_num(a, b) or type(a) is type(b))
         return (_T if rel(a, b) else _F) if ok else BOT_D
     return g
 
@@ -97,25 +104,31 @@ def _cons(mu, o):
     return _mkseq(mu((APP_D, f, x)) for f in whole[1:])
 
 def _const(mu, o):
-    return o[0][1] if o[1] is not BOT_D else BOT_D
+    return o[0][1] if len(o[0]) >= 2 else BOT_D              # ⟨CONST⟩ with no payload is ⊥
 
 def _cond(mu, o):
     whole, x = o[0], o[1]
+    if len(whole) < 4:
+        return BOT_D
     pv = mu((APP_D, whole[1], x))
     return mu((APP_D, whole[2], x)) if pv == _T else (mu((APP_D, whole[3], x)) if pv == _F else BOT_D)
 
 def _alpha(mu, o):
     whole, x = o[0], o[1]
+    if len(whole) < 2:
+        return BOT_D
     return () if x == () else (_mkseq(mu((APP_D, whole[1], xi)) for xi in x) if _isseq(x) else BOT_D)
 
 def _insert(mu, o):
     whole, x = o[0], o[1]
-    if not _isseq(x) or len(x) == 0:
+    if len(whole) < 2 or not _isseq(x) or len(x) == 0:
         return BOT_D
     return x[0] if len(x) == 1 else mu((APP_D, whole[1], _mkseq((x[0], mu((APP_D, whole, x[1:]))))))
 
 def _while(mu, o):
     whole, x = o[0], o[1]
+    if len(whole) < 3:
+        return BOT_D
     pv = mu((APP_D, whole[1], x))
     return mu((APP_D, whole, mu((APP_D, whole[2], x)))) if pv == _T else (x if pv == _F else BOT_D)
 
@@ -125,25 +138,25 @@ _NATIVE = {
     "id": lambda mu, o: o,
     "atom": lambda mu, o: BOT_D if o is BOT_D else (_F if (_isseq(o) and len(o) > 0) else _T),
     "null": lambda mu, o: BOT_D if o is BOT_D else (_T if o == () else _F),
-    "eq": lambda mu, o: (_T if _eqobj(o[0], o[1]) else _F) if (_isseq(o) and len(o) == 2) else BOT_D,
-    "apndl": lambda mu, o: (o[0],) + o[1],
-    "apndr": lambda mu, o: o[0] + (o[1],),
-    "distl": lambda mu, o: tuple((o[0], y) for y in o[1]),
-    "distr": lambda mu, o: tuple((x, o[1]) for x in o[0]),
+    "eq": lambda mu, o: (_T if _eqobj(o[0], o[1]) else _F) if _pair(o) else BOT_D,
+    "apndl": lambda mu, o: (o[0],) + o[1] if _pair_xs(o) else BOT_D,
+    "apndr": lambda mu, o: o[0] + (o[1],) if _pair_sx(o) else BOT_D,
+    "distl": lambda mu, o: tuple((o[0], y) for y in o[1]) if _pair_xs(o) else BOT_D,
+    "distr": lambda mu, o: tuple((x, o[1]) for x in o[0]) if _pair_sx(o) else BOT_D,
     "length": lambda mu, o: len(o) if _isseq(o) else BOT_D,
     "reverse": lambda mu, o: tuple(reversed(o)) if _isseq(o) else BOT_D,
-    "cat": lambda mu, o: o[0] + o[1],
+    "cat": lambda mu, o: o[0] + o[1] if _pair_ss(o) else BOT_D,
     "not": lambda mu, o: _F if o == _T else (_T if o == _F else BOT_D),
-    "and": lambda mu, o: (_T if (o[0] == _T and o[1] == _T) else _F)
-        if (o[0] in (_T, _F) and o[1] in (_T, _F)) else BOT_D,
-    "or": lambda mu, o: (_T if (o[0] == _T or o[1] == _T) else _F)
-        if (o[0] in (_T, _F) and o[1] in (_T, _F)) else BOT_D,
+    "and": lambda mu, o: ((_T if (o[0] == _T and o[1] == _T) else _F)
+        if (o[0] in (_T, _F) and o[1] in (_T, _F)) else BOT_D) if _pair(o) else BOT_D,
+    "or": lambda mu, o: ((_T if (o[0] == _T or o[1] == _T) else _F)
+        if (o[0] in (_T, _F) and o[1] in (_T, _F)) else BOT_D) if _pair(o) else BOT_D,
     "1r": lambda mu, o: o[-1] if (_isseq(o) and len(o) >= 1) else BOT_D,
     "tlr": lambda mu, o: o[:-1] if (_isseq(o) and len(o) >= 1) else BOT_D,
     "+": _binop(lambda a, b: a + b), "-": _binop(lambda a, b: a - b), "*": _binop(lambda a, b: a * b),
     "ge": _cmp(lambda a, b: a >= b), "gt": _cmp(lambda a, b: a > b),
     "le": _cmp(lambda a, b: a <= b), "lt": _cmp(lambda a, b: a < b),
-    "apply": lambda mu, o: mu((APP_D, o[0], o[1])),
+    "apply": lambda mu, o: mu((APP_D, o[0], o[1])) if _pair(o) else BOT_D,
     "COMP": _comp, "CONS": _cons, "CONST": _const, "COND": _cond,
     "ALPHA": _alpha, "INSERT": _insert, "WHILE": _while,
 }

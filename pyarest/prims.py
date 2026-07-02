@@ -28,6 +28,19 @@ _4 = lambda o: L.HEAD(L.TAIL(L.TAIL(L.TAIL(L._list(o)))))
 _params = lambda whole: L.TAIL(L._list(whole))               # f1..fn from ⟨OP, f1..fn⟩
 _seqp = lambda o: o(lambda v: L.FALSE)(lambda l: L.TRUE)(L.FALSE)
 
+# ---- operand-shape guards: a primitive outside its stated shape is ⊥ (§11.2.3) ----
+_isseq_b = lambda x: x(lambda v: L.FALSE)(lambda l: L.TRUE)(L.FALSE)          # Church: is a sequence
+_pair_b  = lambda o: o(lambda v: L.FALSE)(lambda l: L.AND(L.NOT(L.LNULL(l)))(  # exactly two elements
+              L.AND(L.NOT(L.LNULL(L.TAIL(l))))(L.LNULL(L.TAIL(L.TAIL(l))))))(L.FALSE)
+_pair_xs = lambda o: L.AND(_pair_b(o))(_isseq_b(_2(o)))                        # ⟨x, ⟨…⟩⟩
+_pair_sx = lambda o: L.AND(_pair_b(o))(_isseq_b(_1(o)))                        # ⟨⟨…⟩, x⟩
+_pair_ss = lambda o: L.AND(_pair_b(o))(L.AND(_isseq_b(_1(o)))(_isseq_b(_2(o))))  # ⟨⟨…⟩, ⟨…⟩⟩
+
+
+def _shaped(test, fn):
+    return lambda mu: lambda o: L.IF(test(o))(lambda: fn(mu)(o))(lambda: L.BOT)
+
+
 # ---- primitive functions (§11.2.3): impl(mu)(o) with mu ignored ----
 def _sel(i):
     s = L.SEL(i)                                              # HEAD ∘ TAIL^(i-1), pure lambda
@@ -37,27 +50,28 @@ _tl    = lambda mu: lambda o: L.TL(o)
 _id    = lambda mu: lambda o: o
 _atom  = lambda mu: lambda o: o(lambda v: aT)(lambda l: L.IF(L.LNULL(l))(lambda: aT)(lambda: aF))(L.BOT)
 _null  = lambda mu: lambda o: o(lambda v: aF)(lambda l: L.IF(L.LNULL(l))(lambda: aT)(lambda: aF))(L.BOT)
-_eq    = lambda mu: lambda o: o(lambda v: L.BOT)(lambda l: BOOL2A(L.EQOBJ(L.HEAD(l))(L.HEAD(L.TAIL(l)))))(L.BOT)
-_apndl = lambda mu: lambda o: L.APNDL(o)
-_apndr = lambda mu: lambda o: L.APNDR(o)
-_distl = lambda mu: lambda o: L.DISTL(o)
-_distr = lambda mu: lambda o: L.DISTR(o)
+_eq    = _shaped(_pair_b, lambda mu: lambda o: BOOL2A(L.EQOBJ(_1(o))(_2(o))))
+_apndl = _shaped(_pair_xs, lambda mu: lambda o: L.APNDL(o))
+_apndr = _shaped(_pair_sx, lambda mu: lambda o: L.APNDR(o))
+_distl = _shaped(_pair_xs, lambda mu: lambda o: L.DISTL(o))
+_distr = _shaped(_pair_sx, lambda mu: lambda o: L.DISTR(o))
 _len   = lambda mu: lambda o: L.LENGTH(o)
 _rev   = lambda mu: lambda o: o(lambda v: L.BOT)(lambda l:
             L.SEQ(L.FOLDR(lambda h: lambda a: L.APPEND(a)(L.CONS(h)(L.NIL)))(L.NIL)(l)))(L.BOT)
-_cat   = lambda mu: lambda o: L.SEQ(L.APPEND(L._list(_1(o)))(L._list(_2(o))))  # cat:⟨⟨a..⟩,⟨b..⟩⟩=⟨a..,b..⟩
+_cat   = _shaped(_pair_ss, lambda mu: lambda o: L.SEQ(L.APPEND(L._list(_1(o)))(L._list(_2(o)))))
 _not   = lambda mu: lambda o: L.IF(L.EQOBJ(o)(aT))(lambda: aF)(
             lambda: L.IF(L.EQOBJ(o)(aF))(lambda: aT)(lambda: L.BOT))              # not on T/F atoms
 _isTF  = lambda v: L.OR(L.EQOBJ(v)(aT))(L.EQOBJ(v)(aF))                           # boolean domain
-_and   = lambda mu: lambda o: L.IF(L.AND(_isTF(_1(o)))(_isTF(_2(o))))(            # and:⟨p,q⟩, T/F only
+_and   = _shaped(_pair_b, lambda mu: lambda o: L.IF(L.AND(_isTF(_1(o)))(_isTF(_2(o))))(
             lambda: L.IF(L.AND(L.EQOBJ(_1(o))(aT))(L.EQOBJ(_2(o))(aT)))(lambda: aT)(lambda: aF))(
-            lambda: L.BOT)
-_or    = lambda mu: lambda o: L.IF(L.AND(_isTF(_1(o)))(_isTF(_2(o))))(            # or:⟨p,q⟩, T/F only
+            lambda: L.BOT))                                                       # and:⟨p,q⟩, T/F only
+_or    = _shaped(_pair_b, lambda mu: lambda o: L.IF(L.AND(_isTF(_1(o)))(_isTF(_2(o))))(
             lambda: L.IF(L.OR(L.EQOBJ(_1(o))(aT))(L.EQOBJ(_2(o))(aT)))(lambda: aT)(lambda: aF))(
-            lambda: L.BOT)
+            lambda: L.BOT))                                                       # or:⟨p,q⟩, T/F only
 _revl  = lambda l: L.FOLDR(lambda h: lambda a: L.APPEND(a)(L.CONS(h)(L.NIL)))(L.NIL)(l)
 _1r    = lambda mu: lambda o: o(lambda v: L.BOT)(lambda l: L.HEAD(_revl(l)))(L.BOT)         # last element
-_tlr   = lambda mu: lambda o: o(lambda v: L.BOT)(lambda l: L.SEQ(_revl(L.TAIL(_revl(l)))))(L.BOT)  # all but last
+_tlr   = lambda mu: lambda o: o(lambda v: L.BOT)(lambda l:                                  # all but last;
+            L.IF(L.LNULL(l))(lambda: L.BOT)(lambda: L.SEQ(_revl(L.TAIL(_revl(l))))))(L.BOT)  # tlr:φ = ⊥
 
 # ---- value boundary ops (§11.2.3 arithmetic + NORMA value comparison): native ORM-typed
 # values, so these are boundary operations, not lambda arithmetic. Same-type operands only. ----
