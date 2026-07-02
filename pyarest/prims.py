@@ -97,6 +97,11 @@ def _cmp(rel):
 _add, _sub, _mul = _binnum(lambda a, b: a + b), _binnum(lambda a, b: a - b), _binnum(lambda a, b: a * b)
 _ge, _gt = _cmp(lambda a, b: a >= b), _cmp(lambda a, b: a > b)
 _le, _lt = _cmp(lambda a, b: a <= b), _cmp(lambda a, b: a < b)
+_div   = lambda mu: lambda o: (lambda a, b: L.atom(a / b) if (_numeric(a, b) and b != 0)
+            else L.BOT)(_pv(_1(o)), _pv(_2(o)))                                # ÷ (÷0 = ⊥)
+_trans = lambda mu: lambda o: L.TRANS(o)
+_rotl  = lambda mu: lambda o: L.ROTL(o)
+_rotr  = lambda mu: lambda o: L.ROTR(o)
 # apply:⟨f, x⟩ = f:x = mu(f : x) — membership is application; the one operation eq. sys performs,
 # and what lets a VALUE (a transition relation, a handler) be fed into the one mu.
 _apply = lambda mu: lambda o: mu(mkapp(_1(o))(_2(o)))
@@ -141,6 +146,9 @@ def _while(mu):
         return L.IF(L.EQOBJ(pv)(aT))(lambda: mkapp(whole)(mkapp(f)(y)))(
                lambda: L.IF(L.EQOBJ(pv)(aF))(lambda: y)(lambda: L.BOT))
     return h
+# BU  (bu f x) : y = f:⟨x, y⟩   — binary-to-unary (§11.2.4); x is quoted data
+_bu = lambda mu: lambda a: mu(mkapp(_2(_1(a)))(
+        L.SEQC(L.CONS(_3(_1(a)))(L.CONS(_2(a))(L.NIL)))))
 
 
 def register_base():
@@ -150,10 +158,12 @@ def register_base():
              "apndl": _apndl, "apndr": _apndr, "distl": _distl, "distr": _distr,
              "length": _len, "reverse": _rev, "cat": _cat,
              "not": _not, "and": _and, "or": _or, "1r": _1r, "tlr": _tlr,
-             "+": _add, "-": _sub, "*": _mul, "ge": _ge, "gt": _gt, "le": _le, "lt": _lt,
+             "trans": _trans, "rotl": _rotl, "rotr": _rotr,
+             "+": _add, "-": _sub, "*": _mul, "div": _div,
+             "ge": _ge, "gt": _gt, "le": _le, "lt": _lt,
              "apply": _apply,
              "COMP": _comp, "CONS": _cons, "CONST": _const, "ALPHA": _alpha,
-             "COND": _cond, "INSERT": _insert, "WHILE": _while}
+             "COND": _cond, "INSERT": _insert, "WHILE": _while, "BU": _bu}
     for name, fn in prims.items():
         register(name, fn)
 

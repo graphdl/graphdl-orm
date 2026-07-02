@@ -132,6 +132,20 @@ def _while(mu, o):
     pv = mu((APP_D, whole[1], x))
     return mu((APP_D, whole, mu((APP_D, whole[2], x)))) if pv == _T else (x if pv == _F else BOT_D)
 
+def _bu(mu, o):
+    whole, y = o[0], o[1]
+    return mu((APP_D, whole[1], (whole[2], y))) if len(whole) >= 3 else BOT_D
+
+def _trans(mu, o):
+    if not _isseq(o) or any(not _isseq(r) for r in o):
+        return BOT_D
+    if len(o) == 0:
+        return ()
+    n = len(o[0])
+    if any(len(r) != n for r in o):
+        return BOT_D
+    return tuple(tuple(r[i] for r in o) for i in range(n))
+
 
 _NATIVE = {
     "tl": lambda mu, o: o[1:] if (_isseq(o) and len(o) >= 1) else BOT_D,
@@ -153,12 +167,16 @@ _NATIVE = {
         if (o[0] in (_T, _F) and o[1] in (_T, _F)) else BOT_D) if _pair(o) else BOT_D,
     "1r": lambda mu, o: o[-1] if (_isseq(o) and len(o) >= 1) else BOT_D,
     "tlr": lambda mu, o: o[:-1] if (_isseq(o) and len(o) >= 1) else BOT_D,
+    "trans": _trans,
+    "rotl": lambda mu, o: o[1:] + o[:1] if _isseq(o) else BOT_D,
+    "rotr": lambda mu, o: o[-1:] + o[:-1] if _isseq(o) else BOT_D,
     "+": _binop(lambda a, b: a + b), "-": _binop(lambda a, b: a - b), "*": _binop(lambda a, b: a * b),
+    "div": lambda mu, o: o[0] / o[1] if (_pair(o) and _num(o[0], o[1]) and o[1] != 0) else BOT_D,
     "ge": _cmp(lambda a, b: a >= b), "gt": _cmp(lambda a, b: a > b),
     "le": _cmp(lambda a, b: a <= b), "lt": _cmp(lambda a, b: a < b),
     "apply": lambda mu, o: mu((APP_D, o[0], o[1])) if _pair(o) else BOT_D,
     "COMP": _comp, "CONS": _cons, "CONST": _const, "COND": _cond,
-    "ALPHA": _alpha, "INSERT": _insert, "WHILE": _while,
+    "ALPHA": _alpha, "INSERT": _insert, "WHILE": _while, "BU": _bu,
 }
 for _i in range(1, 33):
     _NATIVE[_i] = _sel(_i)

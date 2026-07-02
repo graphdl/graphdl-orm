@@ -96,6 +96,25 @@ DISTL = lambda o: (lambda x: lambda ys: SEQ(MAPL(lambda y: SEQ(CONS(x)(CONS(y)(N
 DISTR = lambda o: (lambda xs: lambda y: SEQ(MAPL(lambda x: SEQ(CONS(x)(CONS(y)(NIL))))(xs)))(
                     _list(HEAD(_list(o))))(HEAD(TAIL(_list(o))))                  # distr:⟨⟨x1..⟩,y⟩
 
+REVL  = lambda l: FOLDR(lambda h: lambda a: APPEND(a)(CONS(h)(NIL)))(NIL)(l)   # reverse a Scott list
+ROTL  = lambda o: o(lambda v: BOT)(lambda l:                                   # rotl:⟨x1..xn⟩=⟨x2..xn,x1⟩
+        l(SEQ(NIL))(lambda h: lambda t: SEQ(APPEND(t)(CONS(h)(NIL)))))(BOT)
+ROTR  = lambda o: o(lambda v: BOT)(lambda l:                                   # rotr:⟨x1..xn⟩=⟨xn,x1..⟩
+        l(SEQ(NIL))(lambda h: lambda t:
+          (lambda r: SEQ(CONS(HEAD(r))(REVL(TAIL(r)))))(REVL(CONS(h)(t)))))(BOT)
+
+_ALLB = lambda p: FOLDR(lambda h: lambda a: AND(p(h))(a))(TRUE)
+_ANYB = lambda p: FOLDR(lambda h: lambda a: OR(p(h))(a))(FALSE)
+_trans_rows = Y(lambda rec: lambda rl:                        # transpose a list of row-SEQs
+    IF(_ANYB(lambda r: NOT(SEQP(r)))(rl))(lambda: BOT)(lambda:               # an atom row -> ⊥
+    IF(LNULL(rl))(lambda: PHI)(lambda:                                        # trans:φ = φ
+    IF(_ALLB(lambda r: LNULL(_list(r)))(rl))(lambda: PHI)(lambda:             # all rows spent
+    IF(_ANYB(lambda r: LNULL(_list(r)))(rl))(lambda: BOT)(lambda:             # ragged -> ⊥
+    (lambda rest: rest(lambda v: BOT)(lambda restl:
+        SEQ(CONS(SEQ(MAPL(lambda r: HEAD(_list(r)))(rl)))(restl)))(BOT))(
+        rec(MAPL(TL)(rl))))))))
+TRANS = lambda o: o(lambda v: BOT)(lambda rl: _trans_rows(rl))(BOT)           # trans (§11.2.3)
+
 _tobool = lambda b: b(True)(False)                           # Church bool -> host bool (boundary)
 _is_nil = lambda l: _tobool(LNULL(l))
 def _count(l):                                               # native length of a Scott list

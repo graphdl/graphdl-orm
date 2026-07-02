@@ -37,7 +37,8 @@ def _leaves(rng):
     return [A(rng.randint(1, 4)), A("tl"), A("tlr"), A("1r"), A("id"), A("atom"),
             A("null"), A("eq"), A("reverse"), A("length"), A("cat"), A("apndl"),
             A("apndr"), A("distl"), A("distr"), A("not"), A("and"), A("or"),
-            A("+"), A("ge"), S(A("CONST"), to_lam(gen_obj(rng, 1)))]
+            A("trans"), A("rotl"), A("rotr"), A("+"), A("div"), A("ge"),
+            S(A("CONST"), to_lam(gen_obj(rng, 1)))]
 
 
 def gen_fn(rng, depth):
