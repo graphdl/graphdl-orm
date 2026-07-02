@@ -16,13 +16,21 @@ from .lam import to_lam, from_lam
 from . import ast, system
 from . import constraints as C
 
-# ---- statement grouping: accumulate lines until one ends with '.' (multi-line aware) ----
+# ---- statement grouping: accumulate lines until one ends with '.' (multi-line aware).
+# The corpus writes NORMA storage markers AFTER the period ('Fact Type has Format. **');
+# normalize to the marker-before-period form the derivation stripper reads. ----
+_TRAIL_MARK = re.compile(r"^(.*\S)\.\s*(\*\*|\+\+|\*|\+)$")
+
+
 def statements(text):
     out, buf = [], []
     for line in text.splitlines():
         s = line.strip()
         if not s or s == "Fact Types:":
             continue
+        mm = _TRAIL_MARK.match(s)
+        if mm:
+            s = f"{mm.group(1)} {mm.group(2)}."
         buf.append(s)
         if s.endswith("."):
             out.append(" ".join(buf)); buf = []
@@ -81,6 +89,9 @@ _CLASSIFY = [
     ("inverse_uc", re.compile(r"^[Ff]or each (.+?), at most one (.+) (?:that|those) .+\.$")),
     ("subset", re.compile(r"^[Ii]f (.+) then (.+)\.$")),                      # 'if A then B' = subset (modus ponens)
     ("equality", re.compile(r"^(.+) if and only if (.+)\.$")),                # 'A iff B' = equality
+    # the book's rule surface (Halpin ch.2 ex.4 D1): numbered variables, ' if ' head-body,
+    # ' and ' conjunction; a digit in the head keeps plain readings out of this recognizer
+    ("rule_if", re.compile(r"^(\S.*?\d\S*.*?) if (.+)\.$")),
     # a derivation RULE reading (leading * = derived): a linear role path from a root object type
     # (infosci Mapping_ORM_to_Datalog: *Each FastCarDriver is some Person who drives some Car ...)
     ("derivation_rule", re.compile(r"^\*Each (.+?) is some (.+?) who (.+)\.$")),
@@ -439,6 +450,64 @@ def _h_sm_to(g, k, m):
 def _h_sm_trigger(g, k, m):
     return [("smTrigger", (g[0], _clause_ft(g[1], k)))], []   # ⟨transition, trigger fact type⟩
 
+_VARTOK = re.compile(r"^(\w+)(\d+)$")
+_SOME = re.compile(r"\b(some|that) ")                          # existentials only: the article
+                                                               # 'a' is predicate text ('is a
+                                                               # parent of'), never stripped
+
+def _rule_atom(text, known):
+    """A rule clause → (fact type id, ordered variable list): numbered variables generalize
+    to their base type for fact-type resolution ('Person1' plays a Person role), and the
+    variable sequence follows the reading's role order (the book's D1 convention)."""
+    vars_, out = [], []
+    for tok in text.split():
+        mm = _VARTOK.match(tok)
+        if mm and mm.group(1) in known:
+            vars_.append(mm.group(1) + mm.group(2))
+            out.append(mm.group(1))
+        else:
+            out.append(tok)
+    ft, _decl = _fact_type(_SOME.sub("", " ".join(out)).strip(), known)
+    return ft, vars_
+
+
+def _h_rule_if(g, k, m):
+    """The book's rule form: Head if Clause [and Clause…]. The clauses join linearly on
+    shared variables; the head projects its variables from the joined tuple; the compiled
+    object consumes D (cross-cell) and run_rules derives to the lfp."""
+    import zlib
+    from . import system as _sys
+    head_txt, body = g
+    clauses = [c.strip() for c in body.split(" and ")]
+    hft, hvars = _rule_atom(head_txt, k)
+    atoms = [_rule_atom(c, k) for c in clauses]
+    rule_cid = hft + "_rule_" + format(zlib.crc32(body.encode()), "x")
+    _hf, decl = _fact_type(re.sub(r"\d+", "", head_txt).strip(), k)
+    A_ = decl + [("derivation", (hft, "fully-derived")),
+                 ("derivationRule", (hft, atoms[0][0], len(atoms))),
+                 ("ruleDerives", (rule_cid, hft))]
+    for aft, _av in atoms:
+        A_.append(("ruleReads", (rule_cid, aft)))
+    # column map: first atom contributes its full var list; each later atom appends the
+    # variables after its join column (NatJoin keeps the running tuple and drops S.1)
+    cols, obj = {}, None
+    ok = True
+    for i, (aft, avars) in enumerate(atoms):
+        if i == 0:
+            for v in avars:
+                cols.setdefault(v, len(cols) + 1)
+        else:
+            # linear chain: the joined variable must be the running tuple's LAST column
+            if not avars or cols.get(avars[0]) != len(cols):
+                ok = False                                    # unsupported shape: M-facts only
+                break
+            for v in avars[1:]:
+                cols.setdefault(v, len(cols) + 1)
+    if ok and all(v in cols for v in hvars):
+        obj = _sys.compile_rule([a[0] for a in atoms], [cols[v] for v in hvars])
+    return A_, ([(rule_cid, obj)] if obj is not None else [])
+
+
 def _h_derivation_rule(g, k, m):
     from . import system as _sys
     derived, root, body = g
@@ -466,6 +535,7 @@ _PLAN = {
     "frequency": _h_frequency, "ring": _h_ring, "subtype_of": _h_subtype,
     "set_comparison": _h_set_comparison, "disjunctive_mandatory": _h_disjunctive,
     "subset": _h_subset, "equality": _h_equality, "derivation_rule": _h_derivation_rule,
+    "rule_if": _h_rule_if,
     "negation": _h_negation, "possibility": _h_possibility, "inverse_uc": _h_inverse_uc,
     "sm_def": _h_sm_def, "sm_initial": _h_sm_initial, "sm_from": _h_sm_from,
     "sm_to": _h_sm_to, "sm_trigger": _h_sm_trigger,
@@ -588,6 +658,7 @@ _RENDER = {
     "subset": lambda g: f"If {g[0]} then {g[1]}",
     "equality": lambda g: f"{g[0]} if and only if {g[1]}",
     "derivation_rule": lambda g: f"*Each {g[0]} is some {g[1]} who {g[2]}",
+    "rule_if": lambda g: f"{g[0]} if {g[1]}",
     "negation": lambda g: f"{g[0]} ~{g[1]}",
     "uniqueness": lambda g: f"Each {g[0]} {g[1]} {g[2]}",
     "mandatory": lambda g: f"Each {g[0]} some {g[1]}",

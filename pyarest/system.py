@@ -169,6 +169,47 @@ def links_of(key_pos, sm=None, status_pos=None):
     return _S(_COMP, _CAT, _S(_CONS, nav, transitions_of(sm, status_pos)))  # nav ∪ transitions
 
 
+# --- the book's rule form compiled (Halpin ch.2 ex.4): linear chain join over D ---
+def compile_rule(atom_fts, head_positions):
+    """A rule's body as one FFP object over D: the populations of the clause fact types,
+    each fetched from its own cell, joined linearly (each next atom joins the running
+    tuple's last column to its column 1), with the head's variable positions projected.
+    Cross-cell by construction: this is store-on-derive's read side."""
+    from . import ast
+    expr = ast.FetchPop(atom_fts[0])
+    width = 2
+    for ftn in atom_fts[1:]:
+        expr = _S(_COMP, T.NatJoin(width), _S(_CONS, expr, ast.FetchPop(ftn)))
+        width += 1
+    return _S(_COMP, T.Project(head_positions), expr)
+
+
+def run_rules(D):
+    """Cross-cell derivation to the least fixed point: apply every compiled rule against D
+    (the rule name resolves through D's own DEFS — ρ within the step), union new heads
+    into the head fact type's cell, repeat until no cell changes. The rules are positive,
+    so the iteration is monotone and Knaster–Tarski gives the lfp; finiteness bounds the
+    rounds (Lemma finiteness)."""
+    from . import ast, defs
+    from .reduce import apply as _ap
+    from .lam import to_lam, from_lam, atom as _A
+    rules = [(r[0], r[1]) for r in _pop_rows(D, "ruleDerives")]
+    changed = True
+    while changed:
+        changed = False
+        for rule_cid, head in rules:
+            with defs.step(D):
+                new = from_lam(_ap(_A(rule_cid), D))
+            if not isinstance(new, tuple):
+                continue                                     # rule not compiled (M-facts only)
+            old = {tuple(r) for r in _pop_rows(D, head)}
+            merged = old | {tuple(r) for r in new if isinstance(r, tuple)}
+            if merged != old:
+                D = _ap(ast.Store(head), _S(to_lam(tuple(sorted(merged))), D))
+                changed = True
+    return D
+
+
 # --- the state machine read off M (whitepaper §1): a machine IS a set of facts ---
 # smFrom ⟨t, from⟩ ⋈ smTrigger ⟨t, trigger⟩ ⋈ smTo ⟨t, to⟩, projected to ⟨from, trigger, to⟩ —
 # assembling the machine is a theta1 join over M's cells, not a second interpreter.
