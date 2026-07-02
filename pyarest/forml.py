@@ -23,9 +23,21 @@ _TRAIL_MARK = re.compile(r"^(.*\S)\.\s*(\*\*|\+\+|\*|\+)$")
 
 
 def statements(text):
-    out, buf = [], []
+    out, buf, in_comment = [], [], False
     for line in text.splitlines():
         s = line.strip()
+        # markdown structure is not sentence content: comment blocks vanish, and a
+        # heading BREAKS the accumulation (it never continues a sentence)
+        if in_comment:
+            if "-->" in s:
+                in_comment = False
+            continue
+        if s.startswith("<!--"):
+            in_comment = "-->" not in s
+            continue
+        if s.startswith("#"):
+            buf = []
+            continue
         if not s or s == "Fact Types:":
             continue
         mm = _TRAIL_MARK.match(s)
@@ -96,6 +108,9 @@ _CLASSIFY = [
     ("disjunctive_mandatory", re.compile(r"^[Ff]or each (.+?), (.+ or .+)\.$")),
     ("inverse_uc", re.compile(r"^[Ff]or each (.+?), (at most one|exactly one) (.+) (?:that|those) .+\.$")),
     ("subset", re.compile(r"^[Ii]f (.+) then (.+)\.$")),                      # 'if A then B' = subset (modus ponens)
+    # grammar-as-readings recognizers (forml2-grammar.md: 'the parser is this file'):
+    # a quoted-head iff rule classifies Statements from their field facts
+    ("class_rule", re.compile(r"^(\S[^']*?) has (\S[^']*?) '(.+?)' iff (.+)\.$")),
     ("equality", re.compile(r"^(.+) if and only if (.+)\.$")),                # 'A iff B' = equality
     # the book's rule surface (Halpin ch.2 ex.4 D1): numbered variables, ' if ' head-body,
     # ' and ' conjunction; a digit in the head keeps plain readings out of this recognizer
@@ -450,6 +465,90 @@ def _conj(rest):
     return head + ((" " + tail) if tail else "")
 
 
+_CLAUSE_RE = re.compile(r"^(\S.*?) has (\S.*?)(?: '(.+?)')?$")
+
+
+def _h_class_rule(g, k, m):
+    """The grammar-as-readings recognizer form (forml2-grammar.md): 'Statement has
+    Classification C iff Statement has Field ⟨lit⟩ [and …]' compiles into an ordinary
+    rule deriving ⟨sid, C⟩ from the field cells — the parser IS the file, run by
+    run_rules. Each literal a body clause tests is recorded as a classLit fact; that
+    population is Stage-1's ENTIRE tokenizer vocabulary."""
+    import zlib
+    from . import system as _sys
+    subjh, fieldh, headlit, body = g
+    head_ft = _slug(f"{subjh} has {fieldh}")
+    clauses = []
+    # split on ' and ' only OUTSIDE quotes ('if and only if' is one literal)
+    for c in re.split(r" and (?=(?:[^']*'[^']*')*[^']*$)", body):
+        mm = _CLAUSE_RE.match(c.strip())
+        if not mm:
+            return [], []
+        s2, f2, lit = mm.groups()
+        clauses.append((_slug(f"{s2} has {f2}"), lit))
+    rid = head_ft + "_cls_" + format(zlib.crc32((headlit + "|" + body).encode()), "x")
+    A_ = [("ruleDerives", (rid, head_ft))]
+    for (ftb, lit) in clauses:
+        A_.append(("ruleReads", (rid, ftb)))
+        if lit is not None:
+            A_.append(("classLit", (ftb, lit)))
+    return A_, [(rid, _sys.class_rule(clauses, headlit))]
+
+
+def stage1_vocabulary(D):
+    """Stage-1's token vocabulary, read off the ingested grammar: exactly the literals
+    the recognizer rules test (classLit). The tokenizer knows nothing else."""
+    from . import system as _sys
+    return {(r[0], r[1]) for r in _sys._pop_rows(D, "classLit") if len(r) >= 2}
+
+
+def tokenize_statement(D, stmt, nouns=(), sid="s1"):
+    """Stage-1, the bootstrap kernel: extract field FACTS from one statement. The
+    vocabulary is stage1_vocabulary (from D, never hardcoded); a Trailing Marker must
+    trail; Role References are known-noun occurrences; a quoted token is a Literal
+    Role. Returns [(field_ft, (sid, value)), …]."""
+    text = stmt.strip().rstrip(".")
+    out = []
+    for (ftb, lit) in sorted(stage1_vocabulary(D), key=lambda p: -len(p[1])):
+        # case-insensitive: Stage-1 recognises phrases at any position, 'The possible
+        # values of …' included (the file's own Verb-override comment)
+        if not re.search(r"(?<![A-Za-z])" + re.escape(lit) + r"(?![A-Za-z])", text, re.IGNORECASE):
+            continue
+        if ftb == "Statement_has_Trailing_Marker" and not text.lower().endswith(lit.lower()):
+            continue
+        out.append((ftb, (sid, lit)))
+    for n in nouns:
+        if re.search(r"(?<![A-Za-z])" + re.escape(n) + r"(?![A-Za-z])", text):
+            out.append(("Statement_has_Role_Reference", (sid, n)))
+    quoted = _QUOTED.findall(text)
+    if quoted:
+        out.append(("Statement_has_Literal_Role", (sid, quoted[0])))
+    return out
+
+
+def classify_via_M(D, stmt, nouns=(), sid="s1"):
+    """Stage-2 through the substrate: assert the statement's field facts into D, run
+    the recognizer RULES (run_rules — the parser is the file, the classifier is the
+    rule runner), and read the Statement's classifications back."""
+    from .reduce import apply as _apply
+    from .lam import to_lam
+    from . import system as _sys
+    changed = set()
+    for (ftb, row) in tokenize_statement(D, stmt, nouns, sid):
+        D = _apply(_A2(), ast.run(to_lam(row), D, cell_name=ftb))
+        changed.add(ftb)
+    if not changed:
+        return set()
+    D = _sys.run_rules(D, changed=changed)
+    return {r[1] for r in _sys._pop_rows(D, "Statement_has_Classification")
+            if len(r) >= 2 and r[0] == sid}
+
+
+def _A2():
+    from .lam import atom as _A
+    return _A(2)
+
+
 def _h_neg_pair(g, k, m):
     """NORMA's unary negation pattern (UnaryValuePattern.Negation, FactType.cs): 'X is
     not R.' / 'X does not R.' creates the PAIRED positive-shaped negation fact type,
@@ -624,7 +723,7 @@ _PLAN = {
     "set_comparison": _h_set_comparison, "disjunctive_mandatory": _h_disjunctive,
     "subset": _h_subset, "equality": _h_equality, "derivation_rule": _h_derivation_rule,
     "rule_if": _h_rule_if,
-    "negation": _h_negation, "neg_pair": _h_neg_pair,
+    "negation": _h_negation, "neg_pair": _h_neg_pair, "class_rule": _h_class_rule,
     "finality": lambda g, k, m: ([("finality", (g[0], int(g[1])))], []),
     "possibility": _h_possibility, "inverse_uc": _h_inverse_uc,
     "sm_def": _h_sm_def, "sm_initial": _h_sm_initial, "sm_from": _h_sm_from,
@@ -764,6 +863,7 @@ _RENDER = {
     "neg_pair": lambda g: f"{g[0]} {g[1]} {g[2]}",
     "finality": lambda g: f"{g[0]} becomes final at depth {g[1]}",
     "brace_subtypes": lambda g: "{%s} are %ssubtypes of %s" % (g[0], g[1] or "", g[2]),
+    "class_rule": lambda g: f"{g[0]} has {g[1]} '{g[2]}' iff {g[3]}",
     "uniqueness": lambda g: f"Each {g[0]} {g[1]} {g[2]}",
     "mandatory": lambda g: f"Each {g[0]} some {g[1]}",
     "neg_uniqueness": lambda g: ("any {0} more than one {1}".format(*g) if len(g) == 2 else

@@ -227,6 +227,28 @@ def compile_rule_delta(atom_fts, head_positions, delta_at):
     return _S(_COMP, T.Project(head_positions), expr)
 
 
+def class_rule(clauses, head_const):
+    """A grammar recognizer as one FFP object over D (the parser is the file): each
+    clause ⟨field_ft, literal-or-None⟩ selects the Statements whose field cell holds
+    the literal (or holds anything, when literal-less — the existence test); clauses
+    intersect; the head pairs each surviving Statement with the constant
+    classification."""
+    from . import ast
+
+    def subj(ftb, lit):
+        pop = ast.FetchPop(ftb)
+        if lit is not None:
+            pop = _S(_COMP, T.Filter(_S(_COMP, _EQ, _S(_CONS, A(2), _S(_CONST, A(lit))))), pop)
+        return _S(_COMP, _S(_ALPHA, A(1)), pop)
+
+    s = subj(*clauses[0])
+    for (ftb, lit) in clauses[1:]:
+        keep = _S(_COMP, T.member, _S(_CONS, _1, _2))
+        s = _S(_COMP, _S(_ALPHA, _1), T.Filter(keep), _DISTR, _S(_CONS, s, subj(ftb, lit)))
+    row = _S(_CONS, _ID, _S(_CONST, A(head_const)))
+    return _S(_COMP, _S(_ALPHA, row), T.dedup, s)
+
+
 def run_rules(D, changed=None, stats=None):
     """Cross-cell derivation to the least fixed point, semi-naive (Bancilhon–
     Ramakrishnan 1986): round one evaluates full bodies, BOUNDED by the frontier

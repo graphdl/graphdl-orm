@@ -13,7 +13,7 @@ stages, derive = lfp F_S, HATEOAS links, state machines read off M; `ast` — ce
 the AST transition, eq. sys routing, DefineIn (DEFS into D); `machine` — the one fold
 runner; `meta` — the metamodel M (vignette; the full self-capturing M is Phase 3);
 `forml` — the FORML 2 seed compiler (Stage 1; superseded by grammar-as-readings in
-Stage 2/3, per `arest/readings/forml2-grammar.md`).
+Stage 2/3, per `pyarest/readings/forml2-grammar.md`, vendored).
 """
 from . import lam, defs, reduce, prims                       # the lambda kernel + Backus base
 from .lam import ATOM, SEQ, BOT, PHI, to_lam, from_lam, atom
