@@ -100,8 +100,17 @@ def mandatory():
 
 
 def subset():
-    """Subset constraint A ⊆ B. Input ⟨A, B⟩; V = A ∖ B — the A-facts not present in B."""
+    """Subset constraint A ⊆ B (NORMA 'if A then B' — implication by modus ponens). Input ⟨A, B⟩;
+    V = A ∖ B — the antecedent facts whose consequent does not hold."""
     return T.setminus
+
+
+def equality():
+    """Equality constraint A = B (NORMA 'A if and only if B'). Input ⟨A, B⟩; V = (A ∖ B) ∪ (B ∖ A),
+    the symmetric difference — facts on one side without their counterpart on the other."""
+    ab = _S(_COMP, T.setminus, _S(_CONS, _1, _2))
+    ba = _S(_COMP, T.setminus, _S(_CONS, _2, _1))
+    return _S(_COMP, _CAT, _S(_CONS, ab, ba))
 
 
 # --- set-comparison over a participation population ⟨⟨entity, clause⟩ …⟩ (one fact per clause the

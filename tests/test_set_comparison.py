@@ -7,6 +7,22 @@ import pyarest.prims  # noqa: F401
 from pyarest import constraints as C, forml
 
 
+def test_subset_is_modus_ponens():
+    # 'if A then B': antecedent facts whose consequent does not hold
+    a, b = (("x",), ("y",), ("z",)), (("x",), ("y",))
+    assert set(from_lam(apply(C.subset(), to_lam((a, b))))) == {("z",)}
+
+
+def test_equality_symmetric_difference():
+    a, b = (("x",), ("y",)), (("y",), ("z",))
+    assert set(from_lam(apply(C.equality(), to_lam((a, b))))) == {("x",), ("z",)}
+
+
+def test_if_then_classifies_as_subset_not_derivation():
+    assert forml.classify("If some Message matches some Rep then that Message is sent by that Rep.")[0] == "subset"
+    assert forml.classify("Message is with Phone if and only if Rep has Phone.")[0] == "equality"
+
+
 def ev(obj, data):
     return from_lam(apply(obj, to_lam(data)))
 

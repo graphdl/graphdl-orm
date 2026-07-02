@@ -67,7 +67,8 @@ _CLASSIFY = [
     ("neg_mandatory", re.compile(r"^[Ff]or each (.+?), it is impossible that that .+? (.+) no (.+)\.$")),
     ("disjunctive_mandatory", re.compile(r"^[Ff]or each (.+?), (.+ or .+)\.$")),
     ("inverse_uc", re.compile(r"^[Ff]or each (.+?), at most one (.+) (?:that|those) .+\.$")),
-    ("derivation", re.compile(r"^[Ii]f (.+) then (.+)\.$")),
+    ("subset", re.compile(r"^[Ii]f (.+) then (.+)\.$")),                      # 'if A then B' = subset (modus ponens)
+    ("equality", re.compile(r"^(.+) if and only if (.+)\.$")),                # 'A iff B' = equality
     ("neg_uniqueness", re.compile(r"^any (.+?) more than one (.+)\.$")),      # neg of 'each A .. at most one B'
     ("neg_mandatory", re.compile(r"^any (.+?) no (.+)\.$")),                   # neg of 'each A .. some B'
     ("disjunctive_mandatory", re.compile(r"^[Ee]ach (.+ or .+)\.$")),         # inclusive-or / disjunctive mandatory
@@ -258,8 +259,15 @@ def _h_disjunctive(g, k, m):
     cid = "ior_" + _slug(g[0] if len(g) > 1 else body)[:40]
     return [("constraint", (cid, "disjunctive_mandatory", n, m))], [(cid, C.inclusive_or())]
 
-def _h_derivation(g, k, m):
-    return [("derivation", (g[0][:60], g[1][:60]))], []
+def _h_subset(g, k, m):
+    ante, cons_txt = g
+    conseq, _, _where = cons_txt.partition(" where ")         # a 'where' join condition, if present
+    cid = "subset_" + _slug(ante)[:40]
+    return [("constraint", (cid, "subset", ante[:60], conseq[:60], m))], [(cid, C.subset())]
+
+def _h_equality(g, k, m):
+    cid = "eq_" + _slug(g[0])[:40]
+    return [("constraint", (cid, "equality", g[0][:60], g[1][:60], m))], [(cid, C.equality())]
 
 def _h_negation(g, k, m):
     a, pred = _subject(g[0], k)
@@ -282,7 +290,8 @@ _PLAN = {
     "objectification": _h_objectification, "data_type": _h_meta("data_type"), "ref_mode": _h_meta("ref_mode"),
     "value_constraint": _h_value_constraint, "uniqueness": _h_uniqueness, "mandatory": _h_mandatory,
     "neg_uniqueness": _h_neg_uniqueness, "neg_mandatory": _h_neg_mandatory, "spanning_uc": _h_spanning,
-    "set_comparison": _h_set_comparison, "disjunctive_mandatory": _h_disjunctive, "derivation": _h_derivation,
+    "set_comparison": _h_set_comparison, "disjunctive_mandatory": _h_disjunctive,
+    "subset": _h_subset, "equality": _h_equality,
     "negation": _h_negation, "possibility": _h_possibility, "inverse_uc": _h_inverse_uc,
     "fact_type_reading": _h_fact,
 }

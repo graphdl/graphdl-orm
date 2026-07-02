@@ -2,7 +2,7 @@
 types, value types, objectified associations, fact types, constraints) and the compiled
 constraints enforce (rho c):P = V_c. The fixture is a synthetic university model exercising
 every grammar family (declarations, ref schemes, fact types, uniqueness/mandatory, the
-possibility twin, spanning UC, objectification, set-comparison, derivation, negation)."""
+possibility twin, spanning UC, objectification, set-comparison, subset (if..then), negation)."""
 import os
 from pyarest import forml
 from pyarest.lam import from_lam, to_lam, atom

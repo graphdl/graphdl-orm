@@ -29,7 +29,7 @@ def test_classify_norma_families():
     assert k("In each population of Student enrolls in Course, each Student, Course combination occurs at most once.") == "spanning_uc"
     assert k("This association with Student, Course provides the preferred identification scheme for Enrollment.") == "objectification"
     assert k("For each Enrollment, at most one of the following holds: that Enrollment is by online; that Enrollment is by in-person.") == "set_comparison"
-    assert k("If some Student enrolls in some Course then that Student is advised by some Instructor.") == "derivation"
+    assert k("If some Student enrolls in some Course then that Student is advised by some Instructor.") == "subset"
     assert k("Instructor ~is retired.") == "negation"
     assert k("Student has Name.") == "fact_type_reading"
 
