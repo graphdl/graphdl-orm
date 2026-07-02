@@ -623,6 +623,60 @@ def create(D, fact_type, fact, fuel=None):
     return ast.run(fact, D, cell_name=fact_type, machine=machine, mealy_obj=mealy, fuel=fuel)
 
 
+def finiteness_check(D):
+    """The static condition discharging Lemma finiteness' hypothesis: recursion through
+    the rule dependency graph is admitted — heads are range-restricted by construction,
+    so the fixpoint runs over a finite atom domain and terminates — but no dependency
+    CYCLE may pass through value invention, a rule whose definition applies a registered
+    (boundary, Cor. boundary) function and so can introduce individuals drawn from no
+    stored population, unboundedly. Value invention is (a) anything registered beyond
+    the formal base (bridges, cellkey, FFI — the boundary proper) and (b) the base's own
+    value-constructing ops (arithmetic, length, dynamic apply), which mint new atoms just
+    as surely. Acyclic invention stays admissible (a finite composition introduces
+    finitely many individuals). Returns the offending rule names. Definitions are cells,
+    so rule bodies are read from D like everything else."""
+    from . import defs, prims
+    from .lam import from_lam
+    reads, derives = {}, {}
+    for (r, ft) in _pop_rows(D, "ruleReads"):
+        reads.setdefault(r, set()).add(ft)
+    for (r, ft) in _pop_rows(D, "ruleDerives"):
+        derives.setdefault(r, set()).add(ft)
+    boundary = (set(defs._registered) - set(prims.BASE)) | {"+", "-", "*", "div", "length", "apply"}
+
+    def _atoms(v):
+        if isinstance(v, tuple):
+            for x in v:
+                yield from _atoms(x)
+        elif isinstance(v, str):
+            yield v
+
+    cells = defs._cells_of(D)
+    inventive = set()
+    for r in set(reads) | set(derives):
+        body = cells.get(r)
+        if body is not None and any(a in boundary for a in _atoms(from_lam(body))):
+            inventive.add(r)
+    succ = {}
+    for r in reads:                                          # ft-level dependency edges
+        for src in reads[r]:
+            succ.setdefault(src, set()).update(derives.get(r, ()))
+
+    def _reaches(a, b):
+        seen, stack = set(), [a]
+        while stack:
+            n = stack.pop()
+            if n == b:
+                return True
+            if n not in seen:
+                seen.add(n)
+                stack.extend(succ.get(n, ()))
+        return False
+
+    return sorted(r for r in inventive
+                  if any(_reaches(d, s) for d in derives.get(r, ()) for s in reads.get(r, ())))
+
+
 def governance_rules(D):
     """Install the governedBy closure with the engine's own rule machinery: a noun is
     governed by the machine it is bound to, and by any machine governing a supertype.

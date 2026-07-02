@@ -97,9 +97,11 @@ def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_o
     With `mealy_obj` (same input shape as sm_obj) the fired transitions' Mealy emissions are
     appended to the representation o as its last part. Commits iff the alethic flag is false."""
     validate_obj = validate_obj if validate_obj is not None else _STUB_VALIDATE
-    resolve_stage = resolve_obj if resolve_obj is not None else _APNDL
+    from .theta import Filter, member
+    # fact-as-function: a population is a set, so the default resolve is append-if-absent
+    # and re-assertion is the identity (at-least-once delivery is free for asserts)
+    resolve_stage = resolve_obj if resolve_obj is not None else _S(_COND, member, _2, _APNDL)
     derive_stage = derive_obj if derive_obj is not None else A("id")
-    from .theta import Filter
     P = _S(_COMP, FetchPop(cell_name), _2)                   # ⟨I,D⟩ → the cell's population
     resolved = _S(_COMP, resolve_stage, _S(_CONS, _1, P))    # resolve:⟨I, P⟩ = P'
     derived = _S(_COMP, derive_stage, resolved)              # derive:P' = P''

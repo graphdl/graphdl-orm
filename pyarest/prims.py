@@ -169,3 +169,8 @@ def register_base():
 
 
 register_base()
+
+# the formal base, snapshotted: everything registered AFTER this line (bridges, cellkey,
+# FFI) is beyond the paper's base language — the boundary of Cor. boundary
+from . import defs as _defs
+BASE = tuple(_defs._registered)

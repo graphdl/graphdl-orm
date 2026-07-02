@@ -70,3 +70,24 @@ def test_mealy_emission_lands_in_the_representation():
 def test_the_host_wired_path_is_gone():
     assert not hasattr(system, "sm_step")
     assert not hasattr(system, "machine_wiring")
+
+
+def _rows(Dpy, name):
+    for c in Dpy:
+        if isinstance(c, tuple) and len(c) == 3 and c[:2] == ("CELL", name):
+            return c[2]                                       # raw rows, duplicates visible
+    return ()
+
+
+def test_reasserting_a_fact_is_the_identity_on_D():
+    # fact-as-function: a population is a set, so re-assertion is the identity. This is
+    # the ground case of the schema-derived failure model: at-least-once delivery is
+    # free for asserts, and machine double-fire is structurally safe because firing
+    # consumes the FROM status (a re-delivered trigger finds no transition to take).
+    D, _ = forml.compile_model(MODEL)
+    D = _with_pop(D, "Order_status", (("o1", "In Cart"),))
+    D1 = apply(A(2), system.create(D, "Customer_places_Order", to_lam(("c1", "o1"))))
+    D2 = apply(A(2), system.create(D1, "Customer_places_Order", to_lam(("c1", "o1"))))
+    D2py = from_lam(D2)
+    assert _rows(D2py, "Customer_places_Order") == (("c1", "o1"),)   # once, not twice
+    assert _cell(D2py, "Order_status") == {("o1", "Placed")}         # no double-fire
