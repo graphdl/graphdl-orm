@@ -1,31 +1,52 @@
-"""DEFS — the state D (Backus §14): a sequence of cells, here a Church list.
-A cell is the pair ⟨name, contents⟩. `fetch` is Backus's naming function
-(§13.3.4): a fold whose branch is chosen by a Church boolean (numeral
-equality). Pure λ — no host comparison, no `if`.
+"""DEFS — the definition store (Backus §13.3.5), a lambda Scott list of cells.
+
+A cell is ⟨key, tag, impl⟩ (a Scott list): tag TRUE = a *registered* host lambda of
+the form impl(mu)(operand) — the enumerable boundary (Cor. boundary); tag FALSE = a
+*compiled* FFP object o, whose meaning is mu(o : x). fetch ↑ is a lambda over the list.
+register/define build the list host-side (the store is mutable state, the paper's D);
+everything the reducer touches — FETCH, the cells, the keys — is lambda.
 """
 from . import lam as L
-from .objects import numeral_of, DEFAULT
 
-_D = [L.NIL]                          # current state D (a Church list of cells)
-
-cell = lambda name: lambda contents: L.PAIR(name)(contents)
+_store = L.NIL            # the current Scott list of cells (newest first)
+_registered = []          # names of registered (boundary) defs — host-side mirror for boundary()
 
 
-def define(name_atom, contents):      # install a cell (reader boundary)
-    _D[0] = L.CONS(cell(name_atom)(contents))(_D[0])
+def _cell(name, tag, impl):
+    return L.CONS(name)(L.CONS(tag)(L.CONS(impl)(L.NIL)))     # key is the raw name value (ORM-typed)
 
 
-def defs():
-    return _D[0]
+def register(name, fn):
+    """Register a host lambda fn = impl(mu)(operand). The boundary (Cor. boundary)."""
+    global _store
+    _store = L.CONS(_cell(name, L.TRUE, fn))(_store)
+    if name not in _registered:
+        _registered.append(name)
 
 
-# fetch n D : contents of the first cell named n, else DEFAULT.  Z + EQ + Church bool.
-fetch = lambda n: L.Z(lambda rec: lambda d:
-    L.ISNIL(d)
-        (lambda _u: DEFAULT)
-        (lambda _u: (lambda c:
-            L.EQ(numeral_of(L.FST(c)))(n)
-                (lambda _v: L.SND(c))
-                (lambda _v: rec(L.TAIL(d)))
-                (L.I))(L.HEAD(d)))
-        (L.I))
+def define(name, obj):
+    """Compile: bind `name` to an FFP object o; its meaning is mu(o : x)  (Def. reg)."""
+    global _store
+    _store = L.CONS(_cell(name, L.FALSE, obj))(_store)
+
+
+def current():
+    return _store
+
+
+def reset():
+    global _store, _registered
+    _store, _registered = L.NIL, []
+
+
+# ↑key : store → ⟨found?, ⟨tag, impl⟩⟩   (first match wins, else ⟨F, _⟩); keys compared by NATEQ
+FETCH = L.Y(lambda rec: lambda key: lambda d:
+    d(L.PAIR(L.FALSE)(L.NIL))(lambda h: lambda t:
+      L.IF(L.NATEQ(L.HEAD(h))(key))
+        (lambda: L.PAIR(L.TRUE)(L.TAIL(h)))
+        (lambda: rec(key)(t))))
+
+
+def boundary():
+    """Cor. boundary: the registered definitions — the informal surface of the system."""
+    return list(_registered)

@@ -1,58 +1,69 @@
-"""Objects as self-dispatching lambdas (Scott encoding); atom identity is a
-Church numeral. Branching is application — an object takes one handler per case
-and applies its own. No `if`, no `isinstance`.
-
-    object = λ on_atom. λ on_seq. λ on_app. λ on_bottom. λ on_prim. <selects>
-
-  atom : carries a Church numeral (its identity — the characteristica
-         universalis, the I Ching's binary: an atom *is* a number)
-  seq  : carries a Church list of objects (walking it is a fold)
-  app  : carries operator and operand — an application (o:x), reduced by μ
-  ⊥    : selects on_bottom
-  prim : wraps a host primitive λ, so primitives live in DEFS like everything else
+"""Objects (Backus §11.2.1) and expressions (§13.2) — the substrate the paper
+takes as given. An object is an atom, a sequence ⟨x1..xn⟩, or ⊥; an expression
+adds an application (f:x). Atoms are strings or numbers, exactly as Backus.
 """
-from functools import reduce as _fold
-from . import lam as L
-
-atom = lambda a: lambda oa: lambda os: lambda op: lambda ob: lambda opr: oa(a)
-sq = lambda s: lambda oa: lambda os: lambda op: lambda ob: lambda opr: os(s)
-app = lambda o: lambda x: lambda oa: lambda os: lambda op: lambda ob: lambda opr: op(o)(x)
-bot = lambda oa: lambda os: lambda op: lambda ob: lambda opr: ob
-prim = lambda g: lambda oa: lambda os: lambda op: lambda ob: lambda opr: opr(g)
-
-NIL = L.NIL
-
-# --- the reader: intern surface names to numeral-tagged atoms (host boundary) ---
-_id = {}
-_nm = {}
-_nat = lambda i: _fold(lambda n, _k: L.SUCC(n), range(i), L.ZERO)
 
 
-def sym(name):
-    """Intern a surface name to a numeral-identified atom (reader boundary)."""
-    i = _id.setdefault(name, len(_id))
-    _nm[i] = name
-    return atom(_nat(i))
+class Atom:
+    """An atom (§11.2.1). Optionally carries its raw data type `t` for storage —
+    a portable data-type name like 'Unsigned Integer' or 'String', not the ORM
+    value type (which is schema-level; a value type *has* a data type). A value
+    may serve as an id, but what it stores is the data type. Substrate atoms
+    (function symbols, T/F/φ/#) leave it None. Equality is by value and data type."""
+    __slots__ = ("v", "t")
+
+    def __init__(self, v, t=None):
+        self.v = v
+        self.t = t
+
+    def __eq__(self, o):
+        return (isinstance(o, Atom) and o.t == self.t
+                and type(o.v) is type(self.v) and o.v == self.v)
+
+    def __hash__(self):
+        return hash(("A", type(self.v).__name__, self.v, self.t))
+
+    def __repr__(self):
+        return str(self.v) if self.t is None else f"{self.v}·{self.t}"
 
 
-# sequence objects — folds, not loops
-seq = lambda *xs: sq(_fold(lambda t, h: L.CONS(h)(t), reversed(xs), L.NIL))
-seq2 = lambda a: lambda b: sq(L.CONS(a)(L.CONS(b)(L.NIL)))
-PHI = sq(L.NIL)
+class Seq:
+    __slots__ = ("xs",)
 
-# extract an atom's numeral identity by dispatch (non-atoms → 0)
-numeral_of = lambda o: o(lambda p: p)(lambda s: L.ZERO)(lambda f: lambda x: L.ZERO)(L.ZERO)(lambda g: L.ZERO)
+    def __init__(self, xs):
+        self.xs = tuple(xs)
 
-DEFAULT = sym("#")                       # fetch's "not found" (Backus §13.3.4)
-_HASH = numeral_of(DEFAULT)
-# is this object the atom # ?  (Church boolean, by dispatch — only atoms can be)
-is_default = lambda o: o(lambda p: L.EQ(p)(_HASH))(lambda s: L.FALSE)(lambda f: lambda x: L.FALSE)(L.FALSE)(lambda g: L.FALSE)
+    def __eq__(self, o):
+        return isinstance(o, Seq) and o.xs == self.xs
 
-# --- reify: object → host data for tests (recursion by Z, branch by dispatch) ---
-_toi = lambda n: n(lambda k: k + 1)(0)
-reify = L.Z(lambda self: lambda o: o
-            (lambda a: _nm[_toi(a)])                                   # atom → name
-            (lambda s: s(lambda h: lambda acc: (self(h),) + acc)(()))  # seq  → tuple
-            (lambda f: lambda x: ("app", self(f), self(x)))            # app
-            ("⊥")                                                      # ⊥
-            (lambda g: "prim"))                                        # prim
+    def __hash__(self):
+        return hash(("S", self.xs))
+
+    def __repr__(self):
+        return "⟨" + ",".join(map(repr, self.xs)) + "⟩"
+
+
+class App:
+    """An application expression (f:x), Backus §13.2 — reduced away by μ."""
+    __slots__ = ("f", "x")
+
+    def __init__(self, f, x):
+        self.f = f
+        self.x = x
+
+    def __repr__(self):
+        return f"({self.f!r}:{self.x!r})"
+
+
+class _Bottom:
+    def __repr__(self):
+        return "⊥"
+
+
+BOT = _Bottom()
+PHI = Seq(())                    # the empty sequence φ
+
+
+def sq(*xs):
+    """⊥-preserving sequence constructor (§11.2.1)."""
+    return BOT if any(map(lambda x: x is BOT, xs)) else Seq(xs)
