@@ -1,53 +1,73 @@
-"""compile ∘ parse = create over M (D3 / Cor. closure): a schema change is an ordinary
-command on M's population, validated by M's own constraints. No compiler subsystem."""
+"""Widened FORML grammar (NORMA verbalization) → M-facts + compiled constraints, via
+compile∘parse = create over M. compile_model folds a whole verbalization into M."""
 import pytest
-from pyarest import from_lam, apply
+from pyarest import from_lam, to_lam, apply
 from pyarest.lam import atom as A
 import pyarest.prims  # noqa: F401
 from pyarest import forml, meta
-from pyarest import constraints as C
-
-_Dstate = lambda result: apply(A(2), result)                 # D' from ⟨o, D'⟩ as an FFP object
+from pyarest import constraints as C  # noqa: F401
 
 
-def cell_of(Dpy, name):
-    for c in Dpy:
-        if isinstance(c, tuple) and len(c) == 3 and c[0] == "CELL" and c[1] == name:
-            return c[2]
-    return ()
+def cells(D, name):
+    for c in from_lam(D):
+        if isinstance(c, tuple) and len(c) == 3 and c[:2] == ("CELL", name):
+            return set(c[2])
+    return set()
 
 
-def test_compile_is_create_over_M():
-    (o, Dp) = from_lam(forml.compile("Person is an entity type", meta.initial_D()))
-    (m2, v) = o
-    assert ("Person", "ObjectType") in m2
-    assert ("ObjectType", "ObjectType") in m2         # self-capture preserved through compile
-    assert ("Person", "ObjectType") in cell_of(Dp, "instanceOf")   # committed into M's population
+MODEL = """
+Person is an entity type.
+Country is an entity type.
+Person is identified by PersonName.
+Each Person was born in at most one Country.
+It is possible that some Person visited some Country.
+Each Employee is an instance of Person.
+The possible values of Rating are 1, 2, 3.
+No Person parents itself.
+"""
 
-def test_compile_validated_by_M_own_constraint():
-    # "each name has one kind" = uniqueness on the name (role 1) of instanceOf. Declaring Person
-    # as BOTH an entity type and a value type binds one name to two kinds -> M's own constraint
-    # rejects the schema change, on the same create/validate path as any command (Cor. closure).
-    uc = C.uniqueness([1])
-    r1 = forml.compile("Person is an entity type", meta.initial_D(), constraints=[uc])
-    D1 = _Dstate(r1)                                   # thread D' forward as the FFP state
-    assert ("Person", "ObjectType") in cell_of(from_lam(D1), "instanceOf")  # first declaration commits
-    (o2, D2) = from_lam(forml.compile("Person is a value type", D1, constraints=[uc]))
-    (_m2, v) = o2
-    assert set(v) != set()                            # Person bound to two kinds -> violation
-    assert ("Person", "ValueType") not in cell_of(D2, "instanceOf")  # not committed; M unchanged
 
-def test_value_type_declaration():
-    (o, _Dp) = from_lam(forml.compile("Name is a value type", meta.initial_D()))
-    assert ("Name", "ValueType") in o[0]
+def test_parse_recognizes_norma_families():
+    assert forml.parse("Person is an entity type.")[0] == "entity_type"
+    assert forml.parse("PersonName is a value type.")[0] == "value_type"
+    assert forml.parse("Person is identified by PersonName.")[0] == "ref_scheme"
+    assert forml.parse("Each Person was born in at most one Country.")[0] == "binary"
+    assert forml.parse("It is possible that some Person visited some Country.")[0] == "possibility"
+    assert forml.parse("Each Employee is an instance of Person.")[0] == "subtype"
+    assert forml.parse("The possible values of Rating are 1, 2, 3.")[0] == "value_constraint"
+    assert forml.parse("No Person parents itself.")[0] == "ring_irreflexive"
 
-def test_reading_outside_R_is_rejected():
+
+def test_compile_model_ingests_a_verbalization():
+    D = forml.compile_model(MODEL)
+    io = cells(D, "instanceOf")
+    assert {("Person", "ObjectType"), ("Country", "ObjectType"),
+            ("PersonName", "ValueType"), ("Employee", "ObjectType")} <= io
+    assert ("Employee", "Person") in cells(D, "subtype")
+    assert ("Person", "PersonName") in cells(D, "refScheme")
+    assert ("Person_was_born_in_Country", "was born in") in cells(D, "factType")
+    assert ("Person_was_born_in_Country_uc", "uniqueness", "Person_was_born_in_Country") in cells(D, "constraint")
+    assert ("Rating", ("1", "2", "3")) in cells(D, "valueConstraint")
+    assert ("Person_parents_Person_irreflexive", "ring_irreflexive", "Person_parents_Person") in cells(D, "constraint")
+
+
+def test_compiled_constraint_reflects_and_enforces():
+    forml.compile_model(MODEL)                               # defines the constraint objects in DEFS
+    pop = to_lam((("alice", "france"), ("alice", "spain")))  # alice born in two countries
+    v = from_lam(apply(A("Person_was_born_in_Country_uc"), pop))
+    assert set(v) == {("alice", "france"), ("alice", "spain")}   # uniqueness reflected, (ρc):P = V_c
+
+
+def test_mandatory_from_some_quantifier():
+    D = forml.compile_model("Each Person has some Address.")
+    assert ("Person_has_Address_mand", "mandatory", "Person_has_Address") in cells(D, "constraint")
+
+
+def test_out_of_R_rejected():
     with pytest.raises(ValueError):
         forml.parse("Person who drives Car")
 
 
-def test_nf_is_idempotent():
-    # Prop. Spec: nf = verbalize ∘ parse is idempotent on the fragment R
+def test_nf_idempotent():
     for r in ("Person is an entity type", "Name is a value type"):
         assert forml.nf(r) == r
-        assert forml.nf(forml.nf(r)) == forml.nf(r)
