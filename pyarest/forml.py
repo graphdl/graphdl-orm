@@ -94,7 +94,7 @@ _CLASSIFY = [
     ("neg_uniqueness", re.compile(r"^[Ff]or each (.+?), it is impossible that that .+? (.+) more than one (.+)\.$")),
     ("neg_mandatory", re.compile(r"^[Ff]or each (.+?), it is impossible that that .+? (.+) no (.+)\.$")),
     ("disjunctive_mandatory", re.compile(r"^[Ff]or each (.+?), (.+ or .+)\.$")),
-    ("inverse_uc", re.compile(r"^[Ff]or each (.+?), at most one (.+) (?:that|those) .+\.$")),
+    ("inverse_uc", re.compile(r"^[Ff]or each (.+?), (at most one|exactly one) (.+) (?:that|those) .+\.$")),
     ("subset", re.compile(r"^[Ii]f (.+) then (.+)\.$")),                      # 'if A then B' = subset (modus ponens)
     ("equality", re.compile(r"^(.+) if and only if (.+)\.$")),                # 'A iff B' = equality
     # the book's rule surface (Halpin ch.2 ex.4 D1): numbered variables, ' if ' head-body,
@@ -475,8 +475,17 @@ def _h_possibility(g, k, m):
     return [("possibility", (g[0][:80], m))], []
 
 def _h_inverse_uc(g, k, m):
+    """The inverse-role UC anchors to the FACT TYPE at the subject's computed position
+    (a real role-2 uniqueness, so doubly-functional 1:1 fact types are detectable);
+    'exactly one' adds the mandatory at the same position, Halpin's fewer-nulls signal."""
     a, _r = _subject(g[0], k)
-    return [("constraint", (_slug(a) + "_inv_uc", "uniqueness", a, m))], []
+    reading = f"{g[2]} {g[0]}"
+    ft, facts = _fact_type(reading, k)
+    _t, rtypes = _reading(reading, k)
+    pos = rtypes.index(a) + 1 if a in rtypes else 2
+    cid = _slug(a) + "_inv_uc"
+    also, aobjs = _mandatory_parts(ft, a, m, pos) if g[1] == "exactly one" else ([], [])
+    return facts + [("constraint", (cid, "uniqueness", ft, m)), ("spans", (cid, pos))] + also, aobjs
 
 _QUOTED = re.compile(r"'([^']*)'")
 
@@ -761,7 +770,7 @@ _RENDER = {
                                  "For each {0}, it is impossible that that {0} {1} more than one {2}".format(*g)),
     "neg_mandatory": lambda g: ("any {0} no {1}".format(*g) if len(g) == 2 else
                                 "For each {0}, it is impossible that that {0} {1} no {2}".format(*g)),
-    "inverse_uc": lambda g: f"For each {g[0]}, at most one {g[1]} that applies",
+    "inverse_uc": lambda g: f"For each {g[0]}, {g[1]} {g[2]} that applies",
     "fact_type_reading": lambda g: g[0],
     "sm_def": lambda g: f"State Machine Definition '{g[0]}' is for Noun '{g[1]}'",
     "sm_initial": lambda g: f"Status '{g[0]}' is initial in State Machine Definition '{g[1]}'",

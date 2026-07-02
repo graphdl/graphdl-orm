@@ -377,7 +377,29 @@ def rmap_partition(D):
         return o
 
     subject = {r[1]: _top(r[3]) for r in reversed(_pop_rows(D, "role")) if r[2] == 1}
-    triples = tuple((ft, subject.get(ft, ft),
+    role2 = {r[1]: _top(r[3]) for r in reversed(_pop_rows(D, "role")) if r[2] == 2}
+    spans = {}
+    for r in _pop_rows(D, "spans"):
+        if len(r) == 2:
+            spans.setdefault(r[0], set()).add(r[1])
+    ucpos, mand = {}, {}
+    for c in cons:
+        if len(c) >= 3 and c[1] == "uniqueness":
+            ucpos.setdefault(c[2], set()).update(spans.get(c[0], {1}))
+        if len(c) >= 4 and c[1] == "mandatory":
+            mand.setdefault(c[2], set()).add(_top(c[3]))
+
+    def _side(ft):
+        # 1:1 grouping favors fewer nulls (Halpin §10.3): a doubly-functional fact type
+        # absorbs into the MANDATORY side — every instance there plays, so no # holes
+        s1 = subject.get(ft, ft)
+        if {1, 2} <= ucpos.get(ft, set()):
+            s2 = role2.get(ft)
+            if s2 and s2 in mand.get(ft, set()) and s1 not in mand.get(ft, set()):
+                return s2
+        return s1
+
+    triples = tuple((ft, _side(ft),
                      "functional" if (ft in functional and ft not in spanning) else "spanning")
                     for ft in fts)
     pairs = from_lam(run_machine(rmap_value, to_lam(()), to_lam(triples)))
@@ -454,34 +476,27 @@ def row_resolve(col, width):
     return _S(_COND, _S(_COMP, A("null"), _2), fresh, upd)
 
 
-def create_routed(D, ft, fact, partition, machine=None, mealy_obj=None):
+def create_routed(D, ft, fact, partition, machine=None, mealy_obj=None, validate_obj=None):
     """Route a create through the RMAP partition (spec §4.4: the partition IS the layout).
     An absorbed fact type writes the entity's own cell `table:key`, the write unit of
     Def. iso, updating its column of the row; an own-table fact type creates into its
-    per-fact-type cell unchanged. After a commit the table's index cell (named by the
-    noun, the RegistryDB analog of the TS engine) records the key. A machine (the row
-    form: machine_step(ft, row_col=...)) advances within the routed step."""
+    per-fact-type cell unchanged. The table's index cell records the key IN THE SAME
+    STEP (index_cell rides the commit chain like the machine slot), so a refused write
+    leaves the index untouched. A machine (the row form) advances within the routed
+    step; a validate (row_validate: step 5's constraint mapping) refuses within it."""
     from . import ast
-    from .reduce import apply as _ap
-    from .lam import to_lam, from_lam
-    from . import defs as _d
-    import pyarest.lam as L
+    from .lam import from_lam
     table = partition.get(ft, ft)
     if table == ft:
-        return ast.run(fact, D, cell_name=ft, machine=machine, mealy_obj=mealy_obj)
+        return ast.run(fact, D, cell_name=ft, machine=machine, mealy_obj=mealy_obj,
+                       validate_obj=validate_obj)
     cols = table_columns(partition, table)
     col = 2 + cols.index(ft)
     key = from_lam(fact)[0]
-    res = ast.run(fact, D, cell_name=f"{table}:{key}",
-                  resolve_obj=row_resolve(col, 1 + len(cols)),
-                  machine=machine, mealy_obj=mealy_obj)
-    o, D2 = _d._items(L._list(res))
-    if from_lam(o) != "ERROR":
-        idx = from_lam(_ap(ast.FetchPop(table), D2))
-        if (key,) not in idx:
-            newidx = _ap(A("apndl"), _S(to_lam((key,)), to_lam(tuple(idx))))
-            D2 = _ap(ast.Store(table), _S(newidx, D2))
-    return _S(o, D2)
+    return ast.run(fact, D, cell_name=f"{table}:{key}",
+                   resolve_obj=row_resolve(col, 1 + len(cols)),
+                   machine=machine, mealy_obj=mealy_obj, validate_obj=validate_obj,
+                   index_cell=table)
 
 
 def ft_view(D, ft, partition):
@@ -691,7 +706,8 @@ def create(D, fact_type, fact, fuel=None):
             machine = (noun + "_status", machine_step(fact_type, row_col))
             mealy = mealy_step(fact_type, row_col)
     if table != fact_type:
-        return create_routed(D, fact_type, fact, part, machine=machine, mealy_obj=mealy)
+        return create_routed(D, fact_type, fact, part, machine=machine, mealy_obj=mealy,
+                             validate_obj=row_validate(D, fact_type, part))
     return ast.run(fact, D, cell_name=fact_type, machine=machine, mealy_obj=mealy, fuel=fuel)
 
 
@@ -794,6 +810,32 @@ def step_and_wake(D, fact_type, fact):
             changed.add(noun + "_status")
     D2 = run_rules(D2, changed=changed)
     return _S(o, D2), wake(D2, changed)
+
+
+def row_validate(D, ft, partition):
+    """Step 5's constraint mapping (Halpin §10.3): schema constraints move with the
+    partitioned layout. A value constraint on an absorbed fact type's value player
+    checks the ROW's column on the routed write — the named vc object (already a
+    definition, resolved by ρ in-step) applied to the singleton ⟨row[col]⟩, skipped
+    while the column is a # hole (fresh rows), the flag alethic per the constraint's
+    modality. None when nothing maps."""
+    from .lam import PHI
+    table = partition.get(ft, ft)
+    if table == ft:
+        return None
+    col = 2 + table_columns(partition, table).index(ft)
+    players = [r[3] for r in _pop_rows(D, "role") if len(r) >= 4 and r[1] == ft]
+    vcs = {r[0]: r for r in _pop_rows(D, "valueConstraint") if len(r) >= 3}
+    hits = [vcs[p] for p in players if p in vcs]
+    if not hits:
+        return None
+    vt, _spec, modality = hits[0][0], hits[0][1], hits[0][2]
+    vcell = _S(_COMP, A(col), _1)
+    is_hole = _S(_COMP, _EQ, _S(_CONS, vcell, _S(_CONST, A("#"))))
+    V = _S(_COND, is_hole, _S(_CONST, PHI),
+           _S(_COMP, A(vt + "_vc"), _S(_CONS, _S(_CONS, vcell))))
+    flag = _S(_COMP, A("not"), A("null"), V) if modality == "alethic" else _S(_CONST, A("F"))
+    return _S(_CONS, _1, V, flag)
 
 
 def finality_modality(D, noun, depth):
