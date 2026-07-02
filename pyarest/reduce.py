@@ -18,7 +18,7 @@ from . import lam as L
 from . import defs
 
 # ---- the application node ⟨APP, f, x⟩ (APP = a reserved sentinel atom) ----
-_APP_TAG = ("#APP#",)                                        # a unique machinery sentinel, not an ORM value
+_APP_TAG = L.APPTAG                                          # a unique machinery sentinel, not an ORM value
 APP = L.ATOM(_APP_TAG)
 mkapp = lambda f: lambda x: L.SEQ(L.CONS(APP)(L.CONS(f)(L.CONS(x)(L.NIL))))
 # is o an application node: a sequence whose head is the APP sentinel atom (match the head's

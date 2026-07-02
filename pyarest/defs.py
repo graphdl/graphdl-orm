@@ -11,7 +11,9 @@ from . import lam as L
 _store = L.NIL            # the current Scott list of cells (newest first)
 _registered = []          # names of registered (boundary) defs — host-side mirror for boundary()
 compiled = {}             # name -> the Scott FFP object (host mirror; the delta fast-path converts these)
-version = 0               # bumped on every define, so the delta fast-path can invalidate its native store
+latest = {}               # name -> ("registered", fn) | ("compiled", obj) — recency ACROSS kinds,
+                          # so the delta store resolves a name exactly like the Scott first-match
+version = 0               # bumped on every register/define, so the delta store invalidates
 
 
 def _cell(name, tag, impl):
@@ -20,10 +22,12 @@ def _cell(name, tag, impl):
 
 def register(name, fn):
     """Register a host lambda fn = impl(mu)(operand). The boundary (Cor. boundary)."""
-    global _store
+    global _store, version
     _store = L.CONS(_cell(name, L.TRUE, fn))(_store)
     if name not in _registered:
         _registered.append(name)
+    latest[name] = ("registered", fn)
+    version += 1
 
 
 def define(name, obj):
@@ -31,6 +35,7 @@ def define(name, obj):
     global _store, version
     _store = L.CONS(_cell(name, L.FALSE, obj))(_store)
     compiled[name] = obj
+    latest[name] = ("compiled", obj)
     version += 1
 
 
@@ -39,8 +44,8 @@ def current():
 
 
 def reset():
-    global _store, _registered, compiled, version
-    _store, _registered, compiled, version = L.NIL, [], {}, version + 1
+    global _store, _registered, compiled, latest, version
+    _store, _registered, compiled, latest, version = L.NIL, [], {}, {}, version + 1
 
 
 # ↑key : store → ⟨found?, ⟨tag, impl⟩⟩   (first match wins, else ⟨F, _⟩); keys compared by NATEQ

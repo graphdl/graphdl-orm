@@ -29,6 +29,10 @@ PAIR = lambda a: lambda b: lambda s: s(a)(b)
 FST  = lambda p: p(TRUE)
 SND  = lambda p: p(FALSE)
 
+# the application-node head sentinel, shared by BOTH evaluators (reduce builds it as an
+# ATOM value, delta as a native tuple head) so App nodes survive Scott↔native conversion
+APPTAG = ("#APP#",)
+
 # ============================ objects, lambda-encoded =========================
 # object = ATOM v | SEQ l | BOT   (Scott 3-way union; v is a NATIVE ORM-typed value).
 # match: o(onAtom)(onSeq)(onBot).

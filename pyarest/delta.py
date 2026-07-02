@@ -20,7 +20,8 @@ class _Bot:
 
 
 BOT_D = _Bot()                                               # bottom sentinel (not a tuple!)
-APP_D = ("#app#",)                                           # application-node head sentinel
+APP_D = L.APPTAG                                             # application-node head — SHARED with
+                                                             # the λ kernel so App nodes cross paths
 _T, _F = "T", "F"
 _isseq = lambda o: type(o) is tuple
 
@@ -48,6 +49,8 @@ def scott_to_native(o):
 def native_to_scott(n):
     if n is BOT_D:
         return L.BOT
+    if n is L.APPTAG:                                        # the app sentinel is an ATOM value,
+        return L.ATOM(n)                                     # never a data sequence
     if _isseq(n):
         l = L.NIL
         for e in reversed(n):
@@ -152,11 +155,25 @@ for _i in range(1, 33):
 _cache = {"version": -1, "defs": {}}
 
 
+def _bridge(fn):
+    """Adapt a registered Scott-flavored impl(mu)(operand) — the enumerable boundary:
+    render/httpFetch/upsert and any late-registered host def — to the native path. Operand
+    and result cross by conversion; the mu handed to the impl speaks Scott. App nodes
+    survive both directions because the head sentinel is shared (L.APPTAG)."""
+    def native_impl(mu, x):
+        scott_mu = lambda e: native_to_scott(mu(scott_to_native(e)))
+        return scott_to_native(fn(scott_mu)(native_to_scott(x)))
+    return native_impl
+
+
 def _store():
     if _cache["version"] != _defs_mod.version:
         d = {name: (0, fn) for name, fn in _NATIVE.items()}          # 0 = native primitive
-        for name, obj in _defs_mod.compiled.items():
-            d[name] = (1, scott_to_native(obj))                      # 1 = compiled FFP object (native)
+        for name, (kind, impl) in _defs_mod.latest.items():          # recency across kinds, so the
+            if kind == "compiled":                                   # native store resolves a name
+                d[name] = (1, scott_to_native(impl))                 # exactly like the Scott ↑
+            elif name not in _NATIVE:                                # registered: native twin if we
+                d[name] = (0, _bridge(impl))                         # have one, else bridge the impl
         _cache["version"], _cache["defs"] = _defs_mod.version, d
     return _cache["defs"]
 
