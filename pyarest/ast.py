@@ -147,15 +147,98 @@ def step_input(x, D, fuel=None):
         return _transition(apply(A("SYSTEM"), x), D)
 
 
-def reset(x, D):
+def reset(x, D, fuel=None):
     """§14.3.2 verbatim: the system accepts ⟨RESET, x⟩ at any time. (a) If SYSTEM is
     defined in the current state D, it 'aborts its current computation without altering
     D' and treats x as a new normal input. (b) If SYSTEM is not defined, x is appended
     to D as its first element — the bootstrap of §14.4.3."""
     from . import defs
     if defs._cells_of(D).get("SYSTEM") is not None:
-        return step_input(x, D)
+        return step_input(x, D, fuel)
     return L.SEQ(L.CONS(x)(L._list(D)))
+
+
+def _cell_value(D, name):
+    from . import defs as _d
+    return _d._cells_of(D).get(name)
+
+
+def _component_step(x, Dc, fuel):
+    """One component transition for the framework forms: a store with no SYSTEM answers
+    ⟨ERROR, unchanged⟩ up front (the same check §14.3.2's RESET makes) — an unresolved
+    SYSTEM would otherwise be ⊥, which is divergence, and the framework layer is exactly
+    where Backus puts that answer (§14.3.1)."""
+    from . import defs as _d
+    if _d._cells_of(Dc).get("SYSTEM") is None:
+        from .lam import atom as _A
+        return _A("ERROR"), Dc
+    return _d._items(L._list(step_input(x, Dc, fuel)))
+
+
+def pipe(x, D, a="A", b="B", fuel=None):
+    """§14.5: a system form — the composite transition matches component A's output to
+    component B's input, the component stores riding as tenant cells of the composite
+    store (§14.7). Each component step is the ordinary μ(SYSTEM:x) under its OWN store;
+    a component ERROR aborts the composite step with the composite store unchanged
+    (§14.3.1, lifted). Backus carries the system forms no further than their existence;
+    PIPE is the load-bearing case (process pipelines)."""
+    from . import defs as _d
+    from .lam import from_lam, atom as _A
+    Da, Db = _cell_value(D, a), _cell_value(D, b)
+    if Da is None or Db is None:
+        return _S(_A("ERROR"), D)
+    oa, Da2 = _component_step(x, Da, fuel)
+    if from_lam(oa) == "ERROR":
+        return _S(_A("ERROR"), D)
+    ob, Db2 = _component_step(oa, Db, fuel)
+    if from_lam(ob) == "ERROR":
+        return _S(_A("ERROR"), D)
+    D2 = apply(Store(a), _S(Da2, D))
+    return _S(ob, apply(Store(b), _S(Db2, D2)))
+
+
+def supervise(x, D, child="CHILD", fuel=None):
+    """§14.4.4 delegation with reclaim, across a tenant cell: the child store's
+    transition runs under fuel; a runaway or erroring child answers ⟨ERROR, composite
+    unchanged⟩ — control returns to the parent with the child store intact. Supervision
+    is cell nesting plus fuel, no new mechanism."""
+    from . import defs as _d
+    from .lam import from_lam, atom as _A
+    Dc = _cell_value(D, child)
+    if Dc is None:
+        return _S(_A("ERROR"), D)
+    oc, Dc2 = _component_step(x, Dc, fuel)
+    if from_lam(oc) == "ERROR":
+        return _S(_A("ERROR"), D)
+    return _S(oc, apply(Store(child), _S(Dc2, D)))
+
+
+def child_reset(D, child, x, fuel=None):
+    """RESET into a tenant cell: §14.3.2 applied to the CHILD's store — the bootstrap
+    when the child has no SYSTEM, the child's OWN transition on x when it does. Note the
+    faithful consequence: this cannot repair a child whose SYSTEM diverges (the child
+    would just run it again) — pass fuel, or use child_install, the parent's move."""
+    Dc = _cell_value(D, child)
+    if Dc is None:
+        Dc = L.SEQ(L.NIL)
+    return apply(Store(child), _S(reset(x, Dc, fuel), D))
+
+
+def child_install(D, child, name, obj):
+    """The parent's prerogative (§14.7): a child's store is a cell of the parent's own,
+    so installing a definition in the child — including a NEW SYSTEM for a broken child
+    — is an ordinary store BY THE PARENT, no step of the child involved. This, not
+    RESET, is how a supervisor repairs a divergent subsystem."""
+    Dc = _cell_value(D, child)
+    if Dc is None:
+        Dc = L.SEQ(L.NIL)
+    return apply(Store(child), _S(apply(Store(name), _S(obj, Dc)), D))
+
+
+def child_retire(D, child):
+    """Retire a child system: its cell becomes the empty store (the paper's logical
+    deletion, applied to a whole subsystem)."""
+    return apply(Store(child), _S(L.SEQ(L.NIL), D))
 
 
 def run(input_fact, D, validate_obj=None, cell_name="FILE", resolve_obj=None, derive_obj=None, links_obj=None,
