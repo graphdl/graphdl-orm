@@ -127,17 +127,29 @@ def _alpha(mu, o):
     return () if x == () else (_mkseq(mu((APP_D, whole[1], xi)) for xi in x) if _isseq(x) else BOT_D)
 
 def _insert(mu, o):
+    # /f as an iterative right fold: the same semantics as the recursive definition (each
+    # application reduced by mu, pairs ⊥-collapsing), without one host frame per element,
+    # so ARC-scale populations do not exhaust the stack on the runtime path
     whole, x = o[0], o[1]
     if len(whole) < 2 or not _isseq(x) or len(x) == 0:
         return BOT_D
-    return x[0] if len(x) == 1 else mu((APP_D, whole[1], _mkseq((x[0], mu((APP_D, whole, x[1:]))))))
+    acc = x[-1]
+    for xi in reversed(x[:-1]):
+        acc = mu((APP_D, whole[1], _mkseq((xi, acc))))
+    return acc
 
 def _while(mu, o):
+    # (while p f) as a native loop: Backus's definition is tail recursion, iterated here
     whole, x = o[0], o[1]
     if len(whole) < 3:
         return BOT_D
-    pv = mu((APP_D, whole[1], x))
-    return mu((APP_D, whole, mu((APP_D, whole[2], x)))) if pv == _T else (x if pv == _F else BOT_D)
+    while True:
+        pv = mu((APP_D, whole[1], x))
+        if pv == _F:
+            return x
+        if pv != _T:
+            return BOT_D
+        x = mu((APP_D, whole[2], x))
 
 def _bu(mu, o):
     whole, y = o[0], o[1]

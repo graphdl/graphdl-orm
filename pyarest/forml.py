@@ -280,20 +280,24 @@ def _h_value_constraint(g, k, m):
         [(g[0] + "_vc", _value_constraint(g[1]))]
 
 
-def _mandatory_parts(ft, subject, m):
-    """The M-fact + the two attachment objects of one mandatory constraint: fact-side
-    (entities read from the subject type's cell) and entity-side (facts read from ft)."""
+def _mandatory_parts(ft, subject, m, pos=1):
+    """The M-fact + spans + the two attachment objects of one mandatory constraint:
+    fact-side (entities read from the subject type's cell) and entity-side (facts from ft)."""
     cid = ft + "_mand"
-    return [("constraint", (cid, "mandatory", ft, subject, m))], \
+    return [("constraint", (cid, "mandatory", ft, subject, m)), ("spans", (cid, pos))], \
         [(cid, C.scoped_mandatory_entities(subject)), (cid + "_e", C.scoped_mandatory_facts(ft))]
 
 
 def _h_uniqueness(g, k, m):
-    ft, facts = _fact_type(g[0] + " " + g[2], k)               # mixfix template + roles
+    reading = g[0] + " " + g[2]
+    ft, facts = _fact_type(reading, k)                         # mixfix template + roles
+    _t, rtypes = _reading(reading, k)
     subject = _subject(g[0], k)[0]
-    also, aobjs = _mandatory_parts(ft, subject, m) if g[1] == "exactly one" else ([], [])
-    return facts + [("constraint", (ft + "_uc", "uniqueness", ft, m))] + also, \
-        [(ft + "_uc", C.uniqueness([1]))] + aobjs              # the 'Each A' role is unique
+    pos = rtypes.index(subject) + 1 if subject in rtypes else 1   # computed, not assumed
+    also, aobjs = _mandatory_parts(ft, subject, m, pos) if g[1] == "exactly one" else ([], [])
+    return facts + [("constraint", (ft + "_uc", "uniqueness", ft, m)),
+                    ("spans", (ft + "_uc", pos))] + also, \
+        [(ft + "_uc", C.uniqueness([pos]))] + aobjs            # the quantified role's position
 
 def _h_mandatory(g, k, m):
     ft, facts = _fact_type(g[0] + " " + g[1], k)
@@ -311,7 +315,9 @@ def _h_neg_mandatory(g, k, m):
 
 def _h_spanning(g, k, m):
     ftn = g[0].replace(" ", "_")
-    return [("constraint", (ftn + "_uc", "spanning_uniqueness", ftn, m))], [(ftn + "_uc", C.uniqueness([1, 2]))]
+    cid = ftn + "_uc"
+    return [("constraint", (cid, "spanning_uniqueness", ftn, m)),
+            ("spans", (cid, 1)), ("spans", (cid, 2))], [(cid, C.uniqueness([1, 2]))]
 
 
 def _h_frequency(g, k, m):
@@ -322,7 +328,8 @@ def _h_frequency(g, k, m):
     n = int(g[3])
     lo, hi = {"at most": (None, n), "at least": (n, None), "exactly": (n, n)}[g[2]]
     cid = ftn + "_freq"
-    return [("constraint", (cid, "frequency", ftn, m))], [(cid, C.frequency(roles, lo, hi))]
+    return [("constraint", (cid, "frequency", ftn, m))] + [("spans", (cid, p)) for p in roles], \
+        [(cid, C.frequency(roles, lo, hi))]
 
 
 _RING_BUILDERS = {"irreflexive": C.ring_irreflexive, "symmetric": C.ring_symmetric,
