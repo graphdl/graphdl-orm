@@ -113,7 +113,9 @@ def affected_rules(fact_type):
 def recompute_frontier(fact_type):
     """The bound on the lfp for a change to `fact_type`: the constraints to re-check and the
     rules to re-fire — and the fact types those rules derive, which feed the next incremental
-    round (the transitive closure that makes the bounded lfp reach its fixpoint)."""
+    round (the transitive closure that makes the bounded lfp reach its fixpoint). The
+    rules→derives hop is a theta1 natural join over M, like every other frontier read."""
     rules = affected_rules(fact_type)
-    derives = tuple(ft for (rid, ft) in _RULE_DERIVES if rid in rules)
-    return {"constraints": affected_constraints(fact_type), "rules": rules, "derives": derives}
+    joined = _S(A("COMP"), _S(A("ALPHA"), A(2)), T.NatJoin(1))       # π_ft(rules ⋈ ruleDerives)
+    derives = from_lam(apply(joined, to_lam((tuple((r,) for r in rules), _RULE_DERIVES))))
+    return {"constraints": affected_constraints(fact_type), "rules": rules, "derives": tuple(derives)}
