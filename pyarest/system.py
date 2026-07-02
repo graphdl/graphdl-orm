@@ -514,6 +514,83 @@ def process_table(D, noun):
     return out
 
 
+def machine_step(trigger_ft):
+    """The machine that runs IS the M-facts: one FFP object over ⟨statusPop, P″, D⟩ that
+    reads the transitions (smFrom ⋈ smTrigger ⋈ smTo), the guards (smGuard), and the
+    addressed entity's role position (role facts joined with the governed nouns, smDef
+    plus the derived governedBy closure) from D INSIDE the reduction, then advances each
+    entity whose trigger fact entered P″ with its guard satisfied. Numbers are selectors,
+    so the runtime role position selects dynamically via the apply primitive. Editing M
+    redirects this step with no rewiring; `trigger_ft` is the handler's compile-time
+    identity, exactly as cell_name is for build_system."""
+    from . import ast
+    trig = _S(_CONST, A(trigger_ft))
+    hash_ = _S(_CONST, A("#"))
+    popD = lambda name: _S(_COMP, ast.FetchPop(name), A(3))
+    # the named transitions of THIS trigger, joined from M in-step
+    trs4 = _S(_COMP, _sm_join_named(), _S(_CONS, popD("smFrom"), popD("smTrigger"), popD("smTo")))
+    mine = _S(_COMP, T.Filter(_S(_COMP, _EQ, _S(_CONS, A(3), trig))), trs4)
+    # left-join guards by transition name: ⟨from, to, guard-or-#⟩
+    ghits = _S(_COMP, T.Filter(_S(_COMP, _EQ, _S(_CONS, _S(_COMP, _1, _1), _2))),
+               _DISTR, _S(_CONS, _2, _S(_COMP, _1, _1)))
+    gname_row = _S(_COND, _S(_COMP, A("null"), ghits), hash_, _S(_COMP, A(2), _1, _1, ghits))
+    row_fto = _S(_CONS, _S(_COMP, A(2), _1), _S(_COMP, A(4), _1), gname_row)
+    trsG = _S(_COMP, _S(_ALPHA, row_fto), _DISTR, _S(_CONS, mine, popD("smGuard")))
+    # the governed nouns: smDef bindings plus the derived closure (supertype governance)
+    govnouns = _S(_COMP, _CAT, _S(_CONS, _S(_COMP, _S(_ALPHA, A(2)), popD("smDef")),
+                                  _S(_COMP, _S(_ALPHA, A(1)), popD("governedBy"))))
+    rmatch = _S(_COMP, A("and"), _S(_CONS,
+                _S(_COMP, _EQ, _S(_CONS, _S(_COMP, A(2), _1), trig)),
+                _S(_COMP, T.member, _S(_CONS, _S(_COMP, A(4), _1), _2))))
+    posrows = _S(_COMP, _S(_ALPHA, _1), T.Filter(rmatch), _DISTR,
+                 _S(_CONS, popD("role"), govnouns))
+    pos = _S(_COMP, A(3), _1, posrows)                       # the governed player's position
+    # per-entity update, with the read-once context ⟨P″, trs, pos, D⟩ riding along
+    ctx = _S(_CONS, _2, trsG, pos, A(3))
+    e = _S(_COMP, _1, _1)
+    s = _S(_COMP, _2, _1)
+    P = _S(_COMP, _1, _2)
+    trs = _S(_COMP, _2, _2)
+    posv = _S(_COMP, A(3), _2)
+    Dd = _S(_COMP, A(4), _2)
+    fmatch = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, A("apply"), _S(_CONS, _S(_COMP, _2, _2), _1)),
+                               _S(_COMP, _1, _2)))           # fact[pos] = e, dynamically
+    fired = _S(_COMP, A("not"), A("null"), T.Filter(fmatch), _DISTR,
+               _S(_CONS, P, _S(_CONS, e, posv)))
+    from_is_s = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, _1, _1), _2))
+    nexts = _S(_COMP, _S(_ALPHA, _1), T.Filter(from_is_s), _DISTR, _S(_CONS, trs, s))
+    first = _S(_COMP, _1, nexts)
+    to = _S(_COMP, A(2), first)
+    gname = _S(_COMP, A(3), first)
+    gpop = _S(_COMP, ast.DynFetch(), _S(_CONS, gname, Dd))
+    unguarded = _S(_COMP, _EQ, _S(_CONS, gname, hash_))
+    satisfied = _S(_COMP, T.member, _S(_CONS, e, _S(_COMP, _S(_ALPHA, A(1)), gpop)))
+    okg = _S(_COND, unguarded, _S(_CONST, A("T")),
+             _S(_COND, _S(_COMP, A("atom"), gpop), _S(_CONST, A("F")), satisfied))
+    hasnext = _S(_COMP, A("not"), A("null"), nexts)
+    both = _S(_COMP, A("and"), _S(_CONS, fired, hasnext))
+    upd = _S(_COND, both, _S(_COND, okg, _S(_CONS, e, to), _1), _1)
+    return _S(_COMP, _S(_ALPHA, upd), _DISTR, _S(_CONS, _1, ctx))
+
+
+def governance_rules(D):
+    """Install the governedBy closure with the engine's own rule machinery: a noun is
+    governed by the machine it is bound to, and by any machine governing a supertype.
+    run_rules then derives the closure like any other rule."""
+    from . import ast
+    from .reduce import apply as _ap
+    from .lam import to_lam
+    D = _ap(ast.DefineIn("governedBy_rule_base", compile_rule(["smDef"], [2, 1])), D)
+    D = _ap(ast.DefineIn("governedBy_rule_step", compile_rule(["subtype", "governedBy"], [1, 3])), D)
+    derives = tuple(tuple(r) for r in _pop_rows(D, "ruleDerives")) + \
+        (("governedBy_rule_base", "governedBy"), ("governedBy_rule_step", "governedBy"))
+    D = _ap(ast.Store("ruleDerives"), _S(to_lam(derives), D))
+    reads = tuple(tuple(r) for r in _pop_rows(D, "ruleReads")) + \
+        (("governedBy_rule_base", "smDef"), ("governedBy_rule_step", "subtype"),
+         ("governedBy_rule_step", "governedBy"))
+    return _ap(ast.Store("ruleReads"), _S(to_lam(reads), D))
+
+
 def sm_step(pairs, entity_role):
     """The live machine step (Prop. onestep) as one FFP object: ⟨statusPop, P″, D⟩ →
     statusPop′. An entity advances iff a trigger fact naming it (at `entity_role`)
