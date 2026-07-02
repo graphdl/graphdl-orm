@@ -11,10 +11,24 @@ the store is a dict (O(1) fetch); metacomposition is the only mechanism, as in t
 from . import lam as L
 from . import defs as _defs_mod
 
-BOT_D = ("#bot#",)                                            # bottom sentinel
+class _Bot:
+    """⊥ as a non-sequence singleton: it can never be indexed, iterated, or mistaken for
+    data (the audit's A1 — a tuple sentinel leaked through _isseq into ALPHA as a list)."""
+    __slots__ = ()
+    def __repr__(self):
+        return "⊥"
+
+
+BOT_D = _Bot()                                               # bottom sentinel (not a tuple!)
 APP_D = ("#app#",)                                           # application-node head sentinel
 _T, _F = "T", "F"
 _isseq = lambda o: type(o) is tuple
+
+
+def _mkseq(items):
+    """⊥-collapsing sequence construction (Backus §11.2.1): ⟨…,⊥,…⟩ IS ⊥."""
+    t = tuple(items)
+    return BOT_D if any(i is BOT_D for i in t) else t
 
 
 # ============================ native <-> Scott conversion =====================
@@ -77,7 +91,7 @@ def _comp(mu, o):
 
 def _cons(mu, o):
     whole, x = o[0], o[1]
-    return tuple(mu((APP_D, f, x)) for f in whole[1:])
+    return _mkseq(mu((APP_D, f, x)) for f in whole[1:])
 
 def _const(mu, o):
     return o[0][1] if o[1] is not BOT_D else BOT_D
@@ -89,13 +103,13 @@ def _cond(mu, o):
 
 def _alpha(mu, o):
     whole, x = o[0], o[1]
-    return () if x == () else (tuple(mu((APP_D, whole[1], xi)) for xi in x) if _isseq(x) else BOT_D)
+    return () if x == () else (_mkseq(mu((APP_D, whole[1], xi)) for xi in x) if _isseq(x) else BOT_D)
 
 def _insert(mu, o):
     whole, x = o[0], o[1]
     if not _isseq(x) or len(x) == 0:
         return BOT_D
-    return x[0] if len(x) == 1 else mu((APP_D, whole[1], (x[0], mu((APP_D, whole, x[1:])))))
+    return x[0] if len(x) == 1 else mu((APP_D, whole[1], _mkseq((x[0], mu((APP_D, whole, x[1:]))))))
 
 def _while(mu, o):
     whole, x = o[0], o[1]
@@ -117,8 +131,10 @@ _NATIVE = {
     "reverse": lambda mu, o: tuple(reversed(o)) if _isseq(o) else BOT_D,
     "cat": lambda mu, o: o[0] + o[1],
     "not": lambda mu, o: _F if o == _T else (_T if o == _F else BOT_D),
-    "and": lambda mu, o: _T if (o[0] == _T and o[1] == _T) else _F,
-    "or": lambda mu, o: _T if (o[0] == _T or o[1] == _T) else _F,
+    "and": lambda mu, o: (_T if (o[0] == _T and o[1] == _T) else _F)
+        if (o[0] in (_T, _F) and o[1] in (_T, _F)) else BOT_D,
+    "or": lambda mu, o: (_T if (o[0] == _T or o[1] == _T) else _F)
+        if (o[0] in (_T, _F) and o[1] in (_T, _F)) else BOT_D,
     "1r": lambda mu, o: o[-1] if (_isseq(o) and len(o) >= 1) else BOT_D,
     "tlr": lambda mu, o: o[:-1] if (_isseq(o) and len(o) >= 1) else BOT_D,
     "+": _binop(lambda a, b: a + b), "-": _binop(lambda a, b: a - b), "*": _binop(lambda a, b: a * b),
@@ -150,6 +166,8 @@ def _make_mu(store):
         # a value is its own meaning; an application node ⟨APP, f, x⟩ reduces (metacomposition)
         if type(e) is tuple and len(e) == 3 and e[0] is APP_D:
             f = mu(e[1]); x = mu(e[2])                               # reduce operator, then operand (cbv)
+            if f is BOT_D or x is BOT_D:                             # §13.3.1: ρ⊥ = ⊥ and every
+                return BOT_D                                         # function is ⊥-preserving
             if _isseq(f):                                            # seq operator -> metacomposition
                 return mu((APP_D, f[0], (f, x)))
             hit = store.get(f)

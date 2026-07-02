@@ -49,7 +49,9 @@ def make_mu(store_fn):
                       (lambda: L.BOT))(defs.FETCH(a)(store_fn()))
                 on_seq = lambda l: mu(mkapp(L.HEAD(l))(       # metacomposition on the head
                     L.SEQ(L.CONS(fr)(L.CONS(x)(L.NIL)))))
-                return fr(on_atom)(on_seq)(L.BOT)
+                # §11.2.1/§13.3.1: every function is ⊥-preserving — a ⊥ operand short-circuits
+                # before any impl or metacomposition can see ⊥ as data (ρ⊥ is the fr-match's ⊥ leg)
+                return L.IF(L.ISBOT(x))(lambda: L.BOT)(lambda: fr(on_atom)(on_seq)(L.BOT))
             return L.IF(isapp(e))(lambda: reduce_app())(lambda: e)  # App reduces; a value is its meaning
         return step
     return L.Y(tau)                                          # mu = lfp tau

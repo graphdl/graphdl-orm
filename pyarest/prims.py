@@ -48,10 +48,13 @@ _rev   = lambda mu: lambda o: o(lambda v: L.BOT)(lambda l:
 _cat   = lambda mu: lambda o: L.SEQ(L.APPEND(L._list(_1(o)))(L._list(_2(o))))  # cat:⟨⟨a..⟩,⟨b..⟩⟩=⟨a..,b..⟩
 _not   = lambda mu: lambda o: L.IF(L.EQOBJ(o)(aT))(lambda: aF)(
             lambda: L.IF(L.EQOBJ(o)(aF))(lambda: aT)(lambda: L.BOT))              # not on T/F atoms
-_and   = lambda mu: lambda o: L.IF(L.EQOBJ(_1(o))(aT))(                           # and:⟨p,q⟩ on T/F
-            lambda: L.IF(L.EQOBJ(_2(o))(aT))(lambda: aT)(lambda: aF))(lambda: aF)
-_or    = lambda mu: lambda o: L.IF(L.EQOBJ(_1(o))(aT))(lambda: aT)(               # or:⟨p,q⟩ on T/F
-            lambda: L.IF(L.EQOBJ(_2(o))(aT))(lambda: aT)(lambda: aF))
+_isTF  = lambda v: L.OR(L.EQOBJ(v)(aT))(L.EQOBJ(v)(aF))                           # boolean domain
+_and   = lambda mu: lambda o: L.IF(L.AND(_isTF(_1(o)))(_isTF(_2(o))))(            # and:⟨p,q⟩, T/F only
+            lambda: L.IF(L.AND(L.EQOBJ(_1(o))(aT))(L.EQOBJ(_2(o))(aT)))(lambda: aT)(lambda: aF))(
+            lambda: L.BOT)
+_or    = lambda mu: lambda o: L.IF(L.AND(_isTF(_1(o)))(_isTF(_2(o))))(            # or:⟨p,q⟩, T/F only
+            lambda: L.IF(L.OR(L.EQOBJ(_1(o))(aT))(L.EQOBJ(_2(o))(aT)))(lambda: aT)(lambda: aF))(
+            lambda: L.BOT)
 _revl  = lambda l: L.FOLDR(lambda h: lambda a: L.APPEND(a)(L.CONS(h)(L.NIL)))(L.NIL)(l)
 _1r    = lambda mu: lambda o: o(lambda v: L.BOT)(lambda l: L.HEAD(_revl(l)))(L.BOT)         # last element
 _tlr   = lambda mu: lambda o: o(lambda v: L.BOT)(lambda l: L.SEQ(_revl(L.TAIL(_revl(l)))))(L.BOT)  # all but last
@@ -87,13 +90,14 @@ _apply = lambda mu: lambda o: mu(mkapp(_1(o))(_2(o)))
 # ---- controlling operators (§13.3.2): impl(mu)(⟨⟨OP, params⟩, y⟩) ----
 # COMP  f1∘..∘fn : y = f1:(f2:(..(fn:y)))        right fold of application
 _comp = lambda mu: lambda a: L.FOLDR(lambda f: lambda acc: mkapp(f)(acc))(_2(a))(_params(_1(a)))
-# CONS  [f1..fn] : y = ⟨f1:y,..,fn:y⟩            each element reduced by mu (the result nests them)
-_cons = lambda mu: lambda a: L.SEQ(L.MAPL(lambda f: mu(mkapp(f)(_2(a))))(_params(_1(a))))
+# CONS  [f1..fn] : y = ⟨f1:y,..,fn:y⟩            each element reduced by mu (the result nests them);
+#                                                 ⊥-collapsing: any fi:y = ⊥ makes the whole ⊥ (§11.2.1)
+_cons = lambda mu: lambda a: L.SEQC(L.MAPL(lambda f: mu(mkapp(f)(_2(a))))(_params(_1(a))))
 # CONST  x̄ : y = x   (⊥-preserving: x̄ : ⊥ = ⊥)
 _const = lambda mu: lambda a: _2(a)(lambda v: _2(_1(a)))(lambda l: _2(_1(a)))(L.BOT)
-# ALPHA  αf : ⟨y1..yn⟩ = ⟨f:y1,..,f:yn⟩
+# ALPHA  αf : ⟨y1..yn⟩ = ⟨f:y1,..,f:yn⟩          ⊥-collapsing like CONS
 _alpha = lambda mu: lambda a: _2(a)(lambda v: L.BOT)(lambda l:
-            L.SEQ(L.MAPL(lambda yi: mu(mkapp(_2(_1(a)))(yi)))(l)))(L.BOT)
+            L.SEQC(L.MAPL(lambda yi: mu(mkapp(_2(_1(a)))(yi)))(l)))(L.BOT)
 # COND  (p→f;g) : y = f:y if p:y=T ; g:y if p:y=F ; else ⊥
 def _cond(mu):
     def h(a):
@@ -110,8 +114,9 @@ def _insert(mu):
         return L.IF(L.LNULL(yl))(lambda: L.BOT)(lambda:
             L.IF(L.LNULL(L.TAIL(yl)))(lambda: L.HEAD(yl))(lambda:
                 # /f:⟨x1..xn⟩ = f:⟨x1, /f:⟨x2..xn⟩⟩ — reduce the tail fold FIRST (it sits in
-                # data position inside the pair, where mu would not otherwise descend)
-                mkapp(f)(L.SEQ(L.CONS(L.HEAD(yl))(
+                # data position inside the pair, where mu would not otherwise descend);
+                # SEQC collapses the pair to ⊥ when the fold bottomed (§11.2.1)
+                mkapp(f)(L.SEQC(L.CONS(L.HEAD(yl))(
                     L.CONS(mu(mkapp(whole)(L.SEQ(L.TAIL(yl)))))(L.NIL))))))
     return h
 # WHILE  (while p f) : y = (while p f):(f:y) if p:y=T ; y if p:y=F ; else ⊥

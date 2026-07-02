@@ -66,6 +66,11 @@ EQOBJ = Y(lambda eq: lambda a: lambda b:                      # object equality 
 
 PHI = SEQ(NIL)                                                # the empty sequence
 
+# ---- the bottom discipline (§11.2.1): a sequence containing ⊥ IS ⊥ ----
+ISBOT  = lambda o: o(lambda v: FALSE)(lambda l: FALSE)(TRUE)  # is the object ⊥?
+ANYBOT = lambda l: FOLDR(lambda h: lambda a: OR(ISBOT(h))(a))(FALSE)(l)
+SEQC   = lambda l: IF(ANYBOT(l))(lambda: BOT)(lambda: SEQ(l)) # ⊥-collapsing constructor
+
 # ============================ Backus primitives (lambda) ======================
 _list = lambda o: o(lambda v: NIL)(lambda l: l)(NIL)          # the Scott list inside a SEQ
 
