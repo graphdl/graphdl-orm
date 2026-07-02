@@ -62,8 +62,15 @@ _CLASSIFY = [
     ("spanning_uc", re.compile(r"^[Ii]n each population of (.+), each (.+) combination occurs at most once\.$")),
     ("objectification", re.compile(r"^[Tt]his association with (.+) provides the preferred identification scheme for (.+)\.$")),
     ("set_comparison", re.compile(r"^[Ff]or each (.+?), (exactly|at most) one of the following holds: (.+)\.$")),
-    ("derivation", re.compile(r"^[Ii]f (.+) then (.+)\.$")),
+    # negative forms (constraint verbalization paper): map to the SAME constraint as the positive twin
+    ("neg_uniqueness", re.compile(r"^[Ff]or each (.+?), it is impossible that that .+? (.+) more than one (.+)\.$")),
+    ("neg_mandatory", re.compile(r"^[Ff]or each (.+?), it is impossible that that .+? (.+) no (.+)\.$")),
+    ("disjunctive_mandatory", re.compile(r"^[Ff]or each (.+?), (.+ or .+)\.$")),
     ("inverse_uc", re.compile(r"^[Ff]or each (.+?), at most one (.+) (?:that|those) .+\.$")),
+    ("derivation", re.compile(r"^[Ii]f (.+) then (.+)\.$")),
+    ("neg_uniqueness", re.compile(r"^any (.+?) more than one (.+)\.$")),      # neg of 'each A .. at most one B'
+    ("neg_mandatory", re.compile(r"^any (.+?) no (.+)\.$")),                   # neg of 'each A .. some B'
+    ("disjunctive_mandatory", re.compile(r"^[Ee]ach (.+ or .+)\.$")),         # inclusive-or / disjunctive mandatory
     ("uniqueness", re.compile(r"^[Ee]ach (.+?) (at most one|exactly one) (.+)\.$")),
     ("mandatory", re.compile(r"^[Ee]ach (.+?) some (.+)\.$")),
     ("negation", re.compile(r"^(.+) ~(.+)\.$")),
@@ -104,21 +111,13 @@ def _known(stmts):
 
 
 def _subject(text, known):
+    """The leading object type of a reading + the remainder (a find over known types — the string
+    boundary): used by negation/inverse-uc where only the subject is needed."""
     for k in known:
         if text == k or text.startswith(k + " "):
             return k, text[len(k):].strip()
     first = text.split(" ", 1)
     return first[0], (first[1] if len(first) > 1 else "")
-
-
-def _object(text, known):
-    for k in known:
-        if text == k:
-            return k, ""
-        if text.endswith(" " + k):
-            return k, text[:-(len(k) + 1)].strip()
-    last = text.rsplit(" ", 1)
-    return last[-1], (" ".join(last[:-1]) if len(last) > 1 else "")
 
 
 def _ftid(a, pred, b):
@@ -135,92 +134,163 @@ def _num(s):
     return s
 
 
+def _reading(text, known):
+    """A fact-type reading → (template, roles): a mixfix predicate template with {i} placeholders
+    plus the ordered role object types (the paper's field-replacement model). Scans left to right,
+    replacing each known type (longest, word-bounded) with a placeholder; front text, inter-object
+    text, and trailing text remain in the template, so unary, binary and n-ary readings, front
+    text ('the birth of {0} occurred in {1}'), and hyphen binding ('adj-Type') all parse."""
+    kset = sorted(known, key=lambda k: -len(k.split()))
+    toks, roles, out, i = text.split(), [], [], 0
+    while i < len(toks):
+        tok = toks[i]
+        if "-" in tok and not tok.endswith("-"):             # forward hyphen binding: adj-Type -> role Type
+            _pre, _, post = tok.partition("-")
+            if post in known:
+                roles.append(post); out.append("{%d}" % (len(roles) - 1)); i += 1; continue
+        matched = next((k for k in kset if toks[i:i + len(k.split())] == k.split()), None)
+        if matched:
+            roles.append(matched); out.append("{%d}" % (len(roles) - 1)); i += len(matched.split())
+        else:
+            out.append(tok); i += 1
+    return " ".join(out), roles
+
+
+def _ftid_from(template, roles):
+    """A stable fact-type id: the template with its role types substituted back in, slugified."""
+    s = template
+    for i, r in enumerate(roles):
+        s = s.replace("{%d}" % i, r)
+    return re.sub(r"[^0-9A-Za-z]+", "_", s).strip("_")
+
+
+def _role_facts(ft, roles):
+    return [("role", (ft + "." + str(i + 1), ft, i + 1, r)) for i, r in enumerate(roles)]
+
+
+def _fact_type(reading, known):
+    """A reading → (ftid, assertions) declaring the fact type (template) and its roles in M."""
+    template, roles = _reading(reading, known)
+    ft = _ftid_from(template, roles)
+    return ft, [("factType", (ft, template))] + _role_facts(ft, roles)
+
+
+# NORMA value specs → a value constraint object over role 1. A pattern table (regex is the string
+# boundary); the first match's builder wins, else an enumeration. No if/elif dispatch.
+_VALUE_SPECS = [
+    (re.compile(r"^\[(.+?)\.\.(.+?)\]$"), lambda gp: C.value_range(1, _num(gp[0]), _num(gp[1]))),
+    (re.compile(r"^at least (.+?) to at most (.+)$"), lambda gp: C.value_range(1, _num(gp[0]), _num(gp[1]))),
+    (re.compile(r"^at least (.+?) (?:to|and) below (.+)$"), lambda gp: C.value_range(1, _num(gp[0]), _num(gp[1]), hi_open=True)),
+    (re.compile(r"^above (.+?) to at most (.+)$"), lambda gp: C.value_range(1, _num(gp[0]), _num(gp[1]), lo_open=True)),
+    (re.compile(r"^above (.+?) (?:to|and) below (.+)$"), lambda gp: C.value_range(1, _num(gp[0]), _num(gp[1]), lo_open=True, hi_open=True)),
+    (re.compile(r"^at least (.+)$"), lambda gp: C.value_range(1, lo=_num(gp[0]))),
+    (re.compile(r"^above (.+)$"), lambda gp: C.value_range(1, lo=_num(gp[0]), lo_open=True)),
+    (re.compile(r"^at most (.+)$"), lambda gp: C.value_range(1, hi=_num(gp[0]))),
+    (re.compile(r"^below (.+)$"), lambda gp: C.value_range(1, hi=_num(gp[0]), hi_open=True)),
+]
+
+
 def _value_constraint(spec):
-    """A NORMA value spec → a value constraint object over role 1: enumeration or open/closed
-    range. Ranges: [lo..hi], 'at least L to at most H', '… to/and below H', 'above L …', and the
-    one-sided forms."""
     spec = spec.strip()
-    m = re.match(r"^\[(.+?)\.\.(.+?)\]$", spec)                          # [lo..hi]
-    if m:
-        return C.value_range(1, _num(m.group(1)), _num(m.group(2)))
-    for pat, kw in [(r"^at least (.+?) to at most (.+)$", (False, False)),
-                    (r"^at least (.+?) (?:to|and) below (.+)$", (False, True)),
-                    (r"^above (.+?) to at most (.+)$", (True, False)),
-                    (r"^above (.+?) (?:to|and) below (.+)$", (True, True))]:
-        m = re.match(pat, spec)
-        if m:
-            return C.value_range(1, _num(m.group(1)), _num(m.group(2)), lo_open=kw[0], hi_open=kw[1])
-    for pat, kw in [(r"^at least (.+)$", ("lo", False)), (r"^above (.+)$", ("lo", True)),
-                    (r"^at most (.+)$", ("hi", False)), (r"^below (.+)$", ("hi", True))]:
-        m = re.match(pat, spec)
-        if m:
-            v = _num(m.group(1))
-            return (C.value_range(1, lo=v, lo_open=kw[1]) if kw[0] == "lo"
-                    else C.value_range(1, hi=v, hi_open=kw[1]))
-    vals = tuple(_num(v) for v in re.split(r",| and ", spec) if v.strip())
-    return C.value_enumeration(1, vals)
+    hit = next(((pat.match(spec), build) for pat, build in _VALUE_SPECS if pat.match(spec)), None)
+    return hit[1](hit[0].groups()) if hit else \
+        C.value_enumeration(1, tuple(_num(v) for v in re.split(r",| and ", spec) if v.strip()))
 
 
 # ---- planning: (kind, groups, modality) + known → (assertions, constraints) ----
+# Each reading kind is planned by its own handler (g, known, modality) -> (assertions, constraints).
+# Dispatch is by key into this table (application/reflection), never an if/elif chain.
+_slug = lambda s: re.sub(r"[^0-9A-Za-z]+", "_", s).strip("_")
+
+
+def _h_entity(g, k, m):
+    return [("instanceOf", (g[0], "ObjectType"))], []
+
+def _h_value(g, k, m):
+    return [("instanceOf", (g[0], "ValueType"))], []
+
+def _h_ref_scheme(g, k, m):
+    return [("instanceOf", (g[0], "ObjectType")), ("instanceOf", (g[1], "ValueType")),
+            ("refScheme", (g[0], g[1]))], []
+
+def _h_objectification(g, k, m):
+    return [("instanceOf", (g[1], "ObjectType")), ("objectification", (g[1], g[0]))], []
+
+def _h_meta(cell):
+    return lambda g, k, m: ([(cell, (g[0],))], [])             # data_type / ref_mode metadata
+
+def _h_value_constraint(g, k, m):
+    return [("valueConstraint", (g[0], g[1], m))], [(g[0] + "_vc", _value_constraint(g[1]))]
+
+def _h_uniqueness(g, k, m):
+    ft, facts = _fact_type(g[0] + " " + g[2], k)               # mixfix template + roles
+    also = {"exactly one": [("constraint", (ft + "_mand", "mandatory", ft, m))]}.get(g[1], [])
+    return facts + [("constraint", (ft + "_uc", "uniqueness", ft, m))] + also, \
+        [(ft + "_uc", C.uniqueness([1]))]                      # the 'Each A' role is unique
+
+def _h_mandatory(g, k, m):
+    ft, facts = _fact_type(g[0] + " " + g[1], k)
+    return facts + [("constraint", (ft + "_mand", "mandatory", ft, m))], []
+
+def _h_neg_uniqueness(g, k, m):
+    ft, facts = _fact_type(" ".join(g), k)                     # reconstruct the reading; same constraint
+    return facts + [("constraint", (ft + "_uc", "uniqueness", ft, m))], [(ft + "_uc", C.uniqueness([1]))]
+
+def _h_neg_mandatory(g, k, m):
+    ft, facts = _fact_type(" ".join(g), k)
+    return facts + [("constraint", (ft + "_mand", "mandatory", ft, m))], []
+
+def _h_spanning(g, k, m):
+    ftn = g[0].replace(" ", "_")
+    return [("constraint", (ftn + "_uc", "spanning_uniqueness", ftn, m))], [(ftn + "_uc", C.uniqueness([1, 2]))]
+
+def _h_set_comparison(g, k, m):
+    subj, mode, body = g
+    n = len([c for c in body.split(";") if c.strip()])
+    kind = {"exactly": "exclusive_or", "at most": "exclusion"}[mode]
+    cid = _slug(subj) + {"exactly": "_xor", "at most": "_excl"}[mode]
+    obj = {"exactly": C.exclusive_or, "at most": C.exclusion}[mode]()
+    return [("constraint", (cid, kind, subj, n, m))], [(cid, obj)]
+
+def _h_disjunctive(g, k, m):
+    body = g[-1]
+    n = len([d for d in body.split(" or ") if d.strip()])
+    cid = "ior_" + _slug(g[0] if len(g) > 1 else body)[:40]
+    return [("constraint", (cid, "disjunctive_mandatory", n, m))], [(cid, C.inclusive_or())]
+
+def _h_derivation(g, k, m):
+    return [("derivation", (g[0][:60], g[1][:60]))], []
+
+def _h_negation(g, k, m):
+    a, pred = _subject(g[0], k)
+    return [("negation", (a, pred + " " + g[1]))], []
+
+def _h_possibility(g, k, m):
+    return [("possibility", (g[0][:80], m))], []
+
+def _h_inverse_uc(g, k, m):
+    a, _r = _subject(g[0], k)
+    return [("constraint", (_slug(a) + "_inv_uc", "uniqueness", a, m))], []
+
+def _h_fact(g, k, m):
+    _ft, facts = _fact_type(g[0], k)                           # mixfix template + ordered roles
+    return facts, []
+
+
+_PLAN = {
+    "entity_type": _h_entity, "value_type": _h_value, "ref_scheme": _h_ref_scheme,
+    "objectification": _h_objectification, "data_type": _h_meta("data_type"), "ref_mode": _h_meta("ref_mode"),
+    "value_constraint": _h_value_constraint, "uniqueness": _h_uniqueness, "mandatory": _h_mandatory,
+    "neg_uniqueness": _h_neg_uniqueness, "neg_mandatory": _h_neg_mandatory, "spanning_uc": _h_spanning,
+    "set_comparison": _h_set_comparison, "disjunctive_mandatory": _h_disjunctive, "derivation": _h_derivation,
+    "negation": _h_negation, "possibility": _h_possibility, "inverse_uc": _h_inverse_uc,
+    "fact_type_reading": _h_fact,
+}
+
+
 def _plan(kind, g, known, modality="alethic"):
-    A, cons = [], []
-    if kind == "entity_type":
-        A = [("instanceOf", (g[0], "ObjectType"))]
-    elif kind == "value_type":
-        A = [("instanceOf", (g[0], "ValueType"))]
-    elif kind == "ref_scheme":
-        A = [("instanceOf", (g[0], "ObjectType")), ("instanceOf", (g[1], "ValueType")),
-             ("refScheme", (g[0], g[1]))]
-    elif kind == "objectification":
-        A = [("instanceOf", (g[1], "ObjectType")), ("objectification", (g[1], g[0]))]
-    elif kind in ("data_type", "ref_mode"):
-        A = [(kind, (g[0],))]
-    elif kind == "value_constraint":
-        name, spec = g
-        A = [("valueConstraint", (name, spec, modality))]
-        cons = [(name + "_vc", _value_constraint(spec))]
-    elif kind in ("uniqueness", "mandatory"):
-        subj, rest = (g[0], g[2]) if kind == "uniqueness" else (g[0], g[1])
-        a, pred = _subject(subj, known)
-        b, _ad = _object(rest, known)
-        ft = _ftid(a, pred, b)
-        A = [("factType", (ft, pred)), ("role", (ft + ".1", ft, 1, a)), ("role", (ft + ".2", ft, 2, b))]
-        if kind == "uniqueness":
-            A.append(("constraint", (ft + "_uc", "uniqueness", ft, modality)))
-            cons.append((ft + "_uc", C.uniqueness([1])))
-            if g[1] == "exactly one":
-                A.append(("constraint", (ft + "_mand", "mandatory", ft, modality)))
-        else:
-            A.append(("constraint", (ft + "_mand", "mandatory", ft, modality)))
-    elif kind == "spanning_uc":
-        ftname = g[0].replace(" ", "_")
-        A = [("constraint", (ftname + "_uc", "spanning_uniqueness", ftname, modality))]
-        cons.append((ftname + "_uc", C.uniqueness([1, 2])))
-    elif kind == "set_comparison":
-        subj, mode, body = g
-        clauses = tuple(c.strip() for c in body.split(";") if c.strip())
-        cid = subj.replace(" ", "_") + ("_xor" if mode == "exactly" else "_excl")
-        A = [("constraint", (cid, "exclusive_or" if mode == "exactly" else "exclusion", subj, len(clauses), modality))]
-    elif kind == "derivation":
-        A = [("derivation", (g[0][:60], g[1][:60]))]
-    elif kind == "negation":
-        a, pred = _subject(g[0], known)
-        A = [("negation", (a, pred + " " + g[1]))]
-    elif kind == "possibility":
-        A = [("possibility", (g[0][:80], modality))]
-    elif kind == "inverse_uc":
-        a, _ = _subject(g[0], known)
-        A = [("constraint", (a.replace(" ", "_") + "_inv_uc", "uniqueness", a, modality))]
-    elif kind == "fact_type_reading":
-        a, rest = _subject(g[0], known)
-        if rest:
-            b, _ad = _object(rest, known)
-            pred = rest[:len(rest) - len(b)].strip() if rest.endswith(b) else rest
-            ft = _ftid(a, pred, b)
-            A = [("factType", (ft, pred)), ("role", (ft + ".1", ft, 1, a)), ("role", (ft + ".2", ft, 2, b))]
-        else:
-            A = [("factType", (g[0].replace(" ", "_"), g[0]))]
-    return A, cons
+    """Dispatch the reading kind to its handler (application by key), never an if/elif chain."""
+    return _PLAN.get(kind, lambda g, k, m: ([], []))(g, known, modality)
 
 
 def compile(stmt, D, known=()):

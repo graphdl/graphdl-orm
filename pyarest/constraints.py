@@ -104,6 +104,33 @@ def subset():
     return T.setminus
 
 
+# --- set-comparison over a participation population ⟨⟨entity, clause⟩ …⟩ (one fact per clause the
+# entity participates in). These reduce to theta1 constraints already defined. ---
+_CAT = A("cat")
+
+
+def exclusion():
+    """Exclusion — at most one of the clauses holds per entity. V = the participations whose entity
+    also appears with a DIFFERENT clause (uniqueness on the entity role of the participation)."""
+    return uniqueness([1])
+
+
+def inclusive_or():
+    """Inclusive-or / disjunctive mandatory — at least one clause holds per entity. Input
+    ⟨universe, players⟩ (players = entities in some clause); V = universe ∖ players (setminus)."""
+    return T.setminus
+
+
+def exclusive_or():
+    """Exclusive-or — exactly one clause holds per entity. Input ⟨universe, participation⟩; V = the
+    entities in NO clause (universe ∖ pi1(participation)) together with those in TWO OR MORE (the
+    uniqueness violations of the participation) — everyone not holding exactly one."""
+    players = _S(_COMP, T.Project([1]), _2)                       # entities that participate
+    none = _S(_COMP, T.setminus, _S(_CONS, _1, players))          # in no clause
+    many = _S(_COMP, T.Project([1]), uniqueness([1]), _2)         # in >= 2 clauses
+    return _S(_COMP, _CAT, _S(_CONS, none, many))                 # none ∪ many
+
+
 def violations(constraint_obj, population):
     """(rho c) : P — reduce the violation object against a population (an FFP object)."""
     return apply(constraint_obj, population)
