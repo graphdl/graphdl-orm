@@ -58,11 +58,24 @@ def make_mu(store_fn):
 _MU = make_mu(defs.current)
 
 
-def meaning(e):
-    """mu e — reduce an FFP expression to its meaning (its normal form)."""
+def meaning_lambda(e):
+    """mu e — reduce an FFP expression via the pure lambda kernel (mu = Y(tau)). Ground truth."""
     return _MU(e)
 
 
-def apply(f, x):
-    """The FFP application (f : x), evaluated: mu(f : x)."""
+def apply_lambda(f, x):
+    """The FFP application (f : x) via the pure lambda kernel: mu(f : x). Ground truth."""
     return _MU(mkapp(f)(x))
+
+
+# The runtime evaluates via the delta fast-path (spec §4.2 / D5): observationally equal to the
+# lambda kernel above, which stays the ground truth (and the equivalence oracle in test_delta).
+from . import delta as _delta   # noqa: E402  (delta imports only lam + defs; no cycle)
+
+
+def meaning(e):
+    return _delta.meaning(e)
+
+
+def apply(f, x):
+    return _delta.apply(f, x)

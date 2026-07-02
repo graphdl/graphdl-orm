@@ -10,6 +10,8 @@ from . import lam as L
 
 _store = L.NIL            # the current Scott list of cells (newest first)
 _registered = []          # names of registered (boundary) defs — host-side mirror for boundary()
+compiled = {}             # name -> the Scott FFP object (host mirror; the delta fast-path converts these)
+version = 0               # bumped on every define, so the delta fast-path can invalidate its native store
 
 
 def _cell(name, tag, impl):
@@ -26,8 +28,10 @@ def register(name, fn):
 
 def define(name, obj):
     """Compile: bind `name` to an FFP object o; its meaning is mu(o : x)  (Def. reg)."""
-    global _store
+    global _store, version
     _store = L.CONS(_cell(name, L.FALSE, obj))(_store)
+    compiled[name] = obj
+    version += 1
 
 
 def current():
@@ -35,8 +39,8 @@ def current():
 
 
 def reset():
-    global _store, _registered
-    _store, _registered = L.NIL, []
+    global _store, _registered, compiled, version
+    _store, _registered, compiled, version = L.NIL, [], {}, version + 1
 
 
 # ↑key : store → ⟨found?, ⟨tag, impl⟩⟩   (first match wins, else ⟨F, _⟩); keys compared by NATEQ
