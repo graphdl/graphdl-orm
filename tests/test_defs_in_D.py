@@ -45,8 +45,10 @@ def test_sibling_tenants_resolve_their_own_defs():
     (oa, _) = from_lam(ast.run(to_lam(("f",)), D_a, derive_obj=A("greet")))
     (ob, _) = from_lam(ast.run(to_lam(("f",)), D_b, derive_obj=A("greet")))
     assert (oa[0], ob[0]) == ("from-A", "from-B")             # same name, per-store meaning
-    # a store WITHOUT the def cannot address it at all (Prop. tenant)
-    assert from_lam(ast.run(to_lam(("f",)), BASE(), derive_obj=A("greet"))) == "⊥"
+    # a store WITHOUT the def cannot address it at all (Prop. tenant); the step answers
+    # with the §14.3.1 transition rule: error output, state unchanged
+    (oc, _Dc) = from_lam(ast.run(to_lam(("f",)), BASE(), derive_obj=A("greet")))
+    assert oc == "ERROR"
 
 
 def test_both_paths_agree_on_step_defs():

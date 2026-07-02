@@ -52,12 +52,32 @@ def FetchPop(name):
     return _S(_COND, is_absent, _S(_CONST, PHI), f)
 
 
-def Store(name):
-    """↓name — ⟨x, D⟩ → D with the cell named `name` set to x (purge the old, prepend fresh)."""
+def Pop(name):
+    """(pop n) — remove the FIRST cell named `name`, preserving deeper ones (§13.3.4: cells
+    of one name form a LIFO stack; pop and purge are distinct operators). A WHILE-fold over
+    ⟨removed?, acc, rest⟩ standing in for Backus's recursive definition."""
+    head = _S(_COMP, _1, _3)
+    hit = _S(_COMP, A("and"), _S(_CONS,
+              _S(_COMP, _EQ, _S(_CONS, _1, _S(_CONST, A("F")))),      # not yet removed
+              _S(_COMP, _named(name), head)))                          # and head is the cell
+    take = _S(_CONS, _S(_CONST, A("T")), _2, _S(_COMP, A("tl"), _3))  # drop it, flag removed
+    keep = _S(_CONS, _1, _S(_COMP, A("apndr"), _S(_CONS, _2, head)), _S(_COMP, A("tl"), _3))
+    loop = _S(A("WHILE"), _S(_COMP, _NOT, _NULL, _3), _S(_COND, hit, take, keep))
+    init = _S(_CONS, _S(_CONST, A("F")), _S(_CONST, PHI), A("id"))    # ⟨F, φ, D⟩
+    return _S(_COMP, _2, loop, init)
+
+
+def Purge(name):
+    """(purge n) — remove ALL cells named `name` (§13.3.4's other operator)."""
     from .theta import Filter
-    purge = Filter(_S(_COMP, _NOT, _named(name)))            # keep cells NOT named `name`
+    return Filter(_S(_COMP, _NOT, _named(name)))
+
+
+def Store(name):
+    """↓name — ⟨x, D⟩ → (push n):⟨x, (pop n):D⟩ (§13.3.4 verbatim): replace the TOP of the
+    stack named `name`; deeper same-named cells survive. Fetch still reads the top."""
     make = _S(_CONS, _S(_CONST, CELL), _S(_CONST, A(name)), _1)   # ⟨x,D⟩ → ⟨CELL, name, x⟩
-    return _S(_COMP, _APNDL, _S(_CONS, make, _S(_COMP, purge, _2)))
+    return _S(_COMP, _APNDL, _S(_CONS, make, _S(_COMP, Pop(name), _2)))
 
 
 def DefineIn(name, obj):
@@ -128,7 +148,7 @@ def run(input_fact, D, validate_obj=None, cell_name="FILE", resolve_obj=None, de
     from . import defs
     handler = build_system(validate_obj, cell_name, resolve_obj, derive_obj, links_obj, machine)
     with defs.step(D):
-        return apply(handler, _S(input_fact, D))
+        return _transition(apply(handler, _S(input_fact, D)), D)
 
 
 # ============================ eq. sys — the whole system as one lambda =========
@@ -165,4 +185,15 @@ def dispatch(entity, op, D):
     fetches # and reduces to ⊥ (Prop. tenant)."""
     from . import defs
     with defs.step(D):
-        return apply(SYSTEM, _S(_S(A(entity), op), D))
+        return _transition(apply(SYSTEM, _S(_S(A(entity), op), D)), D)
+
+
+def _transition(result, D):
+    """The AST transition rule (Backus §14.3.1 verbatim): 'If μ(SYSTEM:x) is not a pair,
+    the output is an error message and the state remains unchanged.' The transition rules
+    are the framework's third element (§14.3), OUTSIDE the applicative subsystem — host
+    placement of this check is the faithful placement."""
+    from . import defs
+    if len(defs._items(L._list(result))) == 2:
+        return result
+    return _S(A("ERROR"), D)

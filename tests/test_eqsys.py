@@ -31,7 +31,9 @@ def test_eq_sys_routes_to_the_entity_handler_in_D():
 
 def test_eq_sys_tenant_unaddressability():
     # an address naming no cell of D fetches # ; #:x reduces to ⊥ — wrong-tenant access is
-    # not forbidden but impossible (Prop. tenant)
+    # not forbidden but impossible (Prop. tenant). The ⊥ never escapes the step: the
+    # transition rule (Backus §14.3.1) answers with an error output and an unchanged state.
     handler = ast.build_system(cell_name="people")
     D = _D(ast.cell("addPerson", handler), ast.cell("people", to_lam(())))
-    assert from_lam(ast.dispatch("ghost", to_lam(("x", "y")), D)) == "⊥"
+    (o, Dp) = from_lam(ast.dispatch("ghost", to_lam(("x", "y")), D))
+    assert o == "ERROR" and Dp == from_lam(D)
