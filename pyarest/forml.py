@@ -69,6 +69,9 @@ _CLASSIFY = [
     ("inverse_uc", re.compile(r"^[Ff]or each (.+?), at most one (.+) (?:that|those) .+\.$")),
     ("subset", re.compile(r"^[Ii]f (.+) then (.+)\.$")),                      # 'if A then B' = subset (modus ponens)
     ("equality", re.compile(r"^(.+) if and only if (.+)\.$")),                # 'A iff B' = equality
+    # a derivation RULE reading (leading * = derived): a linear role path from a root object type
+    # (infosci Mapping_ORM_to_Datalog: *Each FastCarDriver is some Person who drives some Car ...)
+    ("derivation_rule", re.compile(r"^\*Each (.+?) is some (.+?) who (.+)\.$")),
     ("neg_uniqueness", re.compile(r"^any (.+?) more than one (.+)\.$")),      # neg of 'each A .. at most one B'
     ("neg_mandatory", re.compile(r"^any (.+?) no (.+)\.$")),                   # neg of 'each A .. some B'
     ("disjunctive_mandatory", re.compile(r"^[Ee]ach (.+ or .+)\.$")),         # inclusive-or / disjunctive mandatory
@@ -194,6 +197,17 @@ def _strip_derivation(text):
     return None, text
 
 
+def _role_path(body):
+    """A linear role-path body -> ordered hops [(verb, type|None)]: 'drives some Car that is fast'
+    -> [('drives','Car'), ('is fast', None)]. Split on the ' that '/' who ' navigation connectives;
+    a hop 'V some T' is a step to object type T via predicate V, else a unary/property hop."""
+    hops = []
+    for part in re.split(r" that | who ", body):
+        m = re.match(r"^(.+?) some (.+)$", part.strip())
+        hops.append((m.group(1), m.group(2)) if m else (part.strip(), None))
+    return hops
+
+
 # NORMA value specs → a value constraint object over role 1. A pattern table (regex is the string
 # boundary); the first match's builder wins, else an enumeration. No if/elif dispatch.
 _VALUE_SPECS = [
@@ -304,6 +318,18 @@ def _h_fact(g, k, m):
     deriv = [("derivation", (ft, kind))] if kind else []      # link the fact type to its derivation/storage
     return facts + deriv, []
 
+def _h_derivation_rule(g, k, m):
+    from . import system as _sys
+    derived, root, body = g
+    hops = _role_path(body)                                    # the role path from the root
+    rule_cid = _slug(derived) + "_rule"
+    A = [("instanceOf", (derived, "ObjectType")), ("derivation", (_slug(derived), "fully-derived")),
+         ("derivationRule", (_slug(derived), root, len(hops)))]
+    # a two-hop linear path (root -V1-> T, T -V2-> ...) is a join on the shared type projecting the
+    # root: rule:⟨hop1, hop2⟩ = NatJoin(2) then Project([1]) (infosci ORM->Datalog).
+    cons = [(rule_cid, _sys.join_rule2(2, [1]))] if len(hops) == 2 else []
+    return A, cons
+
 
 _PLAN = {
     "entity_type": _h_entity, "value_type": _h_value, "ref_scheme": _h_ref_scheme,
@@ -311,7 +337,7 @@ _PLAN = {
     "value_constraint": _h_value_constraint, "uniqueness": _h_uniqueness, "mandatory": _h_mandatory,
     "neg_uniqueness": _h_neg_uniqueness, "neg_mandatory": _h_neg_mandatory, "spanning_uc": _h_spanning,
     "set_comparison": _h_set_comparison, "disjunctive_mandatory": _h_disjunctive,
-    "subset": _h_subset, "equality": _h_equality,
+    "subset": _h_subset, "equality": _h_equality, "derivation_rule": _h_derivation_rule,
     "negation": _h_negation, "possibility": _h_possibility, "inverse_uc": _h_inverse_uc,
     "fact_type_reading": _h_fact,
 }
