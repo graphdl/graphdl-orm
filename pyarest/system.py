@@ -293,22 +293,6 @@ def machine_for(D, noun):
     return bound.get(n)
 
 
-def machine_wiring(D, trigger_ft, noun):
-    """Read `trigger_ft`'s wiring off M: (from, to, guard) triples of the transitions it
-    fires (guard = the transition's guard fact type, or '#' for unguarded — a guard is a
-    possibly-derived fact type, so it is positive and the groundedness condition holds by
-    construction), and the addressed noun's role position in the trigger fact type."""
-    from . import ast
-    from .reduce import apply as _ap
-    from .lam import from_lam
-    guards = {r[0]: r[1] for r in _pop_rows(D, "smGuard")}
-    pairs = tuple((f, t, guards.get(name, "#"))
-                  for (name, f, tr, t) in sm_triples_named(D) if tr == trigger_ft)
-    roles = from_lam(_ap(ast.FetchPop("role"), D))
-    pos = next((p for (_rid, ft, p, otype) in roles if ft == trigger_ft and otype == noun), 1)
-    return pairs, pos
-
-
 # --- Phase 4 opening: RMAP read off M, driving D's layout (spec §4.4; §Cells) ---
 def _pop_rows(D, name):
     from . import ast
@@ -514,15 +498,12 @@ def process_table(D, noun):
     return out
 
 
-def machine_step(trigger_ft):
-    """The machine that runs IS the M-facts: one FFP object over ⟨statusPop, P″, D⟩ that
-    reads the transitions (smFrom ⋈ smTrigger ⋈ smTo), the guards (smGuard), and the
-    addressed entity's role position (role facts joined with the governed nouns, smDef
-    plus the derived governedBy closure) from D INSIDE the reduction, then advances each
-    entity whose trigger fact entered P″ with its guard satisfied. Numbers are selectors,
-    so the runtime role position selects dynamically via the apply primitive. Editing M
-    redirects this step with no rewiring; `trigger_ft` is the handler's compile-time
-    identity, exactly as cell_name is for build_system."""
+def _machine_exprs(trigger_ft):
+    """The shared in-step expressions of the M-driven machine, over ⟨statusPop, P″, D⟩:
+    the transition rows ⟨from, to, guard-or-#, emit-or-#⟩ joined from M in-reduction,
+    the governed player's role position, and the per-entity pieces (fired, guard
+    verdict, target) over pairs ⟨⟨e,s⟩, ⟨P″, trs, pos, D⟩⟩. machine_step and mealy_step
+    are two projections of this one machine."""
     from . import ast
     trig = _S(_CONST, A(trigger_ft))
     hash_ = _S(_CONST, A("#"))
@@ -530,12 +511,17 @@ def machine_step(trigger_ft):
     # the named transitions of THIS trigger, joined from M in-step
     trs4 = _S(_COMP, _sm_join_named(), _S(_CONS, popD("smFrom"), popD("smTrigger"), popD("smTo")))
     mine = _S(_COMP, T.Filter(_S(_COMP, _EQ, _S(_CONS, A(3), trig))), trs4)
-    # left-join guards by transition name: ⟨from, to, guard-or-#⟩
-    ghits = _S(_COMP, T.Filter(_S(_COMP, _EQ, _S(_CONS, _S(_COMP, _1, _1), _2))),
-               _DISTR, _S(_CONS, _2, _S(_COMP, _1, _1)))
-    gname_row = _S(_COND, _S(_COMP, A("null"), ghits), hash_, _S(_COMP, A(2), _1, _1, ghits))
-    row_fto = _S(_CONS, _S(_COMP, A(2), _1), _S(_COMP, A(4), _1), gname_row)
-    trsG = _S(_COMP, _S(_ALPHA, row_fto), _DISTR, _S(_CONS, mine, popD("smGuard")))
+
+    # left-join guards and Mealy emits by transition name; row context ⟨row, ⟨gp, ep⟩⟩
+    def _named(pop_sel):
+        hits = _S(_COMP, T.Filter(_S(_COMP, _EQ, _S(_CONS, _S(_COMP, _1, _1), _2))),
+                  _DISTR, _S(_CONS, pop_sel, _S(_COMP, _1, _1)))
+        return _S(_COND, _S(_COMP, A("null"), hits), hash_, _S(_COMP, A(2), _1, _1, hits))
+
+    row_ftge = _S(_CONS, _S(_COMP, A(2), _1), _S(_COMP, A(4), _1),
+                  _named(_S(_COMP, _1, _2)), _named(_S(_COMP, _2, _2)))
+    trsGE = _S(_COMP, _S(_ALPHA, row_ftge), _DISTR,
+               _S(_CONS, mine, _S(_CONS, popD("smGuard"), popD("smEmit"))))
     # the governed nouns: smDef bindings plus the derived closure (supertype governance)
     govnouns = _S(_COMP, _CAT, _S(_CONS, _S(_COMP, _S(_ALPHA, A(2)), popD("smDef")),
                                   _S(_COMP, _S(_ALPHA, A(1)), popD("governedBy"))))
@@ -545,8 +531,8 @@ def machine_step(trigger_ft):
     posrows = _S(_COMP, _S(_ALPHA, _1), T.Filter(rmatch), _DISTR,
                  _S(_CONS, popD("role"), govnouns))
     pos = _S(_COMP, A(3), _1, posrows)                       # the governed player's position
-    # per-entity update, with the read-once context ⟨P″, trs, pos, D⟩ riding along
-    ctx = _S(_CONS, _2, trsG, pos, A(3))
+    # per-entity pieces, with the read-once context ⟨P″, trs, pos, D⟩ riding along
+    ctx = _S(_CONS, _2, trsGE, pos, A(3))
     e = _S(_COMP, _1, _1)
     s = _S(_COMP, _2, _1)
     P = _S(_COMP, _1, _2)
@@ -562,6 +548,7 @@ def machine_step(trigger_ft):
     first = _S(_COMP, _1, nexts)
     to = _S(_COMP, A(2), first)
     gname = _S(_COMP, A(3), first)
+    em = _S(_COMP, A(4), first)
     gpop = _S(_COMP, ast.DynFetch(), _S(_CONS, gname, Dd))
     unguarded = _S(_COMP, _EQ, _S(_CONS, gname, hash_))
     satisfied = _S(_COMP, T.member, _S(_CONS, e, _S(_COMP, _S(_ALPHA, A(1)), gpop)))
@@ -569,8 +556,71 @@ def machine_step(trigger_ft):
              _S(_COND, _S(_COMP, A("atom"), gpop), _S(_CONST, A("F")), satisfied))
     hasnext = _S(_COMP, A("not"), A("null"), nexts)
     both = _S(_COMP, A("and"), _S(_CONS, fired, hasnext))
-    upd = _S(_COND, both, _S(_COND, okg, _S(_CONS, e, to), _1), _1)
-    return _S(_COMP, _S(_ALPHA, upd), _DISTR, _S(_CONS, _1, ctx))
+    return dict(ctx=ctx, e=e, s=s, to=to, em=em, okg=okg, both=both, hash_=hash_, Dd=Dd)
+
+
+def machine_step(trigger_ft):
+    """The machine that runs IS the M-facts: one FFP object over ⟨statusPop, P″, D⟩ that
+    reads the transitions (smFrom ⋈ smTrigger ⋈ smTo), the guards (smGuard), and the
+    addressed entity's role position (role facts joined with the governed nouns, smDef
+    plus the derived governedBy closure) from D INSIDE the reduction, then advances each
+    entity whose trigger fact entered P″ with its guard satisfied. Numbers are selectors,
+    so the runtime role position selects dynamically via the apply primitive. Editing M
+    redirects this step with no rewiring; `trigger_ft` is the handler's compile-time
+    identity, exactly as cell_name is for build_system."""
+    x = _machine_exprs(trigger_ft)
+    upd = _S(_COND, x["both"], _S(_COND, x["okg"], _S(_CONS, x["e"], x["to"]), _1), _1)
+    return _S(_COMP, _S(_ALPHA, upd), _DISTR, _S(_CONS, _1, x["ctx"]))
+
+
+def mealy_step(trigger_ft):
+    """Mealy output on the SAME step: for each entity whose transition fires, the
+    transition's named definition (smEmit, read from M in-step like everything else) is
+    resolved by ρ from D's own cells (definitions are ordinary cells, §13.3.5) and
+    applied to ⟨e, from, to⟩; the emissions ⟨⟨e, result⟩ …⟩ join the representation o.
+    Silent transitions, absent definitions, and unfired machines emit nothing."""
+    from . import ast
+    x = _machine_exprs(trigger_ft)
+    dcell = _S(_COMP, ast.DynFetch(), _S(_CONS, x["em"], x["Dd"]))
+    has_em = _S(_COMP, A("not"), _EQ, _S(_CONS, x["em"], x["hash_"]))
+    has_def = _S(_COMP, A("not"), A("atom"), dcell)
+    result = _S(_COMP, A("apply"), _S(_CONS, x["em"], _S(_CONS, x["e"], x["s"], x["to"])))
+    row = _S(_COND, x["both"], _S(_COND, x["okg"], _S(_COND, has_em,
+             _S(_COND, has_def, _S(_CONS, x["e"], result), x["hash_"]), x["hash_"]),
+             x["hash_"]), x["hash_"])
+    return _S(_COMP, T.Filter(_S(_COMP, A("not"), A("atom"))), _S(_ALPHA, row),
+              _DISTR, _S(_CONS, _1, x["ctx"]))
+
+
+def _governed_player(D, ft):
+    """The player of `ft` whose noun a machine governs (directly via smDef, or through
+    the derived governedBy closure), and so whose status cell the trigger advances."""
+    gov = {r[1] for r in _pop_rows(D, "smDef")} | {r[0] for r in _pop_rows(D, "governedBy")}
+    for (_rid, f, _p, otype) in _pop_rows(D, "role"):
+        if f == ft and otype in gov:
+            return otype
+    return None
+
+
+def create(D, fact_type, fact, fuel=None):
+    """THE ORM-level entry: the caller names only the fact. Whether a machine runs is the
+    ORM layer's business, read off M — when `fact_type` is some transition's trigger
+    (smTrigger) and one of its players is governed (smDef plus the derived governedBy
+    closure), the M-driven machine step and its Mealy emissions are attached to that
+    player's status cell; how it runs is the AST layer's (Prop. onestep: the one
+    transition, the trigger fact entering P IS the firing). Absorbed fact types route to
+    their RMAP table (machines on absorbed triggers: pending)."""
+    from . import ast
+    part = rmap_partition(D)
+    if part.get(fact_type, fact_type) != fact_type:
+        return create_routed(D, fact_type, fact, part)
+    machine = mealy = None
+    if any(r[1] == fact_type for r in _pop_rows(D, "smTrigger")):
+        noun = _governed_player(D, fact_type)
+        if noun is not None:
+            machine = (noun + "_status", machine_step(fact_type))
+            mealy = mealy_step(fact_type)
+    return ast.run(fact, D, cell_name=fact_type, machine=machine, mealy_obj=mealy, fuel=fuel)
 
 
 def governance_rules(D):
@@ -591,35 +641,3 @@ def governance_rules(D):
     return _ap(ast.Store("ruleReads"), _S(to_lam(reads), D))
 
 
-def sm_step(pairs, entity_role):
-    """The live machine step (Prop. onestep) as one FFP object: ⟨statusPop, P″, D⟩ →
-    statusPop′. An entity advances iff a trigger fact naming it (at `entity_role`)
-    entered P″, a transition leaves its current status, AND the transition's guard is
-    satisfied: the guard is a fact type ('#' when unguarded), and satisfaction is the
-    entity's membership in role 1 of the guard's population fetched from the frozen D.
-    A guard on a DERIVED fact type gives guards full rule power while staying positive."""
-    from .lam import to_lam
-    from . import ast
-    norm = tuple((p[0], p[1], p[2] if len(p) > 2 else "#") for p in pairs)
-    trs = _S(_CONST, to_lam(norm))
-    pairsD = _S(_COMP, _DISTR, _S(_CONS, _1, _S(_CONS, _2, A(3))))   # ⟨⟨es, ⟨P″,D⟩⟩ …⟩
-    e = _S(_COMP, _1, _1)                                    # of ⟨⟨e,s⟩, ⟨P″,D⟩⟩
-    s = _S(_COMP, _2, _1)
-    P = _S(_COMP, _1, _2)
-    Dd = _S(_COMP, _2, _2)
-    fact_names_e = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, A(entity_role), _1), _2))   # ⟨fact,e⟩
-    fired = _S(_COMP, A("not"), A("null"), T.Filter(fact_names_e), _DISTR, _S(_CONS, P, e))
-    from_is_s = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, _1, _1), _2))                  # ⟨⟨f,t,g⟩,s⟩
-    nexts = _S(_COMP, _S(_ALPHA, _1), T.Filter(from_is_s), _DISTR, _S(_CONS, trs, s))
-    first = _S(_COMP, _1, nexts)
-    to = _S(_COMP, A(2), first)
-    gname = _S(_COMP, A(3), first)
-    gpop = _S(_COMP, ast.DynFetch(), _S(_CONS, gname, Dd))   # the guard population, or #
-    unguarded = _S(_COMP, _EQ, _S(_CONS, gname, _S(_CONST, A("#"))))
-    satisfied = _S(_COMP, T.member, _S(_CONS, e, _S(_COMP, _S(_ALPHA, A(1)), gpop)))
-    okg = _S(_COND, unguarded, _S(_CONST, A("T")),
-             _S(_COND, _S(_COMP, A("atom"), gpop), _S(_CONST, A("F")), satisfied))
-    hasnext = _S(_COMP, A("not"), A("null"), nexts)
-    both = _S(_COMP, A("and"), _S(_CONS, fired, hasnext))
-    upd = _S(_COND, both, _S(_COND, okg, _S(_CONS, e, to), _1), _1)
-    return _S(_COMP, _S(_ALPHA, upd), pairsD)                # over each ⟨⟨e,s⟩, ⟨P″,D⟩⟩

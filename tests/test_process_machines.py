@@ -46,9 +46,7 @@ Status 'Placed' emits 'awaiting-shipment'.
 
 
 def _step_place(D, fact):
-    pairs, pos = system.machine_wiring(D, "Customer_places_Order", "Order")
-    return from_lam(ast.run(to_lam(fact), D, cell_name="Customer_places_Order",
-                            machine=("Order_status", system.sm_step(pairs, pos), pos)))
+    return from_lam(system.create(D, "Customer_places_Order", to_lam(fact)))
 
 
 def test_guard_facts_parse_into_M():

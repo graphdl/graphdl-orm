@@ -56,11 +56,11 @@ def test_sm_readings_populate_M():
     assert ("Order", "OrderId") in _cell(Dpy, "refMode")      # the (.OrderId) reference mode
 
 
-def test_machine_wiring_reads_the_sm_off_M():
+def test_the_sm_triples_read_off_M():
     D, _ = forml.compile_model(MODEL)
-    pairs, pos = system.machine_wiring(D, "Customer_places_Order", "Order")
-    assert pairs == (("In Cart", "Placed", "#"),)             # place: In Cart -> Placed, unguarded
-    assert pos == 2                                           # Order plays role 2 of the trigger
+    triples = set(system.sm_triples_named(D))
+    assert ("place", "In Cart", "Customer_places_Order", "Placed") in triples
+    assert ("ship", "Placed", "Customer_ships_Order", "Shipped") in triples
 
 
 def test_place_then_ship_advances_the_machine_with_correct_links():
@@ -74,10 +74,9 @@ def test_place_then_ship_advances_the_machine_with_correct_links():
     avail0 = from_lam(apply(trans_of, to_lam((("o1", "In Cart"),))))
     assert {t[1] for t in avail0} == {"Customer_places_Order"}
 
-    # the 'place' trigger fact enters P — ONE AST step advances the machine (Prop. onestep)
-    pairs, pos = system.machine_wiring(D, "Customer_places_Order", "Order")
-    D = apply(A(2), ast.run(to_lam(("c1", "o1")), D, cell_name="Customer_places_Order",
-                            machine=("Order_status", system.sm_step(pairs, pos))))
+    # the 'place' trigger fact enters P — ONE AST step advances the machine (Prop. onestep);
+    # the ORM layer attaches the machine from M, the caller names only the fact
+    D = apply(A(2), system.create(D, "Customer_places_Order", to_lam(("c1", "o1"))))
     Dpy = from_lam(D)
     assert _cell(Dpy, "Order_status") == {("o1", "Placed")}   # advanced
     assert ("c1", "o1") in _cell(Dpy, "Customer_places_Order")
@@ -87,9 +86,7 @@ def test_place_then_ship_advances_the_machine_with_correct_links():
     assert {t[1] for t in avail1} == {"Customer_ships_Order"}
 
     # ship advances to Shipped
-    pairs2, pos2 = system.machine_wiring(D, "Customer_ships_Order", "Order")
-    D = apply(A(2), ast.run(to_lam(("c1", "o1")), D, cell_name="Customer_ships_Order",
-                            machine=("Order_status", system.sm_step(pairs2, pos2))))
+    D = apply(A(2), system.create(D, "Customer_ships_Order", to_lam(("c1", "o1"))))
     assert _cell(from_lam(D), "Order_status") == {("o1", "Shipped")}
 
 
@@ -101,9 +98,8 @@ def test_the_representation_itself_carries_the_changed_links():
     D = _with_pop(D, "Order_status", (("o1", "In Cart"),))
     trans_of = system.transitions_of(to_lam(system.sm_triples(D)), 2)
 
-    pairs, pos = system.machine_wiring(D, "Customer_places_Order", "Order")
     (o, Dp) = from_lam(ast.run(to_lam(("c1", "o1")), D, cell_name="Customer_places_Order",
-                               machine=("Order_status", system.sm_step(pairs, pos), pos),
+                               machine=("Order_status", system.machine_step("Customer_places_Order"), 2),
                                links_obj=trans_of))
     _p2, _v, links = o
     assert {t[1] for t in links} == {"Customer_ships_Order"}  # ship offered, place gone
@@ -111,9 +107,8 @@ def test_the_representation_itself_carries_the_changed_links():
     # ship reaches Shipped — no outgoing transitions, so links(e) = φ: the paper's
     # logical deletion ("an entity that reaches a status with no outgoing transitions")
     D2 = _rebuild(Dp)
-    pairs2, pos2 = system.machine_wiring(D2, "Customer_ships_Order", "Order")
     (o2, _D3) = from_lam(ast.run(to_lam(("c1", "o1")), D2, cell_name="Customer_ships_Order",
-                                 machine=("Order_status", system.sm_step(pairs2, pos2), pos2),
+                                 machine=("Order_status", system.machine_step("Customer_ships_Order"), 2),
                                  links_obj=trans_of))
     assert o2[2] == ()                                        # links(e) = φ — nothing left to do
 

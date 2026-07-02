@@ -89,12 +89,13 @@ def DefineIn(name, obj):
 
 
 def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_obj=None, links_obj=None,
-                 machine=None):
+                 machine=None, mealy_obj=None):
     """The transition create_cell:⟨I, D⟩ → ⟨⟨P'',V⟩, D'⟩ over one cell, wired with a schema's
     validate (and optionally its resolve/derive). It touches only `cell_name` — plus, when
     `machine=(status_cell, sm_obj)` is wired, the noun's status cell: the trigger fact entering
     P advances the machine within the SAME step (Prop. onestep), atomically with the commit.
-    Commits iff the alethic flag is false."""
+    With `mealy_obj` (same input shape as sm_obj) the fired transitions' Mealy emissions are
+    appended to the representation o as its last part. Commits iff the alethic flag is false."""
     validate_obj = validate_obj if validate_obj is not None else _STUB_VALIDATE
     resolve_stage = resolve_obj if resolve_obj is not None else _APNDL
     derive_stage = derive_obj if derive_obj is not None else A("id")
@@ -126,6 +127,8 @@ def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_o
             match_e = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, _1, _1), _2))    # ⟨⟨e?,s⟩, e⟩
             links_in = _S(_COMP, _S(A("ALPHA"), _1), Filter(match_e), _DISTR, _S(_CONS, snew, e))
         parts = [P2, V, _S(_COMP, links_obj, links_in)]
+    if mealy_obj is not None and machine is not None:        # Mealy: the fired transitions'
+        parts.append(_S(_COMP, mealy_obj, _S(_CONS, spop, P2, _2)))   # emissions, last part of o
     o = _S(_CONS, *parts)                                    # o = ⟨P'', V⟩ or ⟨P'', V, links⟩ (hateoas)
     commit = _S(_COMP, Store(cell_name), _S(_CONS, P2, _2))  # ↓cell:⟨P'', D⟩
     if snew is not None:
@@ -154,7 +157,7 @@ def reset(x, D):
 
 
 def run(input_fact, D, validate_obj=None, cell_name="FILE", resolve_obj=None, derive_obj=None, links_obj=None,
-        machine=None, fuel=None):
+        machine=None, mealy_obj=None, fuel=None):
     """One AST transition: mu(create_cell:⟨input, D⟩) = ⟨o, D'⟩, with D's OWN definitions in
     scope for the whole step (defs.step — frozen, Backus §14.6). Without a validate it commits
     (V = φ); with validate_of it refuses to commit on an alethic violation; with links_obj the
@@ -163,7 +166,7 @@ def run(input_fact, D, validate_obj=None, cell_name="FILE", resolve_obj=None, de
     onestep) — and given the entity_role, links_obj is fed the entity's POST-step status, so
     the returned representation offers exactly the next actions (§1: ship, no longer place)."""
     from . import defs
-    handler = build_system(validate_obj, cell_name, resolve_obj, derive_obj, links_obj, machine)
+    handler = build_system(validate_obj, cell_name, resolve_obj, derive_obj, links_obj, machine, mealy_obj)
     with defs.step(D, fuel):
         return _transition(apply(handler, _S(input_fact, D)), D)
 
