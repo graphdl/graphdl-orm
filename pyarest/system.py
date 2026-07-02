@@ -51,6 +51,16 @@ def validate_of(constraints, alethic=None):
     return _S(_CONS, _ID, _violations(constraints), flag)
 
 
+def validate_modal(pairs):
+    """validate over constraints tagged with modality: pairs = [(constraint_obj, modality)]. V is
+    the union of ALL violations, but only the ALETHIC ones set the block-commit flag (AREST Def.
+    Violation / eq. create). A deontic violation is reported in V yet never blocks commit —
+    'ought to be obeyed but may be violated' (the constraint verbalization paper's deontic o)."""
+    objs = [o for o, _m in pairs]
+    alethic = [o for o, m in pairs if m == "alethic"]
+    return validate_of(objs, alethic=alethic)
+
+
 # --- derive = lfp(F_S): the immediate-consequence operator iterated to a fixed point ---
 def F_of(rules):
     """One round: F_S(P) = P ∪ ⋃_rules rule(P), with set semantics (dedup ∘ flatten ∘ [id, rules])."""

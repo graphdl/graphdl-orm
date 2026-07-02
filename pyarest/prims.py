@@ -60,18 +60,21 @@ _tlr   = lambda mu: lambda o: o(lambda v: L.BOT)(lambda l: L.SEQ(_revl(L.TAIL(_r
 # values, so these are boundary operations, not lambda arithmetic. Same-type operands only. ----
 _NA = object()
 _pv = lambda o: o(lambda v: v)(lambda l: _NA)(_NA)          # the native value of an atom, else _NA
+_numeric = lambda a, b: isinstance(a, (int, float)) and isinstance(b, (int, float)) \
+    and not isinstance(a, bool) and not isinstance(b, bool)
 def _binnum(f):
     def prim(mu):
         def g(o):
             a, b = _pv(_1(o)), _pv(_2(o))
-            return L.atom(f(a, b)) if (isinstance(a, (int, float)) and type(a) is type(b)) else L.BOT
+            return L.atom(f(a, b)) if _numeric(a, b) else L.BOT        # int/float are one numeric domain
         return g
     return prim
 def _cmp(rel):
     def prim(mu):
         def g(o):
             a, b = _pv(_1(o)), _pv(_2(o))
-            return (aT if rel(a, b) else aF) if (a is not _NA and b is not _NA and type(a) is type(b)) else L.BOT
+            ok = a is not _NA and b is not _NA and (_numeric(a, b) or type(a) is type(b))
+            return (aT if rel(a, b) else aF) if ok else L.BOT         # numeric ordering across int/float
         return g
     return prim
 _add, _sub, _mul = _binnum(lambda a, b: a + b), _binnum(lambda a, b: a - b), _binnum(lambda a, b: a * b)

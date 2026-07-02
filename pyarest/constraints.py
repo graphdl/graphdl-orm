@@ -62,13 +62,35 @@ def ring_symmetric(roles=(1, 2)):
     return _S(_COMP, _S(_ALPHA, _1), T.Filter(viol), _DISTR, _S(_CONS, _ID, _ID))
 
 
-def value_range(role, lo, hi):
-    """Value constraint: the value at `role` lies in [lo, hi]. V = the facts outside the range
-    (a boundary comparison on the ORM-typed value)."""
+_LE, _GE = A("le"), A("ge")
+
+
+def value_range(role, lo=None, hi=None, lo_open=False, hi_open=False):
+    """Value constraint over a continuous range (NORMA's value ranges). The value at `role` must
+    lie in the range with bounds lo/hi (None = unbounded, *_open = exclusive). V = the facts
+    outside it — a boundary comparison on the ORM-typed value. Closed [lo,hi] violates below lo
+    or above hi; open bounds use le/ge instead of lt/gt."""
     rv = A(role)
-    below = _S(_COMP, _LT, _S(_CONS, rv, _S(_CONST, to_lam(lo))))
-    above = _S(_COMP, _GT, _S(_CONS, rv, _S(_CONST, to_lam(hi))))
-    return T.Filter(_S(_COMP, _OR, _S(_CONS, below, above)))
+    parts = []
+    if lo is not None:
+        parts.append(_S(_COMP, _LE if lo_open else _LT, _S(_CONS, rv, _S(_CONST, to_lam(lo)))))
+    if hi is not None:
+        parts.append(_S(_COMP, _GE if hi_open else _GT, _S(_CONS, rv, _S(_CONST, to_lam(hi)))))
+    if len(parts) == 2:
+        pred = _S(_COMP, _OR, _S(_CONS, parts[0], parts[1]))
+    elif parts:
+        pred = parts[0]
+    else:
+        pred = _S(_CONST, A("F"))                             # unbounded both ways ⇒ nothing violates
+    return T.Filter(pred)
+
+
+def value_enumeration(role, values):
+    """Value constraint over an enumeration (NORMA's 'the possible values of X are …'). The value
+    at `role` must be one of `values`. V = the facts whose value is not in the set (via member)."""
+    allowed = to_lam(tuple(values))
+    in_set = _S(_COMP, T.member, _S(_CONS, A(role), _S(_CONST, allowed)))   # value ∈ allowed
+    return T.Filter(_S(_COMP, _NOT, in_set))                                # keep facts NOT in the set
 
 
 def mandatory():
