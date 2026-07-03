@@ -279,6 +279,8 @@ By Definition~\ref{def:reg} a compiled definition is finite reduction over a fin
 
 \noindent A noun backed by an external system sits on this line: its population is fetched by a registered function, and its facts enter under the open-world assumption~\cite{halpin08}. Informality is not removed but localized to a queryable fact set, and the trusted base (the parser, the compiler, the verbalizer, and the registered functions) is precisely what~(\ref{eq:boundary}) returns.
 
+\smallskip\noindent\textbf{Verified accelerations.} A registered definition that shadows a compiled definition of the same name --- a host-native twin of a canonical object, held observationally equal to it by a differential the system itself runs --- contributes no informality: its meaning is the canonical definition's, decidable by Definition~\ref{def:reg}, and the twin is an implementation detail a host may omit, resolution degrading to the canonical form with the same result. The informal surface of~(\ref{eq:boundary}) therefore refines to the registered definitions \emph{without} canonical twins (the true foreign functions: fetch, render, storage, devices), and a runtime may carry per-host twin sets --- one per language, one per machine --- without widening the boundary, which is what makes the system's semantics portable across hosts while its performance is not required to be.
+
 
 \section{Conclusion}
 
