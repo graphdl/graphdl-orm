@@ -157,10 +157,10 @@ def nav_of(key_pos):
 def transitions_of(sm, status_pos):
     """transitions(status(e)): the state-machine transitions available from the head fact's
     status. `sm` is a value ⟨⟨from, trigger, to⟩…⟩; a transition fires when from = status(head).
-        α(1) ∘ Filter(from(t) = status) ∘ distr ∘ [sm̄, status∘1]"""
-    keyed = _S(_CONS, _S(_CONST, sm), _S(_COMP, A(status_pos), _1))   # ⟨sm, status(head)⟩
-    match = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, _1, _1), _2))          # from(t) = status?
-    return _S(_COMP, _S(_ALPHA, _1), T.Filter(match), _DISTR, keyed)
+        α(1) ∘ Filter(from(t) = status) ∘ distr ∘ [sm̄, status∘1]
+    The canonical builder applied to ⟨sm, pos⟩ (shared/system.py)."""
+    from .reduce import apply as _apply
+    return _apply(A("system:transitions_of"), _S(sm, A(status_pos)))
 
 
 def links_of(key_pos, sm=None, status_pos=None):
@@ -670,77 +670,6 @@ def process_table(D, noun):
     return out
 
 
-def _machine_exprs(trigger_ft, row_col=None):
-    """The shared in-step expressions of the M-driven machine, over ⟨statusPop, P″, D⟩:
-    the transition rows ⟨from, to, guard-or-#, emit-or-#⟩ joined from M in-reduction,
-    the governed player's role position, and the per-entity pieces (fired, guard
-    verdict, target) over pairs ⟨⟨e,s⟩, ⟨P″, trs, pos, D⟩⟩. machine_step and mealy_step
-    are two projections of this one machine. With `row_col`, P″ is an ABSORBED entity's
-    3NF row instead of a fact population: fired means the trigger's column went non-hole
-    and the addressed entity is the row's key (or the column's value when the governed
-    noun plays role 2 — the position still read from M in-step)."""
-    from . import ast
-    trig = _S(_CONST, A(trigger_ft))
-    hash_ = _S(_CONST, A("#"))
-    popD = lambda name: _S(_COMP, ast.FetchPop(name), A(3))
-    # the named transitions of THIS trigger, joined from M in-step
-    trs4 = _S(_COMP, _sm_join_named(), _S(_CONS, popD("smFrom"), popD("smTrigger"), popD("smTo")))
-    mine = _S(_COMP, T.Filter(_S(_COMP, _EQ, _S(_CONS, A(3), trig))), trs4)
-
-    # left-join guards and Mealy emits by transition name; row context ⟨row, ⟨gp, ep⟩⟩
-    def _named(pop_sel):
-        hits = _S(_COMP, T.Filter(_S(_COMP, _EQ, _S(_CONS, _S(_COMP, _1, _1), _2))),
-                  _DISTR, _S(_CONS, pop_sel, _S(_COMP, _1, _1)))
-        return _S(_COND, _S(_COMP, A("null"), hits), hash_, _S(_COMP, A(2), _1, _1, hits))
-
-    row_ftge = _S(_CONS, _S(_COMP, A(2), _1), _S(_COMP, A(4), _1),
-                  _named(_S(_COMP, _1, _2)), _named(_S(_COMP, _2, _2)))
-    trsGE = _S(_COMP, _S(_ALPHA, row_ftge), _DISTR,
-               _S(_CONS, mine, _S(_CONS, popD("smGuard"), popD("smEmit"))))
-    # the governed nouns: smDef bindings plus the derived closure (supertype governance)
-    govnouns = _S(_COMP, _CAT, _S(_CONS, _S(_COMP, _S(_ALPHA, A(2)), popD("smDef")),
-                                  _S(_COMP, _S(_ALPHA, A(1)), popD("governedBy"))))
-    rmatch = _S(_COMP, A("and"), _S(_CONS,
-                _S(_COMP, _EQ, _S(_CONS, _S(_COMP, A(2), _1), trig)),
-                _S(_COMP, T.member, _S(_CONS, _S(_COMP, A(4), _1), _2))))
-    posrows = _S(_COMP, _S(_ALPHA, _1), T.Filter(rmatch), _DISTR,
-                 _S(_CONS, popD("role"), govnouns))
-    pos = _S(_COMP, A(3), _1, posrows)                       # the governed player's position
-    # per-entity pieces, with the read-once context ⟨P″, trs, pos, D⟩ riding along
-    ctx = _S(_CONS, _2, trsGE, pos, A(3))
-    e = _S(_COMP, _1, _1)
-    s = _S(_COMP, _2, _1)
-    P = _S(_COMP, _1, _2)
-    trs = _S(_COMP, _2, _2)
-    posv = _S(_COMP, A(3), _2)
-    Dd = _S(_COMP, A(4), _2)
-    if row_col is None:
-        fmatch = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, A("apply"), _S(_CONS, _S(_COMP, _2, _2), _1)),
-                                   _S(_COMP, _1, _2)))       # fact[pos] = e, dynamically
-        fired = _S(_COMP, A("not"), A("null"), T.Filter(fmatch), _DISTR,
-                   _S(_CONS, P, _S(_CONS, e, posv)))
-    else:
-        e_addr = _S(_COND, _S(_COMP, _EQ, _S(_CONS, posv, _S(_CONST, A(1)))),
-                    _S(_COMP, A(1), P), _S(_COMP, A(row_col), P))
-        nonhole = _S(_COMP, A("not"), _EQ, _S(_CONS, _S(_COMP, A(row_col), P), hash_))
-        fired = _S(_COMP, A("and"), _S(_CONS,
-                   _S(_COMP, _EQ, _S(_CONS, e, e_addr)), nonhole))
-    from_is_s = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, _1, _1), _2))
-    nexts = _S(_COMP, _S(_ALPHA, _1), T.Filter(from_is_s), _DISTR, _S(_CONS, trs, s))
-    first = _S(_COMP, _1, nexts)
-    to = _S(_COMP, A(2), first)
-    gname = _S(_COMP, A(3), first)
-    em = _S(_COMP, A(4), first)
-    gpop = _S(_COMP, ast.DynFetch(), _S(_CONS, gname, Dd))
-    unguarded = _S(_COMP, _EQ, _S(_CONS, gname, hash_))
-    satisfied = _S(_COMP, T.member, _S(_CONS, e, _S(_COMP, _S(_ALPHA, A(1)), gpop)))
-    okg = _S(_COND, unguarded, _S(_CONST, A("T")),
-             _S(_COND, _S(_COMP, A("atom"), gpop), _S(_CONST, A("F")), satisfied))
-    hasnext = _S(_COMP, A("not"), A("null"), nexts)
-    both = _S(_COMP, A("and"), _S(_CONS, fired, hasnext))
-    return dict(ctx=ctx, e=e, s=s, to=to, em=em, okg=okg, both=both, hash_=hash_, Dd=Dd)
-
-
 def machine_step(trigger_ft, row_col=None):
     """The machine that runs IS the M-facts: one FFP object over ⟨statusPop, P″, D⟩ that
     reads the transitions (smFrom ⋈ smTrigger ⋈ smTo), the guards (smGuard), and the
@@ -751,9 +680,10 @@ def machine_step(trigger_ft, row_col=None):
     redirects this step with no rewiring; `trigger_ft` is the handler's compile-time
     identity, exactly as cell_name is for build_system. `row_col` selects the absorbed
     (3NF-row) fired form."""
-    x = _machine_exprs(trigger_ft, row_col)
-    upd = _S(_COND, x["both"], _S(_COND, x["okg"], _S(_CONS, x["e"], x["to"]), _1), _1)
-    return _S(_COMP, _S(_ALPHA, upd), _DISTR, _S(_CONS, _1, x["ctx"]))
+    from .reduce import apply as _apply
+    from .lam import to_lam
+    rc = to_lam(()) if row_col is None else _S(to_lam(row_col))
+    return _apply(A("system:machine_step"), _S(A(trigger_ft), rc))
 
 
 def mealy_step(trigger_ft, row_col=None):
@@ -762,17 +692,10 @@ def mealy_step(trigger_ft, row_col=None):
     resolved by ρ from D's own cells (definitions are ordinary cells, §13.3.5) and
     applied to ⟨e, from, to⟩; the emissions ⟨⟨e, result⟩ …⟩ join the representation o.
     Silent transitions, absent definitions, and unfired machines emit nothing."""
-    from . import ast
-    x = _machine_exprs(trigger_ft, row_col)
-    dcell = _S(_COMP, ast.DynFetch(), _S(_CONS, x["em"], x["Dd"]))
-    has_em = _S(_COMP, A("not"), _EQ, _S(_CONS, x["em"], x["hash_"]))
-    has_def = _S(_COMP, A("not"), A("atom"), dcell)
-    result = _S(_COMP, A("apply"), _S(_CONS, x["em"], _S(_CONS, x["e"], x["s"], x["to"])))
-    row = _S(_COND, x["both"], _S(_COND, x["okg"], _S(_COND, has_em,
-             _S(_COND, has_def, _S(_CONS, x["e"], result), x["hash_"]), x["hash_"]),
-             x["hash_"]), x["hash_"])
-    return _S(_COMP, T.Filter(_S(_COMP, A("not"), A("atom"))), _S(_ALPHA, row),
-              _DISTR, _S(_CONS, _1, x["ctx"]))
+    from .reduce import apply as _apply
+    from .lam import to_lam
+    rc = to_lam(()) if row_col is None else _S(to_lam(row_col))
+    return _apply(A("system:mealy_step"), _S(A(trigger_ft), rc))
 
 
 def _governed_player(D, ft):
