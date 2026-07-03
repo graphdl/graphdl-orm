@@ -36,9 +36,16 @@ def _untuple(v):
 
 
 # ============================ sqlite: cells one-to-one ========================
-def save_sqlite(D, path):
+def save_sqlite(D, path, seal_key=None):
     """Snapshot every cell (fact populations AND definitions — both are data) into a
-    cells table, insertion order preserved (first match wins on load, as in D)."""
+    cells table, insertion order preserved (first match wins on load, as in D). With a
+    seal_key, the roles the schema derives as sensitive (seal.plan) are sealed before
+    they touch disk — field-level encryption at rest, mode per constraint."""
+    from . import seal as _seal
+    sealing = _seal.plan(D)["roles"] if seal_key else {}
+    bycol = {}
+    for ((ft, pos), mode) in sealing.items():
+        bycol.setdefault(ft, []).append((pos, mode))
     con = sqlite3.connect(path)
     try:
         con.execute("CREATE TABLE IF NOT EXISTS cells (ord INTEGER PRIMARY KEY, "
@@ -46,21 +53,30 @@ def save_sqlite(D, path):
         con.execute("DELETE FROM cells")
         for i, c in enumerate(from_lam(D)):
             if isinstance(c, tuple) and len(c) == 3 and c[0] == "CELL":
+                contents = c[2]
+                if seal_key and c[1] in bycol and isinstance(contents, tuple):
+                    contents = _seal.seal_rows(seal_key, contents, bycol[c[1]])
                 con.execute("INSERT INTO cells (ord, name, contents) VALUES (?, ?, ?)",
-                            (i, json.dumps(c[1]), json.dumps(_conv(c[2]),
+                            (i, json.dumps(c[1]), json.dumps(_conv(contents),
                                                              ensure_ascii=False)))
         con.commit()
     finally:
         con.close()
 
 
-def load_sqlite(path):
+def load_sqlite(path, seal_key=None):
+    from . import seal as _seal
     con = sqlite3.connect(path)
     try:
         rows = con.execute("SELECT name, contents FROM cells ORDER BY ord").fetchall()
     finally:
         con.close()
     cells = tuple(("CELL", json.loads(n), _untuple(json.loads(c))) for (n, c) in rows)
+    if seal_key:
+        cells = tuple(
+            (t, n, _seal.unseal_rows(seal_key, v)
+             if isinstance(v, tuple) and all(isinstance(r, tuple) for r in v) else v)
+            for (t, n, v) in cells)
     return to_lam(cells)
 
 
