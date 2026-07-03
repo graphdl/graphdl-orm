@@ -219,30 +219,20 @@ def run(input_fact, D, validate_obj=None, cell_name="FILE", resolve_obj=None, de
 # An address naming no cell of D fetches # — and #:x reduces to ⊥, so wrong-tenant access is
 # not forbidden but impossible (Prop. tenant: isolation = preservation of addressability under ↑).
 
-# DynFetch : ⟨name, D⟩ → contents of the first cell of D named `name` (a runtime value), else #.
-_name_pairs = _S(_COMP, _DISTR, _S(_CONS, _2, _1))          # ⟨name, D⟩ → ⟨⟨cell, name⟩ …⟩
-_cell_named = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, _2, _1), _2))   # ⟨cell, name⟩ → (name of cell) = name?
-def _dyn_hits():
-    from .theta import Filter
-    return _S(_COMP, Filter(_cell_named), _name_pairs)
-def _DynFetch():
-    hits = _dyn_hits()
-    return _S(_COND, _S(_COMP, _NULL, hits),
-              _S(_CONST, DEFAULT),                           # no such cell ⇒ # (unaddressable)
-              _S(_COMP, _3, _1, _1, hits))                   # else contents of the first match's cell
+# DynFetch : ⟨name, D⟩ → contents of the first cell of D named `name` (a runtime
+# value), else #. SYSTEM : ⟨⟨entity, op⟩, D⟩ → apply:⟨↑entity:D, ⟨op, D⟩⟩. Both are
+# the CANON's (shared/ast.py, eq. sys verbatim); this module binds them.
+from . import canon as _canon
+_C = dict(_canon.read("ast.py"))
+
 
 def DynFetch():
     """The dynamic fetch expression over ⟨name, D⟩: contents of the first cell of D whose
     name equals the runtime value `name`, else # (the public form of eq. sys's fetch)."""
-    return _DynFetch()
+    return _C["ast:DynFetch"]
 
 
-# SYSTEM : ⟨⟨entity, op⟩, D⟩ → apply:⟨↑entity:D, ⟨op, D⟩⟩
-def _SYSTEM():
-    handler = _S(_COMP, _DynFetch(), _S(_CONS, _S(_COMP, _1, _1), _2))   # ↑entity:D
-    op_D = _S(_CONS, _S(_COMP, _2, _1), _2)                              # ⟨op, D⟩
-    return _S(_COMP, _APPLY, _S(_CONS, handler, op_D))
-SYSTEM = _SYSTEM()
+SYSTEM = _C["ast:SYSTEM"]
 
 
 def dispatch(entity, op, D):
