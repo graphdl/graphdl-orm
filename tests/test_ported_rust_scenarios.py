@@ -9,8 +9,7 @@ VALID (the old contract holds here):
   recursive_self_join_closure_e2e — transitive closure to the lfp (surface adapted to
   the book's numbered-variable rule form; same semantics).
 
-VALID SPEC, GAP IN BOTH ENGINES (their test documents the right spec AND their own
-resolver missing it; pyarest shares the gap, pinned as xfail):
+VALID SPEC, was a gap in BOTH engines, now CLOSED here (the clause lift):
   subtype_join_antecedent_supertype_ft_e2e — a subtype-keyed clause must resolve up to
   the supertype-declared fact type (subtype instances ARE supertype instances).
 
@@ -109,12 +108,9 @@ Glyph1 reaches Glyph3 if Glyph1 links Glyph2 and Glyph2 reaches Glyph3.
     assert got == {("a", "b"), ("b", "c"), ("c", "d"), ("a", "c"), ("b", "d"), ("a", "d")}
 
 
-@pytest.mark.xfail(reason="valid spec, gap in BOTH engines: a subtype-keyed rule clause "
-                          "must resolve up to the supertype-declared fact type (subtype "
-                          "instances ARE supertype instances); the old engine's own test "
-                          "documents its resolver missing this, and pyarest's clause "
-                          "resolution shares the gap — the subtype-lift is queued")
 def test_subtype_clause_resolves_up_to_the_supertype_fact_type():
+    # the gap BOTH engines shared, now closed here: the clause lift resolves a
+    # subtype-keyed atom up to the supertype-declared fact type
     MODEL = """Function(.id) is an entity type.
 Domain(.id) is an entity type.
 Resource(.id) is an entity type.

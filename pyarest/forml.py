@@ -155,6 +155,57 @@ def classify(stmt):
     return kind, groups
 
 
+class _Known(set):
+    """The known TYPE NAMES, carrying the prepass context rules need: the subtype
+    closure (noun → its ancestors) and the declared fact-type slugs, so a rule clause
+    keyed on a subtype can resolve UP to the supertype-declared fact type (subtype
+    instances are supertype instances — the lift both engines' tests demanded)."""
+    def __new__(cls, names, subs=None, fts=None):
+        self = super().__new__(cls, names)
+        self.subs = subs or {}
+        self.fts = fts or set()
+        return self
+
+    def __init__(self, names, subs=None, fts=None):
+        super().__init__(names)
+
+
+def _prepass_context(stmts, names):
+    """Collect subtype edges (closed transitively) and declared fact-type slugs."""
+    edges = []
+    fts = set()
+    for s in stmts:
+        kind, g = classify(s)
+        if kind == "subtype_of":
+            edges.append((g[0].strip(), g[1].strip()))
+        elif kind == "brace_subtypes":
+            for sub in g[0].split(","):
+                edges.append((sub.strip(), g[2].strip()))
+        elif kind == "fact_type_reading" and "'" not in g[0]:
+            ft, _ = _fact_type(_strip_derivation(g[0])[1], names)
+            fts.add(ft)
+        elif kind == "uniqueness":
+            ft, _ = _fact_type(g[0] + " " + g[2], names)
+            fts.add(ft)
+        elif kind == "mandatory":
+            ft, _ = _fact_type(g[0] + " " + g[1], names)
+            fts.add(ft)
+    parents = {}
+    for (a, b) in edges:
+        parents.setdefault(a, set()).add(b)
+    closure = {}
+    for start in parents:
+        seen, todo = set(), [start]
+        while todo:
+            cur = todo.pop()
+            for p in parents.get(cur, ()):
+                if p not in seen:
+                    seen.add(p)
+                    todo.append(p)
+        closure[start] = seen
+    return closure, fts
+
+
 # ---- two-pass name resolution: split a reading against the known type names ----
 def _known(stmts):
     names = set()
@@ -387,11 +438,23 @@ def _h_ring(g, k, m):
 
 
 def _h_subtype(g, k, m):
+    """A subtype declaration MEANS upward inclusion — subtype instances ARE supertype
+    instances — so it installs the derivation rule super(x) ← sub(x) through the
+    ordinary rule machinery (semi-naive variants included; chains compose round by
+    round). The subset constraint remains the check; the rule is the meaning."""
+    from . import system as _sys
     sub, sup = g[0].strip(), g[1].strip()
     cid = _slug(sub) + "_sub_" + _slug(sup)
-    return [("instanceOf", (sub, "ObjectType")), ("instanceOf", (sup, "ObjectType")),
-            ("subtype", (sub, sup)),
-            ("constraint", (cid, "subtype", sub, sup, m))], [(cid, C.scoped_subset(sup))]
+    rid = _slug(sub) + "_isa_" + _slug(sup)
+    facts = [("instanceOf", (sub, "ObjectType")), ("instanceOf", (sup, "ObjectType")),
+             ("subtype", (sub, sup)),
+             ("constraint", (cid, "subtype", sub, sup, m)),
+             ("ruleDerives", (rid, sup)), ("ruleReads", (rid, sub)),
+             ("ruleAtom", (rid, 1, sub))]
+    objs = [(cid, C.scoped_subset(sup)),
+            (rid, _sys.compile_rule([sub], [1], [1])),
+            (f"{rid}~d1", _sys.compile_rule_delta([sub], [1], 0, [1]))]
+    return facts, objs
 
 
 def _h_brace_subtypes(g, k, m):
@@ -650,7 +713,17 @@ def _rule_atom(text, known):
             out.append(mm.group(1))
         else:
             out.append(tok)
-    ft, _decl = _fact_type(_SOME.sub("", " ".join(out)).strip(), known)
+    reading = _SOME.sub("", " ".join(out)).strip()
+    ft, _decl = _fact_type(reading, known)
+    # the subtype lift: a clause keyed on a subtype resolves UP to the supertype's
+    # declared fact type when its own is undeclared (subtype instances ARE supertype
+    # instances; the fact lives once, in the supertype-keyed cell)
+    if vars_ and isinstance(known, _Known) and known.fts and ft not in known.fts:
+        base = re.sub(r"\d+$", "", vars_[0])
+        for anc in sorted(known.subs.get(base, ())):
+            lifted, _ = _fact_type(reading.replace(base, anc, 1), known)
+            if lifted in known.fts:
+                return lifted, vars_
     return ft, vars_
 
 
@@ -820,7 +893,9 @@ def compile_model_selfhost(text, D=None):
     for kind, pat in _CLASSIFY:
         pats.setdefault(kind, []).append(pat)
     stmts = statements(text)
-    known = _known(stmts)
+    names = _known(stmts)
+    subs, fts = _prepass_context(stmts, names)
+    known = _Known(names, subs, fts)
     if D is None:
         D = meta.initial_D()
     unclassified = []
@@ -864,7 +939,9 @@ def compile_model(text, D=None):
     if D is None:
         D = meta.initial_D()
     stmts = statements(text)
-    known = _known(stmts)
+    names = _known(stmts)
+    subs, fts = _prepass_context(stmts, names)
+    known = _Known(names, subs, fts)
     report, unparsed = Counter(), []
     for s in stmts:
         D, kind = compile(s, D, known)
