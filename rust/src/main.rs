@@ -1374,6 +1374,11 @@ fn handle(j: &J, srv: &mut Srv, serve: bool) -> String {
     }
     let native = matches!(jget(j, "engine"), Some(J::S(s)) if s == "native");
     let mut outs: Vec<String> = Vec::new();
+    if jget(j, "dump").is_some() {
+        let mut s = String::new();
+        write_v(&srv.d, &mut s);
+        outs.push(s);
+    }
     if let Some(J::A(cases)) = jget(j, "cases") {
         for case in cases {
             if native {
@@ -1419,6 +1424,15 @@ fn handle(j: &J, srv: &mut Srv, serve: bool) -> String {
             FRAME.with(|fr| {
                 fr.borrow_mut().pop();
             });
+            if matches!(jget(case, "retain"), Some(J::I(1))) {
+                // commit the step's D' into the retained store (the cluster's owner
+                // instance evolves; a refused step retains nothing)
+                let it = items(&list_of(&res));
+                if it.len() == 2 && !isbot(&it[0]) {
+                    srv.d = it[1].clone();
+                    srv.cells = cells_of(&srv.d);
+                }
+            }
             let mut s = String::new();
             write_v(&res, &mut s);
             outs.push(s);
