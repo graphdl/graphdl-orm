@@ -195,35 +195,40 @@ def membership_def():
 
 
 # --- the book's rule form compiled (Halpin ch.2 ex.4): linear chain join over D ---
-def compile_rule(atom_fts, head_positions):
+def compile_rule(atom_fts, head_positions, widths=None):
     """A rule's body as one FFP object over D: the populations of the clause fact types,
     each fetched from its own cell, joined linearly (each next atom joins the running
     tuple's last column to its column 1), with the head's variable positions projected.
-    Cross-cell by construction: this is store-on-derive's read side."""
+    `widths` carries each atom's arity — a UNARY atom joins on the running tuple's last
+    column and adds no columns (the old binary-only assumption was the same class of bug
+    the Rust engine's #866 documents). Cross-cell by construction: store-on-derive's
+    read side."""
     from . import ast
+    ws = list(widths) if widths else [2] * len(atom_fts)
     expr = ast.FetchPop(atom_fts[0])
-    width = 2
-    for ftn in atom_fts[1:]:
+    width = ws[0]
+    for ftn, w in zip(atom_fts[1:], ws[1:]):
         expr = _S(_COMP, T.NatJoin(width), _S(_CONS, expr, ast.FetchPop(ftn)))
-        width += 1
+        width += w - 1
     return _S(_COMP, T.Project(head_positions), expr)
 
 
-def compile_rule_delta(atom_fts, head_positions, delta_at):
+def compile_rule_delta(atom_fts, head_positions, delta_at, widths=None):
     """The rule body with atom `delta_at` (0-based) reading the round's DELTA instead of
     its cell: an FFP object over ⟨Δ, D⟩ — semi-naive evaluation's inner join
-    (Bancilhon–Ramakrishnan 1986). Same join shape as compile_rule; only the substituted
-    atom differs."""
+    (Bancilhon–Ramakrishnan 1986). Same join shape as compile_rule (widths carry atom
+    arities); only the substituted atom differs."""
     from . import ast
 
     def pop(j, ftn):
         return _1 if j == delta_at else _S(_COMP, ast.FetchPop(ftn), _2)
 
+    ws = list(widths) if widths else [2] * len(atom_fts)
     expr = pop(0, atom_fts[0])
-    width = 2
-    for j, ftn in enumerate(atom_fts[1:], start=1):
+    width = ws[0]
+    for j, (ftn, w) in enumerate(zip(atom_fts[1:], ws[1:]), start=1):
         expr = _S(_COMP, T.NatJoin(width), _S(_CONS, expr, pop(j, ftn)))
-        width += 1
+        width += w - 1
     return _S(_COMP, T.Project(head_positions), expr)
 
 
