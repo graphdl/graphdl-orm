@@ -80,6 +80,56 @@ def load_sqlite(path, seal_key=None):
     return to_lam(cells)
 
 
+# ==================== frozen ingestion: thaw instead of re-ingest =============
+def _cache_dir():
+    base = os.environ.get("PYAREST_CACHE") or os.environ.get("LOCALAPPDATA")
+    if base:
+        return os.path.join(base, "pyarest") if "pyarest" not in base else base
+    return os.path.join(os.path.expanduser("~"), ".cache", "pyarest")
+
+
+_ENGINE_FP = []
+
+
+def _engine_fingerprint():
+    """A hash over the package's own sources: a thawed D carries COMPILED objects, so
+    an engine change must invalidate every snapshot — text alone would serve stale
+    compiled rules silently after a compiler edit."""
+    if not _ENGINE_FP:
+        import hashlib
+        h = hashlib.sha256()
+        pkg = os.path.dirname(os.path.abspath(__file__))
+        for fn in sorted(os.listdir(pkg)):
+            if fn.endswith(".py"):
+                h.update(fn.encode())
+                h.update(open(os.path.join(pkg, fn), "rb").read())
+        _ENGINE_FP.append(h.hexdigest()[:16])
+    return _ENGINE_FP[0]
+
+
+def ingest_frozen(text, cache_dir=None):
+    """Compile `text` THROUGH the local persistence model: the compiled D freezes to a
+    content-keyed sqlite snapshot, and the same text thereafter THAWS from disk instead
+    of re-ingesting (definitions are data, so the snapshot carries the rules). The key
+    hashes the text AND the engine's own sources: changed text or a changed compiler is
+    a different snapshot, so invalidation is by construction. Writes are
+    tmp-then-rename, so racing processes cannot tear one."""
+    import hashlib
+    from . import forml
+    d = cache_dir or _cache_dir()
+    key = hashlib.sha256((_engine_fingerprint() + "\x00" +
+                          text).encode("utf-8")).hexdigest()[:24]
+    snap = os.path.join(d, f"ingest-{key}.sqlite")
+    if os.path.exists(snap):
+        return load_sqlite(snap)
+    D = forml.compile_model(text)[0]
+    os.makedirs(d, exist_ok=True)
+    tmp = snap + f".tmp{os.getpid()}"
+    save_sqlite(D, tmp)
+    os.replace(tmp, snap)
+    return D
+
+
 # ============================ jsonl: the durable step log =====================
 def read_log(path):
     if not os.path.exists(path):

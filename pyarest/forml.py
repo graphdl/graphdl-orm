@@ -992,12 +992,16 @@ _GRAMMAR_CACHE = {}
 
 def grammar_D():
     """The ingested grammar (pyarest/readings/forml2-grammar.md — 'the parser is this
-    file'), cached per process."""
+    file'), cached per process and THAWED from the local persistence model across
+    processes (persist.ingest_frozen: the compiled D freezes to a content-keyed
+    snapshot; the first process on a machine pays the ingest, later ones thaw in
+    milliseconds — definitions are data, so the snapshot carries the rules)."""
     if "D" not in _GRAMMAR_CACHE:
         import os
+        from . import persist
         p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "readings", "forml2-grammar.md")
-        _GRAMMAR_CACHE["D"] = compile_model(open(p, encoding="utf-8").read())[0]
+        _GRAMMAR_CACHE["D"] = persist.ingest_frozen(open(p, encoding="utf-8").read())
     return _GRAMMAR_CACHE["D"]
 
 
