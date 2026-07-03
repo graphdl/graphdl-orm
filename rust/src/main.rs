@@ -282,6 +282,9 @@ thread_local! {
     // resolution prefers a twin, absence degrades to the canonical term (same result)
     static FAST: RefCell<HashMap<String, Rc<dyn Fn(V, V) -> V>>> = RefCell::new(HashMap::new());
     static PROCESS: RefCell<Vec<(String, V)>> = RefCell::new(Vec::new());
+    // the INTERSECTION SOURCE definitions (shared/*.py, include!d verbatim below):
+    // loaded once at startup, resolved by name like any compiled definition
+    static CANON: RefCell<Vec<(String, V)>> = RefCell::new(Vec::new());
 }
 
 fn leaf_key(l: &Leaf) -> Option<String> {
@@ -400,6 +403,12 @@ fn make_mu() -> V {
                         });
                         if let Some(obj) = proc_ {
                             return mu.app(mkapp(obj, x)); // compiled process def: mu(o : x)
+                        }
+                        let can = CANON.with(|p| {
+                            p.borrow().iter().rev().find(|(n, _)| *n == key).map(|(_, v)| v.clone())
+                        });
+                        if let Some(obj) = can {
+                            return mu.app(mkapp(obj, x)); // intersection-source def: mu(o : x)
                         }
                     }
                     bot()
@@ -1447,6 +1456,11 @@ fn handle(j: &J, srv: &mut Srv, serve: bool) -> String {
 }
 
 fn run() {
+    // the intersection source loads ON THE WORKER (CANON is a thread_local; the
+    // reduction thread must hold it)
+    CANON.with(|c| {
+        *c.borrow_mut() = canon_defs();
+    });
     register_base();
     register_overrides();                                     // twins on by default
     let serve = std::env::args().any(|a| a == "--serve");
@@ -1480,6 +1494,44 @@ fn run() {
             println!("{}", out);
         }
     }
+}
+
+fn seqv(xs: Vec<V>) -> V {
+    let mut l = nil();
+    for x in xs.into_iter().rev() {
+        l = cons(x, l);
+    }
+    seq(l)
+}
+
+// ============================ intersection source =============================
+// shared/*.py are INTERSECTION SOURCE: normal Python modules AND, include!d here,
+// normal Rust. One file, two hosts, verbatim; the vocabulary bound below (DEF, A,
+// N, PHI, S2..S9) is this platform's lambda, so the lambda used determines the
+// implementation. No JSON shim, no parser: rustc tokenizes the same bytes CPython
+// executes. The file is ONE tuple literal (include! takes a single expression);
+// elements evaluate left to right in both languages. Constraints the file honors:
+// double-quoted strings, no imports, no assignments, PHI referenced once per file
+// (it is a moved local).
+#[allow(non_snake_case, unused, path_statements)]
+fn canon_defs() -> Vec<(String, V)> {
+    let out: RefCell<Vec<(String, V)>> = RefCell::new(Vec::new());
+    {
+        let DEF = |n: &str, o: V| out.borrow_mut().push((n.to_string(), o));
+        let A = |s: &str| atom(Leaf::S(s.to_string()));
+        let N = |i: i64| atom(Leaf::I(i));
+        let PHI = phi();
+        let S2 = |a: V, b: V| seqv(vec![a, b]);
+        let S3 = |a: V, b: V, c: V| seqv(vec![a, b, c]);
+        let S4 = |a: V, b: V, c: V, d: V| seqv(vec![a, b, c, d]);
+        let S5 = |a: V, b: V, c: V, d: V, e: V| seqv(vec![a, b, c, d, e]);
+        let S6 = |a: V, b: V, c: V, d: V, e: V, f: V| seqv(vec![a, b, c, d, e, f]);
+        let S7 = |a: V, b: V, c: V, d: V, e: V, f: V, g: V| seqv(vec![a, b, c, d, e, f, g]);
+        let S8 = |a: V, b: V, c: V, d: V, e: V, f: V, g: V, h: V| seqv(vec![a, b, c, d, e, f, g, h]);
+        let S9 = |a: V, b: V, c: V, d: V, e: V, f: V, g: V, h: V, i: V| seqv(vec![a, b, c, d, e, f, g, h, i]);
+        include!("../../shared/theta.py");
+    }
+    out.into_inner()
 }
 
 fn main() {
