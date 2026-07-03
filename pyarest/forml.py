@@ -450,7 +450,7 @@ def _h_subtype(g, k, m):
              ("subtype", (sub, sup)),
              ("constraint", (cid, "subtype", sub, sup, m)),
              ("ruleDerives", (rid, sup)), ("ruleReads", (rid, sub)),
-             ("ruleAtom", (rid, 1, sub))]
+             ("ruleAtom", (rid, 1, sub)), ("ruleCopies", (rid, sub, sup))]
     objs = [(cid, C.scoped_subset(sup)),
             (rid, _sys.compile_rule([sub], [1], [1])),
             (f"{rid}~d1", _sys.compile_rule_delta([sub], [1], 0, [1]))]
@@ -823,8 +823,13 @@ def _h_rule_if(g, k, m):
         diag = f"aggregate head variables unbound or output {out_v!r} not in head"
     elif ok and atoms and all(v in cols for v in hvars):
         A_.append(("derivationRule", (hft, atoms[0][0], len(atoms))))
-        obj = _sys.compile_rule([a[0] for a in atoms], [cols[v] for v in hvars],
-                                widths, filters)
+        proj = [cols[v] for v in hvars]
+        if len(atoms) == 1 and not filters and proj == list(range(1, widths[0] + 1)):
+            # a COPY rule (one positive atom, no filters, identity head): it proves
+            # atom ⊆ head at every fixed point, so a matching subset/subtype check
+            # is statically discharged (validate_for reads this fact)
+            A_.append(("ruleCopies", (rule_cid, atoms[0][0], hft)))
+        obj = _sys.compile_rule([a[0] for a in atoms], proj, widths, filters)
     elif ok:
         unbound = sorted(set(hvars) - set(cols)) if atoms else []
         diag = (f"head variable(s) {unbound} unbound in the body" if unbound
@@ -1102,9 +1107,15 @@ def validate_for(fact_type, D, partition=None):
     for r in _cells(D, "spans"):
         if len(r) == 2:
             spans.setdefault(r[0], []).append(r[1])
+    copies = {tuple(r[1:3]) for r in _cells(D, "ruleCopies") if len(r) >= 3}
     local, scoped = [], []
     for f in _cells(D, "constraint"):
         if len(f) < 3:
+            continue
+        if f[1] in ("subtype", "subset") and len(f) >= 4 and (f[2], f[3]) in copies:
+            # a copy rule antecedent->consequent proves the inclusion at every fixed
+            # point of F_S (Def. derive), and Def. create validates the candidate
+            # POST-state, whose derived population contains the copy: discharged
             continue
         for name, is_local in _ATTACH.get(f[1], lambda f, ft: [])(f, fact_type):
             # spec §4.3: the constraint FACT selects the family expression and binds the
