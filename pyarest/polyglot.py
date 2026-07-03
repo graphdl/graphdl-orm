@@ -94,11 +94,16 @@ class RustSession:
         self._rpc({"d": _conv(from_lam(D)), "process": process,
                    "overrides": 1 if overrides else 0, "cases": []})
 
-    def run_facts(self, f, facts, fuel=None):
-        """Apply `f` to ⟨fact, D_retained⟩ per fact — the machine-step shape."""
+    def run_facts(self, f, facts, fuel=None, engine=None):
+        """Apply `f` to ⟨fact, D_retained⟩ per fact — the machine-step shape. `engine`
+        selects the evaluator ("native" = the deepest override; default the Scott
+        closures), certified equal by the differential."""
         fj = _conv(from_lam(f))
-        res = self._rpc({"cases": [{"f": fj, "xd": _conv(from_lam(x)), "fuel": fuel or 0}
-                                   for x in facts]})
+        req = {"cases": [{"f": fj, "xd": _conv(from_lam(x)), "fuel": fuel or 0}
+                         for x in facts]}
+        if engine:
+            req["engine"] = engine
+        res = self._rpc(req)
         return ["⊥" if v is None else _untuple(v) for v in res]
 
     def close(self):

@@ -808,6 +808,329 @@ fn register_overrides() {
     }));
 }
 
+
+// ============================ the native carrier ==============================
+// delta.py's analog, the deepest override behind the same universal interface: a
+// scalar IS an atom, a Vec IS a sequence, Bot is bottom, and an application node is a
+// 3-sequence headed by the shared AppTag sentinel (so App nodes survive conversion).
+// The evaluator is the same mu with the same metacomposition; WHILE and INSERT are
+// iterative exactly as delta.py runs them. Certified: engine=native equals
+// engine=scott equals Python on the differential.
+#[derive(Clone)]
+enum N {
+    A(Rc<Leaf>),
+    S(Rc<Vec<N>>),
+    Bot,
+}
+
+fn napp(f: N, x: N) -> N {
+    N::S(Rc::new(vec![N::A(Rc::new(Leaf::AppTag)), f, x]))
+}
+fn nseq(xs: Vec<N>) -> N {
+    if xs.iter().any(|x| matches!(x, N::Bot)) { N::Bot } else { N::S(Rc::new(xs)) }
+}
+fn n_at() -> N { N::A(Rc::new(Leaf::S("T".into()))) }
+fn n_af() -> N { N::A(Rc::new(Leaf::S("F".into()))) }
+fn nb(b: bool) -> N { if b { n_at() } else { n_af() } }
+fn n_is_t(x: &N) -> bool { matches!(x, N::A(l) if matches!(&**l, Leaf::S(s) if s == "T")) }
+fn n_is_f(x: &N) -> bool { matches!(x, N::A(l) if matches!(&**l, Leaf::S(s) if s == "F")) }
+fn n_eq(a: &N, b: &N) -> bool {
+    match (a, b) {
+        (N::A(x), N::A(y)) => x.nateq(y),
+        (N::S(x), N::S(y)) => x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| n_eq(p, q)),
+        _ => false,
+    }
+}
+
+struct NEval {
+    cells: Vec<(Leaf, N)>,            // the step's DEFS-in-D, first match wins
+    process: Vec<(String, N)>,        // compiled process defs (converted once)
+    defs_n: N,                        // the retained store as N (the DEFS accessor)
+    fuel: std::cell::Cell<i64>,       // <0 = unbounded
+}
+
+impl NEval {
+    fn mu(&self, e: N) -> N {
+        // an application node reduces; a value is its own meaning
+        let (f0, x0) = match &e {
+            N::S(v) if v.len() == 3 && matches!(&v[0], N::A(l) if matches!(&**l, Leaf::AppTag)) => {
+                (v[1].clone(), v[2].clone())
+            }
+            _ => return e,
+        };
+        let fuel = self.fuel.get();
+        if fuel >= 0 {
+            self.fuel.set(fuel - 1);
+            if fuel - 1 <= 0 { return N::Bot; }
+        }
+        let f = self.mu(f0);
+        let x = self.mu(x0);
+        if matches!(f, N::Bot) || matches!(x, N::Bot) { return N::Bot; }
+        match &f {
+            N::S(v) => {
+                if v.is_empty() { return N::Bot; }
+                let pair = nseq(vec![f.clone(), x]);
+                self.mu(napp(v[0].clone(), pair))            // metacomposition on the head
+            }
+            N::A(l) => {
+                let lc: &Leaf = l;
+                if let Some((_, sd)) = self.cells.iter().find(|(k, _)| k.nateq(lc)) {
+                    return self.mu(napp(sd.clone(), x));     // the step's DEFS cell first
+                }
+                if let Some(r) = self.prim(lc, &x) {
+                    return self.mu(r);                       // the native base
+                }
+                if let Some(k) = leaf_key(lc) {
+                    if let Some((_, obj)) = self.process.iter().rev().find(|(n, _)| *n == k) {
+                        return self.mu(napp(obj.clone(), x));
+                    }
+                }
+                N::Bot
+            }
+            N::Bot => N::Bot,
+        }
+    }
+
+    fn prim(&self, name: &Leaf, x: &N) -> Option<N> {
+        if let Leaf::I(i) = name {
+            let i = *i;
+            if (1..=32).contains(&i) {
+                return Some(match x {
+                    N::S(v) if v.len() >= i as usize => v[(i - 1) as usize].clone(),
+                    _ => N::Bot,
+                });
+            }
+            return None;
+        }
+        let s = match name { Leaf::S(s) => s.as_str(), _ => return None };
+        let seqv = |x: &N| -> Option<Rc<Vec<N>>> {
+            if let N::S(v) = x { Some(v.clone()) } else { None }
+        };
+        let pairv = |x: &N| -> Option<(N, N)> {
+            seqv(x).and_then(|v| if v.len() == 2 { Some((v[0].clone(), v[1].clone())) } else { None })
+        };
+        let numv = |n: &N| -> Option<f64> {
+            if let N::A(l) = n { num(l) } else { None }
+        };
+        let intv = |n: &N| -> Option<i64> {
+            if let N::A(l) = n { if let Leaf::I(i) = &**l { Some(*i) } else { None } } else { None }
+        };
+        Some(match s {
+            "id" => x.clone(),
+            "tl" => match seqv(x) { Some(v) if !v.is_empty() => N::S(Rc::new(v[1..].to_vec())), _ => N::Bot },
+            "atom" => match x { N::Bot => N::Bot, N::A(_) => n_at(), N::S(v) => nb(v.is_empty()) },
+            "null" => match x { N::Bot => N::Bot, N::A(_) => n_af(), N::S(v) => nb(v.is_empty()) },
+            "eq" => match pairv(x) { Some((a, b)) => nb(n_eq(&a, &b)), None => N::Bot },
+            "apndl" => match pairv(x) {
+                Some((h, N::S(t))) => { let mut v = vec![h]; v.extend(t.iter().cloned()); N::S(Rc::new(v)) }
+                _ => N::Bot,
+            },
+            "apndr" => match pairv(x) {
+                Some((N::S(t), e)) => { let mut v = t.to_vec(); v.push(e); N::S(Rc::new(v)) }
+                _ => N::Bot,
+            },
+            "distl" => match pairv(x) {
+                Some((a, N::S(ys))) => N::S(Rc::new(ys.iter().map(|y| N::S(Rc::new(vec![a.clone(), y.clone()]))).collect())),
+                _ => N::Bot,
+            },
+            "distr" => match pairv(x) {
+                Some((N::S(xs), b)) => N::S(Rc::new(xs.iter().map(|a| N::S(Rc::new(vec![a.clone(), b.clone()]))).collect())),
+                _ => N::Bot,
+            },
+            "length" => match seqv(x) { Some(v) => N::A(Rc::new(Leaf::I(v.len() as i64))), None => N::Bot },
+            "reverse" => match seqv(x) { Some(v) => { let mut w = v.to_vec(); w.reverse(); N::S(Rc::new(w)) } None => N::Bot },
+            "cat" => match pairv(x) {
+                Some((N::S(a), N::S(b))) => { let mut v = a.to_vec(); v.extend(b.iter().cloned()); N::S(Rc::new(v)) }
+                _ => N::Bot,
+            },
+            "not" => if n_is_t(x) { n_af() } else if n_is_f(x) { n_at() } else { N::Bot },
+            "and" | "or" => match pairv(x) {
+                Some((a, b)) if (n_is_t(&a) || n_is_f(&a)) && (n_is_t(&b) || n_is_f(&b)) =>
+                    nb(if s == "and" { n_is_t(&a) && n_is_t(&b) } else { n_is_t(&a) || n_is_t(&b) }),
+                _ => N::Bot,
+            },
+            "1r" => match seqv(x) { Some(v) if !v.is_empty() => v[v.len() - 1].clone(), _ => N::Bot },
+            "tlr" => match seqv(x) { Some(v) if !v.is_empty() => N::S(Rc::new(v[..v.len() - 1].to_vec())), _ => N::Bot },
+            "rotl" => match seqv(x) {
+                Some(v) => if v.is_empty() { N::S(Rc::new(vec![])) } else {
+                    let mut w = v[1..].to_vec(); w.push(v[0].clone()); N::S(Rc::new(w)) },
+                None => N::Bot,
+            },
+            "rotr" => match seqv(x) {
+                Some(v) => if v.is_empty() { N::S(Rc::new(vec![])) } else {
+                    let mut w = vec![v[v.len() - 1].clone()]; w.extend(v[..v.len() - 1].iter().cloned()); N::S(Rc::new(w)) },
+                None => N::Bot,
+            },
+            "trans" => match seqv(x) {
+                Some(rows) => {
+                    if rows.iter().any(|r| !matches!(r, N::S(_))) { return Some(N::Bot); }
+                    if rows.is_empty() { return Some(N::S(Rc::new(vec![]))); }
+                    let mat: Vec<Rc<Vec<N>>> = rows.iter().map(|r| seqv(r).unwrap()).collect();
+                    let w = mat[0].len();
+                    if mat.iter().any(|r| r.len() != w) { return Some(N::Bot); }
+                    if w == 0 { return Some(N::S(Rc::new(vec![]))); }
+                    N::S(Rc::new((0..w).map(|j| N::S(Rc::new(mat.iter().map(|r| r[j].clone()).collect()))).collect()))
+                }
+                None => N::Bot,
+            },
+            "+" | "-" | "*" => match pairv(x) {
+                Some((a, b)) => match (intv(&a), intv(&b)) {
+                    (Some(p), Some(q)) => N::A(Rc::new(Leaf::I(match s { "+" => p + q, "-" => p - q, _ => p * q }))),
+                    _ => match (numv(&a), numv(&b)) {
+                        (Some(p), Some(q)) => N::A(Rc::new(Leaf::F(match s { "+" => p + q, "-" => p - q, _ => p * q }))),
+                        _ => N::Bot,
+                    },
+                },
+                None => N::Bot,
+            },
+            "div" => match pairv(x) {
+                Some((a, b)) => match (numv(&a), numv(&b)) {
+                    (Some(p), Some(q)) if q != 0.0 => N::A(Rc::new(Leaf::F(p / q))),
+                    _ => N::Bot,
+                },
+                None => N::Bot,
+            },
+            "ge" | "gt" | "le" | "lt" => match pairv(x) {
+                Some((N::A(a), N::A(b))) => match (&*a, &*b) {
+                    (Leaf::S(p), Leaf::S(q)) => nb(match s { "ge" => p >= q, "gt" => p > q, "le" => p <= q, _ => p < q }),
+                    _ => match (num(&a), num(&b)) {
+                        (Some(p), Some(q)) => nb(match s { "ge" => p >= q, "gt" => p > q, "le" => p <= q, _ => p < q }),
+                        _ => N::Bot,
+                    },
+                },
+                _ => N::Bot,
+            },
+            "apply" => match pairv(x) { Some((f, y)) => self.mu(napp(f, y)), None => N::Bot },
+            "COMP" => match pairv(x) {
+                Some((N::S(whole), y)) => whole[1..].iter().rev().fold(y, |acc, f| napp(f.clone(), acc)),
+                _ => N::Bot,
+            },
+            "CONS" => match pairv(x) {
+                Some((N::S(whole), y)) => nseq(whole[1..].iter().map(|f| self.mu(napp(f.clone(), y.clone()))).collect()),
+                _ => N::Bot,
+            },
+            "CONST" => match pairv(x) {
+                Some((N::S(whole), y)) => {
+                    if matches!(y, N::Bot) { N::Bot }
+                    else if whole.len() >= 2 { whole[1].clone() } else { N::Bot }
+                }
+                _ => N::Bot,
+            },
+            "ALPHA" => match pairv(x) {
+                Some((N::S(whole), N::S(ys))) if whole.len() >= 2 =>
+                    nseq(ys.iter().map(|yi| self.mu(napp(whole[1].clone(), yi.clone()))).collect()),
+                Some((N::S(_), _)) => N::Bot,
+                _ => N::Bot,
+            },
+            "COND" => match pairv(x) {
+                Some((N::S(whole), y)) if whole.len() >= 4 => {
+                    let pv = self.mu(napp(whole[1].clone(), y.clone()));
+                    if n_is_t(&pv) { self.mu(napp(whole[2].clone(), y)) }
+                    else if n_is_f(&pv) { self.mu(napp(whole[3].clone(), y)) }
+                    else { N::Bot }
+                }
+                _ => N::Bot,
+            },
+            "INSERT" => match pairv(x) {
+                Some((N::S(whole), N::S(ys))) if whole.len() >= 2 && !ys.is_empty() => {
+                    let mut acc = ys[ys.len() - 1].clone();
+                    for xi in ys[..ys.len() - 1].iter().rev() {
+                        acc = self.mu(napp(whole[1].clone(), nseq(vec![xi.clone(), acc])));
+                        if matches!(acc, N::Bot) { break; }
+                    }
+                    acc
+                }
+                _ => N::Bot,
+            },
+            "WHILE" => match pairv(x) {
+                Some((N::S(whole), y0)) if whole.len() >= 3 => {
+                    let mut y = y0;
+                    loop {
+                        let pv = self.mu(napp(whole[1].clone(), y.clone()));
+                        if n_is_f(&pv) { break y; }
+                        if !n_is_t(&pv) { break N::Bot; }
+                        y = self.mu(napp(whole[2].clone(), y));
+                    }
+                }
+                _ => N::Bot,
+            },
+            "BU" => match pairv(x) {
+                Some((N::S(whole), y)) if whole.len() >= 3 =>
+                    self.mu(napp(whole[1].clone(), nseq(vec![whole[2].clone(), y]))),
+                _ => N::Bot,
+            },
+            "DEFS" => self.defs_n.clone(),
+            "cellkey" => match pairv(x) {
+                Some((N::A(a), N::A(b))) => {
+                    let sv = |l: &Leaf| match l {
+                        Leaf::S(t) => Some(t.clone()),
+                        Leaf::I(i) => Some(i.to_string()),
+                        _ => None,
+                    };
+                    match (sv(&a), sv(&b)) {
+                        (Some(p), Some(q)) => N::A(Rc::new(Leaf::S(format!("{}:{}", p, q)))),
+                        _ => N::Bot,
+                    }
+                }
+                _ => N::Bot,
+            },
+            _ => return None,
+        })
+    }
+}
+
+fn write_n(n: &N, out: &mut String) {
+    match n {
+        N::Bot => out.push_str("null"),
+        N::A(l) => match &**l {
+            Leaf::S(s) => esc(s, out),
+            Leaf::I(i) => out.push_str(&i.to_string()),
+            Leaf::F(f) => {
+                if f.fract() == 0.0 && f.is_finite() { out.push_str(&format!("{:.1}", f)); }
+                else { out.push_str(&format!("{}", f)); }
+            }
+            Leaf::AppTag => out.push_str("\"#APP#\""),
+        },
+        N::S(v) => {
+            out.push('[');
+            for (i, x) in v.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                write_n(x, out);
+            }
+            out.push(']');
+        }
+    }
+}
+
+fn j_to_n(j: &J) -> N {
+    match j {
+        J::S(s) => N::A(Rc::new(Leaf::S(s.clone()))),
+        J::I(i) => N::A(Rc::new(Leaf::I(*i))),
+        J::F(f) => N::A(Rc::new(Leaf::F(*f))),
+        J::A(xs) => N::S(Rc::new(xs.iter().map(j_to_n).collect())),
+        J::O(_) => N::Bot,
+    }
+}
+
+fn n_cells_of(d: &N) -> Vec<(Leaf, N)> {
+    let mut out: Vec<(Leaf, N)> = Vec::new();
+    if let N::S(cells) = d {
+        for c in cells.iter() {
+            if let N::S(it) = c {
+                if it.len() == 3 {
+                    if let (N::A(l0), N::A(k)) = (&it[0], &it[1]) {
+                        if matches!(&**l0, Leaf::S(s) if s == "CELL")
+                            && !out.iter().any(|(e, _)| e.nateq(k)) {
+                            out.push(((**k).clone(), it[2].clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 // ============================ JSON (hand-rolled, zero deps) ==================
 #[derive(Debug, Clone)]
 enum J {
@@ -1014,6 +1337,9 @@ struct Srv {
     d: V,
     cells: Vec<(Leaf, V)>,
     mu: V,
+    nd: N,
+    ncells: Vec<(Leaf, N)>,
+    nprocess: Vec<(String, N)>,
 }
 
 fn handle(j: &J, srv: &mut Srv, serve: bool) -> String {
@@ -1029,10 +1355,12 @@ fn handle(j: &J, srv: &mut Srv, serve: bool) -> String {
         PROCESS.with(|p| {
             let mut b = p.borrow_mut();
             b.clear();
+            srv.nprocess.clear();
             for entry in procs {
                 if let J::A(pair) = entry {
                     if let (J::S(name), val) = (&pair[0], &pair[1]) {
                         b.push((name.clone(), to_v(val)));
+                        srv.nprocess.push((name.clone(), j_to_n(val)));
                     }
                 }
             }
@@ -1041,10 +1369,37 @@ fn handle(j: &J, srv: &mut Srv, serve: bool) -> String {
     if let Some(dj) = jget(j, "d") {
         srv.d = to_v(dj);
         srv.cells = cells_of(&srv.d); // cached once per retained store (resident mode)
+        srv.nd = j_to_n(dj);
+        srv.ncells = n_cells_of(&srv.nd);
     }
+    let native = matches!(jget(j, "engine"), Some(J::S(s)) if s == "native");
     let mut outs: Vec<String> = Vec::new();
     if let Some(J::A(cases)) = jget(j, "cases") {
         for case in cases {
+            if native {
+                // the native-carrier machine: the deepest override, same protocol
+                let f = j_to_n(jget(case, "f").unwrap());
+                let x = match (jget(case, "x"), jget(case, "xd")) {
+                    (Some(xj), _) => j_to_n(xj),
+                    (None, Some(fj)) => nseq(vec![j_to_n(fj), srv.nd.clone()]),
+                    _ => N::Bot,
+                };
+                let fuel = match jget(case, "fuel") {
+                    Some(J::I(n)) if *n > 0 => *n,
+                    _ => -1,
+                };
+                let ev = NEval {
+                    cells: srv.ncells.clone(),
+                    process: srv.nprocess.clone(),
+                    defs_n: srv.nd.clone(),
+                    fuel: std::cell::Cell::new(fuel),
+                };
+                let res = ev.mu(napp(f, x));
+                let mut s = String::new();
+                write_n(&res, &mut s);
+                outs.push(s);
+                continue;
+            }
             let f = to_v(jget(case, "f").unwrap());
             // "x" carries the operand verbatim; "xd" pairs a fact with the RETAINED
             // store (⟨fact, D⟩ without re-serializing D — the resident protocol)
@@ -1081,7 +1436,8 @@ fn run() {
     register_base();
     register_overrides();                                     // twins on by default
     let serve = std::env::args().any(|a| a == "--serve");
-    let mut srv = Srv { d: phi(), cells: Vec::new(), mu: make_mu() };
+    let mut srv = Srv { d: phi(), cells: Vec::new(), mu: make_mu(),
+                        nd: N::Bot, ncells: Vec::new(), nprocess: Vec::new() };
     if serve {
         use std::io::{BufRead, Write};
         let stdin = std::io::stdin();

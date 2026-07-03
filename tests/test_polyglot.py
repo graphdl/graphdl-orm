@@ -192,13 +192,46 @@ def test_benchmark_the_flex(capsys):
         t0 = time.perf_counter()
         resident = ses.run_facts(handler, [fact] * N)
         t_rust_res = time.perf_counter() - t0
+        ses.run_facts(handler, [fact], engine="native")       # warm
+        t0 = time.perf_counter()
+        native = ses.run_facts(handler, [fact] * N, engine="native")
+        t_rust_native = time.perf_counter() - t0
     finally:
         ses.close()
     assert on == off == want                                  # correctness before speed
     assert resident == want                                   # the resident runner agrees
+    assert native == want                                     # the native carrier agrees
     with capsys.disabled():
         print(f"\n[bench] machine step x{N}: "
               f"py-scott={t_scott_py:.2f}s py-delta={t_delta_py:.2f}s "
               f"rust-canonical={t_rust_off:.2f}s rust-overrides={t_rust_on:.2f}s "
-              f"rust-resident={t_rust_res:.3f}s "
+              f"rust-resident={t_rust_res:.3f}s rust-native={t_rust_native:.3f}s "
               f"(one-shot rust pays spawn + D serialization; resident retains the store)")
+
+
+def test_the_native_carrier_agrees_three_ways():
+    # the deepest override: the native-carrier machine (delta.py's analog) must equal
+    # the Scott closures must equal Python — same scenarios, engine selected per request
+    from pyarest.reduce import apply
+    D, _ = forml.compile_model(ORDER)
+    D = apply(ast.Store("Order_status"), S(to_lam((("o1", "In Cart"),)), D))
+    handler = ast.build_system(
+        cell_name="Customer_places_Order",
+        machine=("Order_status", system.machine_step("Customer_places_Order"), 2),
+        mealy_obj=system.mealy_step("Customer_places_Order"))
+    spin = S(A("WHILE"), S(A("CONST"), A("T")), A("id"))
+    cases = [
+        (handler, S(to_lam(("c1", "o1")), D), None),
+        (S(A("INSERT"), A("+")), to_lam((1, 2, 3, 4)), None),
+        (S(A("COND"), A("null"), S(A("CONST"), A("e")), A("length")), to_lam((1, 2)), None),
+        (A("trans"), to_lam(((1, 2), (3,))), None),           # ragged: ⊥
+        (spin, A(7), 3000),                                   # fuel bottoms
+        (A("governedBy_rule_base"), D, None),                 # step-frame resolution
+    ]
+    want = polyglot.python_ground_truth(D, cases)
+    sc = polyglot.export_scenario(D, cases)
+    scott = polyglot.run_rust(sc)
+    sc["engine"] = "native"
+    native = polyglot.run_rust(sc)
+    assert scott == want
+    assert native == want
