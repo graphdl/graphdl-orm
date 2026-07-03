@@ -1,4 +1,4 @@
-"""Grammar self-host, gate one (pyarest/readings/forml2-grammar.md, vendored: 'The
+"""Grammar self-host, gate one (shared/forml2-grammar.md, vendored: 'The
 parser is not a program. It is this file.'): the grammar file ingests through
 compile_model; its iff recognizers ('Statement has Classification C iff Statement has
 Field ⟨literal⟩') compile into ordinary rules run by run_rules; and the Stage-1
@@ -12,7 +12,7 @@ import pyarest.prims  # noqa: F401
 from pyarest import forml
 
 GRAMMAR_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "pyarest", "readings", "forml2-grammar.md")
+                            "shared", "forml2-grammar.md")
 _CACHE = {}
 
 
