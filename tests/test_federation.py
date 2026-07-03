@@ -155,4 +155,5 @@ def test_wild_instance_graphs_ingest_and_verbalize():
     facts = system.facts_about(D, "wd:Q9592")
     assert any("en.wikipedia.org" in str(r) for (_ft, r, _s) in facts)
     sentences = [s for (_ft, _r, s) in facts]
-    assert any("has 'wd:Q9592'" in s for s in sentences)      # rendered via the template
+    assert any("has schema:about 'wd:Q9592'" in s for s in sentences)   # NORMA-style
+    assert any(s.startswith("schema:Article '") for s in sentences)     # players named
