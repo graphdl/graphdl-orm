@@ -209,32 +209,25 @@ def cmp_filter(op, col, lit=None, col2=None):
     return _apply(A("system:cmp_filter_lit"), _S(A(op), A(col), to_lam(lit)))
 
 
-def _body_expr(atom_fts, widths, filters, joins, pop):
-    """The shared body of every rule compiler: the clause populations joined left to
-    right, then the comparator filters. `joins` aligns with atom_fts[1:]; a None entry
-    is the linear chain the fragment always compiled (NatJoin on the running tuple's
-    last column — plans for existing models are bit-identical), and a (pairs, keep)
-    entry is the general Codd join on ANY bound columns (theta.JoinOn), keeping the
-    fresh columns in clause order. `widths` carries each atom's arity — a UNARY atom
-    joins on the running tuple's last column and adds no columns (the old binary-only
-    assumption was the same class of bug the Rust engine's #866 documents)."""
+def _rule_atoms(atom_fts, widths, joins):
+    """⟨⟨ft, width, join?⟩…⟩ — the shared atom-spec encoding for the rule builders."""
+    from .lam import to_lam
     ws = list(widths) if widths else [2] * len(atom_fts)
     js = list(joins) if joins else [None] * (len(atom_fts) - 1)
-    expr = pop(0, atom_fts[0])
-    width = ws[0]
-    for j, (ftn, w) in enumerate(zip(atom_fts[1:], ws[1:]), start=1):
-        spec = js[j - 1] if j - 1 < len(js) else None
-        if spec is None:
-            expr = _S(_COMP, T.NatJoin(width), _S(_CONS, expr, pop(j, ftn)))
-            width += w - 1
-        else:
-            pairs, keep = spec
-            expr = _S(_COMP, T.JoinOn(tuple(pairs), tuple(keep)),
-                      _S(_CONS, expr, pop(j, ftn)))
-            width += len(keep)
-    for pred in (filters or ()):
-        expr = _S(_COMP, T.Filter(pred), expr)               # comparators restrict
-    return expr
+    js = [None] + js                                          # first atom never joins
+    atoms = L.NIL
+    for ftn, w, j in reversed(list(zip(atom_fts, ws, js))):
+        spec = to_lam(()) if j is None else _S(to_lam(tuple(tuple(p) for p in j[0])),
+                                               to_lam(tuple(j[1])))
+        atoms = L.CONS(_S(A(ftn), to_lam(w), spec))(atoms)
+    return L.SEQ(atoms)
+
+
+def _obj_list(objs):
+    out = L.NIL
+    for o in reversed(list(objs or ())):
+        out = L.CONS(o)(out)
+    return L.SEQ(out)
 
 
 def compile_rule(atom_fts, head_positions, widths=None, filters=None, joins=None):
@@ -246,18 +239,8 @@ def compile_rule(atom_fts, head_positions, widths=None, filters=None, joins=None
     store-on-derive's read side."""
     from .reduce import apply as _apply
     from .lam import to_lam
-    ws = list(widths) if widths else [2] * len(atom_fts)
-    js = list(joins) if joins else [None] * (len(atom_fts) - 1)
-    js = [None] + js                                          # first atom never joins
-    atoms = L.NIL
-    for ftn, w, j in reversed(list(zip(atom_fts, ws, js))):
-        spec = to_lam(()) if j is None else _S(to_lam(tuple(tuple(p) for p in j[0])),
-                                               to_lam(tuple(j[1])))
-        atoms = L.CONS(_S(A(ftn), to_lam(w), spec))(atoms)
-    flist = L.NIL
-    for f in reversed(list(filters or ())):
-        flist = L.CONS(f)(flist)
-    rec = _S(L.SEQ(atoms), to_lam(tuple(head_positions)), L.SEQ(flist))
+    rec = _S(_rule_atoms(atom_fts, widths, joins), to_lam(tuple(head_positions)),
+             _obj_list(filters))
     return _apply(A("system:compile_rule"), rec)
 
 
@@ -265,15 +248,14 @@ def compile_rule_delta(atom_fts, head_positions, delta_at, widths=None, filters=
                        joins=None):
     """The rule body with atom `delta_at` (0-based) reading the round's DELTA instead of
     its cell: an FFP object over ⟨Δ, D⟩ — semi-naive evaluation's inner join
-    (Bancilhon–Ramakrishnan 1986). Same join shape as compile_rule; only the
-    substituted atom differs."""
-    from . import ast
-
-    def pop(j, ftn):
-        return _1 if j == delta_at else _S(_COMP, ast.FetchPop(ftn), _2)
-
-    expr = _body_expr(atom_fts, widths, filters, joins, pop)
-    return _S(_COMP, T.Project(head_positions), expr)
+    (Bancilhon–Ramakrishnan 1986). The canonical builder (shared/system.py) applied to
+    ⟨atoms, head, filters, delta_at+1⟩; every non-delta fetch composes with selector 2
+    of the pair."""
+    from .reduce import apply as _apply
+    from .lam import to_lam
+    rec = _S(_rule_atoms(atom_fts, widths, joins), to_lam(tuple(head_positions)),
+             _obj_list(filters), to_lam(delta_at + 1))
+    return _apply(A("system:compile_rule_delta"), rec)
 
 
 def class_rule(clauses, head_const):
@@ -305,24 +287,12 @@ def compile_agg_rule(atom_fts, group_positions, over_position, op,
     head variables) the fold of `op` over the aggregated column. Stratified above the
     positive closure; the head REPLACES on recompute — an aggregate head is functional
     per group, so union-merge would preserve stale folds (the misfold the old engine
-    documented)."""
-    from . import ast
-    expr = _body_expr(atom_fts, widths, filters, joins,
-                      lambda _j, ftn: ast.FetchPop(ftn))
-    rel = "le" if op == "min" else "ge"
-    fold2 = _S(_COND, _S(_COMP, A(rel), _S(_CONS, _1, _2)), _1, _2)
-
-    def gsel(src):
-        return _S(_CONS, *[_S(_COMP, A(p), src) for p in group_positions])
-
-    # per pair ⟨r, rows⟩: the same-group rows' aggregated column, folded
-    samep = _S(_COMP, A("eq"), _S(_CONS, gsel(_1), gsel(_2)))
-    matches = _S(_COMP, T.Filter(samep), _DISTR, _S(_CONS, _2, _1))
-    vals = _S(_COMP, _S(_ALPHA, _S(_COMP, A(over_position), _1)), matches)
-    fold = _S(_COMP, _S(_INSERT, fold2), vals)
-    out_row = _S(_CONS, *([_S(_COMP, A(p), _1) for p in group_positions] + [fold]))
-    agg = _S(_COMP, T.dedup, _S(_ALPHA, out_row), _DISTR, _S(_CONS, _ID, _ID))
-    return _S(_COMP, agg, expr)
+    documented). The canonical builder applied to ⟨atoms, group, over, op, filters⟩."""
+    from .reduce import apply as _apply
+    from .lam import to_lam
+    rec = _S(_rule_atoms(atom_fts, widths, joins), to_lam(tuple(group_positions)),
+             to_lam(over_position), A(op), _obj_list(filters))
+    return _apply(A("system:compile_agg_rule"), rec)
 
 
 def run_rules(D, changed=None, stats=None):
