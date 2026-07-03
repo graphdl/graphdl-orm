@@ -56,6 +56,32 @@ def test_the_constructors_apply_the_canonical_builders():
     assert out == (("a", 1, "z"),)
 
 
+def test_joinon_and_restrict_come_from_the_canon():
+    D = L.SEQ(L.NIL)
+    j = theta.JoinOn(((3, 1),), (2, 3))
+    assert _refs(from_lam(j))
+    R = to_lam(((1, "x", 5), (1, "x", 7)))
+    Sp = to_lam(((5, "u", "keep5"), (7, "v", "keep7"), (9, "w", "no")))
+    with defs.step(D):
+        out = from_lam(apply(j, S(R, Sp)))
+    assert set(out) == {(1, "x", 5, "u", "keep5"), (1, "x", 7, "v", "keep7")}
+    # the degenerate cases ride the same COND builder: cross product and semijoin
+    with defs.step(D):
+        cross = from_lam(apply(theta.JoinOn((), (1,)),
+                               S(to_lam((("a",),)), to_lam((("z",),)))))
+    assert set(cross) == {("a", "z")}
+    with defs.step(D):
+        semi = from_lam(apply(theta.JoinOn(((1, 1),), ()),
+                              S(to_lam((("a", 1), ("b", 2))), to_lam((("a",),)))))
+    assert set(semi) == {("a", 1)}
+    r = theta.Restrict([1], [2])
+    assert _refs(from_lam(r))
+    with defs.step(D):
+        kept = from_lam(apply(r, S(to_lam((("a", 1), ("b", 2))),
+                                   to_lam(((9, "a"),)))))
+    assert set(kept) == {("a", 1)}
+
+
 def test_uniqueness_and_exclusion_come_from_the_canon():
     u = C.uniqueness([1])
     assert _refs(from_lam(u))
