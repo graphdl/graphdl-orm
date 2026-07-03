@@ -249,6 +249,13 @@ def scoped_equality_side(other_cell):
     return _S(_COMP, _CAT, _S(_CONS, ab, ba))
 
 
+def value_comparison(op, col, lit):
+    """NORMA's value-comparison constraint (the paper's Def. Schema lists the family):
+    V = the rows whose `col` value fails <op> against the literal — a Filter over P with
+    the comparison at the value boundary (registered comparators)."""
+    return T.Filter(_S(_COMP, A("not"), A(op), _S(_CONS, A(col), _S(_CONST, A(lit)))))
+
+
 def _participation(clause_fts, target_ft, pops=None):
     """⟨P,D⟩ → ⟨⟨entity, clause⟩ …⟩ over ALL clause cells: the target clause reads from P,
     the sibling clauses from D. Each row is tagged with its clause's fact-type id. `pops`
