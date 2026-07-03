@@ -29,63 +29,44 @@ def cell(name, contents):
     return _S(CELL, A(name), contents)
 
 
-def _named(name):
-    """predicate on a cell: its name (role 2) equals `name`."""
-    return _S(_COMP, _EQ, _S(_CONS, _2, _S(_CONST, A(name))))
-
-
 def Fetch(name):
-    """↑name — contents (role 3) of the first cell named `name`, else # (Backus §13.3.4)."""
-    from .theta import Filter
-    found = Filter(_named(name))
-    return _S(_COND, _S(_COMP, _NULL, found),
-              _S(_CONST, DEFAULT),                           # no such cell ⇒ # (unaddressable)
-              _S(_COMP, _3, _1, found))                      # else contents of the first match
+    """↑name — contents (role 3) of the first cell named `name`, else # (Backus
+    §13.3.4). The canonical builder applied to the name (shared/ast.py)."""
+    return apply(A("ast:Fetch"), A(name))
 
 
 def FetchPop(name):
-    """The create pipeline's view of a cell as a POPULATION: ↑name, with an absent cell an
-    empty population — the fresh-cell default is the pipeline's explicit choice (a COND on
-    #), never a change to ↑'s meaning."""
-    f = Fetch(name)
-    is_absent = _S(_COMP, _EQ, _S(_CONS, f, _S(_CONST, DEFAULT)))
-    return _S(_COND, is_absent, _S(_CONST, PHI), f)
+    """The create pipeline's view of a cell as a POPULATION: ↑name, with an absent
+    cell an empty population — the fresh-cell default is the pipeline's explicit
+    choice (a COND on #), never a change to ↑'s meaning. Canonical."""
+    return apply(A("ast:FetchPop"), A(name))
 
 
 def Pop(name):
-    """(pop n) — remove the FIRST cell named `name`, preserving deeper ones (§13.3.4: cells
-    of one name form a LIFO stack; pop and purge are distinct operators). A WHILE-fold over
-    ⟨removed?, acc, rest⟩ standing in for Backus's recursive definition."""
-    head = _S(_COMP, _1, _3)
-    hit = _S(_COMP, A("and"), _S(_CONS,
-              _S(_COMP, _EQ, _S(_CONS, _1, _S(_CONST, A("F")))),      # not yet removed
-              _S(_COMP, _named(name), head)))                          # and head is the cell
-    take = _S(_CONS, _S(_CONST, A("T")), _2, _S(_COMP, A("tl"), _3))  # drop it, flag removed
-    keep = _S(_CONS, _1, _S(_COMP, A("apndr"), _S(_CONS, _2, head)), _S(_COMP, A("tl"), _3))
-    loop = _S(A("WHILE"), _S(_COMP, _NOT, _NULL, _3), _S(_COND, hit, take, keep))
-    init = _S(_CONS, _S(_CONST, A("F")), _S(_CONST, PHI), A("id"))    # ⟨F, φ, D⟩
-    return _S(_COMP, _2, loop, init)
+    """(pop n) — remove the FIRST cell named `name`, preserving deeper ones (§13.3.4:
+    cells of one name form a LIFO stack). Canonical (a WHILE-fold over
+    ⟨removed?, acc, rest⟩ standing in for Backus's recursive definition)."""
+    return apply(A("ast:Pop"), A(name))
 
 
 def Purge(name):
-    """(purge n) — remove ALL cells named `name` (§13.3.4's other operator)."""
-    from .theta import Filter
-    return Filter(_S(_COMP, _NOT, _named(name)))
+    """(purge n) — remove ALL cells named `name` (§13.3.4's other operator).
+    Canonical."""
+    return apply(A("ast:Purge"), A(name))
 
 
 def Store(name):
-    """↓name — ⟨x, D⟩ → (push n):⟨x, (pop n):D⟩ (§13.3.4 verbatim): replace the TOP of the
-    stack named `name`; deeper same-named cells survive. Fetch still reads the top."""
-    make = _S(_CONS, _S(_CONST, CELL), _S(_CONST, A(name)), _1)   # ⟨x,D⟩ → ⟨CELL, name, x⟩
-    return _S(_COMP, _APNDL, _S(_CONS, make, _S(_COMP, Pop(name), _2)))
+    """↓name — ⟨x, D⟩ → (push n):⟨x, (pop n):D⟩ (§13.3.4 verbatim): replace the TOP
+    of the stack named `name`; deeper same-named cells survive. Canonical."""
+    return apply(A("ast:Store"), A(name))
 
 
 def DefineIn(name, obj):
-    """D → D′ with the definition stored as an ORDINARY cell ⟨CELL, name, obj⟩ of D by ↓name
-    (Backus §13.3.5: such a cell has the same effect as Def name ≡ ρobj). Definitions travel
-    with the store: self-modification is a step, a tenant's DEFS is its own, and mu resolves
-    the name only within steps bound to this store (Prop. tenant / Cor. closure)."""
-    return _S(_COMP, Store(name), _S(_CONS, _S(_CONST, obj), A("id")))       # D → ↓name:⟨obj, D⟩
+    """D → D′ with the definition stored as an ORDINARY cell ⟨CELL, name, obj⟩ of D
+    by ↓name (Backus §13.3.5: such a cell has the same effect as Def name ≡ ρobj).
+    Definitions travel with the store (Prop. tenant / Cor. closure). Canonical,
+    applied to ⟨name, obj⟩."""
+    return apply(A("ast:DefineIn"), _S(A(name), obj))
 
 
 def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_obj=None, links_obj=None,

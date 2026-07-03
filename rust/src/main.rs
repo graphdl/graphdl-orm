@@ -1511,8 +1511,8 @@ fn seqv(xs: Vec<V>) -> V {
 // implementation. No JSON shim, no parser: rustc tokenizes the same bytes CPython
 // executes. The file is ONE tuple literal (include! takes a single expression);
 // elements evaluate left to right in both languages. Constraints the file honors:
-// double-quoted strings, no imports, no assignments, PHI referenced once per file
-// (it is a moved local).
+// double-quoted strings, no imports, no assignments; PHI is nullary (PHI()) so a
+// file may use it any number of times.
 #[allow(non_snake_case, unused, path_statements)]
 fn canon_defs() -> Vec<(String, V)> {
     let out: RefCell<Vec<(String, V)>> = RefCell::new(Vec::new());
@@ -1521,7 +1521,7 @@ fn canon_defs() -> Vec<(String, V)> {
         let A = |s: &str| atom(Leaf::S(s.to_string()));
         let N = |i: i64| atom(Leaf::I(i));
         let K = |x: V| seqv(vec![atom(Leaf::S("CONST".to_string())), x]);
-        let PHI = phi();
+        let PHI = || phi();
         let S1 = |a: V| seqv(vec![a]);
         let S2 = |a: V, b: V| seqv(vec![a, b]);
         let S3 = |a: V, b: V, c: V| seqv(vec![a, b, c]);
@@ -1533,6 +1533,7 @@ fn canon_defs() -> Vec<(String, V)> {
         let S9 = |a: V, b: V, c: V, d: V, e: V, f: V, g: V, h: V, i: V| seqv(vec![a, b, c, d, e, f, g, h, i]);
         include!("../../shared/theta.py");
         include!("../../shared/constraints.py");
+        include!("../../shared/ast.py");
     }
     out.into_inner()
 }

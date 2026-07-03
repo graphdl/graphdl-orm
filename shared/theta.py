@@ -1,8 +1,8 @@
 (
-"theta1 (Codd 2.2) as canonical definitions in INTERSECTION SOURCE: this file is a normal Python module and, include!d in expression position, normal Rust. It is ONE tuple literal whose elements evaluate left to right in both languages; the vocabulary (DEF, A, N, PHI, S2..S9) is defined by each platform, so the lambda bound determines the implementation. Definitions reference each other by NAME, resolved through DEFS by the one mu (Backus 13.3.5): no host functions, no assignments, no imports, double-quoted strings only.",
+"theta1 (Codd 2.2) as canonical definitions in INTERSECTION SOURCE: this file is a normal Python module and, include!d in expression position, normal Rust. It is ONE tuple literal whose elements evaluate left to right in both languages; the vocabulary (DEF, A, N, K, PHI(), S1..S9) is defined by each platform, so the lambda bound determines the implementation. Definitions reference each other by NAME, resolved through DEFS by the one mu (Backus 13.3.5): no host functions, no assignments, no imports, double-quoted strings only.",
 
 DEF("theta:append_phi",
-    S3(A("COMP"), A("apndr"), S3(A("CONS"), A("id"), S2(A("CONST"), PHI)))),
+    S3(A("COMP"), A("apndr"), S3(A("CONS"), A("id"), S2(A("CONST"), PHI())))),
 
 DEF("theta:keep_eq",
     S4(A("COND"), S3(A("COMP"), A("eq"), N(1)), A("apndl"), N(2))),
