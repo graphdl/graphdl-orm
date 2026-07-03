@@ -471,6 +471,10 @@ def _h_brace_subtypes(g, k, m):
     if g[1]:
         cid = "sxc_" + _slug("_".join(subs))[:40]
         A_.append(("constraint", (cid, "exclusion", subs[0], subs, m)))
+        # a mutually exclusive family is Halpin's PARTITION mapping: the subtypes keep
+        # their own RMAP tables (the layout splits; the SEMANTIC subtyping — inclusion
+        # rules, clause lift — is unchanged)
+        A_ += [("subtypePartition", (s, g[2].strip())) for s in subs]
         objs += [(cid, C.exclusion())] + \
                 [(cid + "@" + s, C.scoped_exclusion(subs, s)) for s in subs]
     return A_, objs
@@ -750,7 +754,7 @@ def _h_rule_if(g, k, m):
                  ("ruleDerives", (rule_cid, hft))]
     # one pass, clauses in order: joins extend the column map, comparators filter it
     cols, atoms, filters = {}, [], []
-    ok = True
+    ok, diag = True, None
     for c in clauses:
         mm = _CMP_CLAUSE.match(c)
         if mm and mm.group(1) in cols:
@@ -761,7 +765,9 @@ def _h_rule_if(g, k, m):
             else:
                 lit = _num(objtxt)
                 if isinstance(lit, str):
-                    ok = False                                # neither bound nor literal
+                    ok = False
+                    diag = (f"comparator operand {objtxt!r} is neither a bound "
+                            f"variable nor a literal")
                     break
                 filters.append(_sys.cmp_filter(_CMP_OPS[opw], cols[subj], lit=lit))
             continue
@@ -774,6 +780,8 @@ def _h_rule_if(g, k, m):
             # linear chain: the joined variable must be the running tuple's LAST column
             if not avars or cols.get(avars[0]) != len(cols):
                 ok = False                                    # unsupported shape: M-facts only
+                diag = (f"clause variable {(avars[0] if avars else '?')!r} does not "
+                        f"join the running tuple (non-linear shape)")
                 break
             for v in avars[1:]:
                 cols.setdefault(v, len(cols) + 1)
@@ -784,7 +792,14 @@ def _h_rule_if(g, k, m):
         A_.append(("derivationRule", (hft, atoms[0][0], len(atoms))))
         obj = _sys.compile_rule([a[0] for a in atoms], [cols[v] for v in hvars],
                                 widths, filters)
+    elif ok:
+        unbound = sorted(set(hvars) - set(cols)) if atoms else []
+        diag = (f"head variable(s) {unbound} unbound in the body" if unbound
+                else "no fact-type clause in the body")
     if obj is None:
+        # the rule stays M-facts only, but it SAYS WHY (the diagnostics class)
+        if diag:
+            A_.append(("ruleDiag", (rule_cid, diag)))
         return A_, []
     # semi-naive: the atom list as M-facts, and one ~d delta variant per atom position
     out = [(rule_cid, obj)]
@@ -970,7 +985,9 @@ def compile_model(text, D=None):
         report[kind] += 1
         if kind == "UNPARSED":
             unparsed.append(s)
-    return D, {"total": len(stmts), "kinds": dict(report), "unparsed": unparsed}
+    diags = [tuple(r) for r in system._pop_rows(D, "ruleDiag")]
+    return D, {"total": len(stmts), "kinds": dict(report), "unparsed": unparsed,
+               "rule_diagnostics": diags}
 
 
 def _cells(D, name):

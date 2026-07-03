@@ -407,12 +407,15 @@ def rmap_partition(D):
     spanning = {c[2] for c in cons if len(c) >= 3 and c[1] == "spanning_uniqueness"}
     functional = {c[2] for c in cons if len(c) >= 3 and c[1] == "uniqueness"}
     subs = {r[0]: r[1] for r in _pop_rows(D, "subtype")}
+    partitioned = {tuple(r[:2]) for r in _pop_rows(D, "subtypePartition") if len(r) >= 2}
 
-    def _top(o):                                             # RMAP step 0 (§10.3 verbatim):
-        seen = set()                                         # "Absorb subtypes into their
-        while o in subs and o not in seen:                   # top supertype"
-            seen.add(o)
-            o = subs[o]
+    def _top(o):                                             # RMAP step 0 (§10.3): absorb
+        seen = set()                                         # subtypes into their top
+        while o in subs and o not in seen:                   # supertype — STOPPING at a
+            if (o, subs[o]) in partitioned:                  # partitioned edge (Halpin's
+                break                                        # partition mapping: mutually
+            seen.add(o)                                      # exclusive families keep
+            o = subs[o]                                      # their own tables)
         return o
 
     arity = {}
