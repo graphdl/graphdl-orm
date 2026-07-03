@@ -480,14 +480,25 @@ def _h_brace_subtypes(g, k, m):
     return A_, objs
 
 _QUANT = re.compile(r"\b(some|that|each|no|an|a) ")
+_QUANT_MIN = re.compile(r"\b(some|that|each|no) ")
 
 
 def _clause_ft(text, known):
-    """A constraint clause (quantified reading text) → the fact-type id it references:
-    strip the quantifier words, then resolve as a fact-type reading. The string boundary
-    of set-comparison/subset clause resolution (full RolePath unification is Stage 2)."""
-    ft, _facts = _fact_type(_QUANT.sub("", text.strip()).strip(), known)
-    return ft
+    """A constraint clause (quantified reading text) → the fact-type id it references.
+    Resolution prefers a DECLARED fact type under the MINIMAL quantifier strip
+    (some/that/each/no — an article is predicate text, the rule path's lesson: 'is a
+    manager' declares Employee_is_a_manager, and stripping the article resolved the
+    clause to a cell that does not exist, a silently unenforced constraint). The full
+    strip stays as the fallback, itself preferring a declared hit, so article-free
+    models keep their ids. The string boundary of set-comparison/subset clause
+    resolution (full RolePath unification is Stage 2)."""
+    t = re.sub(r"\s+", " ", text.strip())
+    fts = getattr(known, "fts", None) or ()
+    ft_min, _ = _fact_type(_QUANT_MIN.sub("", t).strip(), known)
+    if ft_min in fts:
+        return ft_min
+    ft_full, _facts = _fact_type(_QUANT.sub("", t).strip(), known)
+    return ft_full
 
 
 def _h_set_comparison(g, k, m):
