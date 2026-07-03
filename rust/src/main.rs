@@ -1520,7 +1520,9 @@ fn canon_defs() -> Vec<(String, V)> {
         let DEF = |n: &str, o: V| out.borrow_mut().push((n.to_string(), o));
         let A = |s: &str| atom(Leaf::S(s.to_string()));
         let N = |i: i64| atom(Leaf::I(i));
+        let K = |x: V| seqv(vec![atom(Leaf::S("CONST".to_string())), x]);
         let PHI = phi();
+        let S1 = |a: V| seqv(vec![a]);
         let S2 = |a: V, b: V| seqv(vec![a, b]);
         let S3 = |a: V, b: V, c: V| seqv(vec![a, b, c]);
         let S4 = |a: V, b: V, c: V, d: V| seqv(vec![a, b, c, d]);
@@ -1530,6 +1532,7 @@ fn canon_defs() -> Vec<(String, V)> {
         let S8 = |a: V, b: V, c: V, d: V, e: V, f: V, g: V, h: V| seqv(vec![a, b, c, d, e, f, g, h]);
         let S9 = |a: V, b: V, c: V, d: V, e: V, f: V, g: V, h: V, i: V| seqv(vec![a, b, c, d, e, f, g, h, i]);
         include!("../../shared/theta.py");
+        include!("../../shared/constraints.py");
     }
     out.into_inner()
 }

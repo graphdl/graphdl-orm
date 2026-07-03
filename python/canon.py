@@ -23,8 +23,9 @@ def _S(*xs):
 
 def vocabulary(out):
     v = {"PHI": _PHI, "A": _atom, "N": _atom,
+         "K": lambda x: _S(_atom("CONST"), x),
          "DEF": lambda name, obj: out.append((name, obj))}
-    for k in range(2, 10):
+    for k in range(1, 10):
         v["S%d" % k] = _S
     return v
 
@@ -44,3 +45,8 @@ def load(name="theta.py"):
     for n, obj in pairs:
         defs.define(n, obj)
     return [n for n, _ in pairs]
+
+
+def load_all():
+    """Every intersection file, in dependency order (constraints references theta)."""
+    return load("theta.py") + load("constraints.py")
