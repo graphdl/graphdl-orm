@@ -1,9 +1,8 @@
-"""The RMAP plan's recorded dependency, closed: scoped constraints read ABSORBED fact
-types through the view (index + dynamic fetch), not the per-fact-type cell. With the
-partition, validate_for rebuilds the affected scoped objects over ftpop_expr; without
-it, the per-fact-type cell is empty under the routed layout and the constraint reports
-spuriously. The discriminator: a routed write satisfies the mandatory constraint only
-through the view."""
+"""Scoped constraints under the routed layout, both paths: with the partition,
+validate_for rebuilds the affected scoped objects over ftpop_expr (the reassembling
+view); and since the absorbed population cell is now maintained as a derived-and-stored
+view in the same commit chain, the plain per-fact-type read AGREES — cache equals
+reassembly, so neither path reports spuriously against a routed write."""
 import pyarest.prims  # noqa: F401
 import pyarest.lam as L
 from pyarest.lam import atom as A, to_lam, from_lam
@@ -41,4 +40,6 @@ def test_scoped_mandatory_reads_through_the_view():
     vo0 = forml.validate_for("Person", D)
     with defs.step(D):
         (_p, V0, _f0) = from_lam(apply(vo0, S(to_lam(ents), D)))
-    assert ("p1",) in set(V0)                                 # the per-ft cell cannot see it
+    # the ** view cache keeps the per-ft cell in agreement with the reassembly, so the
+    # plain read reaches the routed write too — cache equals view, no spurious report
+    assert set(V0) == set(V)
