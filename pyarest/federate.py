@@ -34,36 +34,64 @@ def _http_fetch(url):
 
 
 # ============================ schema.org (JSON-LD) ============================
+def _ids(x):
+    """domainIncludes/rangeIncludes/subClassOf come as a dict OR a list of dicts in the
+    live feed; normalize to a list of ids."""
+    if x is None:
+        return []
+    if isinstance(x, dict):
+        return [x.get("@id")]
+    return [e.get("@id") for e in x if isinstance(e, dict)]
+
+
+def _types(node):
+    t = node.get("@type")
+    return t if isinstance(t, list) else ([t] if t else [])
+
+
 def _vocab_shape(vocab):
-    classes, props = [], []
+    classes, props, subclass = [], [], []
     for node in vocab.get("@graph", []):
-        t = node.get("@type")
-        if t == "rdfs:Class":
+        ts = _types(node)
+        if "rdfs:Class" in ts and "schema:DataType" not in ts:
             classes.append(node["@id"])
-        elif t == "rdf:Property":
+            for sup in _ids(node.get("rdfs:subClassOf")):
+                if sup:
+                    subclass.append((node["@id"], sup))
+        elif "rdf:Property" in ts:
             props.append(node)
-    return classes, props
+    return classes, props, subclass
 
 
 def jsonld_to_readings(vocab):
-    """schema.org-style JSON-LD (@graph of rdfs:Class / rdf:Property with
-    domainIncludes / rangeIncludes) verbalized as canonical FORML."""
-    classes, props = _vocab_shape(vocab)
+    """schema.org-style JSON-LD (@graph of rdfs:Class / rdf:Property with possibly
+    LIST-valued domainIncludes / rangeIncludes, and rdfs:subClassOf) verbalized as
+    canonical FORML — subclass links become the ordinary subtype reading."""
+    classes, props, subclass = _vocab_shape(vocab)
+    cset = set(classes)
     out = [f"{c} is an entity type." for c in classes]
+    out += [f"{sub} is a subtype of {sup}." for (sub, sup) in subclass if sup in cset]
+    declared_vts = set()
     for p in props:
-        dom = p["schema:domainIncludes"]["@id"]
-        rng = p["schema:rangeIncludes"]["@id"]
-        if rng in classes:
-            out.append(f"{dom} {_local(p['@id'])} {rng}.")    # object property
-        else:
-            out.append(f"{p['@id']} is a value type.")        # datatype property
-            out.append(f"{dom} has {p['@id']}.")
+        rngs = _ids(p.get("schema:rangeIncludes"))
+        for dom in _ids(p.get("schema:domainIncludes")):
+            if dom not in cset:
+                continue
+            obj_rngs = [r for r in rngs if r in cset]
+            if obj_rngs:
+                out.append(f"{dom} {_local(p['@id'])} {obj_rngs[0]}.")
+            elif rngs:
+                if p["@id"] not in declared_vts:
+                    declared_vts.add(p["@id"])
+                    out.append(f"{p['@id']} is a value type.")
+                out.append(f"{dom} has {p['@id']}.")
     return "\n".join(out) + "\n"
 
 
 def jsonld_items_to_readings(items, vocab):
     """Instance items → quoted instance-fact readings through the SAME grammar."""
-    classes, props = _vocab_shape(vocab)
+    classes, props, _sub = _vocab_shape(vocab)
+    cset = set(classes)
     bykey = {p["@id"]: p for p in props}
     out = []
     for item in items:
@@ -72,10 +100,10 @@ def jsonld_items_to_readings(items, vocab):
         for key, val in item.items():
             if key.startswith("@") or key not in bykey:
                 continue
-            p = bykey[key]
-            rng = p["schema:rangeIncludes"]["@id"]
-            if rng in classes:
-                out.append(f"{cls} '{iid}' {_local(key)} {rng} '{val}'.")
+            rngs = _ids(bykey[key].get("schema:rangeIncludes"))
+            obj_rngs = [r for r in rngs if r in cset]
+            if obj_rngs:
+                out.append(f"{cls} '{iid}' {_local(key)} {obj_rngs[0]} '{val}'.")
             else:
                 out.append(f"{cls} '{iid}' has {key} '{val}'.")
     return "\n".join(out) + ("\n" if out else "")
@@ -110,7 +138,7 @@ def fetch_and_store(D, url, fetch=None):
     if D is None:
         D = meta.initial_D()
     D, rep = forml.compile_model(readings, D)
-    classes, _ = _vocab_shape(vocab)
+    classes, _props, _sub = _vocab_shape(vocab)
     rows = {tuple(r) for r in system._pop_rows(D, "federatedFrom")} | \
         {(c, url) for c in classes}
     D = _ap(ast.Store("federatedFrom"), _S(to_lam(tuple(sorted(rows))), D))

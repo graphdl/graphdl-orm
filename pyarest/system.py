@@ -906,6 +906,33 @@ def row_validate(D, ft, partition):
     return _S(_CONS, _1, V, flag)
 
 
+def describe(D, noun):
+    """What the system can say about a noun, from its own M-facts (a read view in the
+    ft_view style): kind, supertypes and subtypes, the fact types it plays roles in
+    (with their reading templates and this noun's position), reference mode, the
+    machine governing it (if any), and federation provenance."""
+    readings = {f[0]: f[1] for f in _pop_rows(D, "factType") if len(f) >= 2}
+    roles = [(r[1], r[2], readings.get(r[1], ""))
+             for r in _pop_rows(D, "role") if len(r) >= 4 and r[3] == noun]
+    return {
+        "noun": noun,
+        "kind": sorted({r[1] for r in _pop_rows(D, "instanceOf")
+                        if len(r) >= 2 and r[0] == noun}),
+        "supertypes": sorted({b for (a, b) in
+                              (r[:2] for r in _pop_rows(D, "subtype") if len(r) >= 2)
+                              if a == noun}),
+        "subtypes": sorted({a for (a, b) in
+                            (r[:2] for r in _pop_rows(D, "subtype") if len(r) >= 2)
+                            if b == noun}),
+        "roles": sorted(roles),
+        "ref_mode": sorted({r[1] for r in _pop_rows(D, "refMode")
+                            if len(r) >= 2 and r[0] == noun}),
+        "machine": machine_for(D, noun),
+        "federated_from": sorted({r[1] for r in _pop_rows(D, "federatedFrom")
+                                  if len(r) >= 2 and r[0] == noun}),
+    }
+
+
 def finality_modality(D, noun, depth):
     """The writer model's hardening rule, read off M's finality facts: below the noun's
     declared depth k a violation reports DEONTICALLY (optimistic acceptance, V as the

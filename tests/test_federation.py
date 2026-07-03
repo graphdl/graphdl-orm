@@ -91,3 +91,15 @@ def test_gs1_and_onet_federate_through_the_same_door():
     Dpy = from_lam(D)
     assert ("10000025", "Cheese") in _cell(Dpy, "gs1_Brick_has_gs1_Title")
     assert ("15-1252.00", "Software Developers") in _cell(Dpy, "onet_Occupation_has_onet_Title")
+
+
+def test_describe_speaks_from_the_m_facts():
+    def fixture_fetch(url):
+        return {"vocab": SCHEMA_ORG, "items": SCHEMA_ORG_ITEMS}
+
+    from pyarest import system
+    D, _ = federate.fetch_and_store(None, "https://schema.org/Product", fetch=fixture_fetch)
+    d = system.describe(D, "schema:Product")
+    assert d["kind"] == ["ObjectType"]
+    assert any(ft == "schema_Product_offers_schema_Offer" for (ft, _p, _r) in d["roles"])
+    assert d["federated_from"] == ["https://schema.org/Product"]
