@@ -26,7 +26,11 @@ def vocabulary(out):
          "K": lambda x: _S(_atom("CONST"), x),
          "DEF": lambda name, obj: out.append((name, obj))}
     for k in range(1, 10):
-        v["S%d" % k] = _S
+        def _sk(*xs, _k=k):
+            if len(xs) != _k:
+                raise TypeError("S%d takes %d arguments, got %d" % (_k, _k, len(xs)))
+            return _S(*xs)
+        v["S%d" % k] = _sk
     return v
 
 

@@ -277,13 +277,25 @@ def _participation(clause_fts, target_ft, pops=None):
 
 def scoped_exclusion(clause_fts, target_ft, pops=None):
     """Exclusion over clause fact types, attached to `target_ft`'s cell: at most one clause
-    per entity — uniqueness on the entity role of the participation."""
+    per entity — uniqueness on the entity role of the participation. Canonical unless a
+    pops override (the view seam) rides along."""
+    if not pops:
+        from .reduce import apply as _apply
+        from .lam import to_lam as _tl
+        return _apply(A("constraints:scoped_exclusion"),
+                      _S(_tl(tuple(clause_fts)), A(target_ft)))
     return _S(_COMP, exclusion(), _participation(clause_fts, target_ft, pops))
 
 
 def scoped_exclusive_or(subject_cell, clause_fts, target_ft, pops=None):
     """Exactly one clause per entity: exclusive_or over ⟨universe, participation⟩, the
-    universe being the subject type's own instance cell."""
+    universe being the subject type's own instance cell. Canonical unless a pops
+    override rides along."""
+    if not pops and isinstance(subject_cell, str):
+        from .reduce import apply as _apply
+        from .lam import to_lam as _tl
+        return _apply(A("constraints:scoped_exclusive_or"),
+                      _S(A(subject_cell), _tl(tuple(clause_fts)), A(target_ft)))
     pair = _S(_CONS, _pop_of(subject_cell), _participation(clause_fts, target_ft, pops))
     return _S(_COMP, exclusive_or(), pair)
 
@@ -293,13 +305,24 @@ def scoped_external_uniqueness(other_ft, cols):
     "equivalent to an internal uniqueness constraint spanning [the columns] in the
     natural join of the two tables"). ⟨P, D⟩: join the target population with the
     sibling cell on the shared key (role 1 = role 1), then the internal UC over `cols`
-    of the joined tuples."""
+    of the joined tuples. Canonical for a named sibling."""
+    if isinstance(other_ft, str):
+        from .reduce import apply as _apply
+        from .lam import to_lam as _tl
+        return _apply(A("constraints:scoped_external_uniqueness"),
+                      _S(A(other_ft), _tl(tuple(cols))))
     join = _S(_COMP, T.NatJoin(1), _S(_CONS, _P, _pop_of(other_ft)))
     return _S(_COMP, uniqueness(cols), join)
 
 
 def scoped_inclusive_or(subject_cell, clause_fts, target_ft, pops=None):
-    """At least one clause per entity (disjunctive mandatory): universe ∖ players."""
+    """At least one clause per entity (disjunctive mandatory): universe ∖ players.
+    Canonical unless a pops override rides along."""
+    if not pops and isinstance(subject_cell, str):
+        from .reduce import apply as _apply
+        from .lam import to_lam as _tl
+        return _apply(A("constraints:scoped_inclusive_or"),
+                      _S(A(subject_cell), _tl(tuple(clause_fts)), A(target_ft)))
     players = _S(_COMP, T.Project([1]), _participation(clause_fts, target_ft, pops))
     pair = _S(_CONS, _S(_COMP, T.Project([1]), _pop_of(subject_cell)), players)
     return _S(_COMP, T.setminus, pair)
