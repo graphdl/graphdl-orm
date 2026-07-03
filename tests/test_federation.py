@@ -103,3 +103,33 @@ def test_describe_speaks_from_the_m_facts():
     assert d["kind"] == ["ObjectType"]
     assert any(ft == "schema_Product_offers_schema_Offer" for (ft, _p, _r) in d["roles"])
     assert d["federated_from"] == ["https://schema.org/Product"]
+
+
+def test_sources_declare_in_m_and_resolve_through_defs():
+    # the federation system is FORML + DEFS: sources/connectors are M-facts, fetcher
+    # and translator are DEFINITION NAMES resolved by rho, and swapping the fetch is
+    # re-registering the name — DEFS as the DI container, per the whitepaper
+    from pyarest import defs as d
+    DECL = federate._module_readings() + """
+Source 'schemaorg' has Url 'https://example.test/schema'.
+Source 'schemaorg' uses Connector 'jsonld-http'.
+Connector 'jsonld-http' fetches with Fetcher 'httpFetch'.
+Connector 'jsonld-http' translates with Translator 'translate_jsonld'.
+"""
+    D, rep = forml.compile_model(DECL)
+    assert rep["unparsed"] == []
+
+    def fixture(mu):
+        def g(o):
+            return L.atom({"vocab": SCHEMA_ORG, "items": SCHEMA_ORG_ITEMS})
+        return g
+
+    d.register("httpFetch", fixture)                          # IoC: swap by re-registering
+    try:
+        D2, rep2 = federate.fetch_source(D, "schemaorg")
+        assert rep2["unparsed"] == []
+        Dpy = from_lam(D2)
+        assert ("prod-1", "Widget") in _cell(Dpy, "schema_Product_has_schema_name")
+        assert ("schemaorg", "https://example.test/schema") in _cell(Dpy, "federatedFrom")
+    finally:
+        federate.register_bindings()                          # restore the real binding

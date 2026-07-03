@@ -26,11 +26,50 @@ def _local(iri):
     return iri.split(":", 1)[1] if ":" in iri else iri
 
 
-def _http_fetch(url):
-    """The paper's binding, for real deployments; tests hand a fixture twin instead."""
-    from urllib.request import urlopen
-    with urlopen(url) as r:
-        return json.loads(r.read().decode("utf-8"))
+def _http_fetch_impl(mu):
+    """The paper's NAMED binding, registered into DEFS ("a server registers httpFetch
+    and upsert"): ATOM(url) -> ATOM(parsed payload). Tests re-register this name with a
+    fixture twin — DEFS is the DI container, swapping is re-registering."""
+    from urllib.request import urlopen, Request
+    from . import defs as _d
+
+    def g(o):
+        url = _d._aval(o)
+        if not isinstance(url, str):
+            return L.BOT
+        req = Request(url, headers={"User-Agent": "pyarest-federation/0.1"})
+        with urlopen(req, timeout=60) as r:
+            return L.atom(json.loads(r.read().decode("utf-8")))
+    return g
+
+
+def _translator_impl(fn):
+    """Wrap a verbalizer (payload -> readings text) as a registered def: ATOM(payload)
+    -> ATOM(readings)."""
+    from . import defs as _d
+
+    def impl(mu):
+        def g(o):
+            payload = _d._aval(o)
+            if payload is None:
+                return L.BOT
+            vocab = payload.get("vocab", payload) if isinstance(payload, dict) else payload
+            readings = fn(vocab)
+            if isinstance(payload, dict) and payload.get("items"):
+                readings += jsonld_items_to_readings(payload["items"], vocab)
+            return L.atom(readings)
+        return g
+    return impl
+
+
+def register_bindings():
+    """Register the federation names into DEFS. Idempotent; call again to restore the
+    real bindings after a test swapped them."""
+    from .defs import register
+    register("httpFetch", _http_fetch_impl)
+    register("translate_jsonld", _translator_impl(jsonld_to_readings))
+    register("translate_gs1", _translator_impl(gs1_to_readings))
+    register("translate_onet", _translator_impl(onet_to_readings))
 
 
 # ============================ schema.org (JSON-LD) ============================
@@ -129,9 +168,16 @@ def onet_to_readings(onet):
 # ============================ fetch-and-store =================================
 def fetch_and_store(D, url, fetch=None):
     """Pull the external vocabulary and items, verbalize, ingest through compile_model
-    (the same front door as every reading), and record provenance. Returns (D, report)."""
-    fetch = fetch or _http_fetch
-    payload = fetch(url)
+    (the same front door as every reading), and record provenance. Returns (D, report).
+    With fetch=None the fetch resolves through DEFS by name (rho of httpFetch) — DEFS
+    is the DI container; the M-declared entry is fetch_source."""
+    if fetch is None:
+        from . import defs as _d
+        from .reduce import apply as _apply
+        from .lam import atom as _A
+        payload = _d._aval(_apply(_A("httpFetch"), _A(url)))
+    else:
+        payload = fetch(url)
     vocab = payload.get("vocab", payload)
     readings = jsonld_to_readings(vocab) + \
         jsonld_items_to_readings(payload.get("items", []), vocab)
@@ -143,3 +189,52 @@ def fetch_and_store(D, url, fetch=None):
         {(c, url) for c in classes}
     D = _ap(ast.Store("federatedFrom"), _S(to_lam(tuple(sorted(rows))), D))
     return D, rep
+
+
+# ============================ M-declared sources ==============================
+MODULE = None
+
+
+def _module_readings():
+    global MODULE
+    if MODULE is None:
+        import os
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "readings", "federation.md")
+        MODULE = open(p, encoding="utf-8").read()
+    return MODULE
+
+
+def _lookup(D, ft, key):
+    for r in system._pop_rows(D, ft):
+        if len(r) >= 2 and r[0] == key:
+            return r[1]
+    return None
+
+
+def fetch_source(D, source):
+    """THE federation entry, everything read off M and resolved through DEFS: the
+    Source's Url, its Connector, the Connector's Fetcher and Translator (definition
+    NAMES — rho resolves them, so any backend is a Connector declaring two names).
+    fetch -> translate -> ingest through compile_model -> provenance."""
+    from . import defs as _d
+    from .reduce import apply as _apply
+    from .lam import atom as _A, from_lam
+    url = _lookup(D, "Source_has_Url", source)
+    conn = _lookup(D, "Source_uses_Connector", source)
+    fetcher = _lookup(D, "Connector_fetches_with_Fetcher", conn)
+    translator = _lookup(D, "Connector_translates_with_Translator", conn)
+    if not all((url, conn, fetcher, translator)):
+        return D, {"unparsed": [f"source {source!r} is not fully declared"]}
+    with _d.step(D):
+        payload = _apply(_A(fetcher), _A(url))
+        readings = from_lam(_apply(_A(translator), payload))
+    if not isinstance(readings, str):
+        return D, {"unparsed": [f"translator {translator!r} answered no readings"]}
+    D, rep = forml.compile_model(readings, D)
+    rows = {tuple(r) for r in system._pop_rows(D, "federatedFrom")} | {(source, url)}
+    D = _ap(ast.Store("federatedFrom"), _S(to_lam(tuple(sorted(rows))), D))
+    return D, rep
+
+
+register_bindings()
