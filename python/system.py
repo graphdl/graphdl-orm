@@ -199,11 +199,14 @@ def membership_def():
 
 # --- the book's rule form compiled (Halpin ch.2 ex.4): linear chain join over D ---
 def cmp_filter(op, col, lit=None, col2=None):
-    """A comparator CLAUSE as a filter predicate over the running tuple: the corpus's
-    word comparators applied to a bound variable's column against a literal (or a
-    second bound column). Rule clauses that compare do not join — they restrict."""
-    rhs = A(col2) if col2 is not None else _S(_CONST, A(lit))
-    return _S(_COMP, A(op), _S(_CONS, A(col), rhs))
+    """The comparator PREDICATE over a joined row: col `op` lit, or col `op` col2
+    (the cross-antecedent form). compile_rule Filter-wraps it after the joins. The
+    canonical builders (shared/system.py)."""
+    from .reduce import apply as _apply
+    from .lam import to_lam
+    if col2 is not None:
+        return _apply(A("system:cmp_filter_col"), _S(A(op), A(col), A(col2)))
+    return _apply(A("system:cmp_filter_lit"), _S(A(op), A(col), to_lam(lit)))
 
 
 def _body_expr(atom_fts, widths, filters, joins, pop):
@@ -236,13 +239,26 @@ def _body_expr(atom_fts, widths, filters, joins, pop):
 
 def compile_rule(atom_fts, head_positions, widths=None, filters=None, joins=None):
     """A rule's body as one FFP object over D: the populations of the clause fact types,
-    each fetched from its own cell, joined per _body_expr (linear chain by default, the
-    general Codd join where `joins` says so), with the head's variable positions
-    projected. Cross-cell by construction: store-on-derive's read side."""
-    from . import ast
-    expr = _body_expr(atom_fts, widths, filters, joins,
-                      lambda _j, ftn: ast.FetchPop(ftn))
-    return _S(_COMP, T.Project(head_positions), expr)
+    each fetched from its own cell, joined linearly by default and by the general Codd
+    join where `joins` says so, with the head's variable positions projected. The
+    canonical WHILE-over-atoms builder (shared/system.py) applied to
+    ⟨⟨ft, width, join?⟩…, head, filters⟩. Cross-cell by construction:
+    store-on-derive's read side."""
+    from .reduce import apply as _apply
+    from .lam import to_lam
+    ws = list(widths) if widths else [2] * len(atom_fts)
+    js = list(joins) if joins else [None] * (len(atom_fts) - 1)
+    js = [None] + js                                          # first atom never joins
+    atoms = L.NIL
+    for ftn, w, j in reversed(list(zip(atom_fts, ws, js))):
+        spec = to_lam(()) if j is None else _S(to_lam(tuple(tuple(p) for p in j[0])),
+                                               to_lam(tuple(j[1])))
+        atoms = L.CONS(_S(A(ftn), to_lam(w), spec))(atoms)
+    flist = L.NIL
+    for f in reversed(list(filters or ())):
+        flist = L.CONS(f)(flist)
+    rec = _S(L.SEQ(atoms), to_lam(tuple(head_positions)), L.SEQ(flist))
+    return _apply(A("system:compile_rule"), rec)
 
 
 def compile_rule_delta(atom_fts, head_positions, delta_at, widths=None, filters=None,
