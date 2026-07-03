@@ -116,4 +116,33 @@ DEF("constraints:exclusive_or",
              S3(A("COMP"), A("theta:dedup"),
                 S2(A("ALPHA"), S2(A("CONS"), N(1)))),
              A("constraints:exclusion"), N(2))))),
+
+DEF("constraints:pop_of",
+    S4(A("CONS"), K(A("COMP")), A("ast:FetchPop"), K(N(2)))),
+
+DEF("constraints:scoped_subset",
+    S4(A("CONS"), K(A("COMP")), K(A("theta:setminus")),
+       S4(A("CONS"), K(A("CONS")), K(N(1)), A("constraints:pop_of")))),
+
+DEF("constraints:scoped_mandatory_entities",
+    S4(A("CONS"), K(A("COMP")), K(A("theta:setminus")),
+       S4(A("CONS"), K(A("CONS")),
+          S4(A("CONS"), K(A("COMP")), K(A("theta:proj1")),
+             A("constraints:pop_of")),
+          K(S3(A("COMP"), A("theta:proj1"), N(1)))))),
+
+DEF("constraints:scoped_mandatory_facts",
+    S4(A("CONS"), K(A("COMP")), K(A("theta:setminus")),
+       S4(A("CONS"), K(A("CONS")),
+          K(S3(A("COMP"), A("theta:proj1"), N(1))),
+          S4(A("CONS"), K(A("COMP")), K(A("theta:proj1")),
+             A("constraints:pop_of"))))),
+
+DEF("constraints:scoped_equality_side",
+    S4(A("CONS"), K(A("COMP")), K(A("cat")),
+       S4(A("CONS"), K(A("CONS")),
+          S4(A("CONS"), K(A("COMP")), K(A("theta:setminus")),
+             S4(A("CONS"), K(A("CONS")), K(N(1)), A("constraints:pop_of"))),
+          S4(A("CONS"), K(A("COMP")), K(A("theta:setminus")),
+             S4(A("CONS"), K(A("CONS")), A("constraints:pop_of"), K(N(1))))))),
 )

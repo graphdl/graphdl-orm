@@ -204,34 +204,55 @@ def _pop_of(cell_name):
 _P = _1                                                       # ⟨P,D⟩ → the target population
 
 
+def _scoped(name, cell, host):
+    """A string cell name applies the canonical builder; a ready population
+    EXPRESSION (the RMAP view seam) keeps the host composition until system.py
+    migrates."""
+    if isinstance(cell, str):
+        from .reduce import apply as _apply
+        return _apply(A(name), A(cell))
+    return host()
+
+
 def scoped_mandatory_entities(entity_cell):
     """Mandatory, attached to the FACT-TYPE cell (P = the fact population): the instances
-    in the entity type's own cell that play no fact. V = π1(entities) ∖ π1(P)."""
-    ents = _S(_COMP, T.Project([1]), _pop_of(entity_cell))
-    players = _S(_COMP, T.Project([1]), _P)
-    return _S(_COMP, T.setminus, _S(_CONS, ents, players))
+    in the entity type's own cell that play no fact. V = π1(entities) ∖ π1(P).
+    Canonical for a named sibling."""
+    def host():
+        ents = _S(_COMP, T.Project([1]), _pop_of(entity_cell))
+        players = _S(_COMP, T.Project([1]), _P)
+        return _S(_COMP, T.setminus, _S(_CONS, ents, players))
+    return _scoped("constraints:scoped_mandatory_entities", entity_cell, host)
 
 
 def scoped_mandatory_facts(ft_cell):
     """Mandatory, attached to the ENTITY cell (P = the entity population): the entities of
-    P that play no fact in the fact-type cell. V = π1(P) ∖ π1(↑ft)."""
-    ents = _S(_COMP, T.Project([1]), _P)
-    players = _S(_COMP, T.Project([1]), _pop_of(ft_cell))
-    return _S(_COMP, T.setminus, _S(_CONS, ents, players))
+    P that play no fact in the fact-type cell. V = π1(P) ∖ π1(↑ft). Canonical for a
+    named sibling."""
+    def host():
+        ents = _S(_COMP, T.Project([1]), _P)
+        players = _S(_COMP, T.Project([1]), _pop_of(ft_cell))
+        return _S(_COMP, T.setminus, _S(_CONS, ents, players))
+    return _scoped("constraints:scoped_mandatory_facts", ft_cell, host)
 
 
 def scoped_subset(consequent_cell):
     """Subset A ⊆ B, attached to the antecedent cell (P = A): V = P ∖ ↑B, tuple-wise —
-    the clause readings resolve to fact types whose role order matches (modus ponens)."""
-    return _S(_COMP, T.setminus, _S(_CONS, _P, _pop_of(consequent_cell)))
+    the clause readings resolve to fact types whose role order matches (modus ponens).
+    Canonical for a named sibling."""
+    def host():
+        return _S(_COMP, T.setminus, _S(_CONS, _P, _pop_of(consequent_cell)))
+    return _scoped("constraints:scoped_subset", consequent_cell, host)
 
 
 def scoped_equality_side(other_cell):
     """Equality A = B, attached to ONE side (P = this side): the symmetric difference
-    (P ∖ ↑other) ∪ (↑other ∖ P)."""
-    ab = _S(_COMP, T.setminus, _S(_CONS, _P, _pop_of(other_cell)))
-    ba = _S(_COMP, T.setminus, _S(_CONS, _pop_of(other_cell), _P))
-    return _S(_COMP, _CAT, _S(_CONS, ab, ba))
+    (P ∖ ↑other) ∪ (↑other ∖ P). Canonical for a named sibling."""
+    def host():
+        ab = _S(_COMP, T.setminus, _S(_CONS, _P, _pop_of(other_cell)))
+        ba = _S(_COMP, T.setminus, _S(_CONS, _pop_of(other_cell), _P))
+        return _S(_COMP, _CAT, _S(_CONS, ab, ba))
+    return _scoped("constraints:scoped_equality_side", other_cell, host)
 
 
 def value_comparison(op, col, lit):
