@@ -107,6 +107,59 @@ fn lnull(l: &V) -> V {
     lmatch(l, tru(), vf(|_h| vf(move |_t| fls())))
 }
 
+// ---- lambda combinators over Scott lists (ports of lam.py's Y-built terms: FOLDR,
+// MAPL, APPEND, REVL, ANYBOT/SEQC's fold). Rust's named recursion stands in for the Y
+// self-application with the identical unfolding; the bodies compose ONLY Scott-list
+// operations (head/tail/cons/lnull), never native containers — one level down, not two. ----
+fn foldr(f: &dyn Fn(V, V) -> V, z: V, l: &V) -> V {
+    if tobool(&lnull(l)) {
+        z
+    } else {
+        let rest = foldr(f, z, &tail(l));
+        f(head(l), rest)
+    }
+}
+fn mapl(f: &dyn Fn(V) -> V, l: &V) -> V {
+    if tobool(&lnull(l)) {
+        nil()
+    } else {
+        cons(f(head(l)), mapl(f, &tail(l)))
+    }
+}
+fn lappend(p: &V, q: &V) -> V {
+    if tobool(&lnull(p)) {
+        q.clone()
+    } else {
+        cons(head(p), lappend(&tail(p), q))
+    }
+}
+fn revl(l: &V) -> V {
+    foldr(&|h, a| lappend(&a, &cons(h, nil())), nil(), l)
+}
+fn trans_rows(rl: &V) -> V {
+    // lam.py's _trans_rows, term for term: atom row → ⊥; no rows → φ; all rows spent
+    // → φ; ragged → ⊥; else CONS the head column onto the transpose of the tails
+    let anybad = foldr(&|h, a| if !is_seq(&h) { tru() } else { a }, fls(), rl);
+    if tobool(&anybad) { return bot(); }
+    if tobool(&lnull(rl)) { return phi(); }
+    let allspent = foldr(&|h, a| if tobool(&lnull(&list_of(&h))) { a } else { fls() }, tru(), rl);
+    if tobool(&allspent) { return phi(); }
+    let anyspent = foldr(&|h, a| if tobool(&lnull(&list_of(&h))) { tru() } else { a }, fls(), rl);
+    if tobool(&anyspent) { return bot(); }
+    let col = seq(mapl(&|r| head(&list_of(&r)), rl));
+    let rest = trans_rows(&mapl(&|r| seq(tail(&list_of(&r))), rl));
+    match shape(&rest) {
+        Shape::Seq(restl) => seq(cons(col, restl)),
+        _ => bot(),
+    }
+}
+
+fn seqc_l(l: V) -> V {
+    // SEQC: the ⊥-collapsing constructor via the ANYBOT fold (§11.2.1)
+    let any = foldr(&|h, a| if isbot(&h) { tru() } else { a }, fls(), &l);
+    if tobool(&any) { bot() } else { seq(l) }
+}
+
 // ============================ the object union ===============================
 fn atom(l: Leaf) -> V {
     let l = Rc::new(l);
@@ -430,45 +483,43 @@ fn register_base() {
     }));
     register("apndl", Rc::new(|_mu, o| {
         if !(pair_b(&o) && is_seq(&nth(&o, 1))) { return bot(); }
-        seq(cons(nth(&o, 0), list_of(&nth(&o, 1))))
+        // APNDL = SEQ(CONS(HEAD(_list o))(_list(HEAD(TAIL(_list o)))))
+        let l = list_of(&o);
+        seq(cons(head(&l), list_of(&head(&tail(&l)))))
     }));
     register("apndr", Rc::new(|_mu, o| {
         if !(pair_b(&o) && is_seq(&nth(&o, 0))) { return bot(); }
-        let mut xs = items(&list_of(&nth(&o, 0)));
-        xs.push(nth(&o, 1));
-        seq(from_vec(xs))
+        // APNDR = SEQ(APPEND(_list(HEAD(_list o)))(CONS(HEAD(TAIL(_list o)))(NIL)))
+        let l = list_of(&o);
+        seq(lappend(&list_of(&head(&l)), &cons(head(&tail(&l)), nil())))
     }));
     register("distl", Rc::new(|_mu, o| {
         if !(pair_b(&o) && is_seq(&nth(&o, 1))) { return bot(); }
-        let x = nth(&o, 0);
-        let ys = items(&list_of(&nth(&o, 1)));
-        seq(from_vec(ys.into_iter()
-            .map(|yv| seq(cons(x.clone(), cons(yv, nil())))).collect()))
+        // DISTL = SEQ(MAPL(λy. SEQ⟨x,y⟩)(ys))
+        let l = list_of(&o);
+        let x = head(&l);
+        seq(mapl(&|yv| seq(cons(x.clone(), cons(yv, nil()))), &list_of(&head(&tail(&l)))))
     }));
     register("distr", Rc::new(|_mu, o| {
         if !(pair_b(&o) && is_seq(&nth(&o, 0))) { return bot(); }
-        let xs = items(&list_of(&nth(&o, 0)));
-        let yv = nth(&o, 1);
-        seq(from_vec(xs.into_iter()
-            .map(|x| seq(cons(x, cons(yv.clone(), nil())))).collect()))
+        // DISTR = SEQ(MAPL(λx. SEQ⟨x,y⟩)(xs))
+        let l = list_of(&o);
+        let yv = head(&tail(&l));
+        seq(mapl(&|x| seq(cons(x, cons(yv.clone(), nil()))), &list_of(&head(&l))))
     }));
     register("length", Rc::new(|_mu, o| match shape(&o) {
         Shape::Seq(l) => atom(Leaf::I(items(&l).len() as i64)),
         _ => bot(),
     }));
     register("reverse", Rc::new(|_mu, o| match shape(&o) {
-        Shape::Seq(l) => {
-            let mut xs = items(&l);
-            xs.reverse();
-            seq(from_vec(xs))
-        }
+        Shape::Seq(l) => seq(revl(&l)),                      // FOLDR-built REVL (lam.py)
         _ => bot(),
     }));
     register("cat", Rc::new(|_mu, o| {
         if !(pair_b(&o) && is_seq(&nth(&o, 0)) && is_seq(&nth(&o, 1))) { return bot(); }
-        let mut xs = items(&list_of(&nth(&o, 0)));
-        xs.extend(items(&list_of(&nth(&o, 1))));
-        seq(from_vec(xs))
+        // cat = SEQ(APPEND(_list 1)(_list 2))
+        let l = list_of(&o);
+        seq(lappend(&list_of(&head(&l)), &list_of(&head(&tail(&l)))))
     }));
     register("not", Rc::new(|_mu, o| {
         if eqobj(&o, &at()) { af() } else if eqobj(&o, &af()) { at() } else { bot() }
@@ -488,53 +539,32 @@ fn register_base() {
         bool2a(eqobj(&p, &at()) || eqobj(&q, &at()))
     }));
     register("1r", Rc::new(|_mu, o| match shape(&o) {
-        Shape::Seq(l) => items(&l).last().cloned().unwrap_or_else(bot),
+        Shape::Seq(l) => head(&revl(&l)),                     // 1r = HEAD ∘ REVL (lam.py)
         _ => bot(),
     }));
     register("tlr", Rc::new(|_mu, o| match shape(&o) {
         Shape::Seq(l) => {
-            let mut xs = items(&l);
-            if xs.is_empty() { return bot(); } // tlr:φ = ⊥
-            xs.pop();
-            seq(from_vec(xs))
+            if tobool(&lnull(&l)) { return bot(); }           // tlr:φ = ⊥
+            seq(revl(&tail(&revl(&l))))                       // REVL∘TAIL∘REVL (lam.py)
         }
         _ => bot(),
     }));
     register("trans", Rc::new(|_mu, o| match shape(&o) {
-        Shape::Seq(l) => {
-            let rows = items(&l);
-            if rows.iter().any(|r| !is_seq(r)) { return bot(); } // an atom row -> ⊥
-            if rows.is_empty() { return phi(); }
-            let mat: Vec<Vec<V>> = rows.iter().map(|r| items(&list_of(r))).collect();
-            if mat.iter().all(|r| r.is_empty()) { return phi(); } // all rows spent
-            if mat.iter().any(|r| r.is_empty()) { return bot(); } // ragged -> ⊥
-            let w = mat[0].len();
-            if mat.iter().any(|r| r.len() != w) { return bot(); }
-            let mut cols = Vec::with_capacity(w);
-            for j in 0..w {
-                cols.push(seq(from_vec(mat.iter().map(|r| r[j].clone()).collect())));
-            }
-            seq(from_vec(cols))
-        }
+        Shape::Seq(rl) => trans_rows(&rl),                    // the Y-recursive term (lam.py)
         _ => bot(),
     }));
     register("rotl", Rc::new(|_mu, o| match shape(&o) {
         Shape::Seq(l) => {
-            let mut xs = items(&l);
-            if xs.is_empty() { return phi(); }
-            let h = xs.remove(0);
-            xs.push(h);
-            seq(from_vec(xs))
+            if tobool(&lnull(&l)) { return phi(); }
+            seq(lappend(&tail(&l), &cons(head(&l), nil())))   // APPEND(t)(⟨h⟩) (lam.py)
         }
         _ => bot(),
     }));
     register("rotr", Rc::new(|_mu, o| match shape(&o) {
         Shape::Seq(l) => {
-            let mut xs = items(&l);
-            if xs.is_empty() { return phi(); }
-            let last = xs.pop().unwrap();
-            xs.insert(0, last);
-            seq(from_vec(xs))
+            if tobool(&lnull(&l)) { return phi(); }
+            let r = revl(&l);                                 // ⟨CONS(HEAD r)(REVL(TAIL r))⟩
+            seq(cons(head(&r), revl(&tail(&r))))
         }
         _ => bot(),
     }));
