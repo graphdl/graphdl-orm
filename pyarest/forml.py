@@ -913,27 +913,79 @@ def compile(stmt, D, known=()):
 # grammar file's own arbitration-rule values. ----
 _GENERIC_CLASSIFICATIONS = {"Fact Type Reading", "Instance Fact"}
 
-_KINDS_BY_TRANSLATOR = {
-    "translate_nouns": ["entity_type", "value_type", "subtype_of", "brace_subtypes"],
-    "translate_subtypes": ["subtype_of", "brace_subtypes"],
-    "translate_enum_values": ["value_constraint"],
-    "translate_data_types": ["data_type"],
-    "translate_instance_facts": ["fact_type_reading"],
-    "translate_fact_types": ["fact_type_reading"],
-    "translate_derivation_mode_facts": ["fact_type_reading"],
-    "translate_derivation_rules": ["rule_if", "derivation_rule", "class_rule"],
-    "translate_cardinality_constraints": ["uniqueness", "inverse_uc", "spanning_uc",
-                                          "frequency", "neg_uniqueness", "mandatory",
-                                          "neg_mandatory"],
-    "translate_ring_constraints": ["ring"],
-    "translate_set_constraints": ["set_comparison", "subset", "equality",
-                                  "disjunctive_mandatory"],
-    "translate_value_constraints": ["value_constraint"],
-    "translate_state_machines": ["sm_def", "sm_initial", "sm_from", "sm_to",
-                                 "sm_trigger", "sm_guard", "sm_emit", "sm_moore"],
-    "translate_finality": ["finality"],
-    "translate_negation": ["neg_pair", "negation"],
-}
+_PRODUCTION_CACHE = {}
+
+
+def _productions():
+    """kind → its Stage-1 patterns (the bootstrap kernel's field extractors)."""
+    if not _PRODUCTION_CACHE:
+        for kind, pat in _CLASSIFY:
+            _PRODUCTION_CACHE.setdefault(kind, []).append(pat)
+    return _PRODUCTION_CACHE
+
+
+def _stmt_translator_impl(kinds):
+    """A statement translator as a REGISTERED definition (self-host gate three):
+    ⟨stmt, modality, ctx, D⟩ ↦ D′. The small components decode; D threads through as
+    lambda untouched. Inside, the Stage-1 productions extract fields and _plan
+    asserts — the translator's own production list is its private binding, not an
+    engine dispatch table."""
+    def impl(mu):
+        def g(operand):
+            from .reduce import apply as _apply
+            from .lam import atom as _A, from_lam as _fl
+            stmt = _fl(_apply(_A(1), operand))
+            mod = _fl(_apply(_A(2), operand)) or None
+            names, subs, fts = _fl(_apply(_A(3), operand))
+            D = _apply(_A(4), operand)
+            known = _Known(names, {s: tuple(a) for (s, a) in subs}, set(fts))
+            for kind in kinds:
+                mm = next((p.match(stmt) for p in _productions().get(kind, ())
+                           if p.match(stmt)), None)
+                if mm is None:
+                    continue
+                asserts, objs = _plan(kind, mm.groups(), known, mod)
+                for cell, fact in asserts:
+                    D = _apply(_A(2), ast.run(to_lam(fact), D, cell_name=cell))
+                for name, obj in objs:
+                    D = _apply(ast.DefineIn(name, obj), D)
+                break
+            return D
+        return g
+    return impl
+
+
+def register_translators():
+    """Register the statement translators into DEFS under the names the grammar's
+    Classification-has-Translator readings dispatch to (the same boundary as the
+    federation connectors: DEFS is the DI container, swapping is re-registering).
+    Idempotent; call again to restore the real bindings after a test swapped one."""
+    from .defs import register
+    for name, kinds in (
+        ("translate_nouns", ["entity_type", "value_type", "subtype_of",
+                             "brace_subtypes"]),
+        ("translate_subtypes", ["subtype_of", "brace_subtypes"]),
+        ("translate_enum_values", ["value_constraint"]),
+        ("translate_data_types", ["data_type"]),
+        ("translate_instance_facts", ["fact_type_reading"]),
+        ("translate_fact_types", ["fact_type_reading"]),
+        ("translate_derivation_mode_facts", ["fact_type_reading"]),
+        ("translate_derivation_rules", ["rule_if", "derivation_rule", "class_rule"]),
+        ("translate_cardinality_constraints", ["uniqueness", "inverse_uc",
+                                               "spanning_uc", "frequency",
+                                               "neg_uniqueness", "mandatory",
+                                               "neg_mandatory"]),
+        ("translate_ring_constraints", ["ring"]),
+        ("translate_set_constraints", ["set_comparison", "subset", "equality",
+                                       "disjunctive_mandatory"]),
+        ("translate_value_constraints", ["value_constraint"]),
+        ("translate_state_machines", ["sm_def", "sm_initial", "sm_from", "sm_to",
+                                      "sm_trigger", "sm_guard", "sm_emit",
+                                      "sm_moore"]),
+        ("translate_finality", ["finality"]),
+        ("translate_negation", ["neg_pair", "negation"]),
+    ):
+        register(name, _stmt_translator_impl(kinds))
 
 _GRAMMAR_CACHE = {}
 
@@ -956,21 +1008,22 @@ def compile_model_selfhost(text, D=None):
     extraction feeding the handler). Statements the rules do not classify are reported
     unclassified — the rules, not the regex order, are the classifier. Asserts are
     idempotent, so co-firing translators are harmless by construction."""
-    from . import meta, system as _sys
+    from . import meta, system as _sys, defs as _dm
     from .reduce import apply as _apply
     from .lam import atom as _A
+    import pyarest.lam as _L
     gD = grammar_D()
     dispatch = {}
     for r in _sys._pop_rows(gD, "Classification_has_Translator"):
         if len(r) >= 2:
             dispatch.setdefault(r[0], []).append(r[1])
-    pats = {}
-    for kind, pat in _CLASSIFY:
-        pats.setdefault(kind, []).append(pat)
     stmts = statements(text)
     names = _known(stmts)
     subs, fts = _prepass_context(stmts, names)
     known = _Known(names, subs, fts)
+    ctx = to_lam((tuple(sorted(names)),
+                  tuple(sorted((s, tuple(sorted(a))) for s, a in subs.items())),
+                  tuple(sorted(fts))))
     if D is None:
         D = meta.initial_D()
     unclassified = []
@@ -989,21 +1042,15 @@ def compile_model_selfhost(text, D=None):
         if not translators:
             unclassified.append(stmt)
             continue
-        done = set()
         for t in translators:
-            for kind in _KINDS_BY_TRANSLATOR.get(t, ()):
-                if kind in done:
-                    break
-                mm = next((p.match(inner) for p in pats.get(kind, ()) if p.match(inner)), None)
-                if mm is None:
-                    continue
-                done.add(kind)
-                asserts, objs = _plan(kind, mm.groups(), known, mod)
-                for cell, fact in asserts:
-                    D = _apply(_A(2), ast.run(to_lam(fact), D, cell_name=cell))
-                for name, obj in objs:
-                    D = _apply(ast.DefineIn(name, obj), D)
-                break
+            if _dm.latest.get(t, ("",))[0] != "registered":
+                continue                                       # a name M declares, this
+            operand = _L.SEQ(                                  # host lacks: skipped, the
+                _L.CONS(_A(inner))(                            # boundary's graceful absence
+                    _L.CONS(_A(mod or ""))(
+                        _L.CONS(ctx)(_L.CONS(D)(_L.NIL)))))
+            with _dm.step(D):
+                D = _apply(_A(t), operand)                     # rho: dispatch through DEFS
     return D, {"unclassified": unclassified}
 
 
@@ -1203,3 +1250,8 @@ def nf(reading):
         prefix = "It is permitted that " if mod == "deontic" else "It is possible that "
         return prefix + g[0] + "."
     return _PREFIX[(mod, sign)] + _RENDER[kind](g) + "."
+
+
+# the statement translators register at import, like the federation bindings: the
+# names the grammar dispatches to resolve through DEFS from the first statement on
+register_translators()
