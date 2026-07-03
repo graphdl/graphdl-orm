@@ -69,3 +69,41 @@ def python_ground_truth(D, cases):
         with defs.step(D, fuel):
             out.append(from_lam(apply_lambda(f, x)))
     return out
+
+
+class RustSession:
+    """The resident runner: one spawned kernel serving scenario lines over stdio, the
+    store retained across requests (set_store once, then cases reference it via the
+    xd protocol — ⟨fact, D⟩ without re-serializing D). Amortizes spawn AND store
+    serialization, so timings isolate reduction."""
+
+    def __init__(self):
+        self.proc = subprocess.Popen([_BIN, "--serve"], stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE)
+
+    def _rpc(self, obj):
+        line = json.dumps(obj, ensure_ascii=False) + "\n"
+        self.proc.stdin.write(line.encode("utf-8"))
+        self.proc.stdin.flush()
+        out = self.proc.stdout.readline().decode("utf-8")
+        return json.loads(out)
+
+    def set_store(self, D, overrides=True):
+        process = [[n, _conv(from_lam(obj))]
+                   for n, (kind, obj) in defs.latest.items() if kind == "compiled"]
+        self._rpc({"d": _conv(from_lam(D)), "process": process,
+                   "overrides": 1 if overrides else 0, "cases": []})
+
+    def run_facts(self, f, facts, fuel=None):
+        """Apply `f` to ⟨fact, D_retained⟩ per fact — the machine-step shape."""
+        fj = _conv(from_lam(f))
+        res = self._rpc({"cases": [{"f": fj, "xd": _conv(from_lam(x)), "fuel": fuel or 0}
+                                   for x in facts]})
+        return ["⊥" if v is None else _untuple(v) for v in res]
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=10)
+        except Exception:
+            self.proc.kill()

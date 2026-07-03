@@ -184,9 +184,21 @@ def test_benchmark_the_flex(capsys):
     off = polyglot.run_rust(sc)
     t_rust_off = time.perf_counter() - t0
 
+    ses = polyglot.RustSession()
+    try:
+        ses.set_store(D)
+        fact = to_lam(("c1", "o1"))
+        ses.run_facts(handler, [fact])                        # warm
+        t0 = time.perf_counter()
+        resident = ses.run_facts(handler, [fact] * N)
+        t_rust_res = time.perf_counter() - t0
+    finally:
+        ses.close()
     assert on == off == want                                  # correctness before speed
+    assert resident == want                                   # the resident runner agrees
     with capsys.disabled():
         print(f"\n[bench] machine step x{N}: "
               f"py-scott={t_scott_py:.2f}s py-delta={t_delta_py:.2f}s "
               f"rust-canonical={t_rust_off:.2f}s rust-overrides={t_rust_on:.2f}s "
-              f"(rust includes process spawn + D serialization)")
+              f"rust-resident={t_rust_res:.3f}s "
+              f"(one-shot rust pays spawn + D serialization; resident retains the store)")

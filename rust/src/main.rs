@@ -1010,19 +1010,25 @@ fn write_v(v: &V, out: &mut String) {
 }
 
 // ============================ the scenario runner ============================
-fn run() {
-    let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input).unwrap();
-    let j = P { b: input.as_bytes(), i: 0 }.parse();
+struct Srv {
+    d: V,
+    cells: Vec<(Leaf, V)>,
+    mu: V,
+}
 
-    register_base();
-    let overrides_on = !matches!(jget(&j, "overrides"), Some(J::I(0)));
-    if overrides_on {
-        register_overrides();                                 // twins on unless the scenario
-    }                                                         // says otherwise (degradation)
-    if let Some(J::A(procs)) = jget(&j, "process") {
+fn handle(j: &J, srv: &mut Srv, serve: bool) -> String {
+    match jget(j, "overrides") {
+        Some(J::I(0)) => FAST.with(|r| r.borrow_mut().clear()),
+        Some(J::I(_)) => {
+            FAST.with(|r| r.borrow_mut().clear());
+            register_overrides();
+        }
+        _ => {}
+    }
+    if let Some(J::A(procs)) = jget(j, "process") {
         PROCESS.with(|p| {
             let mut b = p.borrow_mut();
+            b.clear();
             for entry in procs {
                 if let J::A(pair) = entry {
                     if let (J::S(name), val) = (&pair[0], &pair[1]) {
@@ -1032,30 +1038,78 @@ fn run() {
             }
         });
     }
-    let d = jget(&j, "d").map(to_v).unwrap_or_else(phi);
-    let mu = make_mu();
-
-    let mut out = String::new();
-    if let Some(J::A(cases)) = jget(&j, "cases") {
+    if let Some(dj) = jget(j, "d") {
+        srv.d = to_v(dj);
+        srv.cells = cells_of(&srv.d); // cached once per retained store (resident mode)
+    }
+    let mut outs: Vec<String> = Vec::new();
+    if let Some(J::A(cases)) = jget(j, "cases") {
         for case in cases {
             let f = to_v(jget(case, "f").unwrap());
-            let x = to_v(jget(case, "x").unwrap());
+            // "x" carries the operand verbatim; "xd" pairs a fact with the RETAINED
+            // store (⟨fact, D⟩ without re-serializing D — the resident protocol)
+            let x = match (jget(case, "x"), jget(case, "xd")) {
+                (Some(xj), _) => to_v(xj),
+                (None, Some(fj)) => seq(cons(to_v(fj), cons(srv.d.clone(), nil()))),
+                _ => bot(),
+            };
             let fuel = match jget(case, "fuel") {
                 Some(J::I(n)) if *n > 0 => Some(*n),
                 _ => None,
             };
             FRAME.with(|fr| {
-                fr.borrow_mut().push(Frame { cells: cells_of(&d), d: d.clone(), fuel })
+                fr.borrow_mut().push(Frame { cells: srv.cells.clone(), d: srv.d.clone(), fuel })
             });
-            let res = mu.app(mkapp(f, x));
+            let res = srv.mu.app(mkapp(f, x));
             FRAME.with(|fr| {
                 fr.borrow_mut().pop();
             });
-            write_v(&res, &mut out);
-            out.push('\n');
+            let mut s = String::new();
+            write_v(&res, &mut s);
+            outs.push(s);
         }
     }
-    print!("{}", out);
+    if serve {
+        format!("[{}]", outs.join(","))                       // one line per request
+    } else {
+        outs.join("
+")
+    }
+}
+
+fn run() {
+    register_base();
+    register_overrides();                                     // twins on by default
+    let serve = std::env::args().any(|a| a == "--serve");
+    let mut srv = Srv { d: phi(), cells: Vec::new(), mu: make_mu() };
+    if serve {
+        use std::io::{BufRead, Write};
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let j = P { b: line.as_bytes(), i: 0 }.parse();
+            let out = handle(&j, &mut srv, true);
+            let mut so = std::io::stdout();
+            so.write_all(out.as_bytes()).ok();
+            so.write_all(b"
+").ok();
+            so.flush().ok();
+        }
+    } else {
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input).unwrap();
+        let j = P { b: input.as_bytes(), i: 0 }.parse();
+        let out = handle(&j, &mut srv, false);
+        if !out.is_empty() {
+            println!("{}", out);
+        }
+    }
 }
 
 fn main() {
