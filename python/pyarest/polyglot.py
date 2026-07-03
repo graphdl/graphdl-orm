@@ -12,9 +12,9 @@ import subprocess
 from . import defs
 from .lam import from_lam
 
-_BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    "rust", "target", "release",
-                    "arestlam.exe" if os.name == "nt" else "arestlam")
+from .paths import rust_bin
+
+_BIN = rust_bin("arestlam")
 
 
 def _conv(v):

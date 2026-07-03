@@ -237,10 +237,8 @@ MODULE = None
 def _module_readings():
     global MODULE
     if MODULE is None:
-        import os
-        p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "readings", "federation.md")
-        MODULE = open(p, encoding="utf-8").read()
+        from . import paths
+        MODULE = open(paths.shared("federation.md"), encoding="utf-8").read()
     return MODULE
 
 

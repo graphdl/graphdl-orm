@@ -9,8 +9,9 @@ description = "AREST engine on Python's lambda"
 requires-python = ">=3.14"
 
 [tool.setuptools.packages.find]
+where = ["python"]
 include = ["pyarest*"]
 
 [tool.pytest.ini_options]
-pythonpath = ["."]
+pythonpath = ["python"]
 testpaths = ["tests"]
