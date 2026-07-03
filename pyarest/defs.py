@@ -10,6 +10,10 @@ from . import lam as L
 
 _store = L.NIL            # the current Scott list of cells (newest first)
 _registered = []          # names of registered (boundary) defs — host-side mirror for boundary()
+fast = {}                 # the UNIVERSAL OVERRIDE INTERFACE (layering discipline): a host's
+                          # optimized twin of a canonical definition, keyed by name. Resolution
+                          # prefers the twin; a host lacking one degrades gracefully to the
+                          # canonical form; the differential holds twin ≡ canonical.
 compiled = {}             # name -> the Scott FFP object (host mirror; the delta fast-path converts these)
 latest = {}               # name -> ("registered", fn) | ("compiled", obj) — recency ACROSS kinds,
                           # so the delta store resolves a name exactly like the Scott first-match
@@ -27,6 +31,15 @@ def register(name, fn):
     if name not in _registered:
         _registered.append(name)
     latest[name] = ("registered", fn)
+    version += 1
+
+
+def override(name, fn):
+    """Register a host-optimized TWIN of a canonical definition (the universal override
+    interface). fn is native-signature (mu, operand) -> value on the host's fast carrier;
+    the canonical definition remains the meaning, the twin is a verified acceleration."""
+    global version
+    fast[name] = fn
     version += 1
 
 

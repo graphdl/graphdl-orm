@@ -166,6 +166,8 @@ def _trans(mu, o):
     return tuple(tuple(r[i] for r in o) for i in range(n))
 
 
+# Python's override set: registered through the universal interface below (defs.override),
+# so the fast path is a set of verified twins, not a parallel store.
 _NATIVE = {
     "tl": lambda mu, o: o[1:] if (_isseq(o) and len(o) >= 1) else BOT_D,
     "id": lambda mu, o: o,
@@ -218,12 +220,14 @@ def _bridge(fn):
 
 def _store():
     if _cache["version"] != _defs_mod.version:
-        d = {name: (0, fn) for name, fn in _NATIVE.items()}          # 0 = native primitive
-        for name, (kind, impl) in _defs_mod.latest.items():          # recency across kinds, so the
-            if kind == "compiled":                                   # native store resolves a name
-                d[name] = (1, scott_to_native(impl))                 # exactly like the Scott ↑
-            elif name not in _NATIVE:                                # registered: native twin if we
-                d[name] = (0, _bridge(impl))                         # have one, else bridge the impl
+        d = {}
+        for name, (kind, impl) in _defs_mod.latest.items():          # the canonical layer first
+            if kind == "compiled":
+                d[name] = (1, scott_to_native(impl))
+            elif name not in _defs_mod.fast:                         # registered: bridge unless a
+                d[name] = (0, _bridge(impl))                         # twin exists (degradation)
+        for name, fn in _defs_mod.fast.items():                      # the override twins SHADOW the
+            d[name] = (0, fn)                                        # canonical (universal interface)
         _cache["version"], _cache["defs"] = _defs_mod.version, d
     return _cache["defs"]
 
@@ -262,3 +266,9 @@ def meaning(e):
     """mu e on the fast path — reduce an FFP expression to its normal form (Scott object out)."""
     mu = _make_mu(_store(), _defs_mod.step_native(scott_to_native))
     return native_to_scott(mu(scott_to_native(e)))
+
+
+# register the native table as Python's override set (the universal interface): each
+# entry is the host twin of the canonical lambda definition of the same name
+for _name, _fn in _NATIVE.items():
+    _defs_mod.override(_name, _fn)
