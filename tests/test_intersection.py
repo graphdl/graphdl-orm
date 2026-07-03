@@ -34,8 +34,7 @@ CASES = [
 FPOP = (("a", 1), ("b", 2), ("c", 1))
 OTHER = (("a", "x"), ("c", "y"))
 HIGHER = [
-    ("theta:Filter", S(A("COMP"), A("eq"), A(1)),
-     theta.Filter(S(A("COMP"), A("eq"), A(1))), None),
+    ("theta:Filter", A("eq"), theta.Filter(A("eq")), None),
     ("theta:NatJoin", A(2), theta.NatJoin(2), None),
     ("theta:Project", to_lam((2,)), theta.Project([2]), None),
     ("constraints:uniqueness", to_lam((1,)), C.uniqueness([1]), None),

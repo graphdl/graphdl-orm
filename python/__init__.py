@@ -27,5 +27,8 @@ root conftest constructs the package for the checkout; installs map it in
 pyproject."""
 
 from . import lam, defs, reduce, prims                       # the lambda kernel + Backus base
+from . import canon
+canon.load_all()                                             # the INTERSECTION SOURCE, at boot:
+                                                             # canonical names resolve everywhere
 from .lam import ATOM, SEQ, BOT, PHI, to_lam, from_lam, atom
 from .reduce import apply, meaning, mkapp

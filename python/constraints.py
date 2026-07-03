@@ -30,18 +30,13 @@ def _key(roles):
 
 
 def uniqueness(roles):
-    """Uniqueness constraint over `roles` (ORM's fundamental constraint), as the FFP
-    violation object c with (rho c) : P = the tuples of P sharing their key with a
-    *different* tuple:
+    """Uniqueness constraint over `roles` (ORM's fundamental constraint): the
+    canonical builder (shared/constraints.py) applied to the key roles.
         hasDup:⟨t,P⟩ = not null ( Filter(key(1)=key(2) ∧ 1≠2) : (distl:⟨t,P⟩) )
         V_uc         = α(1) ∘ Filter(hasDup) ∘ distr ∘ [id, id]
     """
-    key = _key(roles)
-    same = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, key, A(1)), _S(_COMP, key, A(2))))   # key(t)=key(s)
-    diff = _S(_COMP, _NOT, _EQ)                                                     # t ≠ s
-    both = _S(_COMP, _AND, _S(_CONS, same, diff))
-    has_dup = _S(_COMP, _NOT, _NULL, T.Filter(both), _DISTL)                        # ⟨t,P⟩ -> T/F
-    return _S(_COMP, _S(_ALPHA, A(1)), T.Filter(has_dup), _DISTR, _S(_CONS, _ID, _ID))
+    from .reduce import apply as _apply
+    return _apply(A("constraints:uniqueness"), to_lam(tuple(roles)))
 
 
 def ring_irreflexive(roles=(1, 2)):
@@ -153,24 +148,35 @@ def value_enumeration(role, values):
     return T.Filter(_S(_COMP, _NOT, in_set))                                # keep facts NOT in the set
 
 
+_CC = None
+
+
+def _canon_c(name):
+    global _CC
+    if _CC is None:
+        from . import canon as _canon
+        _CC = dict(_canon.read("constraints.py"))
+    return _CC[name]
+
+
 def mandatory():
     """Simple mandatory role: every entity plays the role. Input ⟨entities, players⟩;
-    V = entities ∖ players (Codd setminus) — the entities that play no fact."""
-    return T.setminus
+    V = entities ∖ players (Codd setminus) — the entities that play no fact. The
+    canon value (shared/constraints.py)."""
+    return _canon_c("constraints:mandatory")
 
 
 def subset():
     """Subset constraint A ⊆ B (NORMA 'if A then B' — implication by modus ponens). Input ⟨A, B⟩;
-    V = A ∖ B — the antecedent facts whose consequent does not hold."""
-    return T.setminus
+    V = A ∖ B — the antecedent facts whose consequent does not hold. The canon value."""
+    return _canon_c("constraints:subset")
 
 
 def equality():
     """Equality constraint A = B (NORMA 'A if and only if B'). Input ⟨A, B⟩; V = (A ∖ B) ∪ (B ∖ A),
-    the symmetric difference — facts on one side without their counterpart on the other."""
-    ab = _S(_COMP, T.setminus, _S(_CONS, _1, _2))
-    ba = _S(_COMP, T.setminus, _S(_CONS, _2, _1))
-    return _S(_COMP, _CAT, _S(_CONS, ab, ba))
+    the symmetric difference — facts on one side without their counterpart on the other. The
+    canon value."""
+    return _canon_c("constraints:equality")
 
 
 # --- set-comparison over a participation population ⟨⟨entity, clause⟩ …⟩ (one fact per clause the
@@ -180,14 +186,16 @@ _CAT = A("cat")
 
 def exclusion():
     """Exclusion — at most one of the clauses holds per entity. V = the participations whose entity
-    also appears with a DIFFERENT clause (uniqueness on the entity role of the participation)."""
-    return uniqueness([1])
+    also appears with a DIFFERENT clause (uniqueness on the entity role, applied through the
+    apply primitive in the canon)."""
+    return _canon_c("constraints:exclusion")
 
 
 def inclusive_or():
     """Inclusive-or / disjunctive mandatory — at least one clause holds per entity. Input
-    ⟨universe, players⟩ (players = entities in some clause); V = universe ∖ players (setminus)."""
-    return T.setminus
+    ⟨universe, players⟩ (players = entities in some clause); V = universe ∖ players (setminus).
+    The canon value."""
+    return _canon_c("constraints:inclusive_or")
 
 
 def exclusive_or():
