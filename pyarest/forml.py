@@ -10,6 +10,11 @@ permitted/forbidden/impossible that), and the multi-line constructs. Modality is
 alethic constraints block commit, deontic ones only flag (AREST Def. Violation / eq. create) —
 so each constraint is tagged {alethic|deontic}. Value constraints cover enumerations and
 open/closed ranges. Parsing is two-pass over a document; compile_model folds it into M.
+
+NO NON-CANONICAL FORML: the grammar accepts NORMA's canonical verbalizations (and the
+whitepaper/corpus surfaces for constructs NORMA lacks) — never engine-invented dialects.
+A literal bound on a value role is a VALUE CONSTRAINT ('The possible values of Rating
+are at most 5.'), not a bespoke trailing form.
 """
 import re
 from .lam import to_lam, from_lam
@@ -127,9 +132,6 @@ _CLASSIFY = [
     ("finality", re.compile(r"^(\S+) becomes final at depth (\d+)\.$")),
     # NORMA's unary negation pattern: the reading creates the PAIRED negation fact type
     ("neg_pair", re.compile(r"^(\S+) (does not|is not) (\S.*)\.$")),
-    # NORMA's value-comparison constraint, word-form comparators (corpus vocabulary),
-    # trailing-marker style like the ring forms: '<reading> is at most 5.'
-    ("value_comparison", re.compile(r"^(.+?) (exceeds|is greater than|is less than|is at least|is at most|equals) (\d+(?:\.\d+)?)\.$")),
     ("negation", re.compile(r"^(.+) ~(.+)\.$")),
     ("fact_type_reading", re.compile(r"^(.+)\.$")),
 ]
@@ -455,20 +457,6 @@ def _h_equality(g, k, m):
     return [("constraint", (cid, "equality", ft_a, ft_b, m))], \
         [(cid + "_a", C.scoped_equality_side(ft_b)), (cid + "_b", C.scoped_equality_side(ft_a))]
 
-_CMP_OP = {"exceeds": "gt", "is greater than": "gt", "is less than": "lt",
-           "is at least": "ge", "is at most": "le", "equals": "eq"}
-
-
-def _h_value_cmp(g, k, m):
-    """NORMA's ValueComparisonConstraint: the reading's value role (its last role)
-    compared against a literal; the offending rows are the violations."""
-    ft, facts = _fact_type(g[0], k)
-    _t, roles = _reading(g[0], k)
-    col = max(len(roles), 1)
-    cid = ft + "_cmp"
-    return facts + [("constraint", (cid, "value_comparison", ft, m))],         [(cid, C.value_comparison(_CMP_OP[g[1]], col, _num(g[2])))]
-
-
 def _h_negation(g, k, m):
     a, pred = _subject(g[0], k)
     return [("negation", (a, pred + " " + g[1]))], []
@@ -743,7 +731,6 @@ _PLAN = {
     "subset": _h_subset, "equality": _h_equality, "derivation_rule": _h_derivation_rule,
     "rule_if": _h_rule_if,
     "negation": _h_negation, "neg_pair": _h_neg_pair, "class_rule": _h_class_rule,
-    "value_comparison": _h_value_cmp,
     "finality": lambda g, k, m: ([("finality", (g[0], int(g[1])))], []),
     "possibility": _h_possibility, "inverse_uc": _h_inverse_uc,
     "sm_def": _h_sm_def, "sm_initial": _h_sm_initial, "sm_from": _h_sm_from,
@@ -911,7 +898,6 @@ _ATTACH = {
     "subtype":               lambda f, ft: [(f[0], False)] if f[2] == ft else [],
     "external_uniqueness":   lambda f, ft: [(f[0], False)] if f[2] == ft else [],
     "value":                 lambda f, ft: [(f[0], True)] if f[2] == ft else [],
-    "value_comparison":      lambda f, ft: [(f[0], True)] if f[2] == ft else [],
     "mandatory":             lambda f, ft: ([(f[0], False)] if f[2] == ft else [])
                                          + ([(f[0] + "_e", False)] if f[3] == ft else []),
     "subset":                lambda f, ft: [(f[0], False)] if f[2] == ft else [],
@@ -1017,7 +1003,6 @@ _RENDER = {
     "rule_if": lambda g: f"{g[0]} if {g[1]}",
     "negation": lambda g: f"{g[0]} ~{g[1]}",
     "neg_pair": lambda g: f"{g[0]} {g[1]} {g[2]}",
-    "value_comparison": lambda g: f"{g[0]} {g[1]} {g[2]}",
     "finality": lambda g: f"{g[0]} becomes final at depth {g[1]}",
     "brace_subtypes": lambda g: "{%s} are %ssubtypes of %s" % (g[0], g[1] or "", g[2]),
     "class_rule": lambda g: f"{g[0]} has {g[1]} '{g[2]}' iff {g[3]}",

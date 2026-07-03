@@ -250,9 +250,10 @@ def scoped_equality_side(other_cell):
 
 
 def value_comparison(op, col, lit):
-    """NORMA's value-comparison constraint (the paper's Def. Schema lists the family):
-    V = the rows whose `col` value fails <op> against the literal — a Filter over P with
-    the comparison at the value boundary (registered comparators)."""
+    """The value-comparison family expression (paper Def. Schema; NORMA
+    ValueComparisonConstraint). RESERVED for the canonical role-vs-role verbalization
+    when it lands; a LITERAL bound is canonically a VALUE CONSTRAINT range ('The
+    possible values of X are at most 5.'), already wired — no non-canonical FORML."""
     return T.Filter(_S(_COMP, A("not"), A(op), _S(_CONS, A(col), _S(_CONST, A(lit)))))
 
 
