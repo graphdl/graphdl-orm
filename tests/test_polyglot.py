@@ -82,7 +82,10 @@ def test_theta_and_constraints_agree_across_kernels():
         (T.Project([2, 1]), pop, None),
         (T.Filter(S(A("COMP"), A("eq"), S(A("CONS"), A(1), S(A("CONST"), A("o1"))))), pop, None),
         (T.NatJoin(1), S(pop, other), None),
-        (C.uniqueness([1]), pop, None),                       # the UC violation expression
+        (T.JoinOn(((1, 1),), (2,)), S(pop, other), None),     # the general Codd join:
+        (T.JoinOn(((1, 1), (2, 2)), ()), S(pop, pop), None),  # multi-column, semijoin,
+        (T.JoinOn((), (1,)), S(pop, other), None),            # and the cross product —
+        (C.uniqueness([1]), pop, None),                       # same prims, certified
         (T.member, S(A("o2"), to_lam(("o1", "o2"))), None),
     ]
     _diff(D, cases)

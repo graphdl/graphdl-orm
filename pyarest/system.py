@@ -203,44 +203,57 @@ def cmp_filter(op, col, lit=None, col2=None):
     return _S(_COMP, A(op), _S(_CONS, A(col), rhs))
 
 
-def compile_rule(atom_fts, head_positions, widths=None, filters=None):
-    """A rule's body as one FFP object over D: the populations of the clause fact types,
-    each fetched from its own cell, joined linearly (each next atom joins the running
-    tuple's last column to its column 1), with the head's variable positions projected.
-    `widths` carries each atom's arity — a UNARY atom joins on the running tuple's last
-    column and adds no columns (the old binary-only assumption was the same class of bug
-    the Rust engine's #866 documents). Cross-cell by construction: store-on-derive's
-    read side."""
-    from . import ast
+def _body_expr(atom_fts, widths, filters, joins, pop):
+    """The shared body of every rule compiler: the clause populations joined left to
+    right, then the comparator filters. `joins` aligns with atom_fts[1:]; a None entry
+    is the linear chain the fragment always compiled (NatJoin on the running tuple's
+    last column — plans for existing models are bit-identical), and a (pairs, keep)
+    entry is the general Codd join on ANY bound columns (theta.JoinOn), keeping the
+    fresh columns in clause order. `widths` carries each atom's arity — a UNARY atom
+    joins on the running tuple's last column and adds no columns (the old binary-only
+    assumption was the same class of bug the Rust engine's #866 documents)."""
     ws = list(widths) if widths else [2] * len(atom_fts)
-    expr = ast.FetchPop(atom_fts[0])
+    js = list(joins) if joins else [None] * (len(atom_fts) - 1)
+    expr = pop(0, atom_fts[0])
     width = ws[0]
-    for ftn, w in zip(atom_fts[1:], ws[1:]):
-        expr = _S(_COMP, T.NatJoin(width), _S(_CONS, expr, ast.FetchPop(ftn)))
-        width += w - 1
+    for j, (ftn, w) in enumerate(zip(atom_fts[1:], ws[1:]), start=1):
+        spec = js[j - 1] if j - 1 < len(js) else None
+        if spec is None:
+            expr = _S(_COMP, T.NatJoin(width), _S(_CONS, expr, pop(j, ftn)))
+            width += w - 1
+        else:
+            pairs, keep = spec
+            expr = _S(_COMP, T.JoinOn(tuple(pairs), tuple(keep)),
+                      _S(_CONS, expr, pop(j, ftn)))
+            width += len(keep)
     for pred in (filters or ()):
         expr = _S(_COMP, T.Filter(pred), expr)               # comparators restrict
+    return expr
+
+
+def compile_rule(atom_fts, head_positions, widths=None, filters=None, joins=None):
+    """A rule's body as one FFP object over D: the populations of the clause fact types,
+    each fetched from its own cell, joined per _body_expr (linear chain by default, the
+    general Codd join where `joins` says so), with the head's variable positions
+    projected. Cross-cell by construction: store-on-derive's read side."""
+    from . import ast
+    expr = _body_expr(atom_fts, widths, filters, joins,
+                      lambda _j, ftn: ast.FetchPop(ftn))
     return _S(_COMP, T.Project(head_positions), expr)
 
 
-def compile_rule_delta(atom_fts, head_positions, delta_at, widths=None, filters=None):
+def compile_rule_delta(atom_fts, head_positions, delta_at, widths=None, filters=None,
+                       joins=None):
     """The rule body with atom `delta_at` (0-based) reading the round's DELTA instead of
     its cell: an FFP object over ⟨Δ, D⟩ — semi-naive evaluation's inner join
-    (Bancilhon–Ramakrishnan 1986). Same join shape as compile_rule (widths carry atom
-    arities); only the substituted atom differs."""
+    (Bancilhon–Ramakrishnan 1986). Same join shape as compile_rule; only the
+    substituted atom differs."""
     from . import ast
 
     def pop(j, ftn):
         return _1 if j == delta_at else _S(_COMP, ast.FetchPop(ftn), _2)
 
-    ws = list(widths) if widths else [2] * len(atom_fts)
-    expr = pop(0, atom_fts[0])
-    width = ws[0]
-    for j, (ftn, w) in enumerate(zip(atom_fts[1:], ws[1:]), start=1):
-        expr = _S(_COMP, T.NatJoin(width), _S(_CONS, expr, pop(j, ftn)))
-        width += w - 1
-    for pred in (filters or ()):
-        expr = _S(_COMP, T.Filter(pred), expr)               # comparators restrict
+    expr = _body_expr(atom_fts, widths, filters, joins, pop)
     return _S(_COMP, T.Project(head_positions), expr)
 
 
@@ -267,7 +280,7 @@ def class_rule(clauses, head_const):
 
 
 def compile_agg_rule(atom_fts, group_positions, over_position, op,
-                     widths=None, filters=None):
+                     widths=None, filters=None, joins=None):
     """An aggregate rule (Def. derive: 'an aggregate reducing a finite bag to one
     scalar'): joins and filters as compile_rule, then per GROUP (the non-aggregated
     head variables) the fold of `op` over the aggregated column. Stratified above the
@@ -275,14 +288,8 @@ def compile_agg_rule(atom_fts, group_positions, over_position, op,
     per group, so union-merge would preserve stale folds (the misfold the old engine
     documented)."""
     from . import ast
-    ws = list(widths) if widths else [2] * len(atom_fts)
-    expr = ast.FetchPop(atom_fts[0])
-    width = ws[0]
-    for ftn, w in zip(atom_fts[1:], ws[1:]):
-        expr = _S(_COMP, T.NatJoin(width), _S(_CONS, expr, ast.FetchPop(ftn)))
-        width += w - 1
-    for pred in (filters or ()):
-        expr = _S(_COMP, T.Filter(pred), expr)
+    expr = _body_expr(atom_fts, widths, filters, joins,
+                      lambda _j, ftn: ast.FetchPop(ftn))
     rel = "le" if op == "min" else "ge"
     fold2 = _S(_COND, _S(_COMP, A(rel), _S(_CONS, _1, _2)), _1, _2)
 

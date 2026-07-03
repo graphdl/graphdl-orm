@@ -69,6 +69,31 @@ def NatJoin(i):
     return _S(_COMP, _flatten, _S(_ALPHA, join_one), _DISTR)
 
 
+def JoinOn(pairs, keep):
+    """Codd's join (§2.1.3) in its general equi form: R ⋈ S on {R.ri = S.si} for the
+    (ri, si) in `pairs`, emitting r ++ s[keep] (the fresh columns, in clause order).
+    Empty `pairs` is the degenerate cross product; empty `keep` is the semijoin. The
+    SAME primitives as NatJoin — eq over selector tuples — so every carrier runs it
+    unchanged; NatJoin(i) is the one-column case JoinOn(((i,1),), (2..w)).
+        match   = eq∘[⟨ri…⟩∘1, ⟨si…⟩∘2]
+        combine = cat∘[1, ⟨keep…⟩∘2]        (just 1 when keep is empty)
+        R⋈S     = flatten ∘ α( α(combine) ∘ Filter(match) ∘ distl ) ∘ distr
+    """
+    if keep:
+        ksel = _S(_CONS, *tuple(A(i) for i in keep))
+        combine = _S(_COMP, _CAT, _S(_CONS, _1, _S(_COMP, ksel, _2)))
+    else:
+        combine = _1
+    parts = [_S(_ALPHA, combine)]
+    if pairs:
+        rsel = _S(_CONS, *tuple(_S(_COMP, A(r), _1) for (r, _s) in pairs))
+        ssel = _S(_CONS, *tuple(_S(_COMP, A(s), _2) for (_r, s) in pairs))
+        parts.append(Filter(_S(_COMP, _EQ, _S(_CONS, rsel, ssel))))
+    parts.append(_DISTL)
+    join_one = _S(_COMP, *parts)
+    return _S(_COMP, _flatten, _S(_ALPHA, join_one), _DISTR)
+
+
 # Codd tie gamma (§2.1.3): degree n → n-1, keep tuples with first = last, drop last
 Tie = _S(_COMP, _S(_ALPHA, _TLR), Filter(_S(_COMP, _EQ, _S(_CONS, _1, _1R))))
 

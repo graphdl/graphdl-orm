@@ -763,7 +763,7 @@ def _h_rule_if(g, k, m):
     A_ = decl + [("derivation", (hft, "fully-derived")),
                  ("ruleDerives", (rule_cid, hft))]
     # one pass, clauses in order: joins extend the column map, comparators filter it
-    cols, atoms, filters = {}, [], []
+    cols, atoms, filters, joins = {}, [], [], []
     ok, diag, agg = True, None, None
     for c in clauses:
         ma = _AGG_CLAUSE.match(c)
@@ -797,14 +797,26 @@ def _h_rule_if(g, k, m):
         if not atoms:
             for v in avars:
                 cols.setdefault(v, len(cols) + 1)
-        else:
-            # linear chain: the joined variable must be the running tuple's LAST column
-            if not avars or cols.get(avars[0]) != len(cols):
-                ok = False                                    # unsupported shape: M-facts only
-                diag = (f"clause variable {(avars[0] if avars else '?')!r} does not "
-                        f"join the running tuple (non-linear shape)")
-                break
+        elif avars and cols.get(avars[0]) == len(cols) and len(set(avars)) == len(avars):
+            # the linear chain the fragment always compiled: NatJoin on the running
+            # tuple's last column — existing models keep bit-identical plans
+            joins.append(None)
             for v in avars[1:]:
+                cols.setdefault(v, len(cols) + 1)
+        else:
+            # the general conjunctive shape (Codd's join is not restricted to the
+            # last column): join on EVERY bound variable at its position, keep each
+            # fresh one ONCE at its first occurrence (a repeat's equality is the
+            # fragment boundary, as on the linear path); no bound variable at all is
+            # the degenerate cross product
+            pairs = tuple((cols[v], i + 1) for i, v in enumerate(avars) if v in cols)
+            fresh, seen = [], set()
+            for i, v in enumerate(avars):
+                if v not in cols and v not in seen:
+                    fresh.append(i + 1)
+                    seen.add(v)
+            joins.append((pairs, tuple(fresh)))
+            for v in avars:
                 cols.setdefault(v, len(cols) + 1)
         atoms.append((aft, avars))
     obj = None
@@ -817,7 +829,7 @@ def _h_rule_if(g, k, m):
             A_.append(("ruleAgg", (rule_cid,)))
             obj = _sys.compile_agg_rule([a[0] for a in atoms],
                                         [cols[v] for v in rest], over_col, op,
-                                        widths, filters)
+                                        widths, filters, joins)
             # stratified above the closure, full recompute: no ~d variants
             return A_, [(rule_cid, obj)]
         diag = f"aggregate head variables unbound or output {out_v!r} not in head"
@@ -829,7 +841,8 @@ def _h_rule_if(g, k, m):
             # atom ⊆ head at every fixed point, so a matching subset/subtype check
             # is statically discharged (validate_for reads this fact)
             A_.append(("ruleCopies", (rule_cid, atoms[0][0], hft)))
-        obj = _sys.compile_rule([a[0] for a in atoms], proj, widths, filters)
+        obj = _sys.compile_rule([a[0] for a in atoms], proj, widths, filters,
+                                joins)
     elif ok:
         unbound = sorted(set(hvars) - set(cols)) if atoms else []
         diag = (f"head variable(s) {unbound} unbound in the body" if unbound
@@ -845,7 +858,7 @@ def _h_rule_if(g, k, m):
         A_.append(("ruleAtom", (rule_cid, i + 1, aft)))
         out.append((f"{rule_cid}~d{i + 1}",
                     _sys.compile_rule_delta([a[0] for a in atoms], [cols[v] for v in hvars],
-                                            i, widths, filters)))
+                                            i, widths, filters, joins)))
     return A_, out
 
 
