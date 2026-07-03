@@ -35,9 +35,15 @@ def register(name, fn):
 
 
 def override(name, fn):
-    """Register a host-optimized TWIN of a canonical definition (the universal override
-    interface). fn is native-signature (mu, operand) -> value on the host's fast carrier;
-    the canonical definition remains the meaning, the twin is a verified acceleration."""
+    """Register a host-authored TWIN of a canonical definition (the universal override
+    interface). The taxonomy: a canonical definition that is DATA (a compiled object)
+    needs no entry here — it is mechanically REFLECTED into any carrier (delta's
+    scott_to_native, the Rust engine's j_to_n); this registry exists for the BASE
+    stratum only, whose canonical forms are lambda terms below data, so each host
+    authors its native base once under the differential's equality contract. A
+    registered def with NO canonical is neither reflection nor twin: swapping it is DI
+    (httpFetch and kin), with no equality contract. fn is (mu, operand) -> value on the
+    host's fast carrier; the canonical definition remains the meaning."""
     global version
     fast[name] = fn
     version += 1
