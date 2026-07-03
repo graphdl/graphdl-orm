@@ -92,3 +92,46 @@ def test_uniqueness_and_exclusion_come_from_the_canon():
     with defs.step(D):
         v2 = from_lam(apply(C.exclusion(), to_lam((("e1", "f1"), ("e1", "f2")))))
     assert set(v2) == {("e1", "f1"), ("e1", "f2")}
+
+
+def _wrapper_is_the_canonical_application(built, name, param, x, expected):
+    """The strict authorship gate: the canonical NAME applied to the encoded
+    parameter must produce the SAME behavior as the wrapper, and the absolute
+    result must be right. A wrapper composing canon pieces host-side cannot pass
+    this: the name itself must be defined in the shared file."""
+    D = L.SEQ(L.NIL)
+    with defs.step(D):
+        via_name = apply(A(name), param) if param is not None else apply(A(name), to_lam(()))
+        got = from_lam(apply(via_name, x))
+        wrapped = from_lam(apply(built, x))
+    assert set(got) == expected and set(wrapped) == expected, name
+
+
+def test_the_value_families_come_from_the_canon():
+    _wrapper_is_the_canonical_application(
+        C.value_enumeration(1, ("A", "B")), "constraints:value_enumeration",
+        S(A(1), to_lam(("A", "B"))),
+        to_lam((("A",), ("F",), ("B",))), {("F",)})
+    _wrapper_is_the_canonical_application(
+        C.value_range(2, lo=1, hi=5), "constraints:value_range",
+        S(A(2), S(to_lam(1), A("F")), S(to_lam(5), A("F"))),
+        to_lam((("x", 0), ("y", 3), ("z", 9))), {("x", 0), ("z", 9)})
+    _wrapper_is_the_canonical_application(
+        C.value_range(1, lo=2, lo_open=True), "constraints:value_range",
+        S(A(1), S(to_lam(2), A("T")), to_lam(())),
+        to_lam(((2,), (3,))), {(2,)})
+
+
+def test_frequency_and_exclusive_or_come_from_the_canon():
+    pop = (("a", 1), ("a", 2), ("b", 3), ("c", 4), ("c", 5), ("c", 6))
+    _wrapper_is_the_canonical_application(
+        C.frequency([1], lo=2, hi=2), "constraints:frequency",
+        S(to_lam((1,)), to_lam((2,)), to_lam((2,))),
+        to_lam(pop), {("b", 3), ("c", 4), ("c", 5), ("c", 6)})
+    universe = to_lam((("e1",), ("e2",), ("e3",)))
+    participation = to_lam((("e1", "c1"), ("e3", "c1"), ("e3", "c2")))
+    D = L.SEQ(L.NIL)
+    with defs.step(D):
+        got = from_lam(apply(A("constraints:exclusive_or"), S(universe, participation)))
+        wrapped = from_lam(apply(C.exclusive_or(), S(universe, participation)))
+    assert set(got) == {("e2",), ("e3",)} and set(wrapped) == {("e2",), ("e3",)}

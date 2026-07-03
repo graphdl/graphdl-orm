@@ -24,11 +24,6 @@ _LT, _GT = A("lt"), A("gt")
 _1, _2 = A(1), A(2)
 
 
-def _key(roles):
-    """[sel_i1 … sel_ik] : t -> the tuple's key over the constrained roles."""
-    return _S(_CONS, *tuple(A(i) for i in roles))
-
-
 def uniqueness(roles):
     """Uniqueness constraint over `roles` (ORM's fundamental constraint): the
     canonical builder (shared/constraints.py) applied to the key roles.
@@ -99,53 +94,37 @@ def frequency(roles, lo=None, hi=None):
     """Occurrence frequency (§7.2): "each member of pop(roles) occurs there exactly n
     times", generalized to [lo, hi]; a local constraint on the role population, not the
     object type, so unplayed members are fine. V = the facts whose key count is out of
-    bounds."""
-    key = _key(roles)
-    same = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, key, A(1)), _S(_COMP, key, A(2))))
-    cnt = _S(_COMP, A("length"), T.Filter(same), _DISTL)     # ⟨t,P⟩ → t's key count
-    parts = []
-    if lo is not None:
-        parts.append(_S(_COMP, _LT, _S(_CONS, cnt, _S(_CONST, A(lo)))))
-    if hi is not None:
-        parts.append(_S(_COMP, _GT, _S(_CONS, cnt, _S(_CONST, A(hi)))))
-    if len(parts) == 2:
-        viol = _S(_COMP, _OR, _S(_CONS, parts[0], parts[1]))
-    elif parts:
-        viol = parts[0]
-    else:
-        viol = _S(_CONST, A("F"))
-    return _S(_COMP, _S(_ALPHA, A(1)), T.Filter(viol), _DISTR, _S(_CONS, _ID, _ID))
-
-
-_LE, _GE = A("le"), A("ge")
+    bounds. The canonical builder applied to ⟨roles, lo?, hi?⟩ (an absent bound is the
+    empty sequence)."""
+    from .reduce import apply as _apply
+    from .lam import to_lam as _tl
+    return _apply(A("constraints:frequency"),
+                  _tl((tuple(roles),
+                       (lo,) if lo is not None else (),
+                       (hi,) if hi is not None else ())))
 
 
 def value_range(role, lo=None, hi=None, lo_open=False, hi_open=False):
-    """Value constraint over a continuous range (NORMA's value ranges). The value at `role` must
-    lie in the range with bounds lo/hi (None = unbounded, *_open = exclusive). V = the facts
-    outside it — a boundary comparison on the ORM-typed value. Closed [lo,hi] violates below lo
-    or above hi; open bounds use le/ge instead of lt/gt."""
-    rv = A(role)
-    parts = []
-    if lo is not None:
-        parts.append(_S(_COMP, _LE if lo_open else _LT, _S(_CONS, rv, _S(_CONST, to_lam(lo)))))
-    if hi is not None:
-        parts.append(_S(_COMP, _GE if hi_open else _GT, _S(_CONS, rv, _S(_CONST, to_lam(hi)))))
-    if len(parts) == 2:
-        pred = _S(_COMP, _OR, _S(_CONS, parts[0], parts[1]))
-    elif parts:
-        pred = parts[0]
-    else:
-        pred = _S(_CONST, A("F"))                             # unbounded both ways ⇒ nothing violates
-    return T.Filter(pred)
+    """Value constraint over a continuous range (NORMA's value ranges). The value at
+    `role` must lie in the range with bounds lo/hi (None = unbounded, *_open =
+    exclusive). V = the facts outside it. The canonical builder applied to
+    ⟨role, ⟨lo, openflag⟩?, ⟨hi, openflag⟩?⟩."""
+    from .reduce import apply as _apply
+    from .lam import to_lam as _tl
+    return _apply(A("constraints:value_range"),
+                  _tl((role,
+                       (lo, "T" if lo_open else "F") if lo is not None else (),
+                       (hi, "T" if hi_open else "F") if hi is not None else ())))
 
 
 def value_enumeration(role, values):
-    """Value constraint over an enumeration (NORMA's 'the possible values of X are …'). The value
-    at `role` must be one of `values`. V = the facts whose value is not in the set (via member)."""
-    allowed = to_lam(tuple(values))
-    in_set = _S(_COMP, T.member, _S(_CONS, A(role), _S(_CONST, allowed)))   # value ∈ allowed
-    return T.Filter(_S(_COMP, _NOT, in_set))                                # keep facts NOT in the set
+    """Value constraint over an enumeration (NORMA's 'the possible values of X are
+    …'). The value at `role` must be one of `values`. V = the facts whose value is
+    not in the set. The canonical builder applied to ⟨role, values⟩."""
+    from .reduce import apply as _apply
+    from .lam import to_lam as _tl
+    return _apply(A("constraints:value_enumeration"),
+                  _S(A(role), _tl(tuple(values))))
 
 
 _CC = None
@@ -201,11 +180,9 @@ def inclusive_or():
 def exclusive_or():
     """Exclusive-or — exactly one clause holds per entity. Input ⟨universe, participation⟩; V = the
     entities in NO clause (universe ∖ pi1(participation)) together with those in TWO OR MORE (the
-    uniqueness violations of the participation) — everyone not holding exactly one."""
-    players = _S(_COMP, T.Project([1]), _2)                       # entities that participate
-    none = _S(_COMP, T.setminus, _S(_CONS, _1, players))          # in no clause
-    many = _S(_COMP, T.Project([1]), uniqueness([1]), _2)         # in >= 2 clauses
-    return _S(_COMP, _CAT, _S(_CONS, none, many))                 # none ∪ many
+    uniqueness violations of the participation) — everyone not holding exactly one. The canon
+    value."""
+    return _canon_c("constraints:exclusive_or")
 
 
 # ============================ scoped (cross-cell) families ====================
