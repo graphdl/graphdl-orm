@@ -535,7 +535,7 @@ def create_routed(D, ft, fact, partition, machine=None, mealy_obj=None, validate
     return ast.run(fact, D, cell_name=f"{table}:{key}",
                    resolve_obj=row_resolve(col, 1 + len(cols), unary),
                    machine=machine, mealy_obj=mealy_obj, validate_obj=validate_obj,
-                   index_cell=table)
+                   index_cell=table, append_cell=ft)
 
 
 def ft_view(D, ft, partition):

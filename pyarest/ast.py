@@ -89,7 +89,7 @@ def DefineIn(name, obj):
 
 
 def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_obj=None, links_obj=None,
-                 machine=None, mealy_obj=None, index_cell=None):
+                 machine=None, mealy_obj=None, index_cell=None, append_cell=None):
     """The transition create_cell:⟨I, D⟩ → ⟨⟨P'',V⟩, D'⟩ over one cell, wired with a schema's
     validate (and optionally its resolve/derive). It touches only `cell_name` — plus, when
     `machine=(status_cell, sm_obj)` is wired, the noun's status cell: the trigger fact entering
@@ -147,6 +147,15 @@ def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_o
         inew = _S(_COND, _S(_COMP, member, _S(_CONS, krow, ipop)), ipop,
                   _S(_COMP, _APNDL, _S(_CONS, krow, ipop)))
         commit = _S(_COMP, Store(index_cell), _S(_CONS, inew, commit))
+    if append_cell is not None:
+        # the fact type's population cell as a DERIVED-AND-STORED view (Halpin's **):
+        # the input fact appends idempotently in the SAME commit chain, so per-fact-type
+        # readers (guards, rule atoms, scoped constraints) survive absorption unchanged
+        from .theta import member as _member
+        apop = _S(_COMP, FetchPop(append_cell), _2)
+        anew = _S(_COND, _S(_COMP, _member, _S(_CONS, _3, apop)), apop,
+                  _S(_COMP, _APNDL, _S(_CONS, _3, apop)))
+        commit = _S(_COMP, Store(append_cell), _S(_CONS, anew, commit))
     d_new = _S(_COND, _S(_COMP, _3, _1), _2, commit)         # alethic offender? D : commit
     return _S(_COMP, _S(_CONS, o, d_new), valDI)
 
@@ -254,7 +263,7 @@ def child_retire(D, child):
 
 
 def run(input_fact, D, validate_obj=None, cell_name="FILE", resolve_obj=None, derive_obj=None, links_obj=None,
-        machine=None, mealy_obj=None, fuel=None, index_cell=None):
+        machine=None, mealy_obj=None, fuel=None, index_cell=None, append_cell=None):
     """One AST transition: mu(create_cell:⟨input, D⟩) = ⟨o, D'⟩, with D's OWN definitions in
     scope for the whole step (defs.step — frozen, Backus §14.6). Without a validate it commits
     (V = φ); with validate_of it refuses to commit on an alethic violation; with links_obj the
@@ -264,7 +273,7 @@ def run(input_fact, D, validate_obj=None, cell_name="FILE", resolve_obj=None, de
     the returned representation offers exactly the next actions (§1: ship, no longer place)."""
     from . import defs
     handler = build_system(validate_obj, cell_name, resolve_obj, derive_obj, links_obj, machine, mealy_obj,
-                           index_cell)
+                           index_cell, append_cell)
     with defs.step(D, fuel):
         return _transition(apply(handler, _S(input_fact, D)), D)
 
