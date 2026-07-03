@@ -403,6 +403,10 @@ def rmap_partition(D):
             o = subs[o]
         return o
 
+    arity = {}
+    for r in _pop_rows(D, "role"):
+        if len(r) >= 3:
+            arity[r[1]] = max(arity.get(r[1], 0), r[2])
     subject = {r[1]: _top(r[3]) for r in reversed(_pop_rows(D, "role")) if r[2] == 1}
     role2 = {r[1]: _top(r[3]) for r in reversed(_pop_rows(D, "role")) if r[2] == 2}
     spans = {}
@@ -426,8 +430,13 @@ def rmap_partition(D):
                 return s2
         return s1
 
+    # a UNARY is functional by definition (its internal UC spans its one role —
+    # Halpin's boolean-column mapping; NORMA auto-creates that UC), so it absorbs
+    # with no declaration at all
     triples = tuple((ft, _side(ft),
-                     "functional" if (ft in functional and ft not in spanning) else "spanning")
+                     "functional" if (arity.get(ft) == 1 or
+                                      (ft in functional and ft not in spanning))
+                     else "spanning")
                     for ft in fts)
     pairs = from_lam(run_machine(rmap_value, to_lam(()), to_lam(triples)))
     return {ft: key for (key, ft) in pairs}
@@ -484,12 +493,13 @@ def table_columns(partition, table):
     return [ft for ft, key in partition.items() if key == table and ft != table]
 
 
-def row_resolve(col, width):
+def row_resolve(col, width, unary=False):
     """resolve for an entity-cell write: ⟨I, row⟩ → row′, where I = ⟨key, value⟩ and the
     cell holds the entity's 3NF row (a fresh entity gets holes, the default object #). A
     conflicting functional write makes the column ⊥, the row collapses (§11.2.1), and the
     step's transition rule refuses it atomically: absorption makes the UC structural."""
-    key, val = _S(_COMP, _1, _1), _S(_COMP, _2, _1)
+    key = _S(_COMP, _1, _1)
+    val = _S(_CONST, A("T")) if unary else _S(_COMP, _2, _1)   # unary: the boolean column
     hole = _S(_CONST, A("#"))
     bot = _S(_COMP, _1, _S(_CONST, A("x")))                  # a selector on an atom is ⊥
     fresh = _S(_CONS, key, *[val if j == col else hole for j in range(2, width + 1)])
@@ -520,8 +530,10 @@ def create_routed(D, ft, fact, partition, machine=None, mealy_obj=None, validate
     cols = table_columns(partition, table)
     col = 2 + cols.index(ft)
     key = from_lam(fact)[0]
+    unary = max((r[2] for r in _pop_rows(D, "role") if len(r) >= 3 and r[1] == ft),
+                default=2) == 1
     return ast.run(fact, D, cell_name=f"{table}:{key}",
-                   resolve_obj=row_resolve(col, 1 + len(cols)),
+                   resolve_obj=row_resolve(col, 1 + len(cols), unary),
                    machine=machine, mealy_obj=mealy_obj, validate_obj=validate_obj,
                    index_cell=table)
 
@@ -539,6 +551,8 @@ def ft_view(D, ft, partition):
     if table == ft:
         return set(from_lam(_ap(ast.FetchPop(ft), D)))
     col = 2 + table_columns(partition, table).index(ft)
+    unary = max((r[2] for r in _pop_rows(D, "role") if len(r) >= 3 and r[1] == ft),
+                default=2) == 1
     key = _S(_COMP, _1, _1)                                  # of ⟨⟨key⟩, D⟩: the key scalar
     name = _S(_COMP, A("cellkey"), _S(_CONS, _S(_CONST, A(table)), key))
     row = _S(_COMP, ast.DynFetch(), _S(_CONS, name, _2))
@@ -546,7 +560,10 @@ def ft_view(D, ft, partition):
     nonhole = _S(_COMP, A("not"), _EQ, _S(_CONS, A(2), _S(_CONST, A("#"))))
     expr = _S(_COMP, T.Filter(nonhole), _S(_ALPHA, pair), _DISTR)
     idx = _ap(ast.FetchPop(table), D)
-    return set(from_lam(_ap(expr, _S(idx, D))))
+    pairs = set(from_lam(_ap(expr, _S(idx, D))))
+    if unary:
+        return {(k,) for (k, v) in pairs if v == "T"}         # the boolean column, back
+    return pairs
 
 
 def install_entity_cells(D, noun, rows):
