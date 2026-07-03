@@ -147,11 +147,10 @@ def resolve_minting(col):
 # state machine value; the representation is self-describing, no link table maintained.
 def nav_of(key_pos):
     """nav(e): the facts of P sharing the affected entity's key (role `key_pos` of the head fact).
-        α(1) ∘ Filter(key(f) = headKey) ∘ distr ∘ [id, key∘1]"""
-    key = A(key_pos)
-    keyed = _S(_CONS, _ID, _S(_COMP, key, _1))               # ⟨P, key(head)⟩
-    match = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, key, _1), _2))  # key(f) = headKey?
-    return _S(_COMP, _S(_ALPHA, _1), T.Filter(match), _DISTR, keyed)
+        α(1) ∘ Filter(key(f) = headKey) ∘ distr ∘ [id, key∘1]
+    The canonical builder applied to the key selector (shared/system.py)."""
+    from .reduce import apply as _apply
+    return _apply(A("system:nav_of"), A(key_pos))
 
 
 def transitions_of(sm, status_pos):
