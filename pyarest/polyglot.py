@@ -34,6 +34,7 @@ def export_scenario(D, cases):
     process = [[n, _conv(from_lam(obj))]
                for n, (kind, obj) in defs.latest.items() if kind == "compiled"]
     return {"d": _conv(from_lam(D)),
+            "overrides": 1,
             "process": process,
             "cases": [{"f": _conv(from_lam(f)), "x": _conv(from_lam(x)), "fuel": fuel or 0}
                       for (f, x, fuel) in cases]}

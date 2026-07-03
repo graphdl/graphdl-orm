@@ -129,3 +129,64 @@ State Machine Definition 'Party' is for Noun 'Party'.
     D = system.governance_rules(D)
     # f is an ATOM: it must resolve through the step frame's DEFS in both kernels
     _diff(D, [(A("governedBy_rule_base"), D, None)])
+
+
+def test_overrides_and_canonical_terms_agree():
+    # the universal interface's contract, cross-host: the override twins (native
+    # containers) and the canonical combinator terms answer identically
+    D = L.SEQ(L.NIL)
+    cases = [
+        (A("apndr"), to_lam((("a", "b"), "c")), None),
+        (A("distl"), to_lam(("x", ("p", "q", "r"))), None),
+        (A("trans"), to_lam(((1, 2, 3), (4, 5, 6))), None),
+        (A("rotr"), to_lam((1, 2, 3, 4)), None),
+        (A("tlr"), to_lam((1, 2, 3)), None),
+        (S(A("COMP"), A("reverse"), A("cat")), S(to_lam((1, 2)), to_lam((3, 4))), None),
+    ]
+    sc = polyglot.export_scenario(D, cases)
+    on = polyglot.run_rust(sc)
+    sc["overrides"] = 0
+    off = polyglot.run_rust(sc)
+    want = polyglot.python_ground_truth(D, cases)
+    assert on == off == want
+
+
+def test_benchmark_the_flex(capsys):
+    # correctness-asserted timing: the whitepaper machine step, N times, three ways
+    import time
+    from pyarest.reduce import apply, apply as fast_apply
+    D, _ = forml.compile_model(ORDER)
+    D = apply(ast.Store("Order_status"), S(to_lam((("o1", "In Cart"),)), D))
+    handler = ast.build_system(
+        cell_name="Customer_places_Order",
+        machine=("Order_status", system.machine_step("Customer_places_Order"), 2))
+    x = S(to_lam(("c1", "o1")), D)
+    N = 10
+    cases = [(handler, x, None)] * N
+
+    t0 = time.perf_counter()
+    want = polyglot.python_ground_truth(D, cases)
+    t_scott_py = time.perf_counter() - t0
+
+    from pyarest import defs as _d
+    t0 = time.perf_counter()
+    for _ in range(N):
+        with _d.step(D):
+            fast_apply(handler, x)
+    t_delta_py = time.perf_counter() - t0
+
+    sc = polyglot.export_scenario(D, cases)
+    t0 = time.perf_counter()
+    on = polyglot.run_rust(sc)
+    t_rust_on = time.perf_counter() - t0
+    sc["overrides"] = 0
+    t0 = time.perf_counter()
+    off = polyglot.run_rust(sc)
+    t_rust_off = time.perf_counter() - t0
+
+    assert on == off == want                                  # correctness before speed
+    with capsys.disabled():
+        print(f"\n[bench] machine step x{N}: "
+              f"py-scott={t_scott_py:.2f}s py-delta={t_delta_py:.2f}s "
+              f"rust-canonical={t_rust_off:.2f}s rust-overrides={t_rust_on:.2f}s "
+              f"(rust includes process spawn + D serialization)")

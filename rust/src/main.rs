@@ -278,6 +278,9 @@ struct Frame {
 thread_local! {
     static FRAME: RefCell<Vec<Frame>> = RefCell::new(Vec::new());
     static REGISTRY: RefCell<HashMap<String, Rc<dyn Fn(V, V) -> V>>> = RefCell::new(HashMap::new());
+    // the universal override interface: host-optimized twins of canonical definitions;
+    // resolution prefers a twin, absence degrades to the canonical term (same result)
+    static FAST: RefCell<HashMap<String, Rc<dyn Fn(V, V) -> V>>> = RefCell::new(HashMap::new());
     static PROCESS: RefCell<Vec<(String, V)>> = RefCell::new(Vec::new());
 }
 
@@ -383,10 +386,14 @@ fn make_mu() -> V {
                         return mu.app(mkapp(sd, x)); // the step's DEFS cell first
                     }
                     if let Some(key) = leaf_key(&a) {
+                        let tw = FAST.with(|r| r.borrow().get(&key).cloned());
+                        if let Some(impl_) = tw {
+                            return mu.app(impl_(mu.clone(), x)); // the override twin first
+                        }
                         let reg = REGISTRY
                             .with(|r| r.borrow().get(&key).cloned());
                         if let Some(impl_) = reg {
-                            return mu.app(impl_(mu.clone(), x)); // registered host lambda
+                            return mu.app(impl_(mu.clone(), x)); // the canonical term
                         }
                         let proc_ = PROCESS.with(|p| {
                             p.borrow().iter().rev().find(|(n, _)| *n == key).map(|(_, v)| v.clone())
@@ -710,6 +717,97 @@ fn register_base() {
     }));
 }
 
+fn fastreg(name: &str, p: Prim) {
+    FAST.with(|r| {
+        r.borrow_mut().insert(name.to_string(), p);
+    });
+}
+
+fn register_overrides() {
+    // Rust's override set: native-container twins of the canonical combinator terms,
+    // held observationally equal by the differential (overrides on ≡ off ≡ Python)
+    fastreg("apndl", Rc::new(|_mu, o| {
+        if !(pair_b(&o) && is_seq(&nth(&o, 1))) { return bot(); }
+        seq(cons(nth(&o, 0), list_of(&nth(&o, 1))))
+    }));
+    fastreg("apndr", Rc::new(|_mu, o| {
+        if !(pair_b(&o) && is_seq(&nth(&o, 0))) { return bot(); }
+        let mut xs = items(&list_of(&nth(&o, 0)));
+        xs.push(nth(&o, 1));
+        seq(from_vec(xs))
+    }));
+    fastreg("distl", Rc::new(|_mu, o| {
+        if !(pair_b(&o) && is_seq(&nth(&o, 1))) { return bot(); }
+        let x = nth(&o, 0);
+        seq(from_vec(items(&list_of(&nth(&o, 1))).into_iter()
+            .map(|yv| seq(cons(x.clone(), cons(yv, nil())))).collect()))
+    }));
+    fastreg("distr", Rc::new(|_mu, o| {
+        if !(pair_b(&o) && is_seq(&nth(&o, 0))) { return bot(); }
+        let yv = nth(&o, 1);
+        seq(from_vec(items(&list_of(&nth(&o, 0))).into_iter()
+            .map(|x| seq(cons(x, cons(yv.clone(), nil())))).collect()))
+    }));
+    fastreg("reverse", Rc::new(|_mu, o| match shape(&o) {
+        Shape::Seq(l) => { let mut xs = items(&l); xs.reverse(); seq(from_vec(xs)) }
+        _ => bot(),
+    }));
+    fastreg("cat", Rc::new(|_mu, o| {
+        if !(pair_b(&o) && is_seq(&nth(&o, 0)) && is_seq(&nth(&o, 1))) { return bot(); }
+        let mut xs = items(&list_of(&nth(&o, 0)));
+        xs.extend(items(&list_of(&nth(&o, 1))));
+        seq(from_vec(xs))
+    }));
+    fastreg("1r", Rc::new(|_mu, o| match shape(&o) {
+        Shape::Seq(l) => items(&l).last().cloned().unwrap_or_else(bot),
+        _ => bot(),
+    }));
+    fastreg("tlr", Rc::new(|_mu, o| match shape(&o) {
+        Shape::Seq(l) => {
+            let mut xs = items(&l);
+            if xs.is_empty() { return bot(); }
+            xs.pop();
+            seq(from_vec(xs))
+        }
+        _ => bot(),
+    }));
+    fastreg("rotl", Rc::new(|_mu, o| match shape(&o) {
+        Shape::Seq(l) => {
+            let mut xs = items(&l);
+            if xs.is_empty() { return phi(); }
+            let h = xs.remove(0);
+            xs.push(h);
+            seq(from_vec(xs))
+        }
+        _ => bot(),
+    }));
+    fastreg("rotr", Rc::new(|_mu, o| match shape(&o) {
+        Shape::Seq(l) => {
+            let mut xs = items(&l);
+            if xs.is_empty() { return phi(); }
+            let last = xs.pop().unwrap();
+            xs.insert(0, last);
+            seq(from_vec(xs))
+        }
+        _ => bot(),
+    }));
+    fastreg("trans", Rc::new(|_mu, o| match shape(&o) {
+        Shape::Seq(l) => {
+            let rows = items(&l);
+            if rows.iter().any(|r| !is_seq(r)) { return bot(); }
+            if rows.is_empty() { return phi(); }
+            let mat: Vec<Vec<V>> = rows.iter().map(|r| items(&list_of(r))).collect();
+            if mat.iter().all(|r| r.is_empty()) { return phi(); }
+            if mat.iter().any(|r| r.is_empty()) { return bot(); }
+            let w = mat[0].len();
+            if mat.iter().any(|r| r.len() != w) { return bot(); }
+            seq(from_vec((0..w).map(|j|
+                seq(from_vec(mat.iter().map(|r| r[j].clone()).collect()))).collect()))
+        }
+        _ => bot(),
+    }));
+}
+
 // ============================ JSON (hand-rolled, zero deps) ==================
 #[derive(Debug, Clone)]
 enum J {
@@ -918,6 +1016,10 @@ fn run() {
     let j = P { b: input.as_bytes(), i: 0 }.parse();
 
     register_base();
+    let overrides_on = !matches!(jget(&j, "overrides"), Some(J::I(0)));
+    if overrides_on {
+        register_overrides();                                 // twins on unless the scenario
+    }                                                         // says otherwise (degradation)
     if let Some(J::A(procs)) = jget(&j, "process") {
         PROCESS.with(|p| {
             let mut b = p.borrow_mut();
