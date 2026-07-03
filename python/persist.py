@@ -92,17 +92,20 @@ _ENGINE_FP = []
 
 
 def _engine_fingerprint():
-    """A hash over the package's own sources: a thawed D carries COMPILED objects, so
-    an engine change must invalidate every snapshot — text alone would serve stale
-    compiled rules silently after a compiler edit."""
+    """A hash over the engine's own sources, BOTH strata (this host package and the
+    canonical modules in shared/): a thawed D carries COMPILED objects, so an engine
+    change must invalidate every snapshot — text alone would serve stale compiled
+    rules silently after a compiler edit."""
     if not _ENGINE_FP:
         import hashlib
+        from . import paths
         h = hashlib.sha256()
         pkg = os.path.dirname(os.path.abspath(__file__))
-        for fn in sorted(os.listdir(pkg)):
-            if fn.endswith(".py"):
-                h.update(fn.encode())
-                h.update(open(os.path.join(pkg, fn), "rb").read())
+        for d in (pkg, os.path.join(paths.root(), "shared")):
+            for fn in sorted(os.listdir(d)):
+                if fn.endswith(".py"):
+                    h.update(fn.encode())
+                    h.update(open(os.path.join(d, fn), "rb").read())
         _ENGINE_FP.append(h.hexdigest()[:16])
     return _ENGINE_FP[0]
 

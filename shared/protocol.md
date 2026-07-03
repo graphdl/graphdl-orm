@@ -13,7 +13,7 @@ Within that binding, everything above the lambda kernel is a value, so it travel
 the compiled definitions, the store D, the machines, the constraints, and M itself
 cross as data. Only the base stratum (the Backus primitives and the Scott machinery)
 is implemented per host, under the differential's equality contract. This file
-records the carriage between python/pyarest/polyglot.py and rust/src/main.rs so a
+records the carriage between python/polyglot.py and rust/src/main.rs so a
 further host can adopt it from shared/ without reading either, or supply its own
 carriage and still be a host by passing the differential.
 

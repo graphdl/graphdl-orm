@@ -70,16 +70,16 @@ def test_thresholds_are_declared_facts_not_code_constants():
 
 def test_the_read_log_measures_focus():
     D, _ = forml.compile_model(MODEL)
-    system.reset_read_log()
+    optimize.reset_read_log()
     for _ in range(3):
-        rows = system.read_pop(D, "Country_won_Tally_of_MedalKind")
+        rows = optimize.read_pop(D, "Country_won_Tally_of_MedalKind")
     assert rows == set()                                      # empty population, read fine
-    assert system.read_counts() == {"Country_won_Tally_of_MedalKind": 3}
-    plans = optimize.plan(D, reads=system.read_counts())
+    assert optimize.read_counts() == {"Country_won_Tally_of_MedalKind": 3}
+    plans = optimize.plan(D, reads=optimize.read_counts())
     assert plans[0]["kind"] == "absorb_enumerated_role"       # the hot ft ranks first
     assert plans[0]["reads"] == 3
-    system.reset_read_log()
-    assert system.read_counts() == {}
+    optimize.reset_read_log()
+    assert optimize.read_counts() == {}
 
 
 def test_a_model_without_triggers_yields_no_suggestions():

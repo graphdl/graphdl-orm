@@ -4,7 +4,7 @@ cross-host sources: the grammar and module readings any carrier ingests), python
 through the repo root, never through their own package position."""
 import os
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def root():

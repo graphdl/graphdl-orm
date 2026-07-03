@@ -606,29 +606,6 @@ def create_routed(D, ft, fact, partition, machine=None, mealy_obj=None, validate
                    index_cell=table, append_cell=ft)
 
 
-_READ_LOG = {}
-
-
-def read_pop(D, ft, partition=None):
-    """THE public population read (a ρ-application over the cell or the absorbed
-    view). Logged host-side per fact type: like arrival order, the read log is the
-    log's and no fact of the domain (Prop. onestep's distinction), so the optimizer's
-    'focused queries' are measured counts, not guesses."""
-    _READ_LOG[ft] = _READ_LOG.get(ft, 0) + 1
-    if partition is not None and partition.get(ft, ft) != ft:
-        return ft_view(D, ft, partition)
-    return {tuple(r) if isinstance(r, tuple) else (r,) for r in _pop_rows(D, ft)}
-
-
-def read_counts():
-    """The measured query pattern: fact type → public reads this process."""
-    return dict(_READ_LOG)
-
-
-def reset_read_log():
-    _READ_LOG.clear()
-
-
 def ft_view(D, ft, partition):
     """Reassemble an absorbed fact type's ⟨key, value⟩ population from the entity cells:
     a θ₁ expression over ⟨index, D⟩ pairing each key with its row's column through the

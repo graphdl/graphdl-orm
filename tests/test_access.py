@@ -1,4 +1,4 @@
-"""Authorization per the platform arc: the access MODULE (pyarest/readings/access.md)
+"""Authorization per the platform arc: the access MODULE (shared/access.md)
 is ordinary readings, authorization is the derived fact type `User is authorized for
 Operation on Resource` (rule power: roles, and later subtype closure), and enforcement
 is one membership check in create against the RMAP resource (the table a write lands
@@ -12,7 +12,7 @@ from pyarest import ast, forml, system
 from pyarest.reduce import apply
 
 ACCESS = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           "pyarest", "readings", "access.md"), encoding="utf-8").read()
+                           "shared", "access.md"), encoding="utf-8").read()
 
 MODEL = """Order(.OrderId) is an entity type.
 Customer(.Name) is an entity type.

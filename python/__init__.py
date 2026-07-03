@@ -14,7 +14,18 @@ the AST transition, eq. sys routing, DefineIn (DEFS into D); `machine` — the o
 runner; `meta` — the metamodel M (vignette; the full self-capturing M is Phase 3);
 `forml` — the FORML 2 seed compiler (Stage 1; superseded by grammar-as-readings in
 Stage 2/3, per `shared/forml2-grammar.md`, vendored).
-"""
+
+THE SHARED SOURCE IS POLYGLOT. shared/ holds only sources every host consumes as
+written: the readings (FORML) and the canon (canonical definitions as carrier-free
+object trees, shared/canon/). This directory (python/) is the Python host: the
+lambda platform (lam, reduce, prims, defs), the boundary and bindings, and the
+canonical-stratum AUTHORING TOOLCHAIN (theta, constraints, system, ast, meta —
+authored in the Backus base, no host logic) whose job is to EMIT canon; a module
+retires host-side as its content lands in shared/. Per-host optimizations (delta,
+FAST, the native carrier) are DEFS registrations, never forks of the source. The
+root conftest constructs the package for the checkout; installs map it in
+pyproject."""
+
 from . import lam, defs, reduce, prims                       # the lambda kernel + Backus base
 from .lam import ATOM, SEQ, BOT, PHI, to_lam, from_lam, atom
 from .reduce import apply, meaning, mkapp

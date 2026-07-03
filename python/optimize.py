@@ -27,6 +27,31 @@ import re
 
 from . import system
 
+_READ_LOG = {}
+
+
+def read_pop(D, ft, partition=None):
+    """THE public population read (a ρ-application over the cell or the absorbed
+    view). Logged HERE, host-side, per fact type: like arrival order, the read log is
+    the log's and no fact of the domain (Prop. onestep's distinction), which is also
+    why it lives in this host-tooling module and not in the canonical system module —
+    the optimizer's 'focused queries' are measured counts, not guesses."""
+    _READ_LOG[ft] = _READ_LOG.get(ft, 0) + 1
+    if partition is not None and partition.get(ft, ft) != ft:
+        return system.ft_view(D, ft, partition)
+    return {tuple(r) if isinstance(r, tuple) else (r,)
+            for r in system._pop_rows(D, ft)}
+
+
+def read_counts():
+    """The measured query pattern: fact type → public reads this process."""
+    return dict(_READ_LOG)
+
+
+def reset_read_log():
+    _READ_LOG.clear()
+
+
 _QUOTED = re.compile(r"'([^']*)'")
 
 _DEFAULTS = {"enum_width": 5}                                 # Halpin's "e.g., 5"
