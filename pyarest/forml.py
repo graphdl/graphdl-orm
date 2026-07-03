@@ -727,29 +727,47 @@ def _rule_atom(text, known):
     return ft, vars_
 
 
+_CMP_CLAUSE = re.compile(
+    r"^(\S*\d\S*) (exceeds|is greater than|is less than|is at least|is at most|equals) (\S+)$")
+_CMP_OPS = {"exceeds": "gt", "is greater than": "gt", "is less than": "lt",
+            "is at least": "ge", "is at most": "le", "equals": "eq"}
+
+
 def _h_rule_if(g, k, m):
-    """The book's rule form: Head if Clause [and Clause…]. The clauses join linearly on
-    shared variables; the head projects its variables from the joined tuple; the compiled
-    object consumes D (cross-cell) and run_rules derives to the lfp."""
+    """The book's rule form: Head if Clause [and Clause…]. Fact-type clauses join
+    linearly on shared variables; COMPARATOR clauses (the corpus's word comparators, a
+    bound variable against a literal or another bound variable) do not join — they
+    RESTRICT the running tuple as filters; the head projects its variables; the
+    compiled object consumes D (cross-cell) and run_rules derives to the lfp."""
     import zlib
     from . import system as _sys
     head_txt, body = g
     clauses = [c.strip() for c in body.split(" and ")]
     hft, hvars = _rule_atom(head_txt, k)
-    atoms = [_rule_atom(c, k) for c in clauses]
     rule_cid = hft + "_rule_" + format(zlib.crc32(body.encode()), "x")
     _hf, decl = _fact_type(re.sub(r"\d+", "", head_txt).strip(), k)
     A_ = decl + [("derivation", (hft, "fully-derived")),
-                 ("derivationRule", (hft, atoms[0][0], len(atoms))),
                  ("ruleDerives", (rule_cid, hft))]
-    for aft, _av in atoms:
-        A_.append(("ruleReads", (rule_cid, aft)))
-    # column map: first atom contributes its full var list; each later atom appends the
-    # variables after its join column (NatJoin keeps the running tuple and drops S.1)
-    cols, obj = {}, None
+    # one pass, clauses in order: joins extend the column map, comparators filter it
+    cols, atoms, filters = {}, [], []
     ok = True
-    for i, (aft, avars) in enumerate(atoms):
-        if i == 0:
+    for c in clauses:
+        mm = _CMP_CLAUSE.match(c)
+        if mm and mm.group(1) in cols:
+            subj, opw, objtxt = mm.groups()
+            if objtxt in cols:
+                filters.append(_sys.cmp_filter(_CMP_OPS[opw], cols[subj],
+                                               col2=cols[objtxt]))
+            else:
+                lit = _num(objtxt)
+                if isinstance(lit, str):
+                    ok = False                                # neither bound nor literal
+                    break
+                filters.append(_sys.cmp_filter(_CMP_OPS[opw], cols[subj], lit=lit))
+            continue
+        aft, avars = _rule_atom(c, k)
+        A_.append(("ruleReads", (rule_cid, aft)))
+        if not atoms:
             for v in avars:
                 cols.setdefault(v, len(cols) + 1)
         else:
@@ -759,9 +777,13 @@ def _h_rule_if(g, k, m):
                 break
             for v in avars[1:]:
                 cols.setdefault(v, len(cols) + 1)
+        atoms.append((aft, avars))
+    obj = None
     widths = [max(len(av), 1) for (_aft, av) in atoms]
-    if ok and all(v in cols for v in hvars):
-        obj = _sys.compile_rule([a[0] for a in atoms], [cols[v] for v in hvars], widths)
+    if ok and atoms and all(v in cols for v in hvars):
+        A_.append(("derivationRule", (hft, atoms[0][0], len(atoms))))
+        obj = _sys.compile_rule([a[0] for a in atoms], [cols[v] for v in hvars],
+                                widths, filters)
     if obj is None:
         return A_, []
     # semi-naive: the atom list as M-facts, and one ~d delta variant per atom position
@@ -770,7 +792,7 @@ def _h_rule_if(g, k, m):
         A_.append(("ruleAtom", (rule_cid, i + 1, aft)))
         out.append((f"{rule_cid}~d{i + 1}",
                     _sys.compile_rule_delta([a[0] for a in atoms], [cols[v] for v in hvars],
-                                            i, widths)))
+                                            i, widths, filters)))
     return A_, out
 
 

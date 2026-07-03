@@ -195,7 +195,15 @@ def membership_def():
 
 
 # --- the book's rule form compiled (Halpin ch.2 ex.4): linear chain join over D ---
-def compile_rule(atom_fts, head_positions, widths=None):
+def cmp_filter(op, col, lit=None, col2=None):
+    """A comparator CLAUSE as a filter predicate over the running tuple: the corpus's
+    word comparators applied to a bound variable's column against a literal (or a
+    second bound column). Rule clauses that compare do not join — they restrict."""
+    rhs = A(col2) if col2 is not None else _S(_CONST, A(lit))
+    return _S(_COMP, A(op), _S(_CONS, A(col), rhs))
+
+
+def compile_rule(atom_fts, head_positions, widths=None, filters=None):
     """A rule's body as one FFP object over D: the populations of the clause fact types,
     each fetched from its own cell, joined linearly (each next atom joins the running
     tuple's last column to its column 1), with the head's variable positions projected.
@@ -210,10 +218,12 @@ def compile_rule(atom_fts, head_positions, widths=None):
     for ftn, w in zip(atom_fts[1:], ws[1:]):
         expr = _S(_COMP, T.NatJoin(width), _S(_CONS, expr, ast.FetchPop(ftn)))
         width += w - 1
+    for pred in (filters or ()):
+        expr = _S(_COMP, T.Filter(pred), expr)               # comparators restrict
     return _S(_COMP, T.Project(head_positions), expr)
 
 
-def compile_rule_delta(atom_fts, head_positions, delta_at, widths=None):
+def compile_rule_delta(atom_fts, head_positions, delta_at, widths=None, filters=None):
     """The rule body with atom `delta_at` (0-based) reading the round's DELTA instead of
     its cell: an FFP object over ⟨Δ, D⟩ — semi-naive evaluation's inner join
     (Bancilhon–Ramakrishnan 1986). Same join shape as compile_rule (widths carry atom
@@ -229,6 +239,8 @@ def compile_rule_delta(atom_fts, head_positions, delta_at, widths=None):
     for j, (ftn, w) in enumerate(zip(atom_fts[1:], ws[1:]), start=1):
         expr = _S(_COMP, T.NatJoin(width), _S(_CONS, expr, pop(j, ftn)))
         width += w - 1
+    for pred in (filters or ()):
+        expr = _S(_COMP, T.Filter(pred), expr)               # comparators restrict
     return _S(_COMP, T.Project(head_positions), expr)
 
 

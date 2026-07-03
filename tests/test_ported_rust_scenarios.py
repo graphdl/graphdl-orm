@@ -149,3 +149,23 @@ Task1 is parallelizable if Task1 is ready and Task1 is not file-conflicting.
     derived = {r[0] for r in _cell(from_lam(D), "Task_is_parallelizable")}
     assert "t1" in derived                                    # derives through the pair
     assert "t2" not in derived                                # unknown stays unknown (open world)
+
+
+def test_literal_comparators_filter_in_rule_bodies():
+    # antecedent_literal_value_comparison_e2e, the corpus word-comparator surface:
+    # a clause whose subject is a BOUND variable and whose object is a literal is a
+    # FILTER over the running tuple, not a join atom
+    MODEL = """Item(.Id) is an entity type.
+Weight is a value type.
+Item has Weight.
+Item1 is big if Item1 has Weight2 and Weight2 is greater than 5.
+Item1 is small if Item1 has Weight2 and Weight2 is less than 5.
+"""
+    D, rep = forml.compile_model(MODEL)
+    assert rep["unparsed"] == []
+    D = apply(ast.Store("Item_has_Weight"),
+              S(to_lam((("a", 3), ("b", 7), ("c", 5))), D))
+    D = system.run_rules(D)
+    Dpy = from_lam(D)
+    assert {r[0] for r in _cell(Dpy, "Item_is_big")} == {"b"}
+    assert {r[0] for r in _cell(Dpy, "Item_is_small")} == {"a"}   # c is neither
