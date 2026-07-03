@@ -669,6 +669,15 @@ def _h_fact(g, k, m):
         ids = tuple(_QUOTED.findall(reading))
         dequoted = re.sub(r"\s+", " ", _QUOTED.sub("", reading)).strip()
         ft, _decl = _fact_type(dequoted, k)
+        # the subtype lift, as in _rule_atom: an instance fact authored via a subtype
+        # resolves UP to the supertype-declared fact type when its own is undeclared
+        # (subtype instances ARE supertype instances; the fact lives once)
+        if isinstance(k, _Known) and k.fts and ft not in k.fts:
+            _t, rtypes = _reading(dequoted, k)
+            for anc in sorted(k.subs.get(rtypes[0], ()) if rtypes else ()):
+                lifted, _ = _fact_type(dequoted.replace(rtypes[0], anc, 1), k)
+                if lifted in k.fts:
+                    return [(lifted, ids)], []
         return [(ft, ids)], []
     ft, facts = _fact_type(reading, k)                         # mixfix template + ordered roles
     deriv = [("derivation", (ft, kind))] if kind else []      # link the fact type to its derivation/storage
