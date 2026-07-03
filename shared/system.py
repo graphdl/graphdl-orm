@@ -1,0 +1,31 @@
+(
+"The AREST command pipeline's canonical definitions in INTERSECTION SOURCE (one tuple literal, normal Python and normal Rust verbatim; discipline in shared/intersection.md). validate_S per Def. Command and Def. Violation: from the record of local constraints, an optional alethic subset, scoped constraints, and an optional scoped-alethic subset, build P,V,flag over P,D. V unions every family; only the ALETHIC subset raises the commit-blocking flag, deontic families warn and commit. An absent alethic slot defaults to the whole family; a provided-but-empty one is deliberately deontic. Local constraints compose with the target-population selector; scoped ones consume the pair whole.",
+
+DEF("system:viols",
+    S4(A("COND"), A("null"),
+       K(S2(A("CONST"), PHI())),
+       S4(A("CONS"), K(A("COMP")), K(A("theta:flatten")), A("theta:selrow")))),
+
+DEF("system:wrap_local",
+    S4(A("CONS"), K(A("COMP")), A("id"), K(N(1)))),
+
+DEF("system:validate_of",
+    S5(A("CONS"), K(A("CONS")),
+       K(N(1)),
+       S3(A("COMP"), A("system:viols"),
+          S3(A("COMP"), A("cat"),
+             S3(A("CONS"),
+                S3(A("COMP"), S2(A("ALPHA"), A("system:wrap_local")), N(1)),
+                N(3)))),
+       S5(A("CONS"), K(A("COMP")), K(A("not")), K(A("null")),
+          S3(A("COMP"), A("system:viols"),
+             S3(A("COMP"), A("cat"),
+                S3(A("CONS"),
+                   S4(A("COND"), S3(A("COMP"), A("null"), N(2)),
+                      S3(A("COMP"), S2(A("ALPHA"), A("system:wrap_local")), N(1)),
+                      S3(A("COMP"), S2(A("ALPHA"), A("system:wrap_local")),
+                         S3(A("COMP"), N(1), N(2)))),
+                   S4(A("COND"), S3(A("COMP"), A("null"), N(4)),
+                      N(3),
+                      S3(A("COMP"), N(1), N(4))))))))),
+)

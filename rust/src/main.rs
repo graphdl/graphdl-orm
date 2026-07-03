@@ -1534,6 +1534,7 @@ fn canon_defs() -> Vec<(String, V)> {
         include!("../../shared/theta.py");
         include!("../../shared/constraints.py");
         include!("../../shared/ast.py");
+        include!("../../shared/system.py");
     }
     out.into_inner()
 }

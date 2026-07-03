@@ -52,6 +52,7 @@ def load(name="theta.py"):
 
 
 def load_all():
-    """Every intersection file, in dependency order (constraints and ast reference
-    theta)."""
-    return load("theta.py") + load("constraints.py") + load("ast.py")
+    """Every intersection file, in dependency order (constraints, ast, and system
+    reference theta; system's pipeline references ast)."""
+    return (load("theta.py") + load("constraints.py") + load("ast.py")
+            + load("system.py"))

@@ -36,24 +36,27 @@ define("create", _S(_COMP, A("emit"), A("validate"), A("derive"), A("resolve")))
 
 
 # --- validate: V = ⋃_c (rho c):P, with the alethic commit guard ---
-def _violations(exprs):
-    """X ↦ ⋃_c (rho c):X — flatten the per-constraint violation sets ⟨V_c1..V_cn⟩."""
-    if not exprs:
-        return _S(_CONST, PHI)
-    return _S(_COMP, T.flatten, _S(_CONS, *exprs))
-
-
 def validate_of(constraints, alethic=None, scoped=(), scoped_alethic=None):
     """validate_S : ⟨P, D⟩ ↦ ⟨P, V, alethicViolated⟩ (Def. Command / Violation). `constraints`
     consume the target population P (cell-local — composed with the selector); `scoped` consume
     ⟨P, D⟩ whole (cross-cell — they fetch sibling cells from the frozen D). `alethic` /
-    `scoped_alethic` are the commit-blocking subsets (default: all of each)."""
-    local = [_S(_COMP, c, _1) for c in constraints]
-    la = local if alethic is None else [_S(_COMP, c, _1) for c in alethic]
-    sc = list(scoped)
-    sa = sc if scoped_alethic is None else list(scoped_alethic)
-    flag = _S(_COMP, A("not"), A("null"), _violations(la + sa))   # any alethic offender?
-    return _S(_CONS, _1, _violations(local + sc), flag)
+    `scoped_alethic` are the commit-blocking subsets (default: all of each). The canonical
+    builder (shared/system.py) applied to ⟨local, alethic?, scoped, scoped_alethic?⟩; an
+    absent subset is the empty slot, a provided one wraps (deliberately-deontic empties
+    stay distinct from absence)."""
+    from .reduce import apply as _apply
+
+    def lst(objs):
+        out = L.NIL
+        for o in reversed(list(objs)):
+            out = L.CONS(o)(out)
+        return L.SEQ(out)
+
+    def slot(v):
+        return _S() if v is None else _S(lst(v))
+
+    rec = _S(lst(constraints), slot(alethic), lst(scoped), slot(scoped_alethic))
+    return _apply(A("system:validate_of"), rec)
 
 
 def validate_modal(pairs, scoped_pairs=()):
