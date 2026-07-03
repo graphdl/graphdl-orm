@@ -906,6 +906,39 @@ def row_validate(D, ft, partition):
     return _S(_CONS, _1, V, flag)
 
 
+def facts_about(D, entity):
+    """Every fact mentioning `entity`, VERBALIZED: scan the flat fact cells for rows
+    containing it and render each through its fact type's reading template (Prop.
+    spec's verbalize direction, applied to instances). Returns (ft, row, sentence)."""
+    from .lam import from_lam
+    readings = {f[0]: f[1] for f in _pop_rows(D, "factType") if len(f) >= 2}
+    players = {}
+    for r in _pop_rows(D, "role"):
+        if len(r) >= 4:
+            players.setdefault(r[1], {})[r[2]] = r[3]
+    out = []
+    for c in from_lam(D):
+        if not (isinstance(c, tuple) and len(c) == 3 and c[0] == "CELL"):
+            continue
+        rows = c[2]
+        if not (isinstance(rows, tuple) and all(
+                isinstance(r, tuple) and all(not isinstance(x, tuple) for x in r)
+                for r in rows)):
+            continue
+        template = readings.get(c[1])
+        for r in rows:
+            if entity in r:
+                if template and template.count("{") == len(r):
+                    # NORMA instance verbalization keeps the role player's type name
+                    filled = [f"{players.get(c[1], {}).get(i + 1, '')} '{v}'".strip()
+                              for i, v in enumerate(r)]
+                    sentence = template.format(*filled) + "."
+                else:
+                    sentence = f"{c[1]}{r}"
+                out.append((c[1], r, sentence))
+    return out
+
+
 def describe(D, noun):
     """What the system can say about a noun, from its own M-facts (a read view in the
     ft_view style): kind, supertypes and subtypes, the fact types it plays roles in

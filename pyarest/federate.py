@@ -148,6 +148,41 @@ def jsonld_items_to_readings(items, vocab):
     return "\n".join(out) + ("\n" if out else "")
 
 
+def _lval(v):
+    """A JSON-LD literal: a bare string or {"@language","@value"}."""
+    if isinstance(v, dict):
+        return v.get("@value")
+    return v if isinstance(v, str) else None
+
+
+def jsonld_instance_graph_to_readings(data, types=("schema:Article",), keep=None):
+    """A wild JSON-LD instance graph (Wikidata's EntityData shape: typed nodes with
+    compact schema.org keys) → declarations + quoted instance-fact readings, through
+    the same grammar. `keep` optionally filters nodes (e.g. by language)."""
+    nodes = [n for n in data.get("@graph", []) if n.get("@type") in types]
+    if keep:
+        nodes = [n for n in nodes if keep(n)]
+    used = []
+    for n in nodes:
+        for k in n:
+            if not k.startswith("@") and k not in used and _lval(n[k]) is not None:
+                used.append(k)
+    out = [f"{t} is an entity type." for t in types]
+    for k in used:
+        out.append(f"schema:{k} is a value type.")
+    for t in types:
+        for k in used:
+            out.append(f"{t} has schema:{k}.")
+    for n in nodes:
+        nid = n.get("@id")
+        t = n.get("@type")
+        for k in used:
+            v = _lval(n.get(k))
+            if v is not None:
+                out.append(f"{t} '{nid}' has schema:{k} '{v}'.")
+    return "\n".join(out) + "\n"
+
+
 # ============================ GS1 (GPC bricks) and O*NET ======================
 def gs1_to_readings(gpc):
     out = ["gs1:Brick is an entity type.", "gs1:Title is a value type.",

@@ -133,3 +133,26 @@ Connector 'jsonld-http' translates with Translator 'translate_jsonld'.
         assert ("schemaorg", "https://example.test/schema") in _cell(Dpy, "federatedFrom")
     finally:
         federate.register_bindings()                          # restore the real binding
+
+
+WILD = {"@graph": [
+    {"@id": "https://en.wikipedia.org/wiki/Catholic_Church", "@type": "schema:Article",
+     "about": "wd:Q9592", "inLanguage": "en",
+     "isPartOf": "https://en.wikipedia.org/",
+     "name": {"@language": "en", "@value": "Catholic Church"}},
+    {"@id": "https://la.wikipedia.org/wiki/Ecclesia_Catholica", "@type": "schema:Article",
+     "about": "wd:Q9592", "inLanguage": "la",
+     "isPartOf": "https://la.wikipedia.org/",
+     "name": {"@language": "la", "@value": "Ecclesia Catholica"}},
+]}
+
+
+def test_wild_instance_graphs_ingest_and_verbalize():
+    from pyarest import system
+    readings = federate.jsonld_instance_graph_to_readings(WILD)
+    D, rep = forml.compile_model(readings)
+    assert rep["unparsed"] == []
+    facts = system.facts_about(D, "wd:Q9592")
+    assert any("en.wikipedia.org" in str(r) for (_ft, r, _s) in facts)
+    sentences = [s for (_ft, _r, s) in facts]
+    assert any("has 'wd:Q9592'" in s for s in sentences)      # rendered via the template
