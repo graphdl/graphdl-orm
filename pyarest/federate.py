@@ -123,6 +123,10 @@ def jsonld_to_readings(vocab):
                 if p["@id"] not in declared_vts:
                     declared_vts.add(p["@id"])
                     out.append(f"{p['@id']} is a value type.")
+                    # the range is DECLARED (schema:Text, schema:Number, schema:Boolean,
+                    # …): transfer it as the value type's Data Type — no guessing, and
+                    # the sealing/type derivations read it like any other declaration
+                    out.append(f"Data Type: {p['@id']} is {rngs[0]}.")
                 out.append(f"{dom} has {p['@id']}.")
     return "\n".join(out) + "\n"
 

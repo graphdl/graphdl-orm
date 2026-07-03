@@ -53,6 +53,8 @@ def test_schema_org_vocabulary_federates_as_readings():
     fts = {f[0] for f in _cell(Dpy, "factType")}
     assert "schema_Product_has_schema_name" in fts
     assert "schema_Product_offers_schema_Offer" in fts
+    # the DECLARED range transfers as the value type's Data Type — nothing guessed
+    assert ("schema:name is schema:Text",) in _cell(Dpy, "data_type")
 
 
 def test_instances_fetch_and_store_with_provenance():
