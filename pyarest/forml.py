@@ -731,6 +731,7 @@ def _rule_atom(text, known):
     return ft, vars_
 
 
+_AGG_CLAUSE = re.compile(r"^(\S*\d\S*) is the (min|max) of (\S*\d\S*)$")
 _CMP_CLAUSE = re.compile(
     r"^(\S*\d\S*) (exceeds|is greater than|is less than|is at least|is at most|equals) (\S+)$")
 _CMP_OPS = {"exceeds": "gt", "is greater than": "gt", "is less than": "lt",
@@ -754,8 +755,19 @@ def _h_rule_if(g, k, m):
                  ("ruleDerives", (rule_cid, hft))]
     # one pass, clauses in order: joins extend the column map, comparators filter it
     cols, atoms, filters = {}, [], []
-    ok, diag = True, None
+    ok, diag, agg = True, None, None
     for c in clauses:
+        ma = _AGG_CLAUSE.match(c)
+        if ma:
+            out_v, op, over_v = ma.groups()
+            if over_v in cols and out_v not in cols:
+                agg = (op, cols[over_v], out_v)
+            else:
+                ok = False
+                diag = (f"aggregate clause needs a bound source and an unbound "
+                        f"output ({c!r})")
+                break
+            continue
         mm = _CMP_CLAUSE.match(c)
         if mm and mm.group(1) in cols:
             subj, opw, objtxt = mm.groups()
@@ -788,7 +800,19 @@ def _h_rule_if(g, k, m):
         atoms.append((aft, avars))
     obj = None
     widths = [max(len(av), 1) for (_aft, av) in atoms]
-    if ok and atoms and all(v in cols for v in hvars):
+    if ok and atoms and agg is not None:
+        op, over_col, out_v = agg
+        rest = [v for v in hvars if v != out_v]
+        if out_v in hvars and all(v in cols for v in rest):
+            A_.append(("derivationRule", (hft, atoms[0][0], len(atoms))))
+            A_.append(("ruleAgg", (rule_cid,)))
+            obj = _sys.compile_agg_rule([a[0] for a in atoms],
+                                        [cols[v] for v in rest], over_col, op,
+                                        widths, filters)
+            # stratified above the closure, full recompute: no ~d variants
+            return A_, [(rule_cid, obj)]
+        diag = f"aggregate head variables unbound or output {out_v!r} not in head"
+    elif ok and atoms and all(v in cols for v in hvars):
         A_.append(("derivationRule", (hft, atoms[0][0], len(atoms))))
         obj = _sys.compile_rule([a[0] for a in atoms], [cols[v] for v in hvars],
                                 widths, filters)

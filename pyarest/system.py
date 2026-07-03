@@ -266,6 +266,39 @@ def class_rule(clauses, head_const):
     return _S(_COMP, _S(_ALPHA, row), T.dedup, s)
 
 
+def compile_agg_rule(atom_fts, group_positions, over_position, op,
+                     widths=None, filters=None):
+    """An aggregate rule (Def. derive: 'an aggregate reducing a finite bag to one
+    scalar'): joins and filters as compile_rule, then per GROUP (the non-aggregated
+    head variables) the fold of `op` over the aggregated column. Stratified above the
+    positive closure; the head REPLACES on recompute — an aggregate head is functional
+    per group, so union-merge would preserve stale folds (the misfold the old engine
+    documented)."""
+    from . import ast
+    ws = list(widths) if widths else [2] * len(atom_fts)
+    expr = ast.FetchPop(atom_fts[0])
+    width = ws[0]
+    for ftn, w in zip(atom_fts[1:], ws[1:]):
+        expr = _S(_COMP, T.NatJoin(width), _S(_CONS, expr, ast.FetchPop(ftn)))
+        width += w - 1
+    for pred in (filters or ()):
+        expr = _S(_COMP, T.Filter(pred), expr)
+    rel = "le" if op == "min" else "ge"
+    fold2 = _S(_COND, _S(_COMP, A(rel), _S(_CONS, _1, _2)), _1, _2)
+
+    def gsel(src):
+        return _S(_CONS, *[_S(_COMP, A(p), src) for p in group_positions])
+
+    # per pair ⟨r, rows⟩: the same-group rows' aggregated column, folded
+    samep = _S(_COMP, A("eq"), _S(_CONS, gsel(_1), gsel(_2)))
+    matches = _S(_COMP, T.Filter(samep), _DISTR, _S(_CONS, _2, _1))
+    vals = _S(_COMP, _S(_ALPHA, _S(_COMP, A(over_position), _1)), matches)
+    fold = _S(_COMP, _S(_INSERT, fold2), vals)
+    out_row = _S(_CONS, *([_S(_COMP, A(p), _1) for p in group_positions] + [fold]))
+    agg = _S(_COMP, T.dedup, _S(_ALPHA, out_row), _DISTR, _S(_CONS, _ID, _ID))
+    return _S(_COMP, agg, expr)
+
+
 def run_rules(D, changed=None, stats=None):
     """Cross-cell derivation to the least fixed point, semi-naive (Bancilhon–
     Ramakrishnan 1986): round one evaluates full bodies, BOUNDED by the frontier
@@ -287,7 +320,9 @@ def run_rules(D, changed=None, stats=None):
     for r in _pop_rows(D, "ruleAtom"):
         if len(r) >= 3:
             atomsof.setdefault(r[0], []).append((r[1], r[2]))
-    rules = [(r[0], r[1]) for r in _pop_rows(D, "ruleDerives")]
+    aggids = {r[0] for r in _pop_rows(D, "ruleAgg") if r}
+    all_rules = [(r[0], r[1]) for r in _pop_rows(D, "ruleDerives")]
+    rules = [(rid, h) for (rid, h) in all_rules if rid not in aggids]
     frontier = None if changed is None else set(changed)
     delta, rnd = None, 0
     while True:
@@ -335,8 +370,19 @@ def run_rules(D, changed=None, stats=None):
                 fired = True
                 next_delta.setdefault(head, set()).update(add)
         if not fired:
-            return D
+            break
         delta = next_delta
+    # the aggregate stratum: above the positive closure, heads REPLACED (functional
+    # per group — union would keep stale folds)
+    for (rid, head) in all_rules:
+        if rid not in aggids:
+            continue
+        with defs.step(D):
+            out = from_lam(_ap(_A(rid), D))
+        if isinstance(out, tuple):
+            rows = tuple(sorted({tuple(r) for r in out if isinstance(r, tuple)}))
+            D = _ap(ast.Store(head), _S(to_lam(rows), D))
+    return D
 
 
 # --- the state machine read off M (whitepaper §1): a machine IS a set of facts ---
