@@ -1,10 +1,18 @@
 """The delta fast-path is observationally equal to the lambda kernel (spec §4.2 / D5): for every
 FFP object, reduce.apply (delta) agrees with reduce.apply_lambda (mu = Y(tau), the ground truth).
 The whole suite already runs through delta; this asserts the equivalence deliberately."""
+import pyarest.lam as L
 from pyarest.lam import atom as A, to_lam, from_lam
 from pyarest import reduce as R
 import pyarest.prims  # noqa: F401
 from pyarest import theta as T, constraints as C, system
+
+
+def _S(*xs):
+    l = L.NIL
+    for x in reversed(xs):
+        l = L.CONS(x)(l)
+    return L.SEQ(l)
 
 
 def _agree(f, x):
@@ -30,5 +38,5 @@ def test_delta_equals_lambda_across_the_algebra():
 
 def test_delta_bottom_and_metacomposition():
     assert _agree(A(4), ("a", "b"))                                  # out-of-range selector -> bottom
-    comp = T._S(A("COMP"), A(1), A("tl"))                            # metacomposition ⟨COMP,1,tl⟩
+    comp = _S(A("COMP"), A(1), A("tl"))                            # metacomposition ⟨COMP,1,tl⟩
     assert _agree(comp, ("a", "b", "c"))
