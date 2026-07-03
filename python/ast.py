@@ -21,7 +21,6 @@ _COMP, _CONS, _CONST, _COND = A("COMP"), A("CONS"), A("CONST"), A("COND")
 _1, _2, _3 = A(1), A(2), A(3)
 _APNDL, _NULL, _NOT, _EQ, _APPLY, _DISTR = A("apndl"), A("null"), A("not"), A("eq"), A("apply"), A("distr")
 # a validate that always commits: ⟨P,D⟩ → ⟨P, φ, F⟩ — empty violations, alethic flag false
-_STUB_VALIDATE = _S(_CONS, _1, _S(_CONST, PHI), _S(_CONST, A("F")))
 
 
 def cell(name, contents):
@@ -80,65 +79,18 @@ def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_o
     case) the table's key index records I's key in the SAME commit chain, so refusal leaves
     the index untouched and re-writes stay deduplicated. Commits iff the alethic flag is
     false."""
-    validate_obj = validate_obj if validate_obj is not None else _STUB_VALIDATE
-    from .theta import Filter, member
-    # fact-as-function: a population is a set, so the default resolve is append-if-absent
-    # and re-assertion is the identity (at-least-once delivery is free for asserts)
-    resolve_stage = resolve_obj if resolve_obj is not None else _S(_COND, member, _2, _APNDL)
-    derive_stage = derive_obj if derive_obj is not None else A("id")
-    P = _S(_COMP, FetchPop(cell_name), _2)                   # ⟨I,D⟩ → the cell's population
-    resolved = _S(_COMP, resolve_stage, _S(_CONS, _1, P))    # resolve:⟨I, P⟩ = P'
-    derived = _S(_COMP, derive_stage, resolved)              # derive:P' = P''
-    # validate sees ⟨P'', D⟩: cell-local constraints read P''; scoped (cross-cell) ones
-    # fetch sibling cells from the frozen D (audit C3 — no family drops from enforcement).
-    # I rides along so links can address the entity the input names (Thm. hateoas).
-    valDI = _S(_CONS, _S(_COMP, validate_obj, _S(_CONS, derived, _2)), _2, _1)  # ⟨⟨P'',V,flag⟩, D, I⟩
-    P2 = _S(_COMP, _1, _1)                                   # P''  from ⟨val,D,I⟩
-    V = _S(_COMP, _2, _1)                                    # V    from ⟨val,D,I⟩
-    snew = entity_role = None
-    if machine is not None:                                  # the machine advances in the SAME step:
-        status_cell, sm_obj, *rest = machine                 # status′ = sm:⟨status, P″, D⟩, committed
-        entity_role = rest[0] if rest else None              # with the fact — or neither (atomic);
-        spop = _S(_COMP, FetchPop(status_cell), _2)          # D rides along so GUARDS can fetch
-        snew = _S(_COMP, sm_obj, _S(_CONS, spop, P2, _2))    # their (possibly derived) fact type
-    if links_obj is None:
-        parts = [P2, V]
-    else:
-        links_in = P2
-        if snew is not None and entity_role is not None:
-            # the representation's controls come from the entity's POST-step status: the
-            # σ(1 = e)(status′) singleton, e named by the input fact at entity_role —
-            # "after which the representation offers ship and no longer place" (§1)
-            e = _S(_COMP, A(entity_role), _3)                # the addressed entity, from I
-            match_e = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, _1, _1), _2))    # ⟨⟨e?,s⟩, e⟩
-            links_in = _S(_COMP, _S(A("ALPHA"), _1), Filter(match_e), _DISTR, _S(_CONS, snew, e))
-        # an entity with NO status row has no machine controls: links = φ, never ⊥
-        parts = [P2, V, _S(_COND, _S(_COMP, _NULL, links_in), _S(_CONST, PHI),
-                           _S(_COMP, links_obj, links_in))]
-    if mealy_obj is not None and machine is not None:        # Mealy: the fired transitions'
-        parts.append(_S(_COMP, mealy_obj, _S(_CONS, spop, P2, _2)))   # emissions, last part of o
-    o = _S(_CONS, *parts)                                    # o = ⟨P'', V⟩ or ⟨P'', V, links⟩ (hateoas)
-    commit = _S(_COMP, Store(cell_name), _S(_CONS, P2, _2))  # ↓cell:⟨P'', D⟩
-    if snew is not None:
-        commit = _S(_COMP, Store(machine[0]), _S(_CONS, snew, commit))
-    if index_cell is not None:                               # the key index, SAME commit chain
-        from .theta import member
-        krow = _S(_CONS, _S(_COMP, _1, _3))                  # ⟨key⟩, key = I's first role
-        ipop = _S(_COMP, FetchPop(index_cell), _2)
-        inew = _S(_COND, _S(_COMP, member, _S(_CONS, krow, ipop)), ipop,
-                  _S(_COMP, _APNDL, _S(_CONS, krow, ipop)))
-        commit = _S(_COMP, Store(index_cell), _S(_CONS, inew, commit))
-    if append_cell is not None:
-        # the fact type's population cell as a DERIVED-AND-STORED view (Halpin's **):
-        # the input fact appends idempotently in the SAME commit chain, so per-fact-type
-        # readers (guards, rule atoms, scoped constraints) survive absorption unchanged
-        from .theta import member as _member
-        apop = _S(_COMP, FetchPop(append_cell), _2)
-        anew = _S(_COND, _S(_COMP, _member, _S(_CONS, _3, apop)), apop,
-                  _S(_COMP, _APNDL, _S(_CONS, _3, apop)))
-        commit = _S(_COMP, Store(append_cell), _S(_CONS, anew, commit))
-    d_new = _S(_COND, _S(_COMP, _3, _1), _2, commit)         # alethic offender? D : commit
-    return _S(_COMP, _S(_CONS, o, d_new), valDI)
+    from .lam import to_lam
+
+    def slot(v):
+        return to_lam(()) if v is None else _S(v)
+
+    m = to_lam(()) if machine is None else _S(A(machine[0]), machine[1],
+                                              *(A(r) for r in machine[2:]))
+    record = _S(A(cell_name), slot(validate_obj), slot(resolve_obj), slot(derive_obj),
+                slot(links_obj), m, slot(mealy_obj),
+                slot(A(index_cell)) if index_cell is not None else to_lam(()),
+                slot(A(append_cell)) if append_cell is not None else to_lam(()))
+    return apply(A("ast:build_system"), record)
 
 
 def step_input(x, D, fuel=None):
