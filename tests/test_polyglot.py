@@ -165,11 +165,15 @@ def test_benchmark_the_flex(capsys):
         machine=("Order_status", system.machine_step("Customer_places_Order"), 2))
     x = S(to_lam(("c1", "o1")), D)
     N = 10
-    cases = [(handler, x, None)] * N
+    N_TRUTH = 2                                               # ground truth is deliberately the
+    cases = [(handler, x, None)] * N                          # slow reference; two runs prove
+    cases_truth = cases[:N_TRUTH]                             # stability, ten would prove patience
 
     t0 = time.perf_counter()
-    want = polyglot.python_ground_truth(D, cases)
+    want_truth = polyglot.python_ground_truth(D, cases_truth)
     t_scott_py = time.perf_counter() - t0
+    assert len(set(map(repr, want_truth))) == 1               # identical cases, identical truth
+    want = [want_truth[0]] * N
 
     from pyarest import defs as _d
     t0 = time.perf_counter()
@@ -206,7 +210,7 @@ def test_benchmark_the_flex(capsys):
     assert native == want                                     # the native carrier agrees
     with capsys.disabled():
         print(f"\n[bench] machine step x{N}: "
-              f"py-scott={t_scott_py:.2f}s py-delta={t_delta_py:.2f}s "
+              f"py-scott(x{N_TRUTH})={t_scott_py:.2f}s py-delta={t_delta_py:.2f}s "
               f"rust-canonical={t_rust_off:.2f}s rust-overrides={t_rust_on:.2f}s "
               f"rust-resident={t_rust_res:.3f}s rust-native={t_rust_native:.3f}s "
               f"(one-shot rust pays spawn + D serialization; resident retains the store)")
