@@ -1,0 +1,107 @@
+"""Persistence drivers (the platform arc): the paper names the binding ("a server
+registers httpFetch and upsert"), so a driver is host machinery behind a small
+interface, and the EVENT LOG is the primary durable form — each committed step appended
+as ⟨tx, fact_type, fact⟩, the τ log made durable, with cell snapshots as replay
+optimizations. Facts are the source of truth: replay is re-ingestion through the SAME
+create, and populations being sets makes replay idempotent. sqlite maps the cell model
+one-to-one (a cells table, one row per cell, per-step transactions matching the atomic
+commit); jsonl carries the log for audit and replication."""
+import json
+import os
+import sqlite3
+
+from . import ast, system
+from .lam import to_lam, from_lam, atom as _A
+from .reduce import apply as _ap
+import pyarest.lam as L
+
+
+def _S(*xs):
+    l = L.NIL
+    for x in reversed(xs):
+        l = L.CONS(x)(l)
+    return L.SEQ(l)
+
+
+def _conv(v):
+    if isinstance(v, tuple):
+        return [_conv(x) for x in v]
+    return v
+
+
+def _untuple(v):
+    if isinstance(v, list):
+        return tuple(_untuple(x) for x in v)
+    return v
+
+
+# ============================ sqlite: cells one-to-one ========================
+def save_sqlite(D, path):
+    """Snapshot every cell (fact populations AND definitions — both are data) into a
+    cells table, insertion order preserved (first match wins on load, as in D)."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute("CREATE TABLE IF NOT EXISTS cells (ord INTEGER PRIMARY KEY, "
+                    "name TEXT, contents TEXT)")
+        con.execute("DELETE FROM cells")
+        for i, c in enumerate(from_lam(D)):
+            if isinstance(c, tuple) and len(c) == 3 and c[0] == "CELL":
+                con.execute("INSERT INTO cells (ord, name, contents) VALUES (?, ?, ?)",
+                            (i, json.dumps(c[1]), json.dumps(_conv(c[2]),
+                                                             ensure_ascii=False)))
+        con.commit()
+    finally:
+        con.close()
+
+
+def load_sqlite(path):
+    con = sqlite3.connect(path)
+    try:
+        rows = con.execute("SELECT name, contents FROM cells ORDER BY ord").fetchall()
+    finally:
+        con.close()
+    cells = tuple(("CELL", json.loads(n), _untuple(json.loads(c))) for (n, c) in rows)
+    return to_lam(cells)
+
+
+# ============================ jsonl: the durable step log =====================
+def read_log(path):
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+class JsonlLog:
+    """The durable event log: each COMMITTED step appended as ⟨tx, ft, fact⟩ (a refused
+    step appends nothing — ERROR commits nothing, so it persists nothing). tx is the
+    arrival order at this log, the writer model's transaction time."""
+
+    def __init__(self, path):
+        self.path = path
+        self.tx = len(read_log(path))
+
+    def create(self, D, fact_type, fact, validate_obj=None):
+        if validate_obj is None:
+            res = system.create(D, fact_type, to_lam(fact))
+        else:
+            res = ast.run(to_lam(fact), D, validate_obj=validate_obj, cell_name=fact_type)
+        o = from_lam(_ap(_A(1), res))
+        D2 = _ap(_A(2), res)
+        # a step commits or it doesn't: ERROR answers unchanged D, and an alethic
+        # refusal commits nothing either — only a CHANGED state is a logged event
+        if o == "ERROR" or from_lam(D2) == from_lam(D):
+            return D2
+        self.tx += 1
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"tx": self.tx, "ft": fact_type, "fact": _conv(fact)},
+                               ensure_ascii=False) + "\n")
+        return D2
+
+
+def replay(D, path):
+    """Rebuild state by re-ingesting the log through the SAME create (facts are the
+    source of truth; set semantics make replay idempotent)."""
+    for entry in read_log(path):
+        D = _ap(_A(2), system.create(D, entry["ft"], to_lam(_untuple(entry["fact"]))))
+    return D

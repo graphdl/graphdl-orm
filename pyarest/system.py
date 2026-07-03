@@ -711,7 +711,10 @@ def _governed_player(D, ft):
     return None
 
 
-def create(D, fact_type, fact, fuel=None):
+_AUTH_FT = "User_is_authorized_for_Operation_on_Resource"
+
+
+def create(D, fact_type, fact, fuel=None, actor=None, operation="create"):
     """THE ORM-level entry: the caller names only the fact. Whether a machine runs is the
     ORM layer's business, read off M — when `fact_type` is some transition's trigger
     (smTrigger) and one of its players is governed (smDef plus the derived governedBy
@@ -723,6 +726,13 @@ def create(D, fact_type, fact, fuel=None):
     from . import ast
     part = rmap_partition(D)
     table = part.get(fact_type, fact_type)
+    # authorization (the access module, when ingested): the actor must hold the derived
+    # ⟨user, operation, resource⟩ where the resource is the RMAP table the write lands
+    # in; refusal answers ⟨ERROR, unchanged D⟩. Absent module: ungoverned (graceful).
+    if actor is not None and any(r and r[0] == _AUTH_FT for r in _pop_rows(D, "factType")):
+        allowed = {tuple(r) for r in _pop_rows(D, _AUTH_FT)}
+        if (actor, operation, table) not in allowed:
+            return _S(A("ERROR"), D)
     row_col = None
     if table != fact_type:
         row_col = 2 + table_columns(part, table).index(fact_type)

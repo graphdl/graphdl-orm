@@ -131,7 +131,9 @@ def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_o
             e = _S(_COMP, A(entity_role), _3)                # the addressed entity, from I
             match_e = _S(_COMP, _EQ, _S(_CONS, _S(_COMP, _1, _1), _2))    # ⟨⟨e?,s⟩, e⟩
             links_in = _S(_COMP, _S(A("ALPHA"), _1), Filter(match_e), _DISTR, _S(_CONS, snew, e))
-        parts = [P2, V, _S(_COMP, links_obj, links_in)]
+        # an entity with NO status row has no machine controls: links = φ, never ⊥
+        parts = [P2, V, _S(_COND, _S(_COMP, _NULL, links_in), _S(_CONST, PHI),
+                           _S(_COMP, links_obj, links_in))]
     if mealy_obj is not None and machine is not None:        # Mealy: the fired transitions'
         parts.append(_S(_COMP, mealy_obj, _S(_CONS, spop, P2, _2)))   # emissions, last part of o
     o = _S(_CONS, *parts)                                    # o = ⟨P'', V⟩ or ⟨P'', V, links⟩ (hateoas)
