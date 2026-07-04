@@ -1,9 +1,9 @@
 """The MCP binding (the swap contract, part 2): the old engine's daily-driver
 surface served over the Model Context Protocol's stdio transport, newline-delimited
 JSON-RPC 2.0, in the stdlib only — a platform binding in the paper's sense (a
-server registers its functions; the engine does not change). v1 carries the
-orientation and apps family plus the read tools; the mutation tools (apply,
-retract, context receipts) land with the write path.
+server registers its functions; the engine does not change). It carries the orientation and apps family, the read tools (query, sql),
+and the write path: apply (eq. create with the receipt) and context (the
+last mutation receipt). retract rides the same write path; the tutor/induce family follows.
 
 Run: python -m pyarest.mcp_server <apps_dir>   (or PYAREST_APPS in the env).
 """
@@ -42,6 +42,23 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "statement": {"type": "string"},
          "app": {"type": "string"}}, "required": ["statement"]}},
+    {"name": "apply",
+     "description": "Create one fact (eq. create): validate, commit iff no "
+                    "alethic violation, log, snapshot. Answers the receipt.",
+     "inputSchema": {"type": "object", "properties": {
+         "fact_type": {"type": "string"},
+         "fact": {"type": "array", "items": {"type": "string"}},
+         "app": {"type": "string"}}, "required": ["fact_type", "fact"]}},
+    {"name": "retract",
+     "description": "Logical deletion, validated: the shrunk population must "
+                    "satisfy the schema; commits as a log entry + rebuild.",
+     "inputSchema": {"type": "object", "properties": {
+         "fact_type": {"type": "string"},
+         "fact": {"type": "array", "items": {"type": "string"}},
+         "app": {"type": "string"}}, "required": ["fact_type", "fact"]}},
+    {"name": "context",
+     "description": "The last mutation receipt (committed, violations).",
+     "inputSchema": {"type": "object", "properties": {}}},
 ]
 
 
@@ -56,6 +73,8 @@ def _dispatch(reg, name, args):
         return {"active_app": reg.use(args["name"])}
     if name == "apps_compile":
         return reg.compile(args["name"])
+    if name == "context":
+        return reg.last_receipt or {"note": "no mutation this session"}
     app = args.get("app") or reg.current()
     if not app:
         raise ValueError("no app given and no active app set (apps_use first)")
@@ -64,6 +83,10 @@ def _dispatch(reg, name, args):
                 "rows": reg.query(app, args["fact_type"])}
     if name == "sql":
         return {"app": app, "rows": reg.sql(app, args["statement"])}
+    if name == "apply":
+        return reg.apply(app, args["fact_type"], args["fact"])
+    if name == "retract":
+        return reg.retract(app, args["fact_type"], args["fact"])
     raise ValueError(f"unknown tool {name!r}")
 
 

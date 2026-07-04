@@ -19,6 +19,7 @@ _MARKER = ".pyarest-active-app"
 class Registry:
     def __init__(self, apps_dir):
         self.root = os.path.abspath(apps_dir)
+        self.last_receipt = None                              # the context tool replays it
 
     # ---- inventory ----
     def _app_dir(self, name):
@@ -63,14 +64,102 @@ class Registry:
             return None
         return open(p, encoding="utf-8").read().strip() or None
 
-    # ---- compile: readings -> M -> lfp -> snapshot ----
+    def _log(self, name):
+        return os.path.join(self._app_dir(name), f"{name}.events.jsonl")
+
+    # ---- compile: readings -> M -> lfp -> replay -> snapshot ----
     def compile(self, name):
         texts = [open(p, encoding="utf-8").read() for p in self._readings(name)]
         D, rep = forml.compile_model("\n\n".join(texts))
         D = system.run_rules(D)
+        # the event log replays through the SAME create (facts are the source of
+        # truth; the .db is disposable, set semantics make replay idempotent)
+        if os.path.exists(self._log(name)):
+            D = persist.replay(D, self._log(name))
+            D = system.run_rules(D)
         persist.save_sqlite(D, self._db(name))
         rep["app"] = name
         return rep
+
+    # ---- the write side: eq. create against the app's store ----
+    def apply(self, name, fact_type, fact):
+        """One create against the app's store: validate over the derived candidate,
+        commit iff no alethic violation (eq. create), append the committed step to
+        the event log (a refusal appends nothing), snapshot, and answer the RECEIPT:
+        committed, the violation set, and the representation parts."""
+        from .lam import to_lam, from_lam, atom as _A
+        from .reduce import apply as _ap
+        D = self._load(name)
+        row = tuple(fact)
+        res = system.create(D, fact_type, to_lam(row))
+        o = from_lam(_ap(_A(1), res))
+        D2 = _ap(_A(2), res)
+        refused = o == "ERROR" or from_lam(D2) == from_lam(D)
+        violations = []
+        if isinstance(o, tuple) and len(o) >= 2 and isinstance(o[1], tuple):
+            violations = [list(v) for v in o[1]]
+        elif refused:
+            # create answers the bare ERROR atom on an alethic refusal; the receipt
+            # still owes the offenders (Def. Violation: the message is V), so run
+            # the validate over the candidate population directly
+            from . import defs
+            import pyarest.lam as L
+            val = forml.validate_for(fact_type, D, system.rmap_partition(D))
+            cand = tuple(tuple(r) for r in system._pop_rows(D, fact_type)) + (row,)
+            pair = L.SEQ(L.CONS(to_lam(cand))(L.CONS(D)(L.NIL)))
+            with defs.step(D):
+                _p, v, _f = from_lam(_ap(val, pair))
+            violations = [list(x) if isinstance(x, tuple) else [x] for x in v]
+        if not refused:
+            D2 = system.run_rules(D2, changed=[fact_type])
+            with open(self._log(name), "a", encoding="utf-8") as f:
+                f.write(json.dumps({"ft": fact_type, "fact": list(row)},
+                                   ensure_ascii=False) + "\n")
+            persist.save_sqlite(D2, self._db(name))
+        receipt = {"app": name, "fact_type": fact_type, "fact": list(row),
+                   "committed": not refused, "violations": violations}
+        self.last_receipt = receipt
+        return receipt
+
+    def retract(self, name, fact_type, fact):
+        """Logical deletion, validated: the SHRUNK candidate population must satisfy
+        the schema (a retract can violate mandatory and frequency lower bounds, so
+        it refuses exactly like a create — Def. Violation is direction-blind). On
+        commit the retraction is a LOG entry and the store rebuilds through compile,
+        so derived rows recompute from scratch (the supersession discipline)."""
+        from .lam import to_lam, from_lam
+        from .reduce import apply as _ap
+        from . import defs
+        import pyarest.lam as L
+        D = self._load(name)
+        row = tuple(fact)
+        pop = {tuple(r) for r in system._pop_rows(D, fact_type)}
+        if row not in pop:
+            receipt = {"app": name, "fact_type": fact_type, "fact": list(row),
+                       "committed": False, "violations": [],
+                       "note": "no such fact"}
+            self.last_receipt = receipt
+            return receipt
+        cand = tuple(sorted(pop - {row}))
+        val = forml.validate_for(fact_type, D, system.rmap_partition(D))
+        pair = L.SEQ(L.CONS(to_lam(cand))(L.CONS(D)(L.NIL)))
+        with defs.step(D):
+            _p, v, flag = from_lam(_ap(val, pair))
+        if flag == "T":
+            receipt = {"app": name, "fact_type": fact_type, "fact": list(row),
+                       "committed": False,
+                       "violations": [list(x) if isinstance(x, tuple) else [x]
+                                      for x in v]}
+            self.last_receipt = receipt
+            return receipt
+        with open(self._log(name), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"op": "retract", "ft": fact_type,
+                                "fact": list(row)}, ensure_ascii=False) + "\n")
+        self.compile(name)                                    # rebuild: log applied
+        receipt = {"app": name, "fact_type": fact_type, "fact": list(row),
+                   "committed": True, "violations": []}
+        self.last_receipt = receipt
+        return receipt
 
     # ---- reads ----
     def _load(self, name):

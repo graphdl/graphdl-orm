@@ -172,7 +172,16 @@ class JsonlLog:
 
 def replay(D, path):
     """Rebuild state by re-ingesting the log through the SAME create (facts are the
-    source of truth; set semantics make replay idempotent)."""
+    source of truth; set semantics make replay idempotent). A retract entry removes
+    its row from the base population; derived rows recompute in the caller's
+    run_rules pass after replay."""
     for entry in read_log(path):
+        if entry.get("op") == "retract":
+            ft = entry["ft"]
+            row = _untuple(entry["fact"])
+            rows = tuple(t for t in (tuple(r) for r in system._pop_rows(D, ft))
+                         if t != row)
+            D = _ap(ast.Store(ft), to_lam(rows) if False else _S(to_lam(rows), D))
+            continue
         D = _ap(_A(2), system.create(D, entry["ft"], to_lam(_untuple(entry["fact"]))))
     return D
