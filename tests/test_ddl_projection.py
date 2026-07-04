@@ -82,10 +82,15 @@ def test_a_roleless_fact_type_is_skipped_not_malformed_sql():
     # projection must skip it with a named None count, never emit
     # 'CREATE TABLE x (, PRIMARY KEY ())'
     D, rep = forml.compile_model(MODEL + "\nwidgets frob gadgets.\n")
+    # the selfhost default REPORTS the degenerate (no fields, no
+    # classification, decline tracking) instead of recording a roleless fact
+    # type: strictly safer, same guarantee below (no malformed SQL, ever)
+    flagged = rep["unparsed"] + rep.get("prose", [])
+    assert any("widgets frob gadgets" in s for s in flagged)
     D = system.run_rules(D)
     con = sqlite3.connect(":memory:")
     counts = ddl.project(D, con)
-    assert counts.get("widgets_frob_gadgets", "absent") is None
+    assert counts.get("widgets_frob_gadgets", "absent") in (None, "absent")
     tables = {r[0] for r in con.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     assert "widgets_frob_gadgets" not in tables

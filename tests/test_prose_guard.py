@@ -18,8 +18,12 @@ Task has Task Subject.
 Once the engine surfaces user-domain facts via MCP query (issue 821), the Task Readiness derivation fires after every Task mutation.
 """
     D, rep = forml.compile_model(model)
-    assert len(rep["unparsed"]) == 1
-    assert "Once the engine" in rep["unparsed"][0]
+    # the selfhost default REFINES the seed's contract: a paragraph is
+    # CLASSIFIED prose (the grammar rule), reported in its own list, and
+    # still declares nothing
+    flagged = rep["unparsed"] + rep.get("prose", [])
+    assert len(flagged) == 1
+    assert "Once the engine" in flagged[0]
     fts = [f[0] for f in system._pop_rows(D, "factType")]
     assert not [ft for ft in fts if "Once" in ft or "MCP" in ft]
 
@@ -58,7 +62,8 @@ Hypothesis is an entity type.
 The surface trigger is EXISTENTIAL: once any Hypothesis is disproven, the substrate flags iff the Task warrants it.
 """
     D, rep = forml.compile_model(model)
-    assert len(rep["unparsed"]) == 1
+    flagged = rep["unparsed"] + rep.get("prose", [])
+    assert len(flagged) == 1
     assert rep["rule_diagnostics"] == []
     assert not [f[0] for f in system._pop_rows(D, "factType")
                 if "surface" in f[0].lower()]

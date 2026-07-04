@@ -29,7 +29,7 @@ Verb is a value type.
 Trailing Marker is a value type.
   The possible values of Trailing Marker are 'is an entity type', 'is a value type', 'is abstract', 'is acyclic', 'is asymmetric', 'is antisymmetric', 'is intransitive', 'is irreflexive', 'is reflexive', 'is symmetric', 'is transitive', 'are mutually exclusive', 'is partitioned into', 'is a subtype of'.
 Quantifier is a value type.
-  The possible values of Quantifier are 'each', 'at most one', 'at least one', 'exactly one', 'some', 'no', 'at most', 'at least'.
+  The possible values of Quantifier are 'each', 'at most one', 'at least one', 'exactly one', 'some', 'no', 'at most', 'at least', 'more than one'.
 Prose Stopword is a value type.
   The possible values of Prose Stopword are 'If', 'When', 'Then', 'That', 'This', 'An', 'A', 'The', 'Each', 'Some', 'No', 'Every'.
 Constraint Span Prefix is a value type.
@@ -71,7 +71,7 @@ Quote Escape is a value type.
 Universal Quantifier Keyword is a value type.
   The possible values of Universal Quantifier Keyword are 'for each ', 'given any ', 'every ', 'each '.
 Extraction Clause Keyword is a value type.
-  The possible values of Extraction Clause Keyword are ' is extracted from ', ' is derived from '.
+  The possible values of Extraction Clause Keyword are 'is extracted from', 'is derived from'.
 Noun Has Noun Literal Keyword is a value type.
   The possible values of Noun Has Noun Literal Keyword are ' has '.
 Entity Ref Scheme Literal Keyword is a value type.
@@ -100,6 +100,16 @@ Deontic Constraint Kind Code is a value type.
   The possible values of Deontic Constraint Kind Code are 'UC', 'UC', 'UC'.
 Deontic Constraint Modality is a value type.
   The possible values of Deontic Constraint Modality are 'deontic', 'deontic', 'deontic'.
+Disjunction is a value type.
+  The possible values of Disjunction are 'or'.
+Consequence is a value type.
+  The possible values of Consequence are 'then'.
+Relative Pronoun is a value type.
+  The possible values of Relative Pronoun are 'who'.
+Data Type Prefix is a value type.
+  The possible values of Data Type Prefix are 'Data Type:'.
+Objectification Prefix is a value type.
+  The possible values of Objectification Prefix are 'This association with'.
 Cardinality Constraint Kind is a value type.
   The possible values of Cardinality Constraint Kind are 'Frequency Constraint', 'Uniqueness Constraint', 'Mandatory Role Constraint'.
 Cardinality Constraint Kind Code is a value type.
@@ -126,6 +136,12 @@ Statement has Derivation Marker.
 Statement has Literal Role.
 Statement has Keyword.
 Statement has Prose Punctuation.
+Statement has Disjunction.
+Statement has Consequence.
+Statement has Extraction Clause Keyword.
+Statement has Relative Pronoun.
+Statement has Data Type Prefix.
+Statement has Objectification Prefix.
 Statement has Deontic Operator.
 Statement has Enum Value.
 Statement has Constraint Keyword.
@@ -171,8 +187,12 @@ Classification 'Derivation Rule' has Translator 'translate_derivation_rules'.
 Classification 'Uniqueness Constraint' has Translator 'translate_cardinality_constraints'.
 Classification 'Mandatory Role Constraint' has Translator 'translate_cardinality_constraints'.
 Classification 'Frequency Constraint' has Translator 'translate_cardinality_constraints'.
+Classification 'Disjunctive Mandatory Constraint' has Translator 'translate_cardinality_constraints'.
+Classification 'Subset Constraint' has Translator 'translate_set_constraints'.
+Classification 'Objectification' has Translator 'translate_objectifications'.
 Classification 'Ring Constraint' has Translator 'translate_ring_constraints'.
 Classification 'Subset Constraint' has Translator 'translate_set_constraints'.
+Classification 'Objectification' has Translator 'translate_objectifications'.
 Classification 'Equality Constraint' has Translator 'translate_set_constraints'.
 Classification 'Exclusion Constraint' has Translator 'translate_set_constraints'.
 Classification 'Exclusive-Or Constraint' has Translator 'translate_set_constraints'.
@@ -196,8 +216,12 @@ Classification 'Instance Fact' is a Classification.
 Classification 'Uniqueness Constraint' is a Classification.
 Classification 'Mandatory Role Constraint' is a Classification.
 Classification 'Frequency Constraint' is a Classification.
+Classification 'Disjunctive Mandatory Constraint' is a Classification.
+Classification 'Subset Constraint' is a Classification.
+Classification 'Objectification' is a Classification.
 Classification 'Value Constraint' is a Classification.
 Classification 'Subset Constraint' is a Classification.
+Classification 'Objectification' is a Classification.
 Classification 'Equality Constraint' is a Classification.
 Classification 'Exclusion Constraint' is a Classification.
 Classification 'Exclusive-Or Constraint' is a Classification.
@@ -255,6 +279,16 @@ Statement has Classification 'Mandatory Role Constraint' iff Statement has Quant
 
 Statement has Classification 'Mandatory Role Constraint' iff Statement has Quantifier 'some'.
 
+Statement has Classification 'Uniqueness Constraint' iff Statement has Quantifier 'more than one'.
+Statement has Classification 'Disjunctive Mandatory Constraint' iff Statement has Quantifier 'each' and Statement has Disjunction 'or'.
+Statement has Classification 'Subset Constraint' iff Statement has Keyword 'if' and Statement has Consequence 'then'.
+Statement has Classification 'Derivation Rule' iff Statement has Extraction Clause Keyword 'is derived from'.
+Statement has Classification 'Derivation Rule' iff Statement has Extraction Clause Keyword 'is extracted from'.
+Statement has Classification 'Derivation Rule' iff Statement has Quantifier 'each' and Statement has Relative Pronoun 'who'.
+Statement has Classification 'Data Type Declaration' iff Statement has Data Type Prefix 'Data Type:'.
+Statement has Classification 'Objectification' iff Statement has Objectification Prefix 'This association with'.
+Statement has Classification 'Frequency Constraint' iff Statement has Quantifier 'each' and Statement has Quantifier 'at most'.
+Statement has Classification 'Frequency Constraint' iff Statement has Quantifier 'each' and Statement has Quantifier 'at least'.
 Statement has Classification 'Frequency Constraint' iff Statement has Quantifier 'at most' and Statement has Quantifier 'at least'.
 
 Statement has Classification 'Ring Constraint' iff Statement has Trailing Marker 'is irreflexive'.

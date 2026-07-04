@@ -1425,9 +1425,15 @@ def _stmt_translator_impl(kinds):
             from .lam import atom as _A, from_lam as _fl
             stmt = _fl(_apply(_A(1), operand))
             mod = _fl(_apply(_A(2), operand)) or None
-            names, subs, fts = _fl(_apply(_A(3), operand))
+            unpacked = _fl(_apply(_A(3), operand))
+            names, subs, fts = unpacked[0], unpacked[1], unpacked[2]
+            # the PLAIN set rides the seam too: a head the model declares
+            # plainly must not earn the rule's derivation kind (the storage
+            # kind belongs to the reading; over-marking feeds the sweep)
+            plain = unpacked[3] if len(unpacked) > 3 else ()
             D = _apply(_A(4), operand)
-            known = _Known(names, {s: tuple(a) for (s, a) in subs}, set(fts))
+            known = _Known(names, {s: tuple(a) for (s, a) in subs}, set(fts),
+                           set(plain))
             for kind in kinds:
                 mm = next((p.match(stmt) for p in _productions().get(kind, ())
                            if p.match(stmt)), None)
@@ -1466,7 +1472,9 @@ def register_translators():
         ("translate_cardinality_constraints", ["uniqueness", "inverse_uc",
                                                "spanning_uc", "spanning_uc2",
                                                "frequency",
-                                               "neg_uniqueness", "mandatory",
+                                               "neg_uniqueness",
+                                               "disjunctive_mandatory",
+                                               "mandatory",
                                                "for_each_mandatory",
                                                "neg_mandatory"]),
         ("translate_ring_constraints", ["ring"]),
@@ -1477,6 +1485,7 @@ def register_translators():
                                       "sm_trigger", "sm_guard", "sm_emit",
                                       "sm_moore"]),
         ("translate_finality", ["finality"]),
+        ("translate_objectifications", ["objectification"]),
         ("translate_negation", ["neg_pair", "negation"]),
     ):
         register(name, _stmt_translator_impl(kinds))
@@ -1493,7 +1502,11 @@ def grammar_D():
     if "D" not in _GRAMMAR_CACHE:
         from . import persist, paths, system as _sys
         p = paths.shared("forml2-grammar.md")
-        _GRAMMAR_CACHE["D"] = persist.ingest_frozen(open(p, encoding="utf-8").read())
+        # the grammar BOOTSTRAPS through the seed compiler by definition
+        # (Stage-1 is the bootstrap kernel): routing it through the selfhost
+        # default would need grammar_D inside its own construction
+        _GRAMMAR_CACHE["D"] = persist.ingest_frozen(
+            open(p, encoding="utf-8").read(), compiler=_compile_model_seed)
         _sys.rebuild_class_twins(_GRAMMAR_CACHE["D"])        # twins from classSpec
     return _GRAMMAR_CACHE["D"]
 
@@ -1524,7 +1537,8 @@ def compile_model_selfhost(text, D=None, context_from=None):
     known = _Known(names, subs, fts, plain)
     ctx = to_lam((tuple(sorted(names)),
                   tuple(sorted((s, tuple(sorted(a))) for s, a in subs.items())),
-                  tuple(sorted(fts))))
+                  tuple(sorted(fts)),
+                  tuple(sorted(plain))))
     if D is None:
         D = meta.initial_D()
     unclassified = []
@@ -1538,7 +1552,11 @@ def compile_model_selfhost(text, D=None, context_from=None):
     prose = []
     all_cls = classify_all_via_M(gD, [w[2] for w in work], nouns=known)
     for (stmt, mod, inner), cls in zip(work, all_cls):
-        if "Prose" in cls and not (cls - {"Prose"} - _GENERIC_CLASSIFICATIONS):
+        if "Prose" in cls and not (cls - {"Prose"} - _GENERIC_CLASSIFICATIONS
+                                   - {"Derivation Rule"}):
+            # Prose beats the generics AND the rule claim (the seed's
+            # prose-suspect guard on rule heads: a real rule head is a reading
+            # and never carries the prose punctuation)
             # Prose beats the GENERIC fallbacks only (the seed guard's exact
             # semantics): an enum's separator commas or a spanning form's
             # clause comma carry real recognizer classifications and proceed
@@ -1567,6 +1585,23 @@ def compile_model_selfhost(text, D=None, context_from=None):
 
 
 def compile_model(text, D=None, context_from=None):
+    """Compile a whole NORMA verbalization into M. THE DEFAULT IS THE SELF-HOST
+    (Samuel's flip call, 2026-07-04, with the fleet differential as acceptance):
+    the grammar file classifies, the Classification-has-Translator table
+    dispatches, and the seed's regex arbitration survives only behind
+    PYAREST_SEED=1 as the migration escape hatch until its deletion. The report
+    keeps the seed's contract: total, kinds, unparsed, rule_diagnostics."""
+    import os
+    if not os.environ.get("PYAREST_SEED"):
+        D2, rep = compile_model_selfhost(text, D=D, context_from=context_from)
+        diags = [tuple(r) for r in system._pop_rows(D2, "ruleDiag")]
+        return D2, {"total": len(statements(text)), "kinds": {},
+                    "unparsed": rep["unclassified"], "prose": rep["prose"],
+                    "rule_diagnostics": diags}
+    return _compile_model_seed(text, D=D, context_from=context_from)
+
+
+def _compile_model_seed(text, D=None, context_from=None):
     """Fold `compile` over a whole NORMA verbalization into M (two-pass). Returns
     (D, report). With `context_from`, the known context seeds from that store —
     compile the app's statements ATOP a preloaded base whose types, subtypes and

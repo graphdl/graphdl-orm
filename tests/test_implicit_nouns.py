@@ -102,6 +102,7 @@ Once the engine surfaces user-domain facts via MCP query (issue 821), the Task R
     D, rep = forml.compile_model(model)
     # the prose paragraph stays unparsed; no 'MCP' or 'Task Readiness' or
     # 'Frontier' noun appears from prose or quoted literals
-    assert len(rep["unparsed"]) == 1
+    flagged = rep["unparsed"] + rep.get("prose", [])
+    assert len(flagged) == 1
     nouns = {r[0] for r in system._pop_rows(D, "instanceOf")}
     assert not {"MCP", "Task Readiness", "Frontier", "Familiar Name"} & nouns

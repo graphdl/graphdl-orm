@@ -112,7 +112,7 @@ def _engine_fingerprint():
     return _ENGINE_FP[0]
 
 
-def ingest_frozen(text, cache_dir=None):
+def ingest_frozen(text, cache_dir=None, compiler=None):
     """Compile `text` THROUGH the local persistence model: the compiled D freezes to a
     content-keyed sqlite snapshot, and the same text thereafter THAWS from disk instead
     of re-ingesting (definitions are data, so the snapshot carries the rules). The key
@@ -127,7 +127,7 @@ def ingest_frozen(text, cache_dir=None):
     snap = os.path.join(d, f"ingest-{key}.sqlite")
     if os.path.exists(snap):
         return load_sqlite(snap)
-    D = forml.compile_model(text)[0]
+    D = (compiler or forml.compile_model)(text)[0]
     os.makedirs(d, exist_ok=True)
     tmp = snap + f".tmp{os.getpid()}"
     save_sqlite(D, tmp)

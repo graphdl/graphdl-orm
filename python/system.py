@@ -540,7 +540,7 @@ def run_rules(D, changed=None, stats=None):
                 return True
             return bool(read_set & dirty) or bool(read_set & round_changed)
         for (rid, head) in agg_rules:
-            if _outer and not _touched(reads.get(rid, set())):
+            if (_outer or dirty is not None) and not _touched(reads.get(rid, set())):
                 continue
             with defs.step(D):
                 out = from_lam(_ap(_A(rid), D))
@@ -554,7 +554,7 @@ def run_rules(D, changed=None, stats=None):
                     round_changed.add(head)
                     D = _ap(ast.Store(head), _S(to_lam(_rowsort(merged)), D))
         for head in sorted(keyed_of):
-            if _outer and not _touched(
+            if (_outer or dirty is not None) and not _touched(
                     {ft for rid in keyed_of[head] for ft in reads.get(rid, set())}):
                 continue
             key_pos = sorted(keyspans[head])
