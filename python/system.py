@@ -73,22 +73,19 @@ def validate_modal(pairs, scoped_pairs=()):
 
 # --- derive = lfp(F_S): the immediate-consequence operator iterated to a fixed point ---
 def F_of(rules):
-    """One round: F_S(P) = P ∪ ⋃_rules rule(P), with set semantics (dedup ∘ flatten ∘ [id, rules])."""
-    if not rules:
-        return _ID
-    body = _S(_CONS, _ID, *rules)                            # ⟨P, rule1(P), …, rulen(P)⟩
-    return _S(_COMP, T.dedup, T.flatten, body)               # dedup(P ++ the derived heads)
+    """One round: F_S(P) = P ∪ ⋃_rules rule(P) (the canonical system:F_of applied
+    to the rule sequence; empty rules answer the identity)."""
+    from .reduce import apply as _apply
+    return _apply(A("system:F_of"), _S(*rules) if rules else _S())
 
 
 def derive_of(rules):
-    """derive_S = lfp(F_S, ·): Backus `while` iterating F_S until (F_S:P) ∖ P = φ. Pass only the
-    frontier's affected rules to keep the lfp bounded to the touched fragment (Cor. streaming)."""
-    if not rules:
-        return _ID
-    F = F_of(rules)
-    new = _S(_COMP, T.setminus, _S(_CONS, F, _ID))          # (F:P) ∖ P — the newly derived facts
-    grows = _S(_COMP, A("not"), A("null"), new)              # still deriving something?
-    return _S(_WHILE, grows, F)
+    """derive_S = lfp(F_S, ·): Backus `while` iterating F_S until (F_S:P) ∖ P = φ
+    (the canonical system:derive_of applied to the rule sequence). Pass only the
+    frontier's affected rules to keep the lfp bounded to the touched fragment
+    (Cor. streaming)."""
+    from .reduce import apply as _apply
+    return _apply(A("system:derive_of"), _S(*rules) if rules else _S())
 
 
 # --- role-path -> F_S: a derivation rule is a Datalog rule q(..) <- p1(..), .., pm(..) (ORM ->
@@ -99,15 +96,20 @@ def join_rule(join_role, head_cols):
     """A two-atom SELF-referential role-path rule over one fact type: join the fact type to itself
     on `join_role` (R.join_role = R'.1) and project to `head_cols`. This is the recursive body,
     e.g. ancestor(x,z) <- link(x,y), ancestor(y,z) with head_cols=[1,3], join_role=2 — feed it to
-    derive_of for the least fixed point (transitive closure). rule:P = Project ∘ NatJoin ∘ [id,id]."""
-    return _S(_COMP, T.Project(head_cols), T.NatJoin(join_role), _S(_CONS, _ID, _ID))
+    derive_of for the least fixed point (transitive closure). The canonical
+    system:join_rule applied to ⟨join_role, head_cols⟩."""
+    from .lam import to_lam
+    from .reduce import apply as _apply
+    return _apply(A("system:join_rule"), to_lam((join_role, tuple(head_cols))))
 
 
 def join_rule2(join_role, head_cols):
     """A two-atom role-path rule over two fact types: input ⟨A, B⟩; join A.join_role = B.1 and
     project to head_cols over the combined tuple (e.g. FastCarDriver(x) <- drives(x,y), isFast(y)).
-    rule:⟨A,B⟩ = Project ∘ NatJoin."""
-    return _S(_COMP, T.Project(head_cols), T.NatJoin(join_role))
+    The canonical system:join_rule2 applied to ⟨join_role, head_cols⟩."""
+    from .lam import to_lam
+    from .reduce import apply as _apply
+    return _apply(A("system:join_rule2"), to_lam((join_role, tuple(head_cols))))
 
 
 # the storage half of a NORMA */**/+/++ marker: whether the derived facts are materialized (stored)
@@ -123,22 +125,19 @@ def materialize(marker):
 
 
 # --- resolve with auto-counter minting (Def. Command: mint iff the ref scheme auto-generates) ---
-_max2 = _S(_COND, _S(_COMP, A("ge"), _S(_CONS, _1, _2)), _1, _2)   # the larger of a pair
-
-
 def mint_next(col):
     """P ↦ 1 + the greatest value in column `col` of P (or 1 if empty): the auto-counter's
-    next id — successor of a max-fold over the id column (one surrogate per guarded step)."""
-    biggest = _S(_COMP, _S(_INSERT, _max2), _S(_ALPHA, A(col)))
-    succ = _S(_COMP, A("+"), _S(_CONS, biggest, _S(_CONST, A(1))))
-    return _S(_COND, A("null"), _S(_CONST, A(1)), succ)      # empty → 1 ; else max+1
+    next id — successor of a max-fold over the id column (one surrogate per guarded
+    step). The canonical system:mint_next applied to the column selector."""
+    from .reduce import apply as _apply
+    return _apply(A("system:mint_next"), A(col))
 
 
 def resolve_minting(col):
-    """resolve for an auto-generating entity: mint the next id and prepend ⟨id, …I⟩ to P."""
-    minted = _S(_COMP, mint_next(col), _2)                   # ⟨I,P⟩ → the fresh id (from P)
-    fact = _S(_COMP, _APNDL, _S(_CONS, minted, _1))          # ⟨id, …I⟩
-    return _S(_COMP, _APNDL, _S(_CONS, fact, _2))            # ⟨fact, …P⟩
+    """resolve for an auto-generating entity: mint the next id and prepend ⟨id, …I⟩
+    to P. The canonical system:resolve_minting applied to the column selector."""
+    from .reduce import apply as _apply
+    return _apply(A("system:resolve_minting"), A(col))
 
 
 # --- emit: HATEOAS — the representation carries its own links (Thm. hateoas) ---
@@ -589,26 +588,18 @@ def run_rules(D, changed=None, stats=None):
 
 # --- the state machine read off M (whitepaper §1): a machine IS a set of facts ---
 # smFrom ⟨t, from⟩ ⋈ smTrigger ⟨t, trigger⟩ ⋈ smTo ⟨t, to⟩, projected to ⟨from, trigger, to⟩ —
-# assembling the machine is a theta1 join over M's cells, not a second interpreter.
-def _sm_join():
-    j1 = _S(_COMP, T.NatJoin(1), _S(_CONS, _1, _2))          # ⟨t, from, trigger⟩
-    j2 = _S(_COMP, T.NatJoin(1), _S(_CONS, j1, A(3)))        # ⟨t, from, trigger, to⟩
-    return _S(_COMP, T.Project([2, 3, 4]), j2)
-
-
+# assembling the machine is a theta1 join over M's cells (the canonical defs
+# system:sm_join / system:sm_join_named), not a second interpreter. The host
+# only fetches and converts: the thin-runner posture, per the Operating Rule
+# defs-override-glue-framework.
 def sm_triples(D):
     """The machine's ⟨from, trigger, to⟩ triples, joined from M's smFrom/smTrigger/smTo
-    cells by the theta1 expression above (host code only fetches and converts)."""
+    cells by the canonical system:sm_join."""
     from . import ast
     from .reduce import apply as _ap
     from .lam import from_lam
     pops = _S(*[_ap(ast.FetchPop(n), D) for n in ("smFrom", "smTrigger", "smTo")])
-    return tuple(from_lam(_ap(_sm_join(), pops)))
-
-
-def _sm_join_named():
-    j1 = _S(_COMP, T.NatJoin(1), _S(_CONS, _1, _2))          # ⟨t, from, trigger⟩
-    return _S(_COMP, T.NatJoin(1), _S(_CONS, j1, A(3)))      # ⟨t, from, trigger, to⟩
+    return tuple(from_lam(_ap(A("system:sm_join"), pops)))
 
 
 def sm_triples_named(D):
@@ -618,7 +609,7 @@ def sm_triples_named(D):
     from .reduce import apply as _ap
     from .lam import from_lam
     pops = _S(*[_ap(ast.FetchPop(n), D) for n in ("smFrom", "smTrigger", "smTo")])
-    return tuple(from_lam(_ap(_sm_join_named(), pops)))
+    return tuple(from_lam(_ap(A("system:sm_join_named"), pops)))
 
 
 def machine_for(D, noun):
