@@ -13,13 +13,14 @@
        of a varargs method call by BYTE CONCATENATION (prefix + file + suffix),
        never parsing. The same bytes CPython execs and rustc tokenizes. -->
   <Target Name="WrapCanon" BeforeTargets="CoreCompile"
-          Inputs="../shared/theta.py;../shared/constraints.py;../shared/ast.py;../shared/system.py"
+          Inputs="../shared/theta.py;../shared/constraints.py;../shared/ast.py;../shared/system.py;../shared/scenarios.py"
           Outputs="$(IntermediateOutputPath)Canon.g.cs">
     <PropertyGroup>
       <CanonTheta>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/theta.py'))</CanonTheta>
       <CanonConstraints>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/constraints.py'))</CanonConstraints>
       <CanonAst>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/ast.py'))</CanonAst>
       <CanonSystem>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/system.py'))</CanonSystem>
+      <CanonScenarios>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/scenarios.py'))</CanonScenarios>
       <CanonWrapped>namespace Arestlam%3B
 
 static partial class Canon
@@ -38,6 +39,10 @@ $(CanonAst)
 
     static object LoadSystem() =&gt; T
 $(CanonSystem)
+%3B
+
+    internal static object LoadScenarios() =&gt; T
+$(CanonScenarios)
 %3B
 }
 </CanonWrapped>

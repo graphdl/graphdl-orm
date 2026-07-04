@@ -12,6 +12,10 @@ static class Program
         if (ReferenceEquals(o, Bot.Value)) return "⊥";
         if (o is object[] s) return "(" + string.Join(", ", s.Select(Show)) + ")";
         if (o is string str) return "'" + str + "'";
+        if (o is double d)
+            // Python repr: a whole double still shows its .0
+            return d == Math.Floor(d) && !double.IsInfinity(d)
+                ? d.ToString("0.0") : d.ToString();
         return o.ToString() ?? "null";
     }
 
@@ -44,6 +48,17 @@ static class Program
             Reducer.Mu(Reducer.App("system:derive_of", Seq(rule))),
             Seq(Seq("a", "b"), Seq("b", "c"), Seq("c", "d"))));
         Console.WriteLine($"closure={Show(closure)}");
+
+        // the cross-host case table (shared/scenarios.py): each case is
+        // ⟨expr, operand⟩; reduce and print for the differential
+        Canon.Defs.Clear();
+        Canon.LoadScenarios();
+        foreach (var kv in Canon.Defs.ToList())
+        {
+            var pair = (object[])kv.Value;
+            var got = Reducer.Mu(Reducer.App(pair[0], pair[1]));
+            Console.WriteLine($"{kv.Key}={Show(got)}");
+        }
         return 0;
     }
 }

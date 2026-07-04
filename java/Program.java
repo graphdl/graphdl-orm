@@ -48,5 +48,13 @@ public class Program {
             Reducer.mu(Reducer.app("system:derive_of", seq(rule))),
             seq(seq("a", "b"), seq("b", "c"), seq("c", "d"))));
         System.out.println("closure=" + show(closure));
+
+        // the cross-host case table (shared/scenarios.py): each case is
+        // a pair of expr and operand; reduce and print for the differential
+        for (Object[] kv : Canon.loadScenarioDefs()) {
+            Object[] pair = (Object[]) kv[1];
+            Object got = Reducer.mu(Reducer.app(pair[0], pair[1]));
+            System.out.println(kv[0] + "=" + show(got));
+        }
     }
 }

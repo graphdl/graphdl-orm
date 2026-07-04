@@ -62,3 +62,26 @@ def test_the_java_kernel_agrees_with_the_python_evaluator():
     closure = from_lam(_ap(_ap(A("system:derive_of"), SEQ(CONS(rule)(NIL))),
                            to_lam((("a", "b"), ("b", "c"), ("c", "d")))))
     assert lines["closure"] == _show(closure)
+    _assert_cases_match(lines)
+
+
+def _python_cases():
+    from pyarest import canon
+    from pyarest import reduce as _r
+    from pyarest.lam import atom as A
+    out = {}
+    for name, pair in canon.read("scenarios.py"):
+        expr = _r.apply(A(1), pair)
+        operand = _r.apply(A(2), pair)
+        got = from_lam(_r.apply(expr, operand))
+        # from_lam renders bottom as the bare character; hosts print it bare
+        out[name] = "⊥" if got == "⊥" else _show(got)
+    return out
+
+
+def _assert_cases_match(lines):
+    want = _python_cases()
+    missing = [n for n in want if n not in lines]
+    assert missing == [], f"host missing cases: {missing[:5]}"
+    diverged = {n: (lines[n], want[n]) for n in want if lines[n] != want[n]}
+    assert diverged == {}, f"cross-host divergence: {dict(list(diverged.items())[:3])}"
