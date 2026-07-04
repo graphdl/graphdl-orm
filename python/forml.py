@@ -790,14 +790,21 @@ def classify_all_via_M(D, stmts, nouns=()):
     from .reduce import apply as _apply
     from .lam import to_lam
     from . import system as _sys
-    changed = set()
+    # BATCH the asserts too: group field facts by cell and land ONE Store union
+    # per cell — the phase split measured the one-per-row applies at 2.9s of a
+    # 3.7s classification while the derive (twinned) took 0.27s
+    by_cell = {}
     for i, stmt in enumerate(stmts):
         for (ftb, row) in tokenize_statement(D, stmt, nouns, "s%d" % (i + 1)):
-            D = _apply(_A2(), ast.run(to_lam(row), D, cell_name=ftb))
-            changed.add(ftb)
-    if not changed:
+            by_cell.setdefault(ftb, []).append(tuple(row))
+    if not by_cell:
         return [set() for _ in stmts]
-    D = _sys.run_rules(D, changed=changed)
+    import pyarest.lam as _L
+    for ftb, rows in by_cell.items():
+        merged = {tuple(r) for r in _sys._pop_rows(D, ftb)} | set(rows)
+        pair = _L.SEQ(_L.CONS(to_lam(tuple(sorted(merged))))(_L.CONS(D)(_L.NIL)))
+        D = _apply(ast.Store(ftb), pair)
+    D = _sys.run_rules(D, changed=set(by_cell))
     by_sid = {}
     for r in _sys._pop_rows(D, "Statement_has_Classification"):
         if len(r) >= 2:
