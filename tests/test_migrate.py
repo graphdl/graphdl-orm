@@ -102,6 +102,32 @@ def _old_db(tmp_path):
     return p
 
 
+def test_reflection_cells_are_excluded_unless_a_rule_reads_them(tmp_path):
+    # the claude audit's performance verdict: the old engine's REFLECTION layer
+    # (Fact_is_of_Fact_Type at 1.2MB, instance-of-Noun at 480KB) migrated as
+    # data and dragged through every derive — pyarest's own compile IS the
+    # self-description, so reflection cells report instead of replay. The
+    # carve-out: a reflection cell some compiled rule READS (the base's arity
+    # rule counts Fact_Type_has_Role) stays, because live derivations feed on
+    # it.
+    reg = _mk(tmp_path)
+    p = str(tmp_path / "old3.db")
+    con = sqlite3.connect(p)
+    con.execute("CREATE TABLE cells (name TEXT PRIMARY KEY, contents TEXT)")
+    con.executemany("INSERT INTO cells VALUES (?, ?)", [
+        ("Task_has_Task_Subject",
+         "{a=<<Task, 112>, <Task Subject, Ship it>>}"),
+        ("Fact_is_of_Fact_Type",
+         "{x=<<Fact, f1>, <Fact Type, Task_has_Task_Subject>>}"),
+    ])
+    con.commit()
+    con.close()
+    report = migrate.replay_into(reg, "board", p)
+    assert report["migrated"].get("Task_has_Task_Subject") == 1
+    assert "Fact_is_of_Fact_Type" not in report["migrated"]
+    assert "Fact_is_of_Fact_Type" in report["reflection"]
+
+
 def test_the_report_audits_mis_authored_content(tmp_path):
     # old-app readings are known to be mis-authored in places: prose crammed
     # into values, enum members, or ids. The migration FLAGS these (deontic:

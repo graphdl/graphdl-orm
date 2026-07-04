@@ -324,6 +324,16 @@ def compile_agg_rule(atom_fts, group_positions, over_position, op,
 rule_twins = {}
 
 
+def _rowsort(rows):
+    """Deterministic row ordering that survives MIXED-TYPE cells: a migrated
+    lexical row ('150') and a coerced-arithmetic derivation (150) coexist under
+    NATEQ, and bare sorted() has no int-str ordering (the claude rehearsal
+    crashed exactly there). Type name then lexical value, per element."""
+    return tuple(sorted(rows, key=lambda r: tuple(
+        (type(x).__name__, str(x)) for x in r) if isinstance(r, tuple)
+        else ((type(r).__name__, str(r)),)))
+
+
 def rebuild_class_twins(D):
     """Reconstruct class-rule twins from the store's classSpec facts:
     ⟨rid, field_ft, literal-or-empty, head-classification⟩ per clause. The twin
@@ -375,6 +385,7 @@ def run_rules(D, changed=None, stats=None):
     all_rules = [(r[0], r[1]) for r in _pop_rows(D, "ruleDerives")]
     rules = [(rid, h) for (rid, h) in all_rules if rid not in aggids]
     frontier = None if changed is None else set(changed)
+    closure_changed = set()
     delta, rnd = None, 0
     while True:
         rnd += 1
@@ -399,7 +410,7 @@ def run_rules(D, changed=None, stats=None):
                 if hits:
                     new_rows = set()
                     for (p, ft) in hits:
-                        drows = tuple(sorted(delta[ft]))
+                        drows = _rowsort(delta[ft])
                         with defs.step(D):
                             o = from_lam(_ap(_A(f"{rule_cid}~d{p}"), _S(to_lam(drows), D)))
                         if isinstance(o, tuple):
@@ -425,22 +436,154 @@ def run_rules(D, changed=None, stats=None):
             old = {tuple(r) for r in _pop_rows(D, head)}
             add = new_rows - old
             if add:
-                D = _ap(ast.Store(head), _S(to_lam(tuple(sorted(old | add))), D))
+                D = _ap(ast.Store(head), _S(to_lam(_rowsort(old | add)), D))
                 fired = True
                 next_delta.setdefault(head, set()).update(add)
         if not fired:
             break
         delta = next_delta
-    # the aggregate stratum: above the positive closure, heads REPLACED (functional
-    # per group — union would keep stale folds)
+        closure_changed.update(next_delta)
+    # THE UPPER STRATA, iterated to a JOINT fixpoint. Three passes sit above
+    # the positive closure, and each can invalidate the others' work through
+    # the dependency graph (loads settle, ranks rederives over them, the peak
+    # refolds over ranks), so they repeat until a full sweep changes nothing:
+    #
+    #   agg   — aggregate heads supersede PER GROUP (functional per group;
+    #           union would keep stale folds, whole-cell replace clobbered the
+    #           corpus's paired zero-supply rows — the count-of-empty lesson);
+    #   keyed — heads whose fact type carries a uniqueness over a role prefix
+    #           (the old engine's task-955 upsert) re-evaluate over the
+    #           settled store and supersede PER KEY; asserted rows whose key
+    #           the rules did not produce survive;
+    #   sweep — DELETE-AND-REDERIVE (Gupta-Mumick-Subrahmanian 1993, in the
+    #           library): for a FULLY-derived plain head the stored cell is
+    #           materialization of the expressible set (Codd 1970 §1.5), never
+    #           ground truth, so it re-evaluates whole and REPLACES — which
+    #           both propagates this invocation's supersessions and converges
+    #           staleness inherited from earlier stores (frozen caches, replay
+    #           history), making derive idempotent. Whole-cell rederivation is
+    #           the paper's overestimate-then-rederive at cell granularity,
+    #           sound exactly because no row is asserted. Self-supporting
+    #           heads (reachable from themselves through derived-head reads)
+    #           stay out: their overestimate can rederive itself through the
+    #           cycle, and cleaning them needs the delta form of the paper.
+    kindmap = {r[0]: r[1] for r in _pop_rows(D, "derivation") if len(r) >= 2}
+    spans_of = {}
+    for r in _pop_rows(D, "spans"):
+        if len(r) >= 2:
+            spans_of.setdefault(r[0], set()).add(r[1])
+    keyspans = {}
+    for c in _pop_rows(D, "constraint"):
+        if len(c) >= 3 and c[1] in ("uniqueness", "spanning_uniqueness"):
+            ps = spans_of.get(c[0], set())
+            if ps:
+                keyspans.setdefault(c[2], set()).update(ps)
+    agg_rules = [(rid, head) for (rid, head) in all_rules if rid in aggids]
+    agg_heads = {head for (_rid, head) in agg_rules}
+    keyed_of = {}
+    for (rid, head) in all_rules:
+        if rid not in aggids and head in keyspans:
+            keyed_of.setdefault(head, []).append(rid)
+    plain_of = {}
     for (rid, head) in all_rules:
         if rid not in aggids:
-            continue
-        with defs.step(D):
-            out = from_lam(_ap(_A(rid), D))
-        if isinstance(out, tuple):
-            rows = tuple(sorted({tuple(r) for r in out if isinstance(r, tuple)}))
-            D = _ap(ast.Store(head), _S(to_lam(rows), D))
+            plain_of.setdefault(head, []).append(rid)
+    reach = {h: {ft for rid in rids for ft in reads.get(rid, set())}
+             for h, rids in plain_of.items()}
+    derived_heads = set(agg_heads) | set(plain_of)
+
+    def _self_supporting(h):
+        seen, stack = set(), [x for x in reach.get(h, ()) if x in derived_heads]
+        while stack:
+            x = stack.pop()
+            if x == h:
+                return True
+            if x in seen:
+                continue
+            seen.add(x)
+            stack.extend(y for y in reach.get(x, ()) if y in derived_heads)
+        return False
+
+    sweep = sorted(h for h in plain_of
+                   if kindmap.get(h) == "fully-derived"
+                   and h not in agg_heads and h not in keyed_of
+                   and not _self_supporting(h))
+
+    def _eval_rules(rids, Dx):
+        outs = set()
+        for rid in rids:
+            tw = rule_twins.get(rid)
+            if tw is not None:
+                outs |= set(tw(Dx))
+                continue
+            with defs.step(Dx):
+                o = from_lam(_ap(_A(rid), Dx))
+            if isinstance(o, tuple):
+                outs |= {tuple(r) for r in o if isinstance(r, tuple)}
+        return outs
+
+    # Dirty-set filtering keeps the fixpoint's cost proportional to what
+    # actually changed: round one evaluates agg and keyed passes whole (their
+    # pre-fixpoint status quo) but sweeps only heads whose reads intersect the
+    # dirty set — the asserted frontier plus everything the closure and the
+    # earlier passes stored this call. A FULL call (changed=None) sweeps every
+    # eligible head once, which is where the idempotence guarantee lives; the
+    # per-batch delta path pays only for its own ripple. Later rounds filter
+    # all three passes the same way, so iteration runs exactly as deep as the
+    # dependency chain that moved.
+    dirty = None if changed is None else (set(changed) | closure_changed)
+    for _outer in range(12):
+        settled = True
+        round_changed = set()
+
+        def _touched(read_set):
+            if dirty is None:
+                return True
+            return bool(read_set & dirty) or bool(read_set & round_changed)
+        for (rid, head) in agg_rules:
+            if _outer and not _touched(reads.get(rid, set())):
+                continue
+            with defs.step(D):
+                out = from_lam(_ap(_A(rid), D))
+            if isinstance(out, tuple):
+                agg_rows = {tuple(r) for r in out if isinstance(r, tuple)}
+                keys = {r[:-1] for r in agg_rows}
+                before = {tuple(r) for r in _pop_rows(D, head)}
+                merged = agg_rows | {r for r in before if r[:-1] not in keys}
+                if merged != before:
+                    settled = False
+                    round_changed.add(head)
+                    D = _ap(ast.Store(head), _S(to_lam(_rowsort(merged)), D))
+        for head in sorted(keyed_of):
+            if _outer and not _touched(
+                    {ft for rid in keyed_of[head] for ft in reads.get(rid, set())}):
+                continue
+            key_pos = sorted(keyspans[head])
+            outs = _eval_rules(keyed_of[head], D)
+
+            def key(r, _kp=key_pos):
+                return tuple(r[p - 1] for p in _kp if p <= len(r))
+            keys = {key(r) for r in outs}
+            kept = {tuple(r) for r in _pop_rows(D, head)
+                    if key(tuple(r)) not in keys}
+            merged = _rowsort(outs | kept)
+            current = _rowsort({tuple(r) for r in _pop_rows(D, head)})
+            if merged != current:
+                settled = False
+                round_changed.add(head)
+                D = _ap(ast.Store(head), _S(to_lam(merged), D))
+        for head in sweep:
+            if not _touched(reach.get(head, set())):
+                continue
+            outs = _eval_rules(plain_of[head], D)
+            current = {tuple(r) for r in _pop_rows(D, head)}
+            if outs != current:
+                settled = False
+                round_changed.add(head)
+                D = _ap(ast.Store(head), _S(to_lam(_rowsort(outs)), D))
+        if settled:
+            break
+        dirty = round_changed
     return D
 
 

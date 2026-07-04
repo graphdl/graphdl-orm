@@ -191,7 +191,7 @@ def replay(D, path):
             ft = entry["ft"]
             rows = {tuple(r) for r in system._pop_rows(D, ft)}
             rows |= {_untuple(f) for f in entry["facts"]}
-            D = _ap(ast.Store(ft), _S(to_lam(tuple(sorted(rows))), D))
+            D = _ap(ast.Store(ft), _S(to_lam(system._rowsort(rows)), D))
             continue
         D = _ap(_A(2), system.create(D, entry["ft"], to_lam(_untuple(entry["fact"]))))
     return D

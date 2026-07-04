@@ -38,6 +38,13 @@ def _derive(model):
     return system.run_rules(D), rep
 
 
+def _store(head, rows, D):
+    from pyarest import ast
+    from pyarest.lam import to_lam
+    from pyarest.reduce import apply as _ap
+    return _ap(ast.Store(head), system._S(to_lam(rows), D))
+
+
 def test_the_rooted_rule_computes_the_source_statuses():
     D, rep = _derive(ROOTED)
     assert rep["rule_diagnostics"] == []
@@ -48,6 +55,293 @@ def test_the_rooted_rule_computes_the_source_statuses():
     # to b -> rooted (t1 points to b only in M — the negation is PER MACHINE,
     # which is exactly what the where-scoping preserves).
     assert got == {("a", "M"), ("b", "N")}
+
+
+def test_at_most_zero_is_negation_spelled_as_frequency():
+    # the claude corpus's zero-supplying idiom (affect-select.md, the ledger's
+    # own count-of-empty lesson): 'X is Yed by at most 0 Z' is a negated
+    # existential — the anti-join with the counted type as the FRESH subject —
+    # and the head literal supplies the zero
+    model = """Layer is an entity type.
+Stratum Stack is an entity type.
+Engineering Lever is an entity type.
+Load is a value type.
+Layer stacks into Stratum Stack.
+Layer is operator-loaded by Engineering Lever.
+Layer has Load.
+
+* Layer1 has Load '0' iff Layer1 stacks into Stratum Stack1 and Layer1 is operator-loaded by at most 0 Engineering Lever.
+
+Layer 'L1' stacks into Stratum Stack 's'.
+Layer 'L2' stacks into Stratum Stack 's'.
+Layer 'L2' is operator-loaded by Engineering Lever 'e1'.
+"""
+    D, rep = _derive(model)
+    assert rep["rule_diagnostics"] == []
+    got = {tuple(str(x) for x in r)
+           for r in system._pop_rows(D, "Layer_has_Load")}
+    # L1 idles at zero; L2 is loaded and gets NO zero row
+    assert got == {("L1", "0")}
+
+
+def test_deletions_propagate_through_derived_views():
+    # the corpus's REAL shape (affect-select.md:38): ranks carries NO
+    # uniqueness of its own, so the keyed pass cannot touch it — but Load IS
+    # keyed, its zero-fill rows are superseded by counts, and rows ranks
+    # derived from the superseded loads must RETRACT and rederive. This is
+    # DRed (Gupta-Mumick-Subrahmanian 1993, in the library): delete the
+    # overestimate through the dependency graph, rederive survivors.
+    model = """Layer is an entity type.
+Stratum Stack is an entity type.
+Engineering Lever is an entity type.
+Load is a value type.
+Layer stacks into Stratum Stack.
+Layer is operator-loaded by Engineering Lever.
+Layer has Load.
+Each Layer has at most one Load.
+Stratum Stack ranks Layer at Load. *
+
+* Layer1 has Load iff Load is the count of Engineering Lever1 where Layer1 is operator-loaded by Engineering Lever1.
+
+* Layer1 has Load '0' iff Layer1 stacks into Stratum Stack1 and Layer1 is operator-loaded by at most 0 Engineering Lever.
+
+* Stratum Stack1 ranks Layer1 at Load1 iff Layer1 stacks into Stratum Stack1 and Layer1 has Load1.
+
+Layer 'L1' stacks into Stratum Stack 's'.
+Layer 'L2' stacks into Stratum Stack 's'.
+Layer 'L2' is operator-loaded by Engineering Lever 'e1'.
+Layer 'L2' is operator-loaded by Engineering Lever 'e2'.
+"""
+    D, rep = _derive(model)
+    assert rep["rule_diagnostics"] == []
+    load = {tuple(str(x) for x in r)
+            for r in system._pop_rows(D, "Layer_has_Load")}
+    assert load == {("L1", "0"), ("L2", "2")}
+    got = {tuple(str(x) for x in r)
+           for r in system._pop_rows(D, "Stratum_Stack_ranks_Layer_at_Load")}
+    # NO stale row for L2's superseded zero: the deletion propagated
+    assert got == {("s", "L1", "0"), ("s", "L2", "2")}
+
+
+def test_a_stale_derived_row_is_swept_without_a_fresh_supersession():
+    # the frozen-store case (verdict ten, phase two): a fully-derived cell
+    # carries a row inherited from an earlier compile — a per-invocation
+    # trigger sees nothing superseded NOW and leaves it. For a fully-derived
+    # head the stored cell is materialization of the expressible set (Codd
+    # 1970 §1.5), never ground truth: run_rules must converge it whatever the
+    # store's history, making derive idempotent.
+    model = """Layer is an entity type.
+Stratum Stack is an entity type.
+Engineering Lever is an entity type.
+Load is a value type.
+Layer stacks into Stratum Stack.
+Layer is operator-loaded by Engineering Lever.
+Layer has Load.
+Each Layer has at most one Load.
+Stratum Stack ranks Layer at Load. *
+
+* Layer1 has Load iff Load is the count of Engineering Lever1 where Layer1 is operator-loaded by Engineering Lever1.
+
+* Layer1 has Load '0' iff Layer1 stacks into Stratum Stack1 and Layer1 is operator-loaded by at most 0 Engineering Lever.
+
+* Stratum Stack1 ranks Layer1 at Load1 iff Layer1 stacks into Stratum Stack1 and Layer1 has Load1.
+
+Layer 'L1' stacks into Stratum Stack 's'.
+Layer 'L2' stacks into Stratum Stack 's'.
+Layer 'L2' is operator-loaded by Engineering Lever 'e1'.
+Layer 'L2' is operator-loaded by Engineering Lever 'e2'.
+"""
+    D, rep = _derive(model)
+    assert rep["rule_diagnostics"] == []
+    head = "Stratum_Stack_ranks_Layer_at_Load"
+    rows = {tuple(r) for r in system._pop_rows(D, head)}
+    stale = system._rowsort(rows | {("s", "L1", "9")})
+    D = _store(head, stale, D)
+    D = system.run_rules(D)
+    got = {tuple(str(x) for x in r) for r in system._pop_rows(D, head)}
+    assert got == {("s", "L1", "0"), ("s", "L2", "2")}
+
+
+def test_aggregates_refold_after_downstream_sweeps():
+    # the base-Depth regression (verdict ten): an aggregate folding OVER a
+    # swept head ran before the sweep and kept the stale fold — the strata
+    # must iterate to a JOINT fixpoint (loads settle, ranks rederives, the
+    # peak refolds over the honest ranks)
+    model = """Layer is an entity type.
+Stratum Stack is an entity type.
+Engineering Lever is an entity type.
+Load is a value type.
+Layer stacks into Stratum Stack.
+Layer is operator-loaded by Engineering Lever.
+Layer has Load.
+Each Layer has at most one Load.
+Stratum Stack ranks Layer at Load. *
+Stratum Stack has peak Load. *
+Each Stratum Stack has at most one peak Load.
+
+* Layer1 has Load iff Load is the count of Engineering Lever1 where Layer1 is operator-loaded by Engineering Lever1.
+
+* Layer1 has Load '0' iff Layer1 stacks into Stratum Stack1 and Layer1 is operator-loaded by at most 0 Engineering Lever.
+
+* Stratum Stack1 ranks Layer1 at Load1 iff Layer1 stacks into Stratum Stack1 and Layer1 has Load1.
+
+* Stratum Stack1 has peak Load iff Load is the max of Load1 where Stratum Stack1 ranks Layer1 at Load1.
+
+Layer 'L1' stacks into Stratum Stack 's'.
+Layer 'L2' stacks into Stratum Stack 's'.
+Layer 'L2' is operator-loaded by Engineering Lever 'e1'.
+Layer 'L2' is operator-loaded by Engineering Lever 'e2'.
+"""
+    D, rep = _derive(model)
+    assert rep["rule_diagnostics"] == []
+    ranks = "Stratum_Stack_ranks_Layer_at_Load"
+    rows = {tuple(r) for r in system._pop_rows(D, ranks)}
+    stale = system._rowsort(rows | {("s", "L9", "7")})
+    D = _store(ranks, stale, D)
+    D = system.run_rules(D)
+    got = {tuple(str(x) for x in r)
+           for r in system._pop_rows(D, "Stratum_Stack_has_peak_Load")}
+    # the stale rank must not poison the refolded peak
+    assert got == {("s", "2")}
+
+
+def test_incremental_derive_propagates_through_all_three_passes():
+    # the delta path: after an assert lands, run_rules(changed={ft}) must
+    # carry the change through the count (agg), the keyed upsert, the ranks
+    # rederive (sweep), and the peak refold (agg again) — the joint fixpoint
+    # filtered by the dirty set, not a full re-evaluation of the store
+    model = """Layer is an entity type.
+Stratum Stack is an entity type.
+Engineering Lever is an entity type.
+Load is a value type.
+Layer stacks into Stratum Stack.
+Layer is operator-loaded by Engineering Lever.
+Layer has Load.
+Each Layer has at most one Load.
+Stratum Stack ranks Layer at Load. *
+Stratum Stack has peak Load. *
+Each Stratum Stack has at most one peak Load.
+
+* Layer1 has Load iff Load is the count of Engineering Lever1 where Layer1 is operator-loaded by Engineering Lever1.
+
+* Layer1 has Load '0' iff Layer1 stacks into Stratum Stack1 and Layer1 is operator-loaded by at most 0 Engineering Lever.
+
+* Stratum Stack1 ranks Layer1 at Load1 iff Layer1 stacks into Stratum Stack1 and Layer1 has Load1.
+
+* Stratum Stack1 has peak Load iff Load is the max of Load1 where Stratum Stack1 ranks Layer1 at Load1.
+
+Layer 'L1' stacks into Stratum Stack 's'.
+Layer 'L2' stacks into Stratum Stack 's'.
+Layer 'L2' is operator-loaded by Engineering Lever 'e1'.
+Layer 'L2' is operator-loaded by Engineering Lever 'e2'.
+"""
+    D, rep = _derive(model)
+    assert rep["rule_diagnostics"] == []
+    ft = "Layer_is_operator_loaded_by_Engineering_Lever"
+    rows = {tuple(r) for r in system._pop_rows(D, ft)}
+    D = _store(ft, system._rowsort(rows | {("L1", "e3"), ("L1", "e4"),
+                                           ("L1", "e5")}), D)
+    D = system.run_rules(D, changed={ft})
+    load = {tuple(str(x) for x in r)
+            for r in system._pop_rows(D, "Layer_has_Load")}
+    assert load == {("L1", "3"), ("L2", "2")}
+    ranks = {tuple(str(x) for x in r)
+             for r in system._pop_rows(D, "Stratum_Stack_ranks_Layer_at_Load")}
+    assert ranks == {("s", "L1", "3"), ("s", "L2", "2")}
+    peak = {tuple(str(x) for x in r)
+            for r in system._pop_rows(D, "Stratum_Stack_has_peak_Load")}
+    assert peak == {("s", "3")}
+
+
+def test_keyed_heads_supersede_across_rounds():
+    # verdict seven's cascade: a rule reading a cell that CHANGES across lfp
+    # rounds (zero-fill lands round one, the count later) derives rows for
+    # both values, and plain union keeps the stale one — ranks read 11 rows
+    # where the old engine's keyed upsert (task-955) kept 8. A head whose
+    # fact type carries a spanning uniqueness over its non-value roles
+    # supersedes PER KEY from its rules' evaluation over the settled store.
+    model = """Layer is an entity type.
+Stratum Stack is an entity type.
+Engineering Lever is an entity type.
+Load is a value type.
+Layer stacks into Stratum Stack.
+Layer is operator-loaded by Engineering Lever.
+Layer has Load.
+Stratum Stack ranks Layer at Load.
+In each population of Stratum Stack ranks Layer at Load, each Stratum Stack, Layer combination occurs at most once.
+
+* Layer1 has Load iff Load is the count of Engineering Lever1 where Layer1 is operator-loaded by Engineering Lever1.
+
+* Layer1 has Load '0' iff Layer1 stacks into Stratum Stack1 and Layer1 is operator-loaded by at most 0 Engineering Lever.
+
+* Stratum Stack1 ranks Layer1 at Load1 iff Layer1 stacks into Stratum Stack1 and Layer1 has Load1.
+
+Layer 'L1' stacks into Stratum Stack 's'.
+Layer 'L2' stacks into Stratum Stack 's'.
+Layer 'L2' is operator-loaded by Engineering Lever 'e1'.
+Layer 'L2' is operator-loaded by Engineering Lever 'e2'.
+"""
+    D, rep = _derive(model)
+    assert rep["rule_diagnostics"] == []
+    got = {tuple(str(x) for x in r)
+           for r in system._pop_rows(D, "Stratum_Stack_ranks_Layer_at_Load")}
+    # ONE row per (stack, layer): L1 at zero, L2 at its count — no stale rows
+    assert got == {("s", "L1", "0"), ("s", "L2", "2")}
+
+
+def test_count_and_zero_supply_coexist_on_one_head():
+    # the corpus's full idiom (affect-select.md + the count-of-empty lesson):
+    # the COUNT rule loads the loaded layers, the at-most-0 rule zero-fills the
+    # idle ones — the aggregate stratum must supersede PER GROUP, never wipe the
+    # whole head (the claude verdict: Load derived zero because agg-replace
+    # clobbered the zero-supply rows)
+    model = """Layer is an entity type.
+Stratum Stack is an entity type.
+Engineering Lever is an entity type.
+Load is a value type.
+Layer stacks into Stratum Stack.
+Layer is operator-loaded by Engineering Lever.
+Layer has Load.
+
+* Layer1 has Load iff Load is the count of Engineering Lever1 where Layer1 is operator-loaded by Engineering Lever1.
+
+* Layer1 has Load '0' iff Layer1 stacks into Stratum Stack1 and Layer1 is operator-loaded by at most 0 Engineering Lever.
+
+Layer 'L1' stacks into Stratum Stack 's'.
+Layer 'L2' stacks into Stratum Stack 's'.
+Layer 'L2' is operator-loaded by Engineering Lever 'e1'.
+Layer 'L2' is operator-loaded by Engineering Lever 'e2'.
+"""
+    D, rep = _derive(model)
+    assert rep["rule_diagnostics"] == []
+    got = {tuple(str(x) for x in r)
+           for r in system._pop_rows(D, "Layer_has_Load")}
+    assert got == {("L1", "0"), ("L2", "2")}
+
+
+def test_negation_over_an_absent_cell_is_vacuously_true():
+    # the claude verdict's root cause: the neg side read a cell with NO rows
+    # (nothing is operator-loaded anywhere) and the fetch bottomed instead of
+    # answering the empty population — but 'at most 0 X' over nothing existing
+    # must PASS everything
+    model = """Layer is an entity type.
+Stratum Stack is an entity type.
+Engineering Lever is an entity type.
+Load is a value type.
+Layer stacks into Stratum Stack.
+Layer is operator-loaded by Engineering Lever.
+Layer has Load.
+
+* Layer1 has Load '0' iff Layer1 stacks into Stratum Stack1 and Layer1 is operator-loaded by at most 0 Engineering Lever.
+
+Layer 'L1' stacks into Stratum Stack 's'.
+Layer 'L2' stacks into Stratum Stack 's'.
+"""
+    D, rep = _derive(model)
+    assert rep["rule_diagnostics"] == []
+    got = {tuple(str(x) for x in r)
+           for r in system._pop_rows(D, "Layer_has_Load")}
+    assert got == {("L1", "0"), ("L2", "0")}
 
 
 def test_the_negations_variable_shadows_the_outer_one():

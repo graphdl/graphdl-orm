@@ -134,6 +134,24 @@ def read_cells(db_path):
         con.close()
 
 
+# the old engine's REFLECTION layer: its self-description of facts, types,
+# roles and readings, materialized as cells (the claude audit: 19,008
+# Fact_is_of_Fact_Type rows, 1.2MB — dragged through every derive round when
+# migrated). This engine's own compile IS the self-description, so these
+# report instead of replay — UNLESS a compiled rule reads one (the base's
+# arity rule counts Fact_Type_has_Role), in which case live derivations feed
+# on it and it must migrate.
+REFLECTION = {
+    "Fact_is_of_Fact_Type", "Resource_is_instance_of_Noun",
+    "State_Machine_is_instance_of_Noun", "Fact_Type_has_Role",
+    "Role_is_used_in_Reading", "Noun_plays_Role", "Reading_has_Text",
+    "Fact_Type_has_Reading", "Reading_is_used_by_Verb",
+    "Noun_has_Object_Type", "Noun_has_World_Assumption",
+    "Function_belongs_to_Domain", "Resource_is_of_Function",
+    "Resource_belongs_to_Domain",
+}
+
+
 def plan(D, cells):
     """Classify the old cells against the compiled model: asserted (rows to
     migrate, in role order), derived-with-a-rule (kept aside for verification —
@@ -145,12 +163,16 @@ def plan(D, cells):
     kinds = {r[0]: r[1] for r in system._pop_rows(D, "derivation")
              if len(r) >= 2}
     ruled = {r[1] for r in system._pop_rows(D, "ruleDerives") if len(r) >= 2}
+    rule_read = {r[1] for r in system._pop_rows(D, "ruleReads") if len(r) >= 2}
     out = {"asserted": {}, "derived": {}, "stored_state": [],
-           "unknown": [], "unparsed": []}
+           "reflection": [], "unknown": [], "unparsed": []}
     for name, contents in cells.items():
         parsed = parse_cell(contents or "{}")
         if parsed is None:
             out["unparsed"].append(name)
+            continue
+        if name in REFLECTION and name not in rule_read:
+            out["reflection"].append(name)
             continue
         rows = [tuple(v for (_r, v) in ps) for (_k, ps) in parsed]
         if kinds.get(name) == "fully-derived" and name in ruled:
@@ -246,6 +268,7 @@ def replay_into(registry, app, old_db):
     return {"migrated": {ft: len(rows) for ft, rows in p["asserted"].items()
                          if rows},
             "stored_state": sorted(p["stored_state"]),
+            "reflection": sorted(p["reflection"]),
             "verify": verify, "unknown": sorted(p["unknown"]),
             "unparsed": sorted(p["unparsed"]),
             "authoring": audit_authoring(p, D)}
