@@ -2379,4 +2379,9 @@ DEF("system:nav_of",
        K(A("theta:append_phi")),
        K(A("distr")),
        S4(A("CONS"), K(A("CONS")), K(A("id")), S4(A("CONS"), K(A("COMP")), A("id"), K(N(1)))))),
+
+DEF("system:anti_wrap",
+    S4(A("CONS"), K(A("COMP")),
+       S3(A("COMP"), A("theta:AntiRestrict"), N(3)),
+       S4(A("CONS"), K(A("CONS")), N(1), N(2)))),
 )

@@ -723,6 +723,10 @@ def _h_class_rule(g, k, m):
     A_ = [("ruleDerives", (rid, head_ft))]
     for (ftb, lit) in clauses:
         A_.append(("ruleReads", (rid, ftb)))
+        # classSpec freezes the twin's contract WITH the store, so the thawed
+        # grammar rebuilds its FAST twins (rebuild_class_twins) — speed as
+        # registration, the canonical object below stays the meaning
+        A_.append(("classSpec", (rid, ftb, lit or "", headlit)))
         if lit is not None:
             A_.append(("classLit", (ftb, lit)))
     return A_, [(rid, _sys.class_rule(clauses, headlit))]
@@ -775,6 +779,30 @@ def classify_via_M(D, stmt, nouns=(), sid="s1"):
     D = _sys.run_rules(D, changed=changed)
     return {r[1] for r in _sys._pop_rows(D, "Statement_has_Classification")
             if len(r) >= 2 and r[0] == sid}
+
+
+def classify_all_via_M(D, stmts, nouns=()):
+    """BATCH Stage-2 (stratum 4 of the polyglot debug): assert EVERY statement's
+    field facts under per-statement ids, run the recognizer rules ONCE, read all
+    classifications back. Classification is a derived population over Statement
+    field facts — one equation, one derive (Codd) — where the per-statement
+    variant re-derived the grammar's fixed point each time (measured 44.6x)."""
+    from .reduce import apply as _apply
+    from .lam import to_lam
+    from . import system as _sys
+    changed = set()
+    for i, stmt in enumerate(stmts):
+        for (ftb, row) in tokenize_statement(D, stmt, nouns, "s%d" % (i + 1)):
+            D = _apply(_A2(), ast.run(to_lam(row), D, cell_name=ftb))
+            changed.add(ftb)
+    if not changed:
+        return [set() for _ in stmts]
+    D = _sys.run_rules(D, changed=changed)
+    by_sid = {}
+    for r in _sys._pop_rows(D, "Statement_has_Classification"):
+        if len(r) >= 2:
+            by_sid.setdefault(r[0], set()).add(r[1])
+    return [by_sid.get("s%d" % (i + 1), set()) for i in range(len(stmts))]
 
 
 def _A2():
@@ -1375,9 +1403,10 @@ def grammar_D():
     snapshot; the first process on a machine pays the ingest, later ones thaw in
     milliseconds — definitions are data, so the snapshot carries the rules)."""
     if "D" not in _GRAMMAR_CACHE:
-        from . import persist, paths
+        from . import persist, paths, system as _sys
         p = paths.shared("forml2-grammar.md")
         _GRAMMAR_CACHE["D"] = persist.ingest_frozen(open(p, encoding="utf-8").read())
+        _sys.rebuild_class_twins(_GRAMMAR_CACHE["D"])        # twins from classSpec
     return _GRAMMAR_CACHE["D"]
 
 
@@ -1407,11 +1436,15 @@ def compile_model_selfhost(text, D=None):
     if D is None:
         D = meta.initial_D()
     unclassified = []
+    # BATCH classification (stratum 4): every statement's fields land first,
+    # ONE derive answers all classifications — not one lfp per statement
+    work = []
     for stmt in stmts:
         mod, sign, inner = _split_modality(stmt)
-        if sign == "possibility":
-            continue
-        cls = classify_via_M(gD, inner, nouns=known)
+        if sign != "possibility":
+            work.append((stmt, mod, inner))
+    all_cls = classify_all_via_M(gD, [w[2] for w in work], nouns=known)
+    for (stmt, mod, inner), cls in zip(work, all_cls):
         specific = cls - _GENERIC_CLASSIFICATIONS
         cls = specific or cls
         translators = []

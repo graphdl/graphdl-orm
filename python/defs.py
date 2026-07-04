@@ -49,12 +49,23 @@ def override(name, fn):
     version += 1
 
 
-def define(name, obj):
-    """Compile: bind `name` to an FFP object o; its meaning is mu(o : x)  (Def. reg)."""
+native = {}                # name -> the delta-carrier TWIN of a compiled def (stratum 2 of the
+                           # polyglot debug): byte-identical to scott_to_native of the canonical
+                           # object (pinned by test_canon_native's differential), so the delta
+                           # store rebuild skips the boundary for these names
+
+
+def define(name, obj, native_obj=None):
+    """Compile: bind `name` to an FFP object o; its meaning is mu(o : x)  (Def. reg).
+    An optional native twin registers beside it for the fast path's store."""
     global _store, version
     _store = L.CONS(_cell(name, L.FALSE, obj))(_store)
     compiled[name] = obj
     latest[name] = ("compiled", obj)
+    if native_obj is not None:
+        native[name] = native_obj
+    else:
+        native.pop(name, None)                                # a redefinition EVICTS a stale twin
     version += 1
 
 
@@ -65,6 +76,7 @@ def current():
 def reset():
     global _store, _registered, compiled, latest, version
     _store, _registered, compiled, latest, version = L.NIL, [], {}, {}, version + 1
+    native.clear()
 
 
 # ↑key : store → ⟨found?, ⟨tag, impl⟩⟩   (first match wins, else ⟨F, _⟩); keys compared by NATEQ

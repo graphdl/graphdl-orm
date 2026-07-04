@@ -256,10 +256,11 @@ def compile_rule_neg(atom_fts, head_positions, ncols, widths, filters, joins, ne
                        joins)
     for (nfts, nproj, nwidths, nfilters, njoins, anti_key) in negs:
         neg = compile_rule(nfts, nproj, nwidths, nfilters, njoins)
-        anti = _apply(A("theta:AntiRestrict"),
-                      to_lam((tuple(anti_key),
-                              tuple(range(1, len(nproj) + 1)))))
-        obj = _S(A("COMP"), anti, _S(A("CONS"), obj, neg))
+        # the composition shape is CANONICAL (system:anti_wrap, shared base);
+        # this wrapper only marshals the group spec — the wrapper doctrine
+        obj = _apply(A("system:anti_wrap"),
+                     _S(obj, neg, to_lam((tuple(anti_key),
+                                          tuple(range(1, len(nproj) + 1))))))
     head = _apply(A("theta:Project"), to_lam(tuple(head_positions)))
     return _S(A("COMP"), head, obj)
 
@@ -315,6 +316,40 @@ def compile_agg_rule(atom_fts, group_positions, over_position, op,
     return _apply(A("system:compile_agg_rule"), rec)
 
 
+# FAST twins for classifier rules (stratum 4): keyed by rule cid, fn(D) -> row
+# set. Speed as registration under the canonical name — the canonical object in
+# D stays the meaning; run_rules consults the twin before generic evaluation.
+# Twins rebuild FROM M (classSpec facts freeze with the store), so the thawed
+# grammar path gets them too.
+rule_twins = {}
+
+
+def rebuild_class_twins(D):
+    """Reconstruct class-rule twins from the store's classSpec facts:
+    ⟨rid, field_ft, literal-or-empty, head-classification⟩ per clause. The twin
+    is the contract from system.class_rule — filter each field cell on column 2
+    (or existence), intersect statement ids, pair with the head constant."""
+    specs = {}
+    for r in _pop_rows(D, "classSpec"):
+        if len(r) >= 4:
+            specs.setdefault(r[0], ("", []))
+            head, clauses = specs[r[0]]
+            specs[r[0]] = (r[3], clauses + [(r[1], r[2] or None)])
+    for rid, (head, clauses) in specs.items():
+        def _twin(Dx, _cl=tuple(clauses), _head=head):
+            sids = None
+            for (ftb, lit) in _cl:
+                rows = _pop_rows(Dx, ftb)
+                s = {r[0] for r in rows
+                     if r and (lit is None or (len(r) >= 2 and r[1] == lit))}
+                sids = s if sids is None else (sids & s)
+                if not sids:
+                    return set()
+            return {(sid, _head) for sid in (sids or ())}
+        rule_twins[rid] = _twin
+    return len(specs)
+
+
 def run_rules(D, changed=None, stats=None):
     """Cross-cell derivation to the least fixed point, semi-naive (Bancilhon–
     Ramakrishnan 1986): round one evaluates full bodies, BOUNDED by the frontier
@@ -348,11 +383,15 @@ def run_rules(D, changed=None, stats=None):
             if delta is None:                                # round one: full bodies
                 if frontier is not None and not (reads.get(rule_cid, set()) & frontier):
                     continue
-                with defs.step(D):
-                    outs = from_lam(_ap(_A(rule_cid), D))
-                if not isinstance(outs, tuple):
-                    continue                                 # rule not compiled (M-facts only)
-                new_rows = {tuple(r) for r in outs if isinstance(r, tuple)}
+                tw = rule_twins.get(rule_cid)
+                if tw is not None:                           # the FAST twin: same rows,
+                    new_rows = set(tw(D))                    # no generic evaluation
+                else:
+                    with defs.step(D):
+                        outs = from_lam(_ap(_A(rule_cid), D))
+                    if not isinstance(outs, tuple):
+                        continue                             # rule not compiled (M-facts only)
+                    new_rows = {tuple(r) for r in outs if isinstance(r, tuple)}
                 if stats is not None:
                     stats.append({"round": rnd, "rule": rule_cid, "mode": "full"})
             else:
@@ -370,11 +409,15 @@ def run_rules(D, changed=None, stats=None):
                                           "pos": p, "in": len(drows),
                                           "base": len(_pop_rows(D, ft))})
                 elif rule_cid not in atomsof and (reads.get(rule_cid, set()) & set(delta)):
-                    with defs.step(D):                       # legacy rule: full fallback
-                        outs = from_lam(_ap(_A(rule_cid), D))
-                    if not isinstance(outs, tuple):
-                        continue
-                    new_rows = {tuple(r) for r in outs if isinstance(r, tuple)}
+                    tw = rule_twins.get(rule_cid)
+                    if tw is not None:
+                        new_rows = set(tw(D))
+                    else:
+                        with defs.step(D):                   # legacy rule: full fallback
+                            outs = from_lam(_ap(_A(rule_cid), D))
+                        if not isinstance(outs, tuple):
+                            continue
+                        new_rows = {tuple(r) for r in outs if isinstance(r, tuple)}
                     if stats is not None:
                         stats.append({"round": rnd, "rule": rule_cid, "mode": "full"})
                 else:

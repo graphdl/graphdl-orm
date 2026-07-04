@@ -78,12 +78,34 @@ def apply_lambda(f, x):
 
 # The runtime evaluates via the delta fast-path (spec §4.2 / D5): observationally equal to the
 # lambda kernel above, which stays the ground truth (and the equivalence oracle in test_delta).
+# Stratum 1 of the polyglot debug: the evaluator choice is the ONE seam that cannot ride DEFS
+# (rho is implemented by apply), so it gets the same shape one level down — named registrations,
+# canonical kernel as ground truth, explicit switching. PYAREST_EVALUATOR selects at import.
+import os as _os
 from . import delta as _delta   # noqa: E402  (delta imports only lam + defs; no cycle)
+
+_EVALUATORS = {"lambda": (meaning_lambda, apply_lambda),
+               "delta": (_delta.meaning, _delta.apply)}
+_ACTIVE = _os.environ.get("PYAREST_EVALUATOR", "delta")
+if _ACTIVE not in _EVALUATORS:
+    _ACTIVE = "delta"
+
+
+def use_evaluator(name):
+    global _ACTIVE
+    if name not in _EVALUATORS:
+        raise ValueError(f"unknown evaluator {name!r}; have {sorted(_EVALUATORS)}")
+    _ACTIVE = name
+    return name
+
+
+def active_evaluator():
+    return _ACTIVE
 
 
 def meaning(e):
-    return _delta.meaning(e)
+    return _EVALUATORS[_ACTIVE][0](e)
 
 
 def apply(f, x):
-    return _delta.apply(f, x)
+    return _EVALUATORS[_ACTIVE][1](f, x)

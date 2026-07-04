@@ -258,7 +258,10 @@ def _store():
         d = {}
         for name, (kind, impl) in _defs_mod.latest.items():          # the canonical layer first
             if kind == "compiled":
-                d[name] = (1, scott_to_native(impl))
+                # a native TWIN (canon.load's second vocabulary) skips the boundary;
+                # () is a legitimate twin (PHI), so membership decides, not truth
+                d[name] = (1, _defs_mod.native[name]
+                           if name in _defs_mod.native else scott_to_native(impl))
             elif name not in _defs_mod.fast:                         # registered: bridge unless a
                 d[name] = (0, _bridge(impl))                         # twin exists (degradation)
         for name, fn in _defs_mod.fast.items():                      # the override twins SHADOW the

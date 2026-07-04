@@ -34,6 +34,24 @@ def vocabulary(out):
     return v
 
 
+def vocabulary_native(out):
+    """The THIRD consumer of the intersection files (stratum 2 of the polyglot
+    debug): the same names building the delta evaluator's carrier directly — a
+    scalar IS an atom, a tuple IS a sequence — so definition resolution on the
+    fast path can skip the Scott boundary entirely. Faithfulness is pinned by
+    the differential against scott_to_native of the canonical load."""
+    v = {"PHI": lambda: (), "A": lambda x: x, "N": lambda x: x,
+         "K": lambda x: ("CONST", x),
+         "DEF": lambda name, obj: out.append((name, obj))}
+    for k in range(1, 10):
+        def _sk(*xs, _k=k):
+            if len(xs) != _k:
+                raise TypeError("S%d takes %d arguments, got %d" % (_k, _k, len(xs)))
+            return tuple(xs)
+        v["S%d" % k] = _sk
+    return v
+
+
 def read(name):
     """Collect a shared intersection file's definitions without registering them."""
     p = paths.shared(name)
@@ -42,12 +60,22 @@ def read(name):
     return out
 
 
+def read_native(name):
+    """Collect a shared file's definitions as delta-native objects (no Scott)."""
+    p = paths.shared(name)
+    out = []
+    exec(compile(open(p, encoding="utf-8").read(), p, "exec"), vocabulary_native(out))
+    return out
+
+
 def load(name="theta.py"):
-    """Consume a shared intersection file: exec under the vocabulary, register every
-    definition into DEFS (compiled). Returns the names, in file order."""
+    """Consume a shared intersection file: exec under BOTH vocabularies, register
+    each definition with its native twin (the fast path's store then skips the
+    Scott boundary for canonical names). Returns the names, in file order."""
     pairs = read(name)
+    npairs = dict(read_native(name))
     for n, obj in pairs:
-        defs.define(n, obj)
+        defs.define(n, obj, native_obj=npairs.get(n))
     return [n for n, _ in pairs]
 
 

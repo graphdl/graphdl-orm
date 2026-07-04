@@ -64,6 +64,25 @@ def test_selfhost_compile_matches_the_seed_compiler():
     assert _fact_cells(Ds) == _fact_cells(Dm)
 
 
+def test_class_rule_twins_equal_the_canonical_path():
+    # the FAST twin is a registration; the canonical object is the meaning —
+    # the whole selfhost path must answer identically with the registry cleared
+    # (generic evaluation) and populated (twins)
+    from pyarest import system as S
+    forml.grammar_D()                                         # ensure twins built
+    saved = dict(S.rule_twins)
+    assert saved, "the grammar ingest/thaw must register class-rule twins"
+    try:
+        S.rule_twins.clear()
+        D1, r1 = forml.compile_model_selfhost(MODEL)
+        S.rule_twins.update(saved)
+        D2, r2 = forml.compile_model_selfhost(MODEL)
+    finally:
+        S.rule_twins.update(saved)
+    assert r1["unclassified"] == r2["unclassified"]
+    assert _fact_cells(D1) == _fact_cells(D2)
+
+
 def test_the_rules_not_the_regex_order_are_the_classifier():
     # the seed's fallback recognizer accepts any sentence; the grammar RULES
     # classify only what carries a recognizer literal, a Role Reference (a
