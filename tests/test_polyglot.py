@@ -50,6 +50,12 @@ def test_base_ops_agree_across_kernels():
         (A("eq"), to_lam((1, 1)), None),
         (A("+"), to_lam((2, 3)), None),                       # int stays int
         (A("+"), to_lam((2, 1.5)), None),                     # promotes to float
+        (A("+"), to_lam(("120", "30")), None),                # LEXICAL ints coerce (150)
+        (A("+"), to_lam(("2", 1.5)), None),                   # lexical + float: 3.5
+        (A("+"), to_lam(("a", "3")), None),                   # non-numeric: ⊥ both
+        (A("lt"), to_lam(("9", "10")), None),                 # comparators COERCE: 9 < 10
+        (A("lt"), to_lam((4997, "11000")), None),             # mixed int/lexical (claude's totals)
+        (A("ge"), to_lam(("305", "1190")), None),             # multi-digit text orders numerically
         (A("div"), to_lam((4, 2)), None),                     # Python /: float
         (A("div"), to_lam((4, 0)), None),                     # ÷0 = ⊥
         (A("lt"), to_lam(("apple", "pear")), None),           # string ordering

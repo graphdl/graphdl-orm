@@ -79,19 +79,45 @@ _NA = object()
 _pv = lambda o: o(lambda v: v)(lambda l: _NA)(_NA)          # the native value of an atom, else _NA
 _numeric = lambda a, b: isinstance(a, (int, float)) and isinstance(b, (int, float)) \
     and not isinstance(a, bool) and not isinstance(b, bool)
+
+
+def _tonum(x):
+    """Arithmetic coercion, mirroring delta._tonum (the oracle law: both paths,
+    identically): the store carries LEXICAL atoms, so a numeric-looking string
+    is a number to + and kin; anything else bottoms."""
+    if isinstance(x, bool) or x is _NA:
+        return None
+    if isinstance(x, (int, float)):
+        return x
+    if isinstance(x, str):
+        try:
+            return int(x)
+        except ValueError:
+            try:
+                return float(x)
+            except ValueError:
+                return None
+    return None
+
+
 def _binnum(f):
     def prim(mu):
         def g(o):
-            a, b = _pv(_1(o)), _pv(_2(o))
-            return L.atom(f(a, b)) if _numeric(a, b) else L.BOT        # int/float are one numeric domain
+            a, b = _tonum(_pv(_1(o))), _tonum(_pv(_2(o)))
+            return L.atom(f(a, b)) if a is not None and b is not None else L.BOT
         return g
     return _shaped(_pair_b, prim)                                      # defined on ⟨x,y⟩ exactly
 def _cmp(rel):
     def prim(mu):
         def g(o):
             a, b = _pv(_1(o)), _pv(_2(o))
-            ok = a is not _NA and b is not _NA and (_numeric(a, b) or type(a) is type(b))
-            return (aT if rel(a, b) else aF) if ok else L.BOT         # numeric ordering across int/float
+            if a is _NA or b is _NA:
+                return L.BOT
+            na, nb = _tonum(a), _tonum(b)
+            if na is not None and nb is not None:
+                return aT if rel(na, nb) else aF                       # coerced like arithmetic (delta._cmp mirror)
+            ok = _numeric(a, b) or type(a) is type(b)
+            return (aT if rel(a, b) else aF) if ok else L.BOT
         return g
     return _shaped(_pair_b, prim)                                      # defined on ⟨x,y⟩ exactly
 _add, _sub, _mul = _binnum(lambda a, b: a + b), _binnum(lambda a, b: a - b), _binnum(lambda a, b: a * b)

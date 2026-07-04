@@ -456,6 +456,29 @@ fn num(l: &Leaf) -> Option<f64> {
     }
 }
 
+// Coercion for arithmetic AND comparison (mirrors delta._tonum /
+// prims._tonum: int first, then float): the store carries lexical atoms, so
+// a numeric-looking string is a number to + and kin — and to le/ge/lt/gt,
+// which order numerically wherever BOTH sides parse (the claude analytics
+// family: a singleton sum's string '11000' beside the int 4997) and fall
+// back to lexical only for non-numeric string pairs.
+fn cint(l: &Leaf) -> Option<i64> {
+    match l {
+        Leaf::I(i) => Some(*i),
+        Leaf::S(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn cnum(l: &Leaf) -> Option<f64> {
+    match l {
+        Leaf::I(i) => Some(*i as f64),
+        Leaf::F(f) => Some(*f),
+        Leaf::S(s) => s.trim().parse::<f64>().ok(),
+        Leaf::AppTag => None,
+    }
+}
+
 type Prim = Rc<dyn Fn(V, V) -> V>;
 
 fn register(name: &str, p: Prim) {
@@ -591,9 +614,10 @@ fn register_base() {
         Rc::new(move |_mu, o| {
             if !pair_b(&o) { return bot(); }
             match (aval(&nth(&o, 0)), aval(&nth(&o, 1))) {
-                (Some(a), Some(b)) => match (&*a, &*b) {
-                    (Leaf::I(x), Leaf::I(y)) => atom(Leaf::I(f_i(*x, *y))),
-                    _ => match (num(&a), num(&b)) {
+                (Some(a), Some(b)) => match (cint(&a), cint(&b)) {
+                    // int first (lexical ints included) — mirrors _tonum exactly
+                    (Some(x), Some(y)) => atom(Leaf::I(f_i(x, y))),
+                    _ => match (cnum(&a), cnum(&b)) {
                         (Some(x), Some(y)) => atom(Leaf::F(f_f(x, y))),
                         _ => bot(),
                     },
@@ -616,10 +640,10 @@ fn register_base() {
         Rc::new(move |_mu, o| {
             if !pair_b(&o) { return bot(); }
             match (aval(&nth(&o, 0)), aval(&nth(&o, 1))) {
-                (Some(a), Some(b)) => match (&*a, &*b) {
-                    (Leaf::S(x), Leaf::S(y)) => bool2a(rel_s(x, y)),
-                    _ => match (num(&a), num(&b)) {
-                        (Some(x), Some(y)) => bool2a(rel_n(x, y)),
+                (Some(a), Some(b)) => match (cnum(&a), cnum(&b)) {
+                    (Some(x), Some(y)) => bool2a(rel_n(x, y)),
+                    _ => match (&*a, &*b) {
+                        (Leaf::S(x), Leaf::S(y)) => bool2a(rel_s(x, y)),
                         _ => bot(),
                     },
                 },
@@ -921,9 +945,6 @@ impl NEval {
         let numv = |n: &N| -> Option<f64> {
             if let N::A(l) = n { num(l) } else { None }
         };
-        let intv = |n: &N| -> Option<i64> {
-            if let N::A(l) = n { if let Leaf::I(i) = &**l { Some(*i) } else { None } } else { None }
-        };
         Some(match s {
             "id" => x.clone(),
             "tl" => match seqv(x) { Some(v) if !v.is_empty() => N::S(Rc::new(v[1..].to_vec())), _ => N::Bot },
@@ -983,13 +1004,19 @@ impl NEval {
                 None => N::Bot,
             },
             "+" | "-" | "*" => match pairv(x) {
-                Some((a, b)) => match (intv(&a), intv(&b)) {
-                    (Some(p), Some(q)) => N::A(Rc::new(Leaf::I(match s { "+" => p + q, "-" => p - q, _ => p * q }))),
-                    _ => match (numv(&a), numv(&b)) {
-                        (Some(p), Some(q)) => N::A(Rc::new(Leaf::F(match s { "+" => p + q, "-" => p - q, _ => p * q }))),
-                        _ => N::Bot,
-                    },
-                },
+                // arithmetic-local coercion of lexical atoms (cint/cnum),
+                // int first — mirrors the Python paths' _tonum exactly
+                Some((a, b)) => {
+                    let ci = |n: &N| if let N::A(l) = n { cint(l) } else { None };
+                    let cn = |n: &N| if let N::A(l) = n { cnum(l) } else { None };
+                    match (ci(&a), ci(&b)) {
+                        (Some(p), Some(q)) => N::A(Rc::new(Leaf::I(match s { "+" => p + q, "-" => p - q, _ => p * q }))),
+                        _ => match (cn(&a), cn(&b)) {
+                            (Some(p), Some(q)) => N::A(Rc::new(Leaf::F(match s { "+" => p + q, "-" => p - q, _ => p * q }))),
+                            _ => N::Bot,
+                        },
+                    }
+                }
                 None => N::Bot,
             },
             "div" => match pairv(x) {
@@ -1000,10 +1027,10 @@ impl NEval {
                 None => N::Bot,
             },
             "ge" | "gt" | "le" | "lt" => match pairv(x) {
-                Some((N::A(a), N::A(b))) => match (&*a, &*b) {
-                    (Leaf::S(p), Leaf::S(q)) => nb(match s { "ge" => p >= q, "gt" => p > q, "le" => p <= q, _ => p < q }),
-                    _ => match (num(&a), num(&b)) {
-                        (Some(p), Some(q)) => nb(match s { "ge" => p >= q, "gt" => p > q, "le" => p <= q, _ => p < q }),
+                Some((N::A(a), N::A(b))) => match (cnum(&a), cnum(&b)) {
+                    (Some(p), Some(q)) => nb(match s { "ge" => p >= q, "gt" => p > q, "le" => p <= q, _ => p < q }),
+                    _ => match (&*a, &*b) {
+                        (Leaf::S(p), Leaf::S(q)) => nb(match s { "ge" => p >= q, "gt" => p > q, "le" => p <= q, _ => p < q }),
                         _ => N::Bot,
                     },
                 },

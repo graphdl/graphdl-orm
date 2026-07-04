@@ -114,6 +114,26 @@ def _eqobj(a, b):
 
 _num = lambda a, b: isinstance(a, (int, float)) and isinstance(b, (int, float)) \
     and not isinstance(a, bool) and not isinstance(b, bool)
+
+
+def _tonum(x):
+    """Arithmetic coercion: the store carries LEXICAL atoms ('120' — ORM values
+    are conceptually typed, lexically stored), so a numeric-looking string is a
+    number to + and kin. Anything else answers None (the caller bottoms).
+    Mirrored in prims._tonum — the oracle law: both paths, identically."""
+    if isinstance(x, bool):
+        return None
+    if isinstance(x, (int, float)):
+        return x
+    if isinstance(x, str):
+        try:
+            return int(x)
+        except ValueError:
+            try:
+                return float(x)
+            except ValueError:
+                return None
+    return None
 # operand-shape guards (§11.2.3): a primitive outside its stated shape is ⊥
 _pair = lambda o: _isseq(o) and len(o) == 2                  # ⟨x, y⟩
 _pair_xs = lambda o: _pair(o) and _isseq(o[1])               # ⟨x, ⟨…⟩⟩
@@ -121,14 +141,28 @@ _pair_sx = lambda o: _pair(o) and _isseq(o[0])               # ⟨⟨…⟩, x�
 _pair_ss = lambda o: _pair(o) and _isseq(o[0]) and _isseq(o[1])
 
 def _binop(f):
-    return lambda mu, o: f(o[0], o[1]) if (_pair(o) and _num(o[0], o[1])) else BOT_D
+    def g(mu, o):
+        if not _pair(o):
+            return BOT_D
+        a, b = _tonum(o[0]), _tonum(o[1])
+        return f(a, b) if a is not None and b is not None else BOT_D
+    return g
 
 def _cmp(rel):
     def g(mu, o):
         if not _pair(o):
             return BOT_D
         a, b = o[0], o[1]
-        ok = not _isseq(a) and not _isseq(b) and (_num(a, b) or type(a) is type(b))
+        if _isseq(a) or _isseq(b):
+            return BOT_D
+        na, nb = _tonum(a), _tonum(b)
+        if na is not None and nb is not None:
+            # comparison coerces like arithmetic: the store's lexical numbers
+            # ('305' beside a sum's 4997) order numerically wherever both
+            # sides parse — the old kernel's atoms were typed, so its folds
+            # compared numbers as numbers (the claude analytics family)
+            return _T if rel(na, nb) else _F
+        ok = _num(a, b) or type(a) is type(b)
         return (_T if rel(a, b) else _F) if ok else BOT_D
     return g
 
