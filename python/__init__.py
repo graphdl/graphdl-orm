@@ -26,9 +26,15 @@ FAST, the native carrier) are DEFS registrations, never forks of the source. The
 root conftest constructs the package for the checkout; installs map it in
 pyproject."""
 
-from . import lam, defs, reduce, prims                       # the lambda kernel + Backus base
+from . import kernel                                        # the whole evaluator stack, one file
+import sys as _sys
+for _n in ("lam", "defs", "delta", "reduce", "prims"):
+    # the old module names stay importable (pyarest.lam and kin all resolve
+    # to the kernel), so call sites and tests keep their idioms unchanged
+    _sys.modules[__name__ + "." + _n] = kernel
+lam = defs = delta = reduce = prims = kernel
 from . import canon
 canon.load_all()                                             # the INTERSECTION SOURCE, at boot:
                                                              # canonical names resolve everywhere
-from .lam import ATOM, SEQ, BOT, PHI, to_lam, from_lam, atom
-from .reduce import apply, meaning, mkapp
+from .kernel import ATOM, SEQ, BOT, PHI, to_lam, from_lam, atom
+from .kernel import apply, meaning, mkapp
