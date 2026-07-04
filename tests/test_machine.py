@@ -3,7 +3,7 @@ onestep). RMAP and CSDP are just two of those values."""
 from pyarest import to_lam, from_lam
 from pyarest.lam import atom as A
 import pyarest.prims  # noqa: F401
-from pyarest import machine as M
+from pyarest import system as M
 
 
 def run(t, acc0, inputs):

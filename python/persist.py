@@ -41,8 +41,7 @@ def save_sqlite(D, path, seal_key=None):
     cells table, insertion order preserved (first match wins on load, as in D). With a
     seal_key, the roles the schema derives as sensitive (seal.plan) are sealed before
     they touch disk — field-level encryption at rest, mode per constraint."""
-    from . import seal as _seal
-    sealing = _seal.plan(D)["roles"] if seal_key else {}
+    sealing = plan(D)["roles"] if seal_key else {}
     bycol = {}
     for ((ft, pos), mode) in sealing.items():
         bycol.setdefault(ft, []).append((pos, mode))
@@ -57,7 +56,7 @@ def save_sqlite(D, path, seal_key=None):
             if isinstance(c, tuple) and len(c) == 3 and c[0] == "CELL":
                 contents = c[2]
                 if seal_key and c[1] in bycol and isinstance(contents, tuple):
-                    contents = _seal.seal_rows(seal_key, contents, bycol[c[1]])
+                    contents = seal_rows(seal_key, contents, bycol[c[1]])
                 con.execute("INSERT INTO cells (ord, name, contents) VALUES (?, ?, ?)",
                             (i, json.dumps(c[1]), json.dumps(_conv(contents),
                                                              ensure_ascii=False)))
@@ -67,7 +66,6 @@ def save_sqlite(D, path, seal_key=None):
 
 
 def load_sqlite(path, seal_key=None):
-    from . import seal as _seal
     con = sqlite3.connect(path)
     try:
         rows = con.execute("SELECT name, contents FROM cells ORDER BY ord").fetchall()
@@ -76,7 +74,7 @@ def load_sqlite(path, seal_key=None):
     cells = tuple(("CELL", json.loads(n), _untuple(json.loads(c))) for (n, c) in rows)
     if seal_key:
         cells = tuple(
-            (t, n, _seal.unseal_rows(seal_key, v)
+            (t, n, unseal_rows(seal_key, v)
              if isinstance(v, tuple) and all(isinstance(r, tuple) for r in v) else v)
             for (t, n, v) in cells)
     return to_lam(cells)
@@ -195,3 +193,103 @@ def replay(D, path):
             continue
         D = _ap(_A(2), system.create(D, entry["ft"], to_lam(_untuple(entry["fact"]))))
     return D
+
+
+# =====================================================================
+# Field-level encryption at rest (merged from seal.py, 2026-07-04, the
+# fewer-files push: persistence owns what persists sealed). Sensitivity
+# DERIVES from data types, the mode from constraints (a keyed role seals
+# deterministically because equality must survive sealing; the rest
+# randomized), the key scope is the tenant. The cipher here is
+# TEST-GRADE (HMAC-SHA256 keystream); production binds real AEAD as a
+# boundary def. The engine's part is the derivation and the interface.
+# =====================================================================
+import base64 as _b64
+import hashlib as _hashlib
+import hmac as _hmac
+
+
+SENSITIVE_DATA_TYPES = {"SensitiveText", "Secret", "PII"}
+_MARK = "enc1:"
+
+
+def _data_types(D):
+    out = {}
+    for r in system._pop_rows(D, "data_type"):
+        text = r[0] if r else ""
+        if " is " in text:
+            name, dt = text.split(" is ", 1)
+            out[name.strip()] = dt.strip()
+    return out
+
+
+def plan(D):
+    """The derivation: which ⟨fact type, column⟩ seals, in which mode, plus which nouns'
+    IDENTIFIERS seal (reference modes on sensitive value types — always deterministic,
+    identifiers ARE equality)."""
+    dts = _data_types(D)
+    sensitive = {vt for vt, dt in dts.items() if dt in SENSITIVE_DATA_TYPES}
+    spans = {}
+    for r in system._pop_rows(D, "spans"):
+        if len(r) == 2:
+            spans.setdefault(r[0], set()).add(r[1])
+    uc_pos = {}
+    for c in system._pop_rows(D, "constraint"):
+        if len(c) >= 3 and c[1] in ("uniqueness", "spanning_uniqueness"):
+            uc_pos.setdefault(c[2], set()).update(spans.get(c[0], set()))
+    roles = {}
+    for r in system._pop_rows(D, "role"):
+        if len(r) >= 4 and r[3] in sensitive:
+            ft, pos = r[1], r[2]
+            det = pos in uc_pos.get(ft, set())
+            roles[(ft, pos)] = "deterministic" if det else "randomized"
+    ids = {}
+    for r in system._pop_rows(D, "refMode"):
+        if len(r) >= 2 and r[1] in sensitive:
+            ids[r[0]] = "deterministic"
+    return {"roles": roles, "ids": ids}
+
+
+# ============================ the cipher boundary (TEST-GRADE) ================
+def _stream(key, nonce, n):
+    out = b""
+    counter = 0
+    while len(out) < n:
+        out += _hmac.new(key, nonce + counter.to_bytes(4, "big"), _hashlib.sha256).digest()
+        counter += 1
+    return out[:n]
+
+
+def seal(key, value, deterministic=False):
+    """TEST-GRADE sealing: deterministic mode derives the nonce from the plaintext (same
+    value, same ciphertext — equality survives), randomized mode draws it fresh."""
+    data = json.dumps(value, ensure_ascii=False).encode("utf-8")
+    nonce = (_hmac.new(key, data, _hashlib.sha256).digest()[:8] if deterministic
+             else os.urandom(8))
+    ct = bytes(a ^ b for a, b in zip(data, _stream(key, nonce, len(data))))
+    return _MARK + _b64.b64encode(nonce + ct).decode("ascii")
+
+
+def unseal(key, token):
+    if not (isinstance(token, str) and token.startswith(_MARK)):
+        return token
+    raw = _b64.b64decode(token[len(_MARK):])
+    nonce, ct = raw[:8], raw[8:]
+    data = bytes(a ^ b for a, b in zip(ct, _stream(key, nonce, len(ct))))
+    return json.loads(data.decode("utf-8"))
+
+
+def seal_rows(key, rows, cols_modes):
+    out = []
+    for row in rows:
+        row = list(row)
+        for (pos, mode) in cols_modes:
+            if pos - 1 < len(row):
+                row[pos - 1] = seal(key, row[pos - 1], mode == "deterministic")
+        out.append(tuple(row))
+    return tuple(out)
+
+
+def unseal_rows(key, rows):
+    return tuple(tuple(unseal(key, v) if isinstance(v, str) else v for v in row)
+                 for row in rows)

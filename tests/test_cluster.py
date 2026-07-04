@@ -8,7 +8,7 @@ import pytest
 import pyarest.prims  # noqa: F401
 import pyarest.lam as L
 from pyarest.lam import from_lam, to_lam
-from pyarest import cluster, forml, polyglot, system
+from pyarest import polyglot as cluster, forml, polyglot, system
 
 pytestmark = pytest.mark.skipif(not polyglot.rust_available(),
                                 reason="rust kernel not built (cd rust; cargo build --release)")

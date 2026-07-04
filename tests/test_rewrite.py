@@ -8,7 +8,7 @@ import pytest
 import pyarest.prims  # noqa: F401
 import pyarest.lam as L
 from pyarest.lam import to_lam, from_lam, atom as A
-from pyarest import rewrite
+from pyarest import optimize as rewrite
 from pyarest import canon as theta
 from pyarest.reduce import apply
 

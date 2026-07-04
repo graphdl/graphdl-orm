@@ -7,7 +7,8 @@ import os
 import pyarest.prims  # noqa: F401
 import pyarest.lam as L
 from pyarest.lam import to_lam, from_lam
-from pyarest import ast, forml, persist, seal
+from pyarest import ast, forml, persist
+from pyarest import persist as seal
 from pyarest.reduce import apply
 
 

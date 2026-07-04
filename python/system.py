@@ -675,7 +675,6 @@ def rmap_partition(D):
     as the one machine fold. The kind of each fact type is READ OFF M's constraint facts:
     a spanning UC (or no UC at all, the m:n case) gives the fact type its own table (rule 1);
     a single-role UC makes it functional, absorbed into its role-1 player's table (rule 2)."""
-    from .machine import rmap as rmap_value, run_machine
     from .lam import to_lam, from_lam
     fts = [f[0] for f in reversed(_pop_rows(D, "factType"))]          # declaration order
     cons = _pop_rows(D, "constraint")
@@ -728,7 +727,7 @@ def rmap_partition(D):
                                       (ft in functional and ft not in spanning))
                      else "spanning")
                     for ft in fts)
-    pairs = from_lam(run_machine(rmap_value, to_lam(()), to_lam(triples)))
+    pairs = from_lam(run_machine(rmap, to_lam(()), to_lam(triples)))
     return {ft: key for (key, ft) in pairs}
 
 
@@ -1321,3 +1320,60 @@ def governance_rules(D):
     return _ap(ast.Store("ruleAtom"), _S(to_lam(rows), D))
 
 
+
+
+# =====================================================================
+# Machines as VALUES fed into ONE lambda (merged from machine.py,
+# 2026-07-04, the fewer-files push; Prop. onestep: machine = foldl
+# transition). A machine is not code, it IS its transition relation, a
+# value; `run` folds a transition value over inputs from an initial
+# state, applying with the `apply` primitive. rmap and csdp are Stage-1
+# seed values demonstrating the shape (Halpin 10.3 grouping, 3.2
+# populate); the full processes are roadmap phases, authored M-resident
+# and run by this same fold.
+# =====================================================================
+_3, _TL, _NULL, _NOT = A(3), A("tl"), A("null"), A("not")
+_APPLY, _APNDR = A("apply"), A("apndr")
+_TL, _NULL, _NOT, _APPLY, _APNDR, _EQ, _CONST = A("tl"), A("null"), A("not"), A("apply"), A("apndr"), A("eq"), A("CONST")
+
+# ---- run: the one lambda. run:⟨t, ⟨acc0, inputs⟩⟩ = foldl(t, acc0, inputs). ----
+# The state threads ⟨t, acc, remaining⟩ so the transition VALUE travels with the fold and is
+# applied to ⟨acc, input⟩ each step via `apply`. One runner; the machine is the value `t`.
+_input   = _S(_COMP, _1, _3)                                 # 1:(3:state) — the current input
+_new_acc = _S(_COMP, _APPLY, _S(_CONS, _1, _S(_CONS, _2, _input)))   # apply:⟨t, ⟨acc, input⟩⟩
+_new_rem = _S(_COMP, _TL, _3)                                # tl:(3:state)
+_step    = _S(_CONS, _1, _new_acc, _new_rem)                 # ⟨t, acc', rem'⟩
+_hasmore = _S(_COMP, _NOT, _NULL, _3)                        # remaining non-empty?
+_loop    = _S(_WHILE, _hasmore, _step)
+_init    = _S(_CONS, _1, _S(_COMP, _1, _2), _S(_COMP, _2, _2))       # ⟨t, acc0, inputs⟩
+run = _S(_COMP, _2, _loop, _init)                            # 2:(loop:(init:arg)) = the final acc
+define("run", run)
+
+
+def run_machine(transition, acc0, inputs):
+    """Fold a transition VALUE over `inputs` from `acc0` — via the one `run` lambda."""
+    from .reduce import apply
+    return apply(run, _S(transition, _S(acc0, inputs)))
+
+
+# ---- RMAP as a value (Halpin §10.3): the two grouping rules, as a transition relation. ----
+# Over fact-type facts ⟨factType, objectType, kind⟩, RMAP assigns each fact type a table:
+#   functional role  → grouped ON the object type   (rule 2)
+#   compound UC      → its OWN table                 (rule 1)
+# The transition emits ⟨tableKey, factType⟩; folding it over the schema is the mapping — and
+# "the decomposition into atomic facts IS the relational mapping": each key becomes a cell.
+_kind = _S(_COMP, _3, _2)                                    # kind of the fact-type fact (2:arg)
+_ot   = _S(_COMP, _2, _2)                                    # its object type
+_ft   = _S(_COMP, _1, _2)                                    # its fact type
+_is_functional = _S(_COMP, _EQ, _S(_CONS, _kind, _S(_CONST, A("functional"))))
+_table_key = _S(_COND, _is_functional, _ot, _ft)            # rule 2 → object type ; rule 1 → own
+_entry = _S(_CONS, _table_key, _ft)                         # ⟨tableKey, factType⟩
+rmap = _S(_COMP, _APNDR, _S(_CONS, _1, _entry))            # apndr:⟨acc, ⟨tableKey, factType⟩⟩
+define("rmap", rmap)
+
+
+# ---- CSDP as a value: another transition, run by the SAME lambda. ----
+# The CSDP populate step (Halpin §3.2) folds elementary example facts into the schema's fact
+# set. Here that step is `apndr` (accumulate each verbalized fact) — a different value into `run`.
+csdp = _APNDR
+define("csdp", csdp)
