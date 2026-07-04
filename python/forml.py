@@ -192,7 +192,9 @@ def _prose_suspect(text, known):
     every live db), so the old #789 word-level test applies to rule clauses and
     instance facts, not to plain readings."""
     bare = _QUOTED_SPAN.sub(" ", text)
-    return ("," in bare) or ("(" in bare) or (")" in bare)
+    # the colon tell is SENTENCE punctuation (': ' with a following space); a
+    # colon inside a token is a CURIE (schema:Product — the federation lineage)
+    return ("," in bare) or ("(" in bare) or (")" in bare) or (": " in bare)
 
 
 class _Known(set):
@@ -1266,6 +1268,10 @@ def compile(stmt, D, known=()):
     if kind == "fact_type_reading" and _prose_suspect(g[0], known):
         # a readings PARAGRAPH, not a reading: report it, never declare it (the
         # old engine's check warns the author; silence was the data loss)
+        kind, g = "UNPARSED", (stmt,)
+    elif kind == "rule_iff" and _prose_suspect(g[1], known):
+        # prose containing ' iff ' claims the rule recognizer, but a real rule
+        # HEAD is a reading — commas, colons or parentheses there mean paragraph
         kind, g = "UNPARSED", (stmt,)
     asserts, cons = _plan(kind, g, known, modality)
     for cell, fact in asserts:

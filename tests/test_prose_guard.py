@@ -48,6 +48,22 @@ Each Person likes some Person.
     assert rep["unparsed"] == []
 
 
+def test_prose_containing_iff_stays_prose():
+    # a documentation paragraph whose text contains ' iff ' must not become a
+    # diagnosed rule: a real rule HEAD is a reading and never carries commas,
+    # colons or parentheses (the claude app's two residual diagnostics)
+    model = """Task is an entity type.
+Hypothesis is an entity type.
+
+The surface trigger is EXISTENTIAL: once any Hypothesis is disproven, the substrate flags iff the Task warrants it.
+"""
+    D, rep = forml.compile_model(model)
+    assert len(rep["unparsed"]) == 1
+    assert rep["rule_diagnostics"] == []
+    assert not [f[0] for f in system._pop_rows(D, "factType")
+                if "surface" in f[0].lower()]
+
+
 def test_quoted_literals_are_not_scanned_for_prose():
     model = """Operating Rule is an entity type.
 Rule Statement is a value type.

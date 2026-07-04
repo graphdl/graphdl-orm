@@ -63,6 +63,23 @@ def test_the_base_freezes_once(tmp_path):
     assert frozen2 == frozen
 
 
+def test_readings_load_recursively_app_md_first(tmp_path):
+    # the old engine walks readings/ RECURSIVELY, app.md first then
+    # depth-then-name (rebuild.rs load_app_readings) — the claude app keeps
+    # instance slices in readings/instances/, invisible to a flat listing
+    apps_dir = tmp_path / "apps"
+    r = apps_dir / "board" / "readings"
+    (r / "instances").mkdir(parents=True)
+    (r / "app.md").write_text("Task is an entity type.\nTask Subject is a value type.\n"
+                              "Task has Task Subject.\n", encoding="utf-8")
+    (r / "instances" / "live.md").write_text(
+        "Task 't1' has Task Subject 'Ship the walker'.\n", encoding="utf-8")
+    reg = apps.Registry(str(apps_dir))
+    rep = reg.compile("board")
+    assert rep["unparsed"] == []
+    assert reg.query("board", "Task_has_Task_Subject") == [("t1", "Ship the walker")]
+
+
 def test_the_vendored_base_is_the_old_engines_backbone():
     # the eight CORE_READINGS files plus the deployed evolution overlay
     # (evolution + csdp — the live tasks db carries Domain Change and Rmap

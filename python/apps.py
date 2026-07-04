@@ -42,11 +42,22 @@ class Registry:
         return os.path.join(self._app_dir(name), f"{name}.db")
 
     def _readings(self, name):
+        """The app's reading files, the old engine's walk (rebuild.rs
+        load_app_readings): RECURSIVE over readings/, app.md first, then
+        depth-then-name — instance slices live in subdirectories (the claude
+        app's readings/instances/), and core nouns must be in context first."""
         d = os.path.join(self._app_dir(name), "readings")
         if not os.path.isdir(d):
             return []
-        return [os.path.join(d, fn) for fn in sorted(os.listdir(d))
-                if fn.endswith(".md")]
+        found = []
+        for root, _dirs, files in os.walk(d):
+            for fn in files:
+                if fn.endswith(".md"):
+                    found.append(os.path.join(root, fn))
+        found.sort(key=lambda p: (len(os.path.relpath(p, d).split(os.sep)), p))
+        app_md = [p for p in found if os.path.basename(p) == "app.md"
+                  and os.path.dirname(p) == d]
+        return app_md + [p for p in found if p not in app_md]
 
     def list(self):
         out = []

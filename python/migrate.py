@@ -167,6 +167,51 @@ def plan(D, cells):
     return out
 
 
+def _prose_like(value):
+    """Sentence-shaped content where an atomic value belongs: several words
+    with sentence punctuation, or outright paragraph length. The heuristic is
+    deliberately conservative — the audit flags for re-authoring at swap time,
+    it never blocks."""
+    if not isinstance(value, str):
+        return False
+    words = value.split()
+    if len(value) > 160:
+        return True
+    return len(words) >= 6 and any(m in value for m in (". ", "; ", ", "))
+
+
+def audit_authoring(plan_out, D=None):
+    """The mis-authoring audit: prose crammed into VALUES (catch-all text
+    fields), prose used as IDS (the first role of a row is the reference; a
+    sentence there is an authoring defect), and prose ENUM MEMBERS in the
+    readings' possible-values declarations. Answers {cell, kind, count,
+    sample} findings — the swap-time cleanup list, never a block."""
+    findings = []
+    for ft, rows in sorted(plan_out["asserted"].items()):
+        hits_v = [r for r in rows if any(_prose_like(v) for v in r[1:])]
+        hits_i = [r for r in rows if r and isinstance(r[0], str)
+                  and len(r[0].split()) >= 5]
+        if hits_v:
+            findings.append({"cell": ft, "kind": "prose_value",
+                             "count": len(hits_v),
+                             "sample": str(hits_v[0])[:160]})
+        if hits_i:
+            findings.append({"cell": ft, "kind": "prose_id",
+                             "count": len(hits_i),
+                             "sample": str(hits_i[0][0])[:160]})
+    if D is not None:
+        for r in system._pop_rows(D, "valueConstraint"):
+            if len(r) >= 2 and isinstance(r[1], str):
+                members = re.findall(r"'([^']*)'", r[1])
+                bad = [m for m in members
+                       if _prose_like(m) or len(m.split()) >= 6]
+                if bad:
+                    findings.append({"cell": r[0], "kind": "prose_enum",
+                                     "count": len(bad),
+                                     "sample": bad[0][:160]})
+    return findings
+
+
 def replay_into(registry, app, old_db):
     """Migrate an old .db's asserted populations into the app as BATCH log
     entries, recompile (the log replays through the same path every compile
@@ -202,4 +247,5 @@ def replay_into(registry, app, old_db):
                          if rows},
             "stored_state": sorted(p["stored_state"]),
             "verify": verify, "unknown": sorted(p["unknown"]),
-            "unparsed": sorted(p["unparsed"])}
+            "unparsed": sorted(p["unparsed"]),
+            "authoring": audit_authoring(p, D)}

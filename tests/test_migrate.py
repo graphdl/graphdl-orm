@@ -51,6 +51,8 @@ APP = """Task is an entity type.
 Task Subject is a value type.
 Task has Task Subject.
 Task blocks Task.
+Mood is a value type.
+The possible values of Mood are 'calm', 'the vibe when the build is red and nobody wants to say it out loud in the standup meeting'.
 
 * Resource is currently in Status iff some State Machine is for that Resource and that State Machine is currently in that Status.
 """
@@ -98,6 +100,37 @@ def _old_db(tmp_path):
     con.commit()
     con.close()
     return p
+
+
+def test_the_report_audits_mis_authored_content(tmp_path):
+    # old-app readings are known to be mis-authored in places: prose crammed
+    # into values, enum members, or ids. The migration FLAGS these (deontic:
+    # report and notify, never block) as the swap-time cleanup list.
+    reg = _mk(tmp_path)
+    p = str(tmp_path / "old2.db")
+    con = sqlite3.connect(p)
+    con.execute("CREATE TABLE cells (name TEXT PRIMARY KEY, contents TEXT)")
+    con.executemany("INSERT INTO cells VALUES (?, ?)", [
+        ("Task_has_Task_Subject",
+         "{a=<<Task, 112>, <Task Subject, Fix the parser. It broke last week. "
+         "We should also consider rewriting the whole module\\, since the "
+         "grammar changed underneath it and nobody noticed for a month>>, "
+         "b=<<Task, do the thing we discussed at standup yesterday>, "
+         "<Task Subject, ok>>}"),
+        ("Task_blocks_Task", "<<<Task, 112>, <Task, 113>>>"),
+    ])
+    con.commit()
+    con.close()
+    report = migrate.replay_into(reg, "board", p)
+    audit = report["authoring"]
+    assert any("Task_has_Task_Subject" == a["cell"] and a["kind"] == "prose_value"
+               for a in audit)
+    assert any(a["kind"] == "prose_id" and "standup" in a["sample"]
+               for a in audit)
+    # clean rows are not flagged
+    assert not any("Task_blocks_Task" == a["cell"] for a in audit)
+    # a prose enum member in the READINGS is an authoring defect too
+    assert any(a["kind"] == "prose_enum" and "Mood" in a["cell"] for a in audit)
 
 
 def test_replay_into_migrates_asserted_and_verifies_derived(tmp_path):
