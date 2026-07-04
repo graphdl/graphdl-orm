@@ -90,3 +90,31 @@ def test_a_roleless_fact_type_is_skipped_not_malformed_sql():
         "SELECT name FROM sqlite_master WHERE type='table'")}
     assert "widgets_frob_gadgets" not in tables
     assert "person" in tables                                 # the rest still projects
+
+
+def test_reprojection_adds_columns_for_new_fact_types():
+    # schema evolution on a LIVE db (the gms-1993 filing exposed it): a later
+    # compile declares a new absorbed fact type, and re-projecting into the
+    # same connection must ALTER the new column in — CREATE IF NOT EXISTS
+    # alone never revisits an existing table
+    D, rep = forml.compile_model(MODEL)
+    assert rep["unparsed"] == []
+    D = system.run_rules(D)
+    con = sqlite3.connect(":memory:")
+    ddl.project(D, con)
+    D2, rep2 = forml.compile_model(MODEL + """Person is an algorithm author.
+Rank is a value type.
+Person holds Rank.
+Each Person holds at most one Rank.
+Person 'p2' is an algorithm author.
+Person 'p2' holds Rank 'fellow'.
+""")
+    assert rep2["unparsed"] == []
+    D2 = system.run_rules(D2)
+    ddl.project(D2, con)
+    rows = dict(con.execute(
+        "SELECT person_nr, is_an_algorithm_author FROM person").fetchall())
+    assert rows == {"p1": 0, "p2": 1, "p3": 0}
+    ranks = dict(con.execute(
+        "SELECT person_nr, rank FROM person").fetchall())
+    assert ranks["p2"] == "fellow" and ranks["p1"] is None

@@ -141,6 +141,19 @@ def project(D, con):
         stmt = stmt.replace(" TEXT NOT NULL", " TEXT")
         con.execute(stmt.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS"))
 
+    def ensure_columns(table, colnames, coltypes):
+        # schema evolution on a live db: IF NOT EXISTS never revisits an
+        # existing table, so a later compile's new absorbed fact types ALTER
+        # in, typed as generate types them (BOOLEAN unaries, TEXT values).
+        # Columns the model no longer declares stay behind untouched — the
+        # mirror is soft both ways.
+        have = {r[1] for r in con.execute(
+            f"PRAGMA table_info({_q(_sql_name(table))})")}
+        for c in colnames:
+            if c not in have:
+                con.execute(f"ALTER TABLE {_q(_sql_name(table))} ADD COLUMN "
+                            f"{_q(c)} {coltypes.get(c, 'TEXT')}")
+
     counts = {}
     pops = {}
 
@@ -162,10 +175,12 @@ def project(D, con):
             if row:
                 ids.add(row[0])
         colnames = [_key_col(table, ref)]
+        coltypes = {}
         per_id = {i: {} for i in ids}
         for (ft, col, kind, _other) in _entity_columns(
                 table, partition, roles, ref, entities, entity_tables):
             colnames.append(col)
+            coltypes[col] = "BOOLEAN" if kind == "unary" else "TEXT"
             if kind == "unary":
                 members = {r[0] for r in pop(ft) if r}
                 for i in ids:
@@ -174,6 +189,7 @@ def project(D, con):
             val = {r[0]: r[1] for r in pop(ft) if len(r) >= 2}
             for i in ids:
                 per_id[i][col] = val.get(i)
+        ensure_columns(table, colnames, coltypes)
         marks = ", ".join("?" for _ in colnames)
         for i in sorted(ids):
             con.execute(
