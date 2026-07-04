@@ -55,3 +55,38 @@ def test_the_projection_is_queryable_the_graphdl_way():
         "SELECT p.name FROM person p JOIN person_likes_person l "
         "ON l.person_nr_2 = p.person_nr").fetchall()
     assert got == [("Ada",)]                                  # p3 likes p1, named Ada
+
+
+def test_reserved_word_identifiers_are_quoted():
+    # the base metamodel projects a 'constraint' table (the old .db carries it);
+    # every generated identifier must be quoted or sqlite refuses the schema
+    model = """Constraint is an entity type.
+Name is a value type.
+Constraint has Name.
+Each Constraint has at most one Name.
+Constraint 'c1' has Name 'uc1'.
+"""
+    D, rep = forml.compile_model(model)
+    assert rep["unparsed"] == []
+    D = system.run_rules(D)
+    con = sqlite3.connect(":memory:")
+    counts = ddl.project(D, con)
+    assert counts.get("Constraint") == 1
+    rows = con.execute('SELECT constraint_id, name FROM "constraint"').fetchall()
+    assert rows == [("c1", "uc1")]
+
+
+def test_a_roleless_fact_type_is_skipped_not_malformed_sql():
+    # an ALL-LOWERCASE degenerate reading records a fact type with no role rows
+    # (Title-case words would mine as implicit nouns and carry roles); the
+    # projection must skip it with a named None count, never emit
+    # 'CREATE TABLE x (, PRIMARY KEY ())'
+    D, rep = forml.compile_model(MODEL + "\nwidgets frob gadgets.\n")
+    D = system.run_rules(D)
+    con = sqlite3.connect(":memory:")
+    counts = ddl.project(D, con)
+    assert counts.get("widgets_frob_gadgets", "absent") is None
+    tables = {r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "widgets_frob_gadgets" not in tables
+    assert "person" in tables                                 # the rest still projects

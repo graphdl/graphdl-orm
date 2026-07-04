@@ -183,5 +183,15 @@ def replay(D, path):
                          if t != row)
             D = _ap(ast.Store(ft), to_lam(rows) if False else _S(to_lam(rows), D))
             continue
+        if entry.get("op") == "migrate":
+            # a migration BATCH: rows union in as one Store write (one derive
+            # pass rides the caller's run_rules — the old engine's atomic
+            # collection apply is the precedent; the report at migration time
+            # carried the verification)
+            ft = entry["ft"]
+            rows = {tuple(r) for r in system._pop_rows(D, ft)}
+            rows |= {_untuple(f) for f in entry["facts"]}
+            D = _ap(ast.Store(ft), _S(to_lam(tuple(sorted(rows))), D))
+            continue
         D = _ap(_A(2), system.create(D, entry["ft"], to_lam(_untuple(entry["fact"]))))
     return D

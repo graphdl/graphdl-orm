@@ -17,6 +17,12 @@ def _sql_name(name):
     return s or "t"
 
 
+def _q(name):
+    """Every emitted identifier is quoted: the base metamodel projects tables named
+    constraint, transition, view — SQL reserved words the old .db also carries."""
+    return '"' + name + '"'
+
+
 def _analyze(D):
     partition = system.rmap_partition(D)
     roles = {}
@@ -32,12 +38,39 @@ def _analyze(D):
     entities = {r[0] for r in system._pop_rows(D, "instanceOf")
                 if len(r) >= 2 and r[1] == "ObjectType"}
     cons = system._pop_rows(D, "constraint")
-    mandatory = {c[2] for c in cons if len(c) >= 3 and c[1] == "mandatory"}
+    mandatory = {}
+    for c in cons:
+        if len(c) >= 4 and c[1] == "mandatory":
+            mandatory.setdefault(c[2], set()).add(c[3])       # ft -> mandated players
     return partition, roles, ref, entities, mandatory
 
 
 def _key_col(name, ref):
     return f"{_sql_name(name)}_{_sql_name(ref.get(name, 'id'))}"
+
+
+def _entity_columns(table, partition, roles, ref, entities, entity_tables):
+    """The ordered absorbed columns of an entity table: (ft, column, kind, other)
+    with kind in unary/value/ref. One naming pass shared by generate and project
+    (they must never disagree), deduped with the position suffix the own-table
+    branch uses — the base metamodel absorbs two Status roles into transition and
+    two Texts into constraint."""
+    out, seen = [], {}
+    for ft in system.table_columns(partition, table):
+        rs = roles.get(ft, [])
+        if len(rs) == 1:
+            base = _sql_name(ft[len(table):] if ft.startswith(table) else ft)
+            kind, other = "unary", None
+        else:
+            other = next((t for (_p, t) in rs if t != table), None)
+            if other in entities and other in entity_tables:
+                base, kind = _key_col(other, ref), "ref"
+            else:
+                base, kind = (_sql_name(other) if other else _sql_name(ft)), "value"
+        seen[base] = seen.get(base, 0) + 1
+        col = base if seen[base] == 1 else f"{base}_{seen[base]}"
+        out.append((ft, col, kind, other))
+    return out
 
 
 def generate(D):
@@ -50,38 +83,37 @@ def generate(D):
     entity_tables = entities | ({t for t in partition.values()} - set(own))
 
     for table in sorted(entity_tables):
-        cols = [f"    {_key_col(table, ref)} TEXT PRIMARY KEY"]
-        for ft in system.table_columns(partition, table):
-            rs = roles.get(ft, [])
-            if len(rs) == 1:                                  # absorbed unary: boolean
-                stem = _sql_name(ft[len(table):] if ft.startswith(table) else ft)
-                cols.append(f"    {stem} BOOLEAN")
+        cols = [f"    {_q(_key_col(table, ref))} TEXT PRIMARY KEY"]
+        for (ft, col, kind, other) in _entity_columns(
+                table, partition, roles, ref, entities, entity_tables):
+            if kind == "unary":                               # absorbed unary: boolean
+                cols.append(f"    {_q(col)} BOOLEAN")
                 continue
-            other = next((t for (_p, t) in rs if t != table), None)
-            colname = _sql_name(other) if other else _sql_name(ft)
-            null = " NOT NULL" if ft in mandatory else ""
-            refs = ""
-            if other in entities and other in entity_tables:
-                colname = _key_col(other, ref)
-                refs = f" REFERENCES {_sql_name(other)}({_key_col(other, ref)})"
-            cols.append(f"    {colname} TEXT{null}{refs}")
-        tables[table] = (f"CREATE TABLE {_sql_name(table)} (\n"
+            # Halpin 11.12: the column hardens only when the MANDATED player is
+            # this table (a mandatory on the other role never forces this column)
+            null = " NOT NULL" if table in mandatory.get(ft, ()) else ""
+            refs = ("" if kind != "ref" else
+                    f" REFERENCES {_q(_sql_name(other))}({_q(_key_col(other, ref))})")
+            cols.append(f"    {_q(col)} TEXT{null}{refs}")
+        tables[table] = (f"CREATE TABLE {_q(_sql_name(table))} (\n"
                          + ",\n".join(cols) + "\n);")
 
     for ft in sorted(own):
         rs = roles.get(ft, [])
+        if not rs:                                            # no roles, no relational shape
+            continue
         cols, key, seen = [], [], {}
         for (_pos, player) in rs:
             base = (_key_col(player, ref)
                     if player in entities else _sql_name(player))
             seen[base] = seen.get(base, 0) + 1
             col = base if seen[base] == 1 else f"{base}_{seen[base]}"
-            refs = (f" REFERENCES {_sql_name(player)}({_key_col(player, ref)})"
+            refs = (f" REFERENCES {_q(_sql_name(player))}({_q(_key_col(player, ref))})"
                     if player in entities and player in entity_tables else "")
-            cols.append(f"    {col} TEXT NOT NULL{refs}")
+            cols.append(f"    {_q(col)} TEXT NOT NULL{refs}")
             key.append(col)
-        stmt = (f"CREATE TABLE {_sql_name(ft)} (\n" + ",\n".join(cols)
-                + f",\n    PRIMARY KEY ({', '.join(key)})\n);")
+        stmt = (f"CREATE TABLE {_q(_sql_name(ft))} (\n" + ",\n".join(cols)
+                + f",\n    PRIMARY KEY ({', '.join(_q(c) for c in key)})\n);")
         tables[ft] = stmt
     return tables
 
@@ -102,6 +134,11 @@ def project(D, con):
     own = [ft for ft, key in partition.items() if key == ft]
     entity_tables = entities | ({t for t in partition.values()} - set(own))
     for stmt in generate(D).values():
+        # the projection is SOFT where generate is hard (the old engine's
+        # projected tables are a data mirror: no NOT NULL beyond the keys), so
+        # a migrated population missing a mandatory value lands as a NULL row
+        # instead of crashing the compile — visibility over cascade
+        stmt = stmt.replace(" TEXT NOT NULL", " TEXT")
         con.execute(stmt.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS"))
 
     counts = {}
@@ -126,40 +163,39 @@ def project(D, con):
                 ids.add(row[0])
         colnames = [_key_col(table, ref)]
         per_id = {i: {} for i in ids}
-        for ft in system.table_columns(partition, table):
-            rs = roles.get(ft, [])
-            if len(rs) == 1:
-                stem = _sql_name(ft[len(table):] if ft.startswith(table) else ft)
-                colnames.append(stem)
+        for (ft, col, kind, _other) in _entity_columns(
+                table, partition, roles, ref, entities, entity_tables):
+            colnames.append(col)
+            if kind == "unary":
                 members = {r[0] for r in pop(ft) if r}
                 for i in ids:
-                    per_id[i][stem] = 1 if i in members else 0
+                    per_id[i][col] = 1 if i in members else 0
                 continue
-            other = next((t for (_p, t) in rs if t != table), None)
-            col = (_key_col(other, ref)
-                   if other in entities and other in entity_tables
-                   else (_sql_name(other) if other else _sql_name(ft)))
-            colnames.append(col)
             val = {r[0]: r[1] for r in pop(ft) if len(r) >= 2}
             for i in ids:
                 per_id[i][col] = val.get(i)
         marks = ", ".join("?" for _ in colnames)
         for i in sorted(ids):
             con.execute(
-                f"INSERT OR REPLACE INTO {_sql_name(table)} "
-                f"({', '.join(colnames)}) VALUES ({marks})",
+                f"INSERT OR REPLACE INTO {_q(_sql_name(table))} "
+                f"({', '.join(_q(c) for c in colnames)}) VALUES ({marks})",
                 [i] + [per_id[i].get(c) for c in colnames[1:]])
         counts[table] = len(ids)
 
     for ft in sorted(own):
         rs = roles.get(ft, [])
+        if not rs:
+            # a fact type with no role rows (a reading over undeclared types) has
+            # no relational mapping: named None, never malformed SQL
+            counts[ft] = None
+            continue
         rows = pop(ft)
         if not rows:
             counts[ft] = 0
             continue
         marks = ", ".join("?" for _ in rs)
         for row in rows:
-            con.execute(f"INSERT OR REPLACE INTO {_sql_name(ft)} VALUES ({marks})",
+            con.execute(f"INSERT OR REPLACE INTO {_q(_sql_name(ft))} VALUES ({marks})",
                         list(row[:len(rs)]))
         counts[ft] = len(rows)
     con.commit()

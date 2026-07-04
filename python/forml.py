@@ -97,6 +97,14 @@ _CLASSIFY = [
     ("sm_moore", re.compile(r"^Status '(.+)' emits '(.+)'\.$")),
     ("value_constraint", re.compile(r"^[Tt]he possible values? of (.+?) (?:are|is) (.+)\.$")),
     ("spanning_uc", re.compile(r"^[Ii]n each population of (.+), each (.+) combination occurs at most once\.$")),
+    # the corpus's roles-first spelling of the same constraint (base state.md,
+    # bill-negotiation, support.auto.dev)
+    ("spanning_uc2", re.compile(r"^[Ee]ach (.+?) combination occurs at most once "
+                                r"in the population of (.+)\.$")),
+    # the corpus's for-each mandatory: 'For each Reading, some Role is used in
+    # that Reading.' — declares the fact type through the anaphoric scan and
+    # mandates the for-each subject at its role position
+    ("for_each_mandatory", re.compile(r"^For each (.+?), some (.+)\.$")),
     # Halpin §7.2: frequency generalizes the spanning form from 'once' to bounded counts
     ("frequency", re.compile(r"^[Ii]n each population of (.+), each (.+) combination occurs (at most|at least|exactly) (\d+) times?\.$")),
     # Halpin §7.3 ring constraints, as the corpus grammar's trailing markers on a reading
@@ -122,13 +130,16 @@ _CLASSIFY = [
     # recognizer. The corpus's biconditional spelling 'iff' (the closed-world reading
     # of n rules per head, per the ORM-to-datalog mapping) is a synonym here, and its
     # 'where'-scoped bodies fold into the same conjunction in the handler.
-    ("rule_if", re.compile(r"^(?![*+])(\S.*?\d\S*.*?) iff? (.+)\.$")),
+    # quote-aware: the keyword and the digit must sit OUTSIDE literals (an instance
+    # fact whose quoted value cites ' iff ' or a digit is not a rule — the old
+    # engine's literal-aware keyword scan)
+    ("rule_if", re.compile(r"^(?![*+])((?:[^']|'[^']*')*?\d\S*(?:[^']|'[^']*')*?) iff? (.+)\.$")),
     # the live corpus's unnumbered anaphoric spelling, canonical per the old grammar's
     # own classifier ('Statement has Classification Derivation Rule iff Statement has
     # Keyword iff' — arest readings/forml2-grammar.md): variables are type-name
     # occurrences, that/some qualifiers bind anaphorically, and an optional leading
     # NORMA derivation-storage marker (* ** + ++) names the storage kind
-    ("rule_iff", re.compile(r"^(?:([*+]{1,2}) )?(\S.*?) iff (.+)\.$")),
+    ("rule_iff", re.compile(r"^(?:([*+]{1,2}) )?((?:[^']|'[^']*')*?) iff (.+)\.$")),
     # a derivation RULE reading (leading * = derived): a linear role path from a root object type
     # (infosci Mapping_ORM_to_Datalog: *Each FastCarDriver is some Person who drives some Car ...)
     ("derivation_rule", re.compile(r"^\*Each (.+?) is some (.+?) who (.+)\.$")),
@@ -148,7 +159,11 @@ _CLASSIFY = [
 
 def analyze(stmt):
     """stmt → (kind, groups, modality). A possibility/permitted statement is the absence of a
-    constraint (informational). Otherwise the inner is classified and tagged with its modality."""
+    constraint (informational). Otherwise the inner is classified and tagged with its modality.
+    A TRAILING parenthetical is an annotation, not sentence content: the old corpus writes
+    'Verb is performed during Transition (Mealy semantics).' and its cell is
+    Verb_is_performed_during_Transition — the aside strips before classification."""
+    stmt = re.sub(r"\s*\([^()]*\)\.$", ".", stmt)
     mod, sign, inner = _split_modality(stmt)
     if sign == "possibility":
         return "possibility", (inner.rstrip("."),), mod
@@ -164,25 +179,57 @@ def classify(stmt):
     return kind, groups
 
 
+_QUOTED_SPAN = re.compile(r"'[^']*'")
+
+
+def _prose_suspect(text, known):
+    """A readings PARAGRAPH pretending to be a reading. The tell is STRUCTURAL: a
+    comma or parenthesis outside quoted spans — no legitimate fact-type reading
+    carries either (the base's 916 statements included), while prose runs on
+    commas and asides. A merely-unknown Title-case word is NOT the tell: the old
+    corpus declares role nouns implicitly in readings ('Noun has Object Type.'
+    with Object Type declared nowhere is the base's own style, and its cells ride
+    every live db), so the old #789 word-level test applies to rule clauses and
+    instance facts, not to plain readings."""
+    bare = _QUOTED_SPAN.sub(" ", text)
+    return ("," in bare) or ("(" in bare) or (")" in bare)
+
+
 class _Known(set):
     """The known TYPE NAMES, carrying the prepass context rules need: the subtype
-    closure (noun → its ancestors) and the declared fact-type slugs, so a rule clause
-    keyed on a subtype can resolve UP to the supertype-declared fact type (subtype
-    instances are supertype instances — the lift both engines' tests demanded)."""
-    def __new__(cls, names, subs=None, fts=None):
+    closure (noun → its ancestors), the declared fact-type slugs (rule heads
+    included, for antecedent resolution), and the PLAIN reading declarations
+    (rule heads excluded — a rule against a plainly-declared fact type must not
+    re-mark its storage kind; the reading's own trailing marker owns that)."""
+    def __new__(cls, names, subs=None, fts=None, plain=None):
         self = super().__new__(cls, names)
         self.subs = subs or {}
         self.fts = fts or set()
+        self.plain = plain or set()
         return self
 
-    def __init__(self, names, subs=None, fts=None):
+    def __init__(self, names, subs=None, fts=None, plain=None):
         super().__init__(names)
 
 
-def _prepass_context(stmts, names):
-    """Collect subtype edges (closed transitively) and declared fact-type slugs."""
-    edges = []
-    fts = set()
+def _context_of(D):
+    """The known context READ OFF a compiled store — declared type names, subtype
+    edges, fact-type slugs — so a model can compile ATOP a preloaded base (the old
+    engine folds CORE_READINGS ahead of every app; this is the same seam with the
+    base thawed from frozen ingestion instead of recompiled)."""
+    names = {r[0] for r in system._pop_rows(D, "instanceOf")
+             if len(r) >= 2 and r[1] in ("ObjectType", "ValueType")}
+    fts = {f[0] for f in system._pop_rows(D, "factType") if f}
+    edges = [(r[0], r[1]) for r in system._pop_rows(D, "subtype") if len(r) >= 2]
+    return names, edges, fts
+
+
+def _prepass_context(stmts, names, extra_edges=(), extra_fts=()):
+    """Collect subtype edges (closed transitively), declared fact-type slugs, and
+    the PLAIN reading declarations (fts minus rule heads)."""
+    edges = list(extra_edges)
+    fts = set(extra_fts)
+    plain = set(extra_fts)
     for s in stmts:
         kind, g = classify(s)
         if kind == "subtype_of":
@@ -191,8 +238,11 @@ def _prepass_context(stmts, names):
             for sub in g[0].split(","):
                 edges.append((sub.strip(), g[2].strip()))
         elif kind == "fact_type_reading" and "'" not in g[0]:
+            if _prose_suspect(g[0], names):
+                continue                                       # a paragraph, not a reading
             ft, _ = _fact_type(_strip_derivation(g[0])[1], names)
             fts.add(ft)
+            plain.add(ft)
         elif kind in ("rule_if", "rule_iff"):
             # a rule HEAD is a declaration (NORMA's starred reading): later rules'
             # antecedents resolve against it exactly like an explicit reading
@@ -202,9 +252,11 @@ def _prepass_context(stmts, names):
         elif kind == "uniqueness":
             ft, _ = _fact_type(g[0] + " " + g[2], names)
             fts.add(ft)
+            plain.add(ft)
         elif kind == "mandatory":
             ft, _ = _fact_type(g[0] + " " + g[1], names)
             fts.add(ft)
+            plain.add(ft)
     parents = {}
     for (a, b) in edges:
         parents.setdefault(a, set()).add(b)
@@ -218,10 +270,45 @@ def _prepass_context(stmts, names):
                     seen.add(p)
                     todo.append(p)
         closure[start] = seen
-    return closure, fts
+    return closure, fts, plain
 
 
 # ---- two-pass name resolution: split a reading against the known type names ----
+# sentence vocabulary that never OPENS a type name: the grammar's Prose Stopword
+# enum plus the connective/negation sentence-leaders of the live corpus
+_IMPLICIT_STOP = {"If", "When", "Then", "That", "This", "An", "A", "The",
+                  "Each", "Some", "No", "Every", "Not", "It", "There", "Once",
+                  "For", "In", "Of", "To", "On", "At", "By", "With", "And",
+                  "Or", "Only"}
+
+
+def _implicit_nouns(stmts):
+    """The old corpus's implicit role nouns: a maximal run of Title-case tokens
+    inside a non-prose statement IS a noun, declared by occurrence (the old
+    engine's Role Reference extraction — its dbs bind Event Type, Fact Type and
+    Noun this way with no explicit declaration anywhere). Quoted spans are data;
+    prose and list forms (comma or parenthesis outside quotes) are never mined;
+    numeric subscripts strip per token."""
+    names = set()
+    for s in stmts:
+        s = re.sub(r"\s*\([^()]*\)\.$", ".", s)               # trailing annotation
+        bare = _QUOTED_SPAN.sub(" ", s)
+        if ("," in bare) or ("(" in bare) or (")" in bare):
+            continue
+        run = []
+        for tok in bare.split():
+            base = tok.strip(".;:").rstrip("0123456789")
+            if base and base[0].isupper() and base not in _IMPLICIT_STOP:
+                run.append(base)
+                continue
+            if len(run) >= 1:
+                names.add(" ".join(run))
+            run = []
+        if run:
+            names.add(" ".join(run))
+    return names
+
+
 def _known(stmts):
     names = set()
     for s in stmts:
@@ -232,13 +319,16 @@ def _known(stmts):
             names.add(g[0]); names.add(g[1])
         elif k == "objectification":
             names.add(g[1])
+    names |= _implicit_nouns(stmts)
     return sorted(names, key=len, reverse=True)
 
 
 def _subject(text, known):
     """The leading object type of a reading + the remainder (a find over known types — the string
-    boundary): used by negation/inverse-uc where only the subject is needed."""
-    for k in known:
+    boundary): used by negation/inverse-uc where only the subject is needed. LONGEST
+    name first: 'State Machine Definition has …' must never truncate its subject to a
+    declared prefix type ('State Machine') — set order made it nondeterministic."""
+    for k in sorted(known, key=lambda s: -len(s)):
         if text == k or text.startswith(k + " "):
             return k, text[len(k):].strip()
     first = text.split(" ", 1)
@@ -427,6 +517,49 @@ def _h_spanning(g, k, m):
     cid = ftn + "_uc"
     return [("constraint", (cid, "spanning_uniqueness", ftn, m)),
             ("spans", (cid, 1)), ("spans", (cid, 2))], [(cid, C.uniqueness([1, 2]))]
+
+
+def _h_spanning_corpus(g, k, m):
+    """'Each A, B combination occurs at most once in the population of <reading>.'
+    — the roles-first spelling; the reading declares implicitly, old-corpus style."""
+    names = [s.strip() for s in g[0].split(",")]
+    ftn, decl = _fact_type(g[1], k)
+    _t, rtypes = _reading(g[1], k)
+    roles, used = [], {}
+    for nm in names:
+        occ = [i for i, t in enumerate(rtypes) if t == nm]
+        if occ:
+            roles.append(occ[min(used.get(nm, 0), len(occ) - 1)] + 1)
+            used[nm] = used.get(nm, 0) + 1
+    roles = roles or [1, 2]
+    cid = ftn + "_uc"
+    return (decl + [("constraint", (cid, "spanning_uniqueness", ftn, m))]
+            + [("spans", (cid, p)) for p in roles]), [(cid, C.uniqueness(roles))]
+
+
+def _dequalify(text, known):
+    """The clause with its anaphoric qualifiers dropped — the declared reading
+    behind 'Role is used in that Reading' (the same scan _rule_atom runs)."""
+    kset = sorted(known, key=lambda x: -len(x.split()))
+    toks, out, i = text.split(), [], 0
+    while i < len(toks):
+        if toks[i] in _QUALIFIERS and _type_span(toks, i + 1, kset):
+            i += 1
+            continue
+        out.append(toks[i])
+        i += 1
+    return " ".join(out)
+
+
+def _h_for_each_mandatory(g, k, m):
+    """'For each S, some <clause over S>.' — the clause declares the fact type
+    (implicitly, old-corpus style) and S's role in it is mandatory."""
+    subject, clause = g[0].strip(), _dequalify(g[1], k)
+    ft, decl = _fact_type(clause, k)
+    _t, rtypes = _reading(clause, k)
+    pos = (rtypes.index(subject) + 1) if subject in rtypes else 1
+    mfacts, mobjs = _mandatory_parts(ft, subject, m, pos)
+    return decl + mfacts, mobjs
 
 
 def _h_frequency(g, k, m):
@@ -711,17 +844,25 @@ def _h_fact(g, k, m):
 
 
 # ---- the state-machine readings (whitepaper §1): a machine is a SET OF FACTS in M ----
+# the machine definition IS a set of facts (whitepaper §1; the old cells carry
+# Transition_is_from_Status et al. populated from these very statements), so each
+# DSL statement asserts BOTH the machinery fact and the ordinary instance fact —
+# rules like the base's rooted-status derivation read the plain cells
 def _h_sm_def(g, k, m):
-    return [("smDef", (g[0], g[1]))], []
+    return [("smDef", (g[0], g[1])),
+            ("State_Machine_Definition_is_for_Noun", (g[0], g[1]))], []
 
 def _h_sm_initial(g, k, m):
-    return [("smStatus", (g[1], g[0], "initial"))], []        # ⟨sm, status, initial⟩
+    return [("smStatus", (g[1], g[0], "initial")),            # ⟨sm, status, initial⟩
+            ("Status_is_initial_in_State_Machine_Definition", (g[0], g[1]))], []
 
 def _h_sm_from(g, k, m):
-    return [("smFrom", (g[0], g[1]))], []                     # ⟨transition, from-status⟩
+    return [("smFrom", (g[0], g[1])),                         # ⟨transition, from-status⟩
+            ("Transition_is_from_Status", (g[0], g[1]))], []
 
 def _h_sm_to(g, k, m):
-    return [("smTo", (g[0], g[1]))], []                       # ⟨transition, to-status⟩
+    return [("smTo", (g[0], g[1])),                           # ⟨transition, to-status⟩
+            ("Transition_is_to_Status", (g[0], g[1]))], []
 
 def _h_sm_trigger(g, k, m):
     return [("smTrigger", (g[0], _clause_ft(g[1], k)))], []   # ⟨transition, trigger fact type⟩
@@ -836,7 +977,10 @@ def _coercion(clause, known):
     return sa[0] + sa[1], sb[0] + sb[1]
 
 
-_AGG_CLAUSE = re.compile(r"^(\S+) is the (min|max|count|sum) of (\S*\d\S*)$")
+# the output and source are VARIABLES by the rule convention: numbered
+# (Count1 of Count2) or the corpus's unnumbered type-name spelling (Arity of
+# Role — the base's own Fact_Type_has_Arity rule)
+_AGG_CLAUSE = re.compile(r"^(.+?) is the (min|max|count|sum) of (.+)$")
 _CMP_CLAUSE = re.compile(
     r"^(\S*\d\S*) (exceeds|is greater than|is less than|is at least|is at most|equals) (\S+)$")
 _CMP_OPS = {"exceeds": "gt", "is greater than": "gt", "is less than": "lt",
@@ -853,14 +997,31 @@ def _h_rule_if(g, k, m, kind="fully-derived"):
     derives to the lfp."""
     import zlib
     from . import system as _sys
-    head_txt, body = g
-    body = g[1].replace(' where ', ' and ')                # the corpus's where-scope is conjunction
-    clauses = [c.strip() for c in body.split(" and ")]
+    head_txt, body = g[0], g[1]
+    # ' and ' splits at TOP level; a fragment's ' where '-chain then scopes to
+    # the fragment's own quantifier: inside a 'no'-group it stays the negated
+    # existential's conjunction (it must never escape as a top-level clause),
+    # after an aggregate it hoists to top-level conjunction (the corpus's
+    # bag-scoping spelling, the behavior existing models compiled against)
+    clauses, neg_groups = [], []
+    for frag in (c.strip() for c in body.split(" and ")):
+        if frag.startswith("no "):
+            neg_groups.append([p.strip() for p in frag[3:].split(" where ")])
+        elif " where " in frag:
+            clauses.extend(p.strip() for p in frag.split(" where "))
+        else:
+            clauses.append(frag)
     hft, hvars, _hlits = _rule_atom(head_txt, k)
     rule_cid = hft + "_rule_" + format(zlib.crc32(body.encode()), "x")
     _hf, decl = _fact_type(re.sub(r"\d+", "", head_txt).strip(), k)
-    A_ = decl + [("derivation", (hft, kind)),
-                 ("ruleDerives", (rule_cid, hft))]
+    # the rule's leading marker marks the RULE; the fact type's storage kind
+    # belongs to its READING declaration (trailing marker there, or none). Only
+    # a head the rule itself declares defaults to the rule's kind — the old
+    # base's SM current-status is plainly declared with imperative writers
+    # beside its seed rule, and must not become fully-derived here.
+    head_is_new = not (isinstance(k, _Known) and hft in k.plain)
+    A_ = decl + ([("derivation", (hft, kind))] if head_is_new else []) \
+        + [("ruleDerives", (rule_cid, hft))]
     # one pass, clauses in order: joins extend the column map, comparators filter
     # it. The AGGREGATE clause is extracted first and processed LAST: the corpus
     # places it at the head of the body with its bag scoped by the where-clauses
@@ -929,9 +1090,52 @@ def _h_rule_if(g, k, m, kind="fully-derived"):
         for (vi, lit) in alits:                            # 'Task Status ⟨lit⟩': the role's column
             filters.append(_sys.cmp_filter("eq", cols[avars[vi]], lit=_num(lit)))
         atoms.append((aft, avars))
+    # negation groups compile AFTER the positive body binds its columns: the
+    # group is its own little conjunctive body (fresh namespace — the 'no X'
+    # subject SHADOWS any outer X; other group variables shared-if-bound), and
+    # the anti-join keys on the shared columns
+    negs = []
+    if ok and neg_groups and atoms:
+        for parts in neg_groups:
+            gatoms, gcols, gfilters, gjoins, subject = [], {}, [], [], None
+            for ci, c in enumerate(parts):
+                aft, avars, alits = _rule_atom(c, k)
+                A_.append(("ruleReads", (rule_cid, aft)))
+                if ci == 0:
+                    subject = avars[0] if avars else None
+                if not gatoms:
+                    for v in avars:
+                        gcols.setdefault(v, len(gcols) + 1)
+                else:
+                    pairs = tuple((gcols[v], i + 1)
+                                  for i, v in enumerate(avars) if v in gcols)
+                    fresh, seen = [], set()
+                    for i, v in enumerate(avars):
+                        if v not in gcols and v not in seen:
+                            fresh.append(i + 1)
+                            seen.add(v)
+                    gjoins.append((pairs, tuple(fresh)))
+                    for v in avars:
+                        gcols.setdefault(v, len(gcols) + 1)
+                for (vi, lit) in alits:
+                    gfilters.append(_sys.cmp_filter("eq", gcols[avars[vi]],
+                                                    lit=_num(lit)))
+                gatoms.append((aft, avars))
+            shared = [v for v in gcols if v in cols and v != subject]
+            if not shared:
+                ok = False
+                diag = "negation group shares no bound variable with the body"
+                break
+            gwidths = [max(len(av), 1) for (_aft, av) in gatoms]
+            negs.append(([a[0] for a in gatoms],
+                         [gcols[v] for v in shared], gwidths, gfilters,
+                         gjoins, [cols[v] for v in shared]))
     if ok and agg_clause is not None:
         out_v, op, over_v = _AGG_CLAUSE.match(agg_clause).groups()
-        if over_v in cols and out_v not in cols:
+        if neg_groups:
+            ok = False
+            diag = "an aggregate with a negation group is not supported"
+        elif over_v in cols and out_v not in cols:
             agg = (op, cols[over_v], out_v)
         else:
             ok = False
@@ -954,9 +1158,20 @@ def _h_rule_if(g, k, m, kind="fully-derived"):
             # stratified above the closure, full recompute: no ~d variants
             return A_, [(rule_cid, obj)]
         diag = f"aggregate head variables unbound or output {out_v!r} not in head"
-    elif ok and atoms and all(v in cols for v in hvars):
+    elif ok and atoms and all(v in cols for i, v in enumerate(hvars)
+                              if i not in {vi for vi, _l in _hlits}):
         A_.append(("derivationRule", (hft, atoms[0][0], len(atoms))))
-        proj = [cols[v] for v in hvars]
+        # a head literal fixes its role to a constant: rho applies the spec entry
+        # ⟨CONST, lit⟩ as the constant function, so the projection stays one form
+        litmap = {vi: lit for vi, lit in _hlits}
+        proj = [("CONST", _num(litmap[i])) if i in litmap else cols[v]
+                for i, v in enumerate(hvars)]
+        if negs:
+            # stratified above the closure, full recompute — like aggregates
+            A_.append(("ruleNeg", (rule_cid,)))
+            obj = _sys.compile_rule_neg([a[0] for a in atoms], proj, len(cols),
+                                        widths, filters, joins, negs)
+            return A_, [(rule_cid, obj)]
         if len(atoms) == 1 and not filters and proj == list(range(1, widths[0] + 1)):
             # a COPY rule (one positive atom, no filters, identity head): it proves
             # atom ⊆ head at every fixed point, so a matching subset/subtype check
@@ -965,7 +1180,8 @@ def _h_rule_if(g, k, m, kind="fully-derived"):
         obj = _sys.compile_rule([a[0] for a in atoms], proj, widths, filters,
                                 joins)
     elif ok:
-        unbound = sorted(set(hvars) - set(cols)) if atoms else []
+        fixed = {hvars[vi] for vi, _l in _hlits if vi < len(hvars)}
+        unbound = sorted(set(hvars) - set(cols) - fixed) if atoms else []
         diag = (f"head variable(s) {unbound} unbound in the body" if unbound
                 else "no fact-type clause in the body")
     if obj is None:
@@ -978,7 +1194,7 @@ def _h_rule_if(g, k, m, kind="fully-derived"):
     for i, (aft, _av) in enumerate(atoms):
         A_.append(("ruleAtom", (rule_cid, i + 1, aft)))
         out.append((f"{rule_cid}~d{i + 1}",
-                    _sys.compile_rule_delta([a[0] for a in atoms], [cols[v] for v in hvars],
+                    _sys.compile_rule_delta([a[0] for a in atoms], proj,
                                             i, widths, filters, joins)))
     return A_, out
 
@@ -1021,6 +1237,7 @@ _PLAN = {
     "objectification": _h_objectification, "data_type": _h_meta("data_type"), "ref_mode": _h_meta("ref_mode"),
     "value_constraint": _h_value_constraint, "uniqueness": _h_uniqueness, "mandatory": _h_mandatory,
     "neg_uniqueness": _h_neg_uniqueness, "neg_mandatory": _h_neg_mandatory, "spanning_uc": _h_spanning,
+    "spanning_uc2": _h_spanning_corpus, "for_each_mandatory": _h_for_each_mandatory,
     "frequency": _h_frequency, "ring": _h_ring, "subtype_of": _h_subtype,
     "brace_subtypes": _h_brace_subtypes,
     "set_comparison": _h_set_comparison, "disjunctive_mandatory": _h_disjunctive,
@@ -1046,6 +1263,10 @@ def compile(stmt, D, known=()):
     from .reduce import apply as _apply
     from .lam import atom as _A
     kind, g, modality = analyze(stmt)
+    if kind == "fact_type_reading" and _prose_suspect(g[0], known):
+        # a readings PARAGRAPH, not a reading: report it, never declare it (the
+        # old engine's check warns the author; silence was the data loss)
+        kind, g = "UNPARSED", (stmt,)
     asserts, cons = _plan(kind, g, known, modality)
     for cell, fact in asserts:
         D = _apply(_A(2), ast.run(to_lam(fact), D, cell_name=cell))
@@ -1121,8 +1342,10 @@ def register_translators():
         ("translate_derivation_mode_facts", ["fact_type_reading"]),
         ("translate_derivation_rules", ["rule_if", "rule_iff", "derivation_rule", "class_rule"]),
         ("translate_cardinality_constraints", ["uniqueness", "inverse_uc",
-                                               "spanning_uc", "frequency",
+                                               "spanning_uc", "spanning_uc2",
+                                               "frequency",
                                                "neg_uniqueness", "mandatory",
+                                               "for_each_mandatory",
                                                "neg_mandatory"]),
         ("translate_ring_constraints", ["ring"]),
         ("translate_set_constraints", ["set_comparison", "subset", "equality",
@@ -1170,8 +1393,8 @@ def compile_model_selfhost(text, D=None):
             dispatch.setdefault(r[0], []).append(r[1])
     stmts = statements(text)
     names = _known(stmts)
-    subs, fts = _prepass_context(stmts, names)
-    known = _Known(names, subs, fts)
+    subs, fts, plain = _prepass_context(stmts, names)
+    known = _Known(names, subs, fts, plain)
     ctx = to_lam((tuple(sorted(names)),
                   tuple(sorted((s, tuple(sorted(a))) for s, a in subs.items())),
                   tuple(sorted(fts))))
@@ -1205,16 +1428,21 @@ def compile_model_selfhost(text, D=None):
     return D, {"unclassified": unclassified}
 
 
-def compile_model(text, D=None):
-    """Fold `compile` over a whole NORMA verbalization into M (two-pass). Returns (D, report)."""
+def compile_model(text, D=None, context_from=None):
+    """Fold `compile` over a whole NORMA verbalization into M (two-pass). Returns
+    (D, report). With `context_from`, the known context seeds from that store —
+    compile the app's statements ATOP a preloaded base whose types, subtypes and
+    fact types resolve exactly like in-text declarations."""
     from . import meta
     from collections import Counter
     if D is None:
         D = meta.initial_D()
+    b_names, b_edges, b_fts = ((set(), (), ()) if context_from is None
+                               else _context_of(context_from))
     stmts = statements(text)
-    names = _known(stmts)
-    subs, fts = _prepass_context(stmts, names)
-    known = _Known(names, subs, fts)
+    names = set(_known(stmts)) | b_names
+    subs, fts, plain = _prepass_context(stmts, names, b_edges, b_fts)
+    known = _Known(names, subs, fts, plain)
     report, unparsed = Counter(), []
     for s in stmts:
         D, kind = compile(s, D, known)
@@ -1349,6 +1577,9 @@ _RENDER = {
     "data_type": lambda g: f"Data Type: {g[0]}",
     "value_constraint": lambda g: f"The possible values of {g[0]} are {g[1]}",
     "spanning_uc": lambda g: f"In each population of {g[0]}, each {g[1]} combination occurs at most once",
+    "spanning_uc2": lambda g: (f"Each {g[0]} combination occurs at most once "
+                               f"in the population of {g[1]}"),
+    "for_each_mandatory": lambda g: f"For each {g[0]}, some {g[1]}",
     "frequency": lambda g: f"In each population of {g[0]}, each {g[1]} combination occurs {g[2]} {g[3]} times",
     "ring": lambda g: f"{g[0]} is {g[1]}",
     "subtype_of": lambda g: f"{g[0]} is a subtype of {g[1]}",

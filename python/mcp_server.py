@@ -59,6 +59,25 @@ TOOLS = [
     {"name": "context",
      "description": "The last mutation receipt (committed, violations).",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "get",
+     "description": "The 3NF per-entity view: key, absorbed values, unary "
+                    "booleans, and the facts the id participates in.",
+     "inputSchema": {"type": "object", "properties": {
+         "noun": {"type": "string"},
+         "id": {"type": "string"},
+         "app": {"type": "string"}}, "required": ["noun", "id"]}},
+    {"name": "cells",
+     "description": "Cell names with row counts (optional substring pattern), "
+                    "or one cell's rows via cell=.",
+     "inputSchema": {"type": "object", "properties": {
+         "pattern": {"type": "string"},
+         "cell": {"type": "string"},
+         "app": {"type": "string"}}}},
+    {"name": "schema",
+     "description": "The model surface: object types, fact types with readings "
+                    "and roles, constraints.",
+     "inputSchema": {"type": "object", "properties": {
+         "app": {"type": "string"}}}},
 ]
 
 
@@ -87,13 +106,21 @@ def _dispatch(reg, name, args):
         return reg.apply(app, args["fact_type"], args["fact"])
     if name == "retract":
         return reg.retract(app, args["fact_type"], args["fact"])
+    if name == "get":
+        return reg.get(app, args["noun"], args["id"])
+    if name == "cells":
+        return {"app": app,
+                "cells": reg.cells(app, pattern=args.get("pattern"),
+                                   cell=args.get("cell"))}
+    if name == "schema":
+        return reg.schema(app)
     raise ValueError(f"unknown tool {name!r}")
 
 
 def serve(apps_dir, stdin=None, stdout=None):
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
-    reg = apps.Registry(apps_dir)
+    reg = apps.Registry(apps_dir, base_dir=apps.default_base())
     for line in stdin:
         line = line.strip()
         if not line:

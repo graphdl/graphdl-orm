@@ -65,10 +65,16 @@ def test_selfhost_compile_matches_the_seed_compiler():
 
 
 def test_the_rules_not_the_regex_order_are_the_classifier():
-    # the seed parses 'Data Type: …' (its own recognizer); the grammar rules classify
-    # only the 'the data type of' surface, which this statement lacks, and it holds no
-    # known noun and no rule literal — so the self-hosted path reports it unclassified
-    # while the seed accepts it: the rules, not the regex order, are the classifier
-    _D, rep = forml.compile_model_selfhost("Person is an entity type.\n"
-                                           "Data Type: Salary is Money.\n")
-    assert any(s.startswith("Data Type:") for s in rep["unclassified"])
+    # the seed's fallback recognizer accepts any sentence; the grammar RULES
+    # classify only what carries a recognizer literal, a Role Reference (a
+    # Title-case run — the old Stage-1's implicit-noun semantics, which 'Data
+    # Type: Salary is Money.' now satisfies and classifies, faithfully), or a
+    # Literal Role. An all-lowercase sentence carries none — the self-hosted
+    # path reports IT unclassified while the seed accepts it: the rules, not
+    # the regex order, are the classifier.
+    _D, rep = forml.compile_model_selfhost(
+        "Person is an entity type.\n"
+        "Data Type: Salary is Money.\n"
+        "this sentence resolves to nothing at all.\n")
+    assert not any(s.startswith("Data Type:") for s in rep["unclassified"])
+    assert any(s.startswith("this sentence") for s in rep["unclassified"])

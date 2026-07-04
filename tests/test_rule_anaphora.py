@@ -83,6 +83,106 @@ def test_in_body_literal_restricts_the_role():
     assert rep["rule_diagnostics"] == []
 
 
+def test_a_literal_containing_iff_stays_an_instance_fact():
+    # the claude app's Operating Rule corpus: a rule-statement LITERAL quoting the
+    # word iff must not route the instance fact into the rule path (the old
+    # engine's keyword scan is literal-aware)
+    model = """Operating Rule is an entity type.
+Rule Statement is a value type.
+Operating Rule has Rule Statement.
+
+Operating Rule 'r1' has Rule Statement 'A thing is an entity iff you can SEE it'.
+"""
+    D, rep = _derive(model)
+    got = {tuple(r) for r in system._pop_rows(D, "Operating_Rule_has_Rule_Statement")}
+    assert got == {("r1", "A thing is an entity iff you can SEE it")}
+    assert rep["rule_diagnostics"] == []
+
+
+def test_a_literal_containing_digits_and_iff_stays_an_instance_fact():
+    # the rule_if (numbered) recognizer has the same blindness when the only
+    # digit sits inside the literal (claude's Engine Lesson corpus)
+    model = """Engine Lesson is an entity type.
+Construction is a value type.
+Engine Lesson prescribes Construction.
+
+Engine Lesson 'e1' prescribes Construction 'Layer has Load 0 iff Layer stacks'.
+"""
+    D, rep = _derive(model)
+    got = {tuple(r) for r in system._pop_rows(D, "Engine_Lesson_prescribes_Construction")}
+    assert got == {("e1", "Layer has Load 0 iff Layer stacks")}
+    assert rep["rule_diagnostics"] == []
+
+
+def test_a_head_literal_projects_as_a_constant():
+    # the claude app's deontic-flag idiom: the head fixes one role to a literal,
+    # projected as a constant (rho interprets a ⟨CONST, lit⟩ spec entry)
+    model = """Investigation is an entity type.
+Hypothesis is an entity type.
+Reasoning Practice is a value type.
+Hypothesis Disposition is a value type.
+Investigation should apply Reasoning Practice.
+Hypothesis belongs to Investigation.
+Hypothesis has Hypothesis Disposition.
+
+* Investigation should apply Reasoning Practice 'Systematic Debugging' iff some Hypothesis belongs to that Investigation and that Hypothesis has Hypothesis Disposition 'disproven'.
+
+Hypothesis 'h1' belongs to Investigation 'i1'.
+Hypothesis 'h1' has Hypothesis Disposition 'disproven'.
+Hypothesis 'h2' belongs to Investigation 'i2'.
+"""
+    D, rep = _derive(model)
+    got = {tuple(r) for r in system._pop_rows(
+        D, "Investigation_should_apply_Reasoning_Practice")}
+    assert got == {("i1", "Systematic Debugging")}
+    assert rep["rule_diagnostics"] == []
+
+
+def test_unnumbered_aggregate_clause_compiles():
+    # the base's own spelling: '* Fact Type has Arity iff Arity is the count of
+    # Role where Fact Type has Role.' — no numbered variables anywhere
+    model = """Fact Type is an entity type.
+Role is an entity type.
+Arity is a value type.
+Fact Type has Role.
+Fact Type has Arity.
+
+* Fact Type has Arity iff Arity is the count of Role where Fact Type has Role.
+
+Fact Type 'f1' has Role 'r1'.
+Fact Type 'f1' has Role 'r2'.
+Fact Type 'f2' has Role 'r3'.
+"""
+    D, rep = _derive(model)
+    assert rep["rule_diagnostics"] == []
+    got = {tuple(r) for r in system._pop_rows(D, "Fact_Type_has_Arity")}
+    assert got == {("f1", 2), ("f2", 1)}
+
+
+def test_the_readings_trailing_marker_owns_the_storage_kind():
+    # the rule's leading star marks the RULE; the fact type's storage kind
+    # comes from its READING declaration ('X. **' = derived-and-stored, plain =
+    # no derivation mark at all even when a rule also derives into it — the old
+    # base's SM current-status has two imperative writers beside its seed rule)
+    model = """Person is an entity type.
+Login is an entity type.
+Status is a value type.
+Person has Status.
+Login has Status.
+Login is for Person.
+Task is an entity type.
+Task has Status. **
+
+* Person has Status iff some Login is for that Person and that Login has Status.
+"""
+    D, rep = forml.compile_model(model)
+    der = {r[0]: r[1] for r in system._pop_rows(D, "derivation") if len(r) >= 2}
+    assert "Person_has_Status" not in der                     # declared plain: no mark
+    assert der.get("Task_has_Status") == "derived-and-stored"  # the reading's marker
+    rd = {r[1] for r in system._pop_rows(D, "ruleDerives") if len(r) >= 2}
+    assert "Person_has_Status" in rd                          # the rule still derives
+
+
 def test_numbered_rules_still_compile_the_same():
     model = """Person is an entity type.
 Person likes Person.

@@ -243,6 +243,27 @@ def compile_rule(atom_fts, head_positions, widths=None, filters=None, joins=None
     return _apply(A("system:compile_rule"), rec)
 
 
+def compile_rule_neg(atom_fts, head_positions, ncols, widths, filters, joins, negs):
+    """The positive body wrapped in stratified anti-joins: per negation group
+    (neg_atom_fts, neg_key_proj, neg_widths, neg_filters, neg_joins, anti_key),
+    a running tuple survives iff its anti_key columns are NOT among the group's
+    projected keys (theta:AntiRestrict — Restrict's mirror with the membership
+    negated). Full recompute above the closure, exactly like aggregates:
+    semi-naive deltas are unsound under negation-as-failure."""
+    from .reduce import apply as _apply
+    from .lam import to_lam
+    obj = compile_rule(atom_fts, list(range(1, ncols + 1)), widths, filters,
+                       joins)
+    for (nfts, nproj, nwidths, nfilters, njoins, anti_key) in negs:
+        neg = compile_rule(nfts, nproj, nwidths, nfilters, njoins)
+        anti = _apply(A("theta:AntiRestrict"),
+                      to_lam((tuple(anti_key),
+                              tuple(range(1, len(nproj) + 1)))))
+        obj = _S(A("COMP"), anti, _S(A("CONS"), obj, neg))
+    head = _apply(A("theta:Project"), to_lam(tuple(head_positions)))
+    return _S(A("COMP"), head, obj)
+
+
 def compile_rule_delta(atom_fts, head_positions, delta_at, widths=None, filters=None,
                        joins=None):
     """The rule body with atom `delta_at` (0-based) reading the round's DELTA instead of
