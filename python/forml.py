@@ -122,7 +122,13 @@ _CLASSIFY = [
     # recognizer. The corpus's biconditional spelling 'iff' (the closed-world reading
     # of n rules per head, per the ORM-to-datalog mapping) is a synonym here, and its
     # 'where'-scoped bodies fold into the same conjunction in the handler.
-    ("rule_if", re.compile(r"^(\S.*?\d\S*.*?) iff? (.+)\.$")),
+    ("rule_if", re.compile(r"^(?![*+])(\S.*?\d\S*.*?) iff? (.+)\.$")),
+    # the live corpus's unnumbered anaphoric spelling, canonical per the old grammar's
+    # own classifier ('Statement has Classification Derivation Rule iff Statement has
+    # Keyword iff' — arest readings/forml2-grammar.md): variables are type-name
+    # occurrences, that/some qualifiers bind anaphorically, and an optional leading
+    # NORMA derivation-storage marker (* ** + ++) names the storage kind
+    ("rule_iff", re.compile(r"^(?:([*+]{1,2}) )?(\S.*?) iff (.+)\.$")),
     # a derivation RULE reading (leading * = derived): a linear role path from a root object type
     # (infosci Mapping_ORM_to_Datalog: *Each FastCarDriver is some Person who drives some Car ...)
     ("derivation_rule", re.compile(r"^\*Each (.+?) is some (.+?) who (.+)\.$")),
@@ -186,6 +192,12 @@ def _prepass_context(stmts, names):
                 edges.append((sub.strip(), g[2].strip()))
         elif kind == "fact_type_reading" and "'" not in g[0]:
             ft, _ = _fact_type(_strip_derivation(g[0])[1], names)
+            fts.add(ft)
+        elif kind in ("rule_if", "rule_iff"):
+            # a rule HEAD is a declaration (NORMA's starred reading): later rules'
+            # antecedents resolve against it exactly like an explicit reading
+            head = g[0] if kind == "rule_if" else g[1]
+            ft, _ = _fact_type(re.sub(r"\d+", "", head).strip(), names)
             fts.add(ft)
         elif kind == "uniqueness":
             ft, _ = _fact_type(g[0] + " " + g[2], names)
@@ -723,35 +735,105 @@ def _h_sm_emit(g, k, m):
 def _h_sm_moore(g, k, m):
     return [("smMoore", (g[0], g[1]))], []                    # ⟨status, Moore def name⟩
 
-_VARTOK = re.compile(r"^(\w+)(\d+)$")
-_SOME = re.compile(r"\b(some|that) ")                          # existentials only: the article
-                                                               # 'a' is predicate text ('is a
-                                                               # parent of'), never stripped
+# the anaphoric qualifiers, the old engine's strip_role_qualifiers set. Stripping is a
+# FALLBACK, tried only when the verbatim reading resolves to no declared fact type —
+# 'a' is often predicate text ('Person is a Parent' keeps its article), while
+# 'that Resource' in the corpus's anaphoric rules normalizes to the bare reading.
+_QUALIFIERS = {"that", "some", "the", "other", "a", "an"}
+
+
+def _type_span(toks, i, kset):
+    """The longest known type reading left-to-right from toks[i], its LAST word
+    optionally carrying a numeric subscript (Halpin's Task1 / State Machine2).
+    → (base type, subscript, token span) or None."""
+    for k in kset:
+        kw = k.split()
+        last = i + len(kw) - 1
+        if last < len(toks) and toks[i:last] == kw[:-1]:
+            mm = re.fullmatch(re.escape(kw[-1]) + r"(\d*)", toks[last])
+            if mm:
+                return k, mm.group(1), len(kw)
+    return None
+
+
+def _quoted_at(toks, i):
+    """The quoted literal starting at toks[i] → (text without quotes, next index)."""
+    buf = []
+    for j in range(i, len(toks)):
+        buf.append(toks[j])
+        if toks[j].endswith("'") and (j > i or len(toks[j]) > 1):
+            return " ".join(buf)[1:-1], j + 1
+    return " ".join(buf).strip("'"), len(toks)
+
 
 def _rule_atom(text, known):
-    """A rule clause → (fact type id, ordered variable list): numbered variables generalize
-    to their base type for fact-type resolution ('Person1' plays a Person role), and the
-    variable sequence follows the reading's role order (the book's D1 convention)."""
-    vars_, out = [], []
-    for tok in text.split():
-        mm = _VARTOK.match(tok)
-        if mm and mm.group(1) in known:
-            vars_.append(mm.group(1) + mm.group(2))
-            out.append(mm.group(1))
-        else:
-            out.append(tok)
-    reading = _SOME.sub("", " ".join(out)).strip()
-    ft, _decl = _fact_type(reading, known)
+    """A rule clause → (fact type id, ordered variables, literal restrictions).
+    Variables are type-name occurrences — the corpus's unnumbered anaphoric
+    spelling and the book's numbered D1 convention are one mechanism, a numeric
+    subscript distinguishing same-type twins. A quoted literal directly after a
+    role mention restricts that role. Fact-type resolution tries the verbatim
+    reading first, then the qualifier-stripped one (the old engine's chain)."""
+    kset = sorted(known, key=lambda k: -len(k.split()))
+    toks, vars_, lits = text.split(), [], []
+    verbatim, stripped = [], []
+    i = 0
+    while i < len(toks):
+        tok = toks[i]
+        if tok in _QUALIFIERS and _type_span(toks, i + 1, kset):
+            verbatim.append(tok)                              # kept as reading text
+            i += 1
+            continue
+        span = _type_span(toks, i, kset)
+        if span:
+            base, sub, ln = span
+            vars_.append(base + sub)
+            verbatim.append(base)
+            stripped.append(base)
+            i += ln
+            if i < len(toks) and toks[i].startswith("'"):
+                lit, i = _quoted_at(toks, i)
+                lits.append((len(vars_) - 1, lit))
+            continue
+        verbatim.append(tok)
+        stripped.append(tok)
+        i += 1
+    fts = known.fts if isinstance(known, _Known) else ()
+    ft, _decl = _fact_type(" ".join(verbatim), known)
+    if fts and ft not in fts:
+        alt, _ = _fact_type(" ".join(stripped), known)
+        if alt in fts:
+            ft = alt
     # the subtype lift: a clause keyed on a subtype resolves UP to the supertype's
     # declared fact type when its own is undeclared (subtype instances ARE supertype
     # instances; the fact lives once, in the supertype-keyed cell)
-    if vars_ and isinstance(known, _Known) and known.fts and ft not in known.fts:
+    if vars_ and fts and ft not in fts:
         base = re.sub(r"\d+$", "", vars_[0])
+        reading = " ".join(stripped)
         for anc in sorted(known.subs.get(base, ())):
             lifted, _ = _fact_type(reading.replace(base, anc, 1), known)
-            if lifted in known.fts:
-                return lifted, vars_
-    return ft, vars_
+            if lifted in fts:
+                return lifted, vars_, lits
+    return ft, vars_, lits
+
+
+def _coercion(clause, known):
+    """The corpus's re-keying idiom: a bare 'A is B' over two known types with NO
+    declared fact type is an identity binding between the two variables (subtype
+    coercion: one instance plays both). A declared 'A is B' reading stays an
+    ordinary atom — declaration wins, as in the old engine's reading resolution."""
+    toks = clause.split()
+    kset = sorted(known, key=lambda k: -len(k.split()))
+    sa = _type_span(toks, 0, kset)
+    if not sa or sa[2] >= len(toks) or toks[sa[2]] != "is":
+        return None
+    sb = _type_span(toks, sa[2] + 1, kset)
+    if not sb or sa[2] + 1 + sb[2] != len(toks):
+        return None
+    if isinstance(known, _Known) and known.fts:
+        ft, _ = _fact_type(f"{sa[0]} is {sb[0]}", known)
+        if ft in known.fts:
+            return None
+    return sa[0] + sa[1], sb[0] + sb[1]
 
 
 _AGG_CLAUSE = re.compile(r"^(\S+) is the (min|max|count|sum) of (\S*\d\S*)$")
@@ -761,21 +843,23 @@ _CMP_OPS = {"exceeds": "gt", "is greater than": "gt", "is less than": "lt",
             "is at least": "ge", "is at most": "le", "equals": "eq"}
 
 
-def _h_rule_if(g, k, m):
+def _h_rule_if(g, k, m, kind="fully-derived"):
     """The book's rule form: Head if Clause [and Clause…]. Fact-type clauses join
     linearly on shared variables; COMPARATOR clauses (the corpus's word comparators, a
     bound variable against a literal or another bound variable) do not join — they
-    RESTRICT the running tuple as filters; the head projects its variables; the
-    compiled object consumes D (cross-cell) and run_rules derives to the lfp."""
+    RESTRICT the running tuple as filters; COERCION clauses ('Task is Resource', two
+    known types, no declared fact type) alias their variables to one column; the head
+    projects its variables; the compiled object consumes D (cross-cell) and run_rules
+    derives to the lfp."""
     import zlib
     from . import system as _sys
     head_txt, body = g
     body = g[1].replace(' where ', ' and ')                # the corpus's where-scope is conjunction
     clauses = [c.strip() for c in body.split(" and ")]
-    hft, hvars = _rule_atom(head_txt, k)
+    hft, hvars, _hlits = _rule_atom(head_txt, k)
     rule_cid = hft + "_rule_" + format(zlib.crc32(body.encode()), "x")
     _hf, decl = _fact_type(re.sub(r"\d+", "", head_txt).strip(), k)
-    A_ = decl + [("derivation", (hft, "fully-derived")),
+    A_ = decl + [("derivation", (hft, kind)),
                  ("ruleDerives", (rule_cid, hft))]
     # one pass, clauses in order: joins extend the column map, comparators filter
     # it. The AGGREGATE clause is extracted first and processed LAST: the corpus
@@ -802,7 +886,21 @@ def _h_rule_if(g, k, m):
                     break
                 filters.append(_sys.cmp_filter(_CMP_OPS[opw], cols[subj], lit=lit))
             continue
-        aft, avars = _rule_atom(c, k)
+        coer = _coercion(c, k)
+        if coer is not None:
+            a, b = coer
+            if a in cols and b in cols:
+                filters.append(_sys.cmp_filter("eq", cols[a], col2=cols[b]))
+            elif a in cols:
+                cols[b] = cols[a]                          # alias: one instance, two names
+            elif b in cols:
+                cols[a] = cols[b]
+            else:
+                ok = False
+                diag = f"coercion clause {c!r} has no bound side"
+                break
+            continue
+        aft, avars, alits = _rule_atom(c, k)
         A_.append(("ruleReads", (rule_cid, aft)))
         if not atoms:
             for v in avars:
@@ -828,6 +926,8 @@ def _h_rule_if(g, k, m):
             joins.append((pairs, tuple(fresh)))
             for v in avars:
                 cols.setdefault(v, len(cols) + 1)
+        for (vi, lit) in alits:                            # 'Task Status ⟨lit⟩': the role's column
+            filters.append(_sys.cmp_filter("eq", cols[avars[vi]], lit=_num(lit)))
         atoms.append((aft, avars))
     if ok and agg_clause is not None:
         out_v, op, over_v = _AGG_CLAUSE.match(agg_clause).groups()
@@ -883,6 +983,20 @@ def _h_rule_if(g, k, m):
     return A_, out
 
 
+# NORMA's derivation-storage markers in LEADING position (the corpus's spelling;
+# _DERIVATION handles the same marks trailing a name)
+_MARKER_KIND = {"*": "fully-derived", "**": "derived-and-stored",
+                "+": "semi-derived", "++": "partially-derived-and-stored"}
+
+
+def _h_rule_iff(g, k, m):
+    """The unnumbered anaphoric rule: strip the storage marker, then the one rule
+    handler — numbered and unnumbered spellings are the same mechanism."""
+    marker, head, body = g
+    return _h_rule_if((head, body), k, m,
+                      kind=_MARKER_KIND.get(marker or "*", "fully-derived"))
+
+
 def _h_derivation_rule(g, k, m):
     from . import system as _sys
     derived, root, body = g
@@ -912,6 +1026,7 @@ _PLAN = {
     "set_comparison": _h_set_comparison, "disjunctive_mandatory": _h_disjunctive,
     "subset": _h_subset, "equality": _h_equality, "derivation_rule": _h_derivation_rule,
     "rule_if": _h_rule_if,
+    "rule_iff": _h_rule_iff,
     "negation": _h_negation, "neg_pair": _h_neg_pair, "class_rule": _h_class_rule,
     "finality": lambda g, k, m: ([("finality", (g[0], int(g[1])))], []),
     "possibility": _h_possibility, "inverse_uc": _h_inverse_uc,
@@ -1004,7 +1119,7 @@ def register_translators():
         ("translate_instance_facts", ["fact_type_reading"]),
         ("translate_fact_types", ["fact_type_reading"]),
         ("translate_derivation_mode_facts", ["fact_type_reading"]),
-        ("translate_derivation_rules", ["rule_if", "derivation_rule", "class_rule"]),
+        ("translate_derivation_rules", ["rule_if", "rule_iff", "derivation_rule", "class_rule"]),
         ("translate_cardinality_constraints", ["uniqueness", "inverse_uc",
                                                "spanning_uc", "frequency",
                                                "neg_uniqueness", "mandatory",
@@ -1244,6 +1359,7 @@ _RENDER = {
     "equality": lambda g: f"{g[0]} if and only if {g[1]}",
     "derivation_rule": lambda g: f"*Each {g[0]} is some {g[1]} who {g[2]}",
     "rule_if": lambda g: f"{g[0]} if {g[1]}",
+    "rule_iff": lambda g: f"{g[1]} iff {g[2]}",
     "negation": lambda g: f"{g[0]} ~{g[1]}",
     "neg_pair": lambda g: f"{g[0]} {g[1]} {g[2]}",
     "finality": lambda g: f"{g[0]} becomes final at depth {g[1]}",
