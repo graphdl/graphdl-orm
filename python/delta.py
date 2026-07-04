@@ -40,7 +40,21 @@ def _mkseq(items):
 
 
 # ============================ native <-> Scott conversion =====================
+# Conversion is memoized on NODE IDENTITY: Scott values are immutable closures and
+# commits share structure (Store/apndl reuse the untouched cells), so an unchanged
+# cell converts once per process instead of once per apply. Without this the
+# boundary is quadratic in |D| across a compile (the profile showed 29M calls for
+# a 240-statement model). The keep-list pins ids; the cache clears when it grows
+# past the bound.
+_S2N_MEMO = {}
+_S2N_KEEP = []
+
+
 def scott_to_native(o):
+    key = id(o)
+    hit = _S2N_MEMO.get(key)
+    if hit is not None and hit[0] is o:
+        return hit[1]
     box = []
     def on_atom(v):
         box.append(v)
@@ -50,7 +64,21 @@ def scott_to_native(o):
             items.append(scott_to_native(L.HEAD(cur))); cur = L.TAIL(cur)
         box.append(tuple(items))
     marker = o(on_atom)(on_seq)(BOT_D)
-    return box[0] if box else marker
+    res = box[0] if box else marker
+    if len(_S2N_MEMO) > 500000:
+        _S2N_MEMO.clear()
+        _S2N_KEEP.clear()
+    _S2N_MEMO[key] = (o, res)
+    _S2N_KEEP.append(o)
+    return res
+
+
+# The way back is VALUE-INTERNED: equal native subtrees answer the identical Scott
+# closure, so a result D whose cells mostly match the input D reuses their closures,
+# which keeps the forward memo's identity sharing alive across applies. Without
+# this, every apply rebuilds every closure and the boundary is quadratic across a
+# compile regardless of the forward memo.
+_N2S_MEMO = {}
 
 
 def native_to_scott(n):
@@ -59,10 +87,17 @@ def native_to_scott(n):
     if n is L.APPTAG:                                        # the app sentinel is an ATOM value,
         return L.ATOM(n)                                     # never a data sequence
     if _isseq(n):
+        hit = _N2S_MEMO.get(n)
+        if hit is not None:
+            return hit
         l = L.NIL
         for e in reversed(n):
             l = L.CONS(native_to_scott(e))(l)
-        return L.SEQ(l)
+        out = L.SEQ(l)
+        if len(_N2S_MEMO) > 500000:
+            _N2S_MEMO.clear()
+        _N2S_MEMO[n] = out
+        return out
     return L.ATOM(n)
 
 
