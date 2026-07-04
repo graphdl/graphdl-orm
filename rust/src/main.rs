@@ -1482,6 +1482,33 @@ fn handle(j: &J, srv: &mut Srv, serve: bool) -> String {
     }
 }
 
+
+fn show_case(v: &V, out: &mut String) {
+    match shape(v) {
+        Shape::Bot => out.push('\u{22a5}'),
+        Shape::Atom(l) => match &*l {
+            Leaf::S(s) => { out.push('\''); out.push_str(s); out.push('\''); }
+            Leaf::I(i) => out.push_str(&i.to_string()),
+            Leaf::F(f) => {
+                if f.fract() == 0.0 && f.is_finite() {
+                    out.push_str(&format!("{:.1}", f));
+                } else {
+                    out.push_str(&format!("{}", f));
+                }
+            }
+            Leaf::AppTag => out.push_str("#APP#"),
+        },
+        Shape::Seq(l) => {
+            out.push('(');
+            for (i, x) in items(&l).iter().enumerate() {
+                if i > 0 { out.push_str(", "); }
+                show_case(x, out);
+            }
+            out.push(')');
+        }
+    }
+}
+
 fn run() {
     // the intersection source loads ON THE WORKER (CANON is a thread_local; the
     // reduction thread must hold it)
@@ -1490,6 +1517,20 @@ fn run() {
     });
     register_base();
     register_overrides();                                     // twins on by default
+    if std::env::args().any(|a| a == "--cases") {
+        // the cross-host case table: reduce each pair and print name=result
+        // in the convention every host shares
+        let mu = make_mu();
+        for (name, pair) in scenario_defs() {
+            let expr = nth(&pair, 0);
+            let operand = nth(&pair, 1);
+            let v = mu.app(mkapp(expr, operand));
+            let mut line = String::new();
+            show_case(&v, &mut line);
+            println!("{}={}", name, line);
+        }
+        return;
+    }
     let serve = std::env::args().any(|a| a == "--serve");
     let mut srv = Srv { d: phi(), cells: Vec::new(), mu: make_mu(),
                         nd: N::Bot, ncells: Vec::new(), nprocess: Vec::new() };
@@ -1562,6 +1603,31 @@ fn canon_defs() -> Vec<(String, V)> {
         include!("../../shared/constraints.py");
         include!("../../shared/ast.py");
         include!("../../shared/system.py");
+    }
+    out.into_inner()
+}
+
+// The cross-host case table (shared/scenarios.py), the same bytes the Python,
+// C#, and Java hosts consume: each DEF is ⟨expr, operand⟩, reduced by --cases.
+#[allow(non_snake_case, unused, path_statements)]
+fn scenario_defs() -> Vec<(String, V)> {
+    let out: RefCell<Vec<(String, V)>> = RefCell::new(Vec::new());
+    {
+        let DEF = |n: &str, o: V| out.borrow_mut().push((n.to_string(), o));
+        let A = |s: &str| atom(Leaf::S(s.to_string()));
+        let N = |i: i64| atom(Leaf::I(i));
+        let K = |x: V| seqv(vec![atom(Leaf::S("CONST".to_string())), x]);
+        let PHI = || phi();
+        let S1 = |a: V| seqv(vec![a]);
+        let S2 = |a: V, b: V| seqv(vec![a, b]);
+        let S3 = |a: V, b: V, c: V| seqv(vec![a, b, c]);
+        let S4 = |a: V, b: V, c: V, d: V| seqv(vec![a, b, c, d]);
+        let S5 = |a: V, b: V, c: V, d: V, e: V| seqv(vec![a, b, c, d, e]);
+        let S6 = |a: V, b: V, c: V, d: V, e: V, f: V| seqv(vec![a, b, c, d, e, f]);
+        let S7 = |a: V, b: V, c: V, d: V, e: V, f: V, g: V| seqv(vec![a, b, c, d, e, f, g]);
+        let S8 = |a: V, b: V, c: V, d: V, e: V, f: V, g: V, h: V| seqv(vec![a, b, c, d, e, f, g, h]);
+        let S9 = |a: V, b: V, c: V, d: V, e: V, f: V, g: V, h: V, i: V| seqv(vec![a, b, c, d, e, f, g, h, i]);
+        include!("../../shared/scenarios.py");
     }
     out.into_inner()
 }

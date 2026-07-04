@@ -428,3 +428,34 @@ Layer 'L1' is operator-loaded by Engineering Lever 'e1'.
     D = system.run_rules(D)
     got = {tuple(r) for r in system._pop_rows(D, head)}
     assert got == honest
+
+
+def test_instance_membership_derives_from_the_store_itself():
+    # proposal B (2026-07-04): the old engine MATERIALIZED
+    # Resource_is_instance_of_Noun as a 12,539-row reflection cell; pyarest's
+    # store IS that knowledge. The base's semantic-constraint and
+    # machine-instance rules read the mirror, so the engine derives it: every
+    # id playing one of a noun's roles is an instance of that noun, fresh
+    # each derive, never migrated, never stale.
+    model = """Status is a value type.
+Resource is an entity type.
+Noun is a value type.
+Resource is instance of Noun.
+Task is an entity type.
+Task has Status.
+Flag is a value type.
+Task is flagged with Flag.
+Resource is known.
+
+* Resource1 is known iff Resource1 is instance of Noun 'Task'.
+
+Task 't1' has Status 'open'.
+Task 't2' is flagged with Flag 'red'.
+"""
+    D, rep = _derive(model)
+    assert rep["rule_diagnostics"] == []
+    got = {tuple(r) for r in system._pop_rows(D, "Resource_is_instance_of_Noun")}
+    # the ENGINE mirror knows both tasks (t2 plays only the flag role)
+    assert ("t1", "Task") in got and ("t2", "Task") in got
+    known = {r[0] for r in system._pop_rows(D, "Resource_is_known")}
+    assert known == {"t1", "t2"}

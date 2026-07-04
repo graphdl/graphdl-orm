@@ -106,10 +106,9 @@ def test_reflection_cells_are_excluded_unless_a_rule_reads_them(tmp_path):
     # the claude audit's performance verdict: the old engine's REFLECTION layer
     # (Fact_is_of_Fact_Type at 1.2MB, instance-of-Noun at 480KB) migrated as
     # data and dragged through every derive — pyarest's own compile IS the
-    # self-description, so reflection cells report instead of replay. The
-    # carve-out: a reflection cell some compiled rule READS (the base's arity
-    # rule counts Fact_Type_has_Role) stays, because live derivations feed on
-    # it.
+    # self-description, so reflection cells report instead of replay,
+    # UNCONDITIONALLY after proposal B: a rule reading the instance mirror
+    # gets it derived engine-side from the store's own role facts.
     reg = _mk(tmp_path)
     p = str(tmp_path / "old3.db")
     con = sqlite3.connect(p)

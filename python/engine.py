@@ -985,6 +985,33 @@ def run_rules(D, changed=None, stats=None):
     for r in _pop_rows(D, "ruleReads"):
         if len(r) >= 2:
             reads.setdefault(r[0], set()).add(r[1])
+    # THE INSTANCE MIRROR (proposal B, 2026-07-04): the old engine
+    # materialized Resource_is_instance_of_Noun as a reflection cell and the
+    # migration dragged 12,539 rows through every derive; pyarest's store IS
+    # that knowledge. When any rule reads the mirror, derive it fresh from
+    # the role facts (every id playing one of a noun's roles is an instance
+    # of that noun) before the closure runs — never migrated, never stale.
+    _MIRROR = "Resource_is_instance_of_Noun"
+    if any(_MIRROR in rs for rs in reads.values()):
+        _mroles = {}
+        for r in _pop_rows(D, "role"):
+            if len(r) >= 4:
+                _mroles.setdefault(r[1], []).append((r[2], r[3]))
+        _mnouns = {r[0] for r in _pop_rows(D, "instanceOf")
+                   if len(r) >= 2 and r[1] == "ObjectType"}
+        _mout = set()
+        for _mft, _mrs in _mroles.items():
+            _mrows = None
+            for (_mpos, _mplayer) in _mrs:
+                if _mplayer in _mnouns:
+                    if _mrows is None:
+                        _mrows = [tuple(x) for x in _pop_rows(D, _mft)]
+                    for _mrow in _mrows:
+                        if len(_mrow) >= _mpos:
+                            _mout.add((_mrow[_mpos - 1], _mplayer))
+        if _mout:
+            _mout |= {tuple(r) for r in _pop_rows(D, _MIRROR)}
+            D = _ap(ast.Store(_MIRROR), _S(to_lam(_rowsort(_mout)), D))
     for r in _pop_rows(D, "ruleAtom"):
         if len(r) >= 3:
             atomsof.setdefault(r[0], []).append((r[1], r[2]))

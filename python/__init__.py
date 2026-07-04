@@ -1,30 +1,31 @@
-"""pyarest — the AREST engine on Backus's FP-on-lambda.
+"""pyarest — the AREST engine on Backus's FP-on-lambda, in seven files
+shaped like the sibling hosts (rust one, csharp four, java five).
 
-The kernel (the trusted base): `lam` — the λ substrate (Scott-encoded objects and lists,
-Church booleans/pairs, Y-combinator recursion, the ⊥ discipline); `defs` — the definition
-store, the enumerable boundary (registered host impls), and the per-step DEFS-in-D binding;
-`reduce` — mu = Y(tau) with metacomposition as the only mechanism (the ground truth);
-`delta` — the native fast-path, held observationally equal by the differential oracle
-(tests/test_oracle.py); `prims` — the Backus base (§11.2.3–.4) registered into DEFS.
+`kernel` — the whole evaluator stack: the λ substrate (Scott encodings,
+Church booleans, Y, the ⊥ discipline), the definition store and enumerable
+boundary, the native delta fast-path (held observationally equal by the
+differential oracle), mu = Y(tau) as the ground truth, and the Backus base.
+`canon` — the intersection-source vocabulary, the repo layout, and Codd's
+θ₁ bindings (binds, never authors). `compiler` — the metamodel M and the
+FORML compiler (Stage-1 the bootstrap kernel, dispatching exactly its five
+measured kinds; the grammar file is the parser). `engine` — cells and the
+store walk, the violation expressions, the create pipeline, and derive to
+the least fixed point with the joint strata. `protocol` — the event log and
+freeze/thaw with sealing at rest, the RMAP projection, the swap tool,
+federation, the apps registry, and the MCP binding. `tools` — the two-level
+optimizer and the Rust kernel seam.
 
-Authored above it as FFP objects (no raw λ, spec D4): `theta` — Codd θ₁; `constraints` —
-the violation expressions, cell-local and cross-cell scoped; `system` — the create pipeline
-stages, derive = lfp F_S, HATEOAS links, state machines read off M; `ast` — cells, ↑/↓,
-the AST transition, eq. sys routing, DefineIn (DEFS into D); `machine` — the one fold
-runner; `meta` — the metamodel M (vignette; the full self-capturing M is Phase 3);
-`forml` — the FORML 2 seed compiler (Stage 1; superseded by grammar-as-readings in
-Stage 2/3, per `shared/forml2-grammar.md`, vendored).
+The old module names (pyarest.lam, .defs, .delta, .reduce, .prims, .theta,
+.paths, .machine, .meta, .forml, .ast, .constraints, .system, .persist,
+.ddl, .migrate, .federate, .apps, .mcp_server, .optimize, .polyglot) all
+resolve through the alias table below, so call sites keep their idioms.
 
-THE SHARED SOURCE IS POLYGLOT. shared/ holds only sources every host consumes as
-written: the readings (FORML) and the canon (canonical definitions as carrier-free
-object trees, shared/canon/). This directory (python/) is the Python host: the
-lambda platform (lam, reduce, prims, defs), the boundary and bindings, and the
-canonical-stratum AUTHORING TOOLCHAIN (theta, constraints, system, ast, meta —
-authored in the Backus base, no host logic) whose job is to EMIT canon; a module
-retires host-side as its content lands in shared/. Per-host optimizations (delta,
-FAST, the native carrier) are DEFS registrations, never forks of the source. The
-root conftest constructs the package for the checkout; installs map it in
-pyproject."""
+THE SHARED SOURCE IS POLYGLOT. shared/ holds only sources every host
+consumes as written: the readings (FORML), the canon (theta, constraints,
+ast, system), and the cross-host case table (scenarios). A stratum retires
+host-side as its content lands in shared/; per-host optimizations are DEFS
+registrations, never forks of the source. The root conftest constructs the
+package for the checkout; installs map it in pyproject."""
 
 from . import kernel                                        # the whole evaluator stack, one file
 import sys as _sys

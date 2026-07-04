@@ -702,7 +702,10 @@ def plan(D, cells):
         if parsed is None:
             out["unparsed"].append(name)
             continue
-        if name in REFLECTION and name not in rule_read:
+        if name in REFLECTION:
+            # unconditional after proposal B (2026-07-04): the instance
+            # mirror derives engine-side whenever a rule reads it, so no
+            # reflection cell ever migrates
             out["reflection"].append(name)
             continue
         rows = [tuple(v for (_r, v) in ps) for (_k, ps) in parsed]
