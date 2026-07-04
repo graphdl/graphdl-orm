@@ -118,8 +118,11 @@ _CLASSIFY = [
     ("class_rule", re.compile(r"^(\S[^']*?) has (\S[^']*?) '(.+?)' iff (.+)\.$")),
     ("equality", re.compile(r"^(.+) if and only if (.+)\.$")),                # 'A iff B' = equality
     # the book's rule surface (Halpin ch.2 ex.4 D1): numbered variables, ' if ' head-body,
-    # ' and ' conjunction; a digit in the head keeps plain readings out of this recognizer
-    ("rule_if", re.compile(r"^(\S.*?\d\S*.*?) if (.+)\.$")),
+    # ' and ' conjunction; a digit in the head keeps plain readings out of this
+    # recognizer. The corpus's biconditional spelling 'iff' (the closed-world reading
+    # of n rules per head, per the ORM-to-datalog mapping) is a synonym here, and its
+    # 'where'-scoped bodies fold into the same conjunction in the handler.
+    ("rule_if", re.compile(r"^(\S.*?\d\S*.*?) iff? (.+)\.$")),
     # a derivation RULE reading (leading * = derived): a linear role path from a root object type
     # (infosci Mapping_ORM_to_Datalog: *Each FastCarDriver is some Person who drives some Car ...)
     ("derivation_rule", re.compile(r"^\*Each (.+?) is some (.+?) who (.+)\.$")),
@@ -751,7 +754,7 @@ def _rule_atom(text, known):
     return ft, vars_
 
 
-_AGG_CLAUSE = re.compile(r"^(\S*\d\S*) is the (min|max) of (\S*\d\S*)$")
+_AGG_CLAUSE = re.compile(r"^(\S+) is the (min|max|count|sum) of (\S*\d\S*)$")
 _CMP_CLAUSE = re.compile(
     r"^(\S*\d\S*) (exceeds|is greater than|is less than|is at least|is at most|equals) (\S+)$")
 _CMP_OPS = {"exceeds": "gt", "is greater than": "gt", "is less than": "lt",
@@ -767,27 +770,23 @@ def _h_rule_if(g, k, m):
     import zlib
     from . import system as _sys
     head_txt, body = g
+    body = g[1].replace(' where ', ' and ')                # the corpus's where-scope is conjunction
     clauses = [c.strip() for c in body.split(" and ")]
     hft, hvars = _rule_atom(head_txt, k)
     rule_cid = hft + "_rule_" + format(zlib.crc32(body.encode()), "x")
     _hf, decl = _fact_type(re.sub(r"\d+", "", head_txt).strip(), k)
     A_ = decl + [("derivation", (hft, "fully-derived")),
                  ("ruleDerives", (rule_cid, hft))]
-    # one pass, clauses in order: joins extend the column map, comparators filter it
+    # one pass, clauses in order: joins extend the column map, comparators filter
+    # it. The AGGREGATE clause is extracted first and processed LAST: the corpus
+    # places it at the head of the body with its bag scoped by the where-clauses
+    # after it, so its source binds only once the joins have run.
     cols, atoms, filters, joins = {}, [], [], []
     ok, diag, agg = True, None, None
+    agg_clause = next((c for c in clauses if _AGG_CLAUSE.match(c)), None)
+    if agg_clause is not None:
+        clauses = [c for c in clauses if c != agg_clause]
     for c in clauses:
-        ma = _AGG_CLAUSE.match(c)
-        if ma:
-            out_v, op, over_v = ma.groups()
-            if over_v in cols and out_v not in cols:
-                agg = (op, cols[over_v], out_v)
-            else:
-                ok = False
-                diag = (f"aggregate clause needs a bound source and an unbound "
-                        f"output ({c!r})")
-                break
-            continue
         mm = _CMP_CLAUSE.match(c)
         if mm and mm.group(1) in cols:
             subj, opw, objtxt = mm.groups()
@@ -830,12 +829,23 @@ def _h_rule_if(g, k, m):
             for v in avars:
                 cols.setdefault(v, len(cols) + 1)
         atoms.append((aft, avars))
+    if ok and agg_clause is not None:
+        out_v, op, over_v = _AGG_CLAUSE.match(agg_clause).groups()
+        if over_v in cols and out_v not in cols:
+            agg = (op, cols[over_v], out_v)
+        else:
+            ok = False
+            diag = (f"aggregate clause needs a bound source and an unbound "
+                    f"output ({agg_clause!r})")
     obj = None
     widths = [max(len(av), 1) for (_aft, av) in atoms]
     if ok and atoms and agg is not None:
         op, over_col, out_v = agg
+        # a NUMBERED output variable sits in hvars and is excluded from the group;
+        # the corpus's UNNUMBERED spelling names the head's aggregated role (last in
+        # the head reading), so every numbered head variable is a group key
         rest = [v for v in hvars if v != out_v]
-        if out_v in hvars and all(v in cols for v in rest):
+        if all(v in cols for v in rest):
             A_.append(("derivationRule", (hft, atoms[0][0], len(atoms))))
             A_.append(("ruleAgg", (rule_cid,)))
             obj = _sys.compile_agg_rule([a[0] for a in atoms],

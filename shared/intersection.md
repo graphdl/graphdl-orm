@@ -61,3 +61,13 @@ A host is an implementation of the reduction plus what it registers into DEFS.
 Per-host optimizations (delta, FAST, the native carrier) are DEFS registrations
 over the same names, never forks of the source. A new platform joins by defining
 the vocabulary, consuming the same files, and passing the differential.
+
+## The fourth host, recorded ahead of need
+
+C# consumes the files as written: the tuple literal is a valid C# expression of
+nested static calls, and a source generator wraps the bytes in a method at build
+time. Java has no tuple expressions, so when a JVM host approaches, the files wrap
+their elements in a single CANON(...) call instead of the bare tuple — one more
+vocabulary name, valid in Python, Rust, C#, and Java alike, and a mechanical
+one-line change per file. The intersection was defined carefully once and gets
+defined slightly more carefully when the fourth host shows up; nothing else moves.

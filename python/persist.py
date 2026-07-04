@@ -48,9 +48,11 @@ def save_sqlite(D, path, seal_key=None):
         bycol.setdefault(ft, []).append((pos, mode))
     con = sqlite3.connect(path)
     try:
-        con.execute("CREATE TABLE IF NOT EXISTS cells (ord INTEGER PRIMARY KEY, "
+        # replace, never assume: a pre-existing db (the old engine's, at swap time)
+        # may carry a cells table of another shape; ours is the contract
+        con.execute("DROP TABLE IF EXISTS cells")
+        con.execute("CREATE TABLE cells (ord INTEGER PRIMARY KEY, "
                     "name TEXT, contents TEXT)")
-        con.execute("DELETE FROM cells")
         for i, c in enumerate(from_lam(D)):
             if isinstance(c, tuple) and len(c) == 3 and c[0] == "CELL":
                 contents = c[2]
