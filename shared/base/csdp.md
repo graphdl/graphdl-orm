@@ -13,19 +13,23 @@ current status are the ONLY HATEOAS affordances. Building an app is
 navigation of this machine — the links ARE the next valid CSDP
 steps.
 
+<!--
 Steps per Halpin 2001: (1) elementary facts from examples (sec 3.3),
 (2) draw fact types and populate (3.4), (3) trim schema; note basic
 derivations (3.5), (4) uniqueness constraints + arity check (4.1),
 (5) mandatory roles + logical derivations (5.1), (6) value,
 set-comparison and subtype constraints (6.1), (7) other constraints
 + final checks (7.1).
+-->
 
+<!--
 Registered in the evolution slice (`EVOLUTION_READINGS`): CSDP is
 how a schema comes to BE, the Domain Change SM is how it CHANGES —
 the two halves of the self-modification machinery. First proven as
 the apps/csdp dogfood walk (the tasks app's in-progress-
 recommendation derivation traversed design → rmap end-to-end);
 promoted to the framework proper 2026-06-10 (user directive).
+-->
 
 ## Instance Facts
 
@@ -109,6 +113,7 @@ Transition 'complete-design' is triggered by Event Type 'Schema Design passes fi
 
 ## Description
 
+<!--
 Halpin's basic Rmap procedure (relational mapping, 2001 sec 10.3,
 summary box p. 428) as an executable state machine, the sibling of
 the CSDP machine above: a designed conceptual schema is mapped to a
@@ -121,6 +126,7 @@ group fact types with functional roles attached to the same object
 type into one table keyed on that object type's identifier; map 1:1
 cases to a single table favoring fewer nulls (subtype-specific
 columns carry their qualifications).
+-->
 
 ## Entity Types
 

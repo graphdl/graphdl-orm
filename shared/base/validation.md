@@ -18,7 +18,7 @@ It is permitted that a Fact Type has no Constraint of Constraint Type 'IR', 'AS'
 
 ### Ring Constraint Validity
 
-It is forbidden that a Constraint of Constraint Type 'IR', 'AS', 'AT', 'SY', 'IT', 'TR', or 'AC' spans Roles of a Fact Type where those Roles reference different Nouns.
+<!-- It is forbidden that a Constraint of Constraint Type 'IR', 'AS', 'AT', 'SY', 'IT', 'TR', or 'AC' spans Roles of a Fact Type where those Roles reference different Nouns. -->
 
 ### Singular Naming
 
@@ -38,7 +38,7 @@ It is obligatory that each subtype Noun has some totality or exclusion Constrain
 
 ### Reference Scheme Redundancy
 
-It is forbidden that a Reading restates a Noun reference scheme as a separate fact type.
+<!-- It is forbidden that a Reading restates a Noun reference scheme as a separate fact type. -->
 
 ### Elementary Fact Decomposition
 
@@ -62,6 +62,7 @@ Constraint Kind has Violation Template.
 
 ### Placeholders
 
+<!--
 Each template carries one or more `{name}` substitution markers. The
 per-kind resolver in `compile.rs` maps each name to a `Vec<Func>`
 that runtime-evaluates to the atoms inserted at that position:
@@ -89,6 +90,7 @@ that runtime-evaluates to the atoms inserted at that position:
   right side of the directional subset check).
 - `{pairs}` — subset / equality multi-segment placeholder: expands
   to one `<noun, value>` pair per common-noun join column.
+-->
 
 ### Templates
 

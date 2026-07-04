@@ -1,5 +1,6 @@
 # Induction
 
+<!--
 ## Description
 Vocabulary for the induce Func (#846-#852). The engine's search loop
 populates Hypothesis Candidate facts; ranking is AUTOMATED and domain-
@@ -11,6 +12,7 @@ inductive complement of deduction, not a user knob. A Scoring Rule, when
 present, is a derived/induced fact, never a hand-tuned per-domain heuristic.
 Whitepaper §3 + Theorem 4: induce is a ρ-application over P that returns
 candidate populations as facts in P.
+-->
 
 ## Entity Types
 Hypothesis Candidate(.id) is an entity type.

@@ -268,10 +268,10 @@ Fact Type is activated by Verb.
 Fact is referenced by Verb.
   It is possible that some Verb references more than one Fact.
   It is possible that more than one Verb references the same Fact.
-Verb is performed during Transition (Mealy semantics).
+<!-- Verb is performed during Transition (Mealy semantics). -->
   For each Transition, at most one Verb is performed during that Transition.
   It is possible that some Verb is performed during more than one Transition.
-Verb is performed in Status (Moore semantics).
+<!-- Verb is performed in Status (Moore semantics). -->
   For each Status, at most one Verb is performed in that Status.
   It is possible that some Verb is performed in more than one Status.
 
@@ -406,12 +406,14 @@ Constraint is semantic iff Constraint has modality of Modality Type 'Deontic' an
 
 ## Implicit Derivation Rules (#316 / #287c)
 
+<!--
 The four derivations below are currently materialised by the
 compiler's `compile_derivations` synthesis pass (per-subtype, per-SS,
 per-noun-FT, per-binary-pair fan-out). Expressing them as rules in the
 metamodel closes the loop: the parser will drive them straight from
 these readings once #317 lands anaphora + subscript + metamodel-cell
 push; until then the Rust synthesis continues to cover them.
+-->
 
 ### Subtype inheritance
 
@@ -424,30 +426,36 @@ is a subtype of `Noun2` and a Fact uses a Resource whose Noun is
 
 ### Subset Constraint auto-fill (SS)
 
+<!--
 Each declared Subset Constraint whose `autofill` span marker is true
 copies every antecedent fact into the consequent Fact Type. One
 DerivationRule per SS constraint, each routed through
 `compile_explicit_derivation` as a single-antecedent rule.
+-->
 
 * Fact is in consequent Fact Type iff some Subset Constraint has autofill 'true' and Subset Constraint spans antecedent Fact Type and Fact is instance of that antecedent Fact Type.
 
 ### Transitivity of binary Fact Types
 
+<!--
 For each pair of binary Fact Types `(A R B, B R C)` where the second
 Role of the first FT and the first Role of the second FT share a Noun,
 emit inferred `A R C` facts. Compile-time enumerates FT pairs; runtime
 derives one fact per join.
+-->
 
 * Fact Type has inferred Fact iff some Fact uses Resource for the first Role of that Fact Type and some other Fact uses other Resource for the second Role of a Fact Type sharing the join Noun.
 
 ## Check-Readings Deontic Obligations (#288)
 
+<!--
 Layers 2 and 3 of the readings checker (`crates/arest/src/check.rs`)
 enforce ring-constraint validity and completeness as Rust control
 flow today. Expressing them as deontic constraints here lets #317's
 metamodel-FT push eventually drive them through Theorem 4's
 violation path — the Rust layers retire, and authors see the same
 diagnostics via the standard violation surface.
+-->
 
 ### Layer 2: ring validity — same-noun spans
 
@@ -473,12 +481,14 @@ It is obligatory that each binary Fact Type whose Roles are played by the same N
 
 ## NORMA Structural Decomposition (#279)
 
+<!--
 The concepts below mirror NORMA's `ORMCoreMetaModel.orm`
 decomposition of derivation rule bodies. They are the FORML 2
 surface that the meta-circular parser (#280) populates by
 decomposing each user-authored rule into a `Join Path` +
 `Role Sequence` + `Role Projection`, rather than classifying the
 rule text with Rust heuristics.
+-->
 
 Paper §4 Table 1 correspondence:
   Join Path       ↔ Composition (COMP)
@@ -537,6 +547,7 @@ Fact Type has Derivation Storage Type.
 
 ## Antecedent Clause Shape (#281)
 
+<!--
 Every clause inside a derivation-rule antecedent should parse into a
 recognised `Clause Shape`. If the compiler can't attach a shape (the
 clause didn't match any known pattern — Fact-Type literal, Antecedent
@@ -544,6 +555,7 @@ Role bind, Negation, Comparison, …) the rule is unsafe to chain and
 the validator surfaces the violation. Expressing this as a deontic
 constraint lets the runtime emit the diagnostic through Theorem 4's
 violation path rather than a hard-coded check pass.
+-->
 
 Antecedent Clause(.id) is an entity type.
 Clause Shape is a value type.
@@ -614,6 +626,7 @@ Migration Application has Timestamp.
 
 ## Migration Application ordering (#351)
 
+<!--
 ### Rationale
 Two deontics compose migration chains and make federation convergence
 constructive. The at-most-one obligation rules out direct v1 → v3
@@ -623,6 +636,7 @@ obligation is what lets two peers replay the same Migration + MA stream
 and converge by Cor 5 — timestamps establish the total order the
 replay needs, and visible_population is a function of the replayed
 set, so partial replays up to any T agree across peers.
+-->
 
 It is obligatory that each source Fact has at most one Migration Application per target Fact Type.
 
@@ -894,6 +908,7 @@ Conceptual Data Type 'largeRaw' has JSON Format 'byte'.
 Conceptual Data Type 'picture' has JSON Format 'byte'.
 Conceptual Data Type 'oleObject' has JSON Format 'byte'.
 
+<!--
 SQL/DDL projection of the catalog (#279 P2b). NORMA maps a Conceptual
 Data Type to SQL in two stages: first to an abstract SQL type (the
 DCIL layer — a SQL-standard "predefined type" name), then to the
@@ -903,7 +918,9 @@ onto the Conceptual Data Type cell via RMAP, the same way `jsonType`
 absorbs (P2a) and `conceptualDataType` absorbs onto Noun (P1). The
 generator's `AbstractSqlTypeTable` reads them back; its boot fallback
 mirrors this block one-for-one.
+-->
 
+<!--
 Type-mapping only (P2b): the IDENTITY / auto-increment semantics of
 autoCounter / autoTimestamp and the unsigned-range CHECK constraints
 of the unsigned* leaves are deferred to a later phase — here they map
@@ -912,6 +929,7 @@ objectId → INTEGER; the unsigned* leaves → the smallest signed
 abstract type that fits, i.e. one width up where needed). uuid maps
 to the abstract UUID type; dialects without a native UUID fall back to
 CHARACTER in the vendor layer.
+-->
 
 Conceptual Data Type 'text' has Abstract SQL Type 'CHARACTER VARYING'.
 Conceptual Data Type 'fixedText' has Abstract SQL Type 'CHARACTER'.
@@ -947,6 +965,7 @@ Conceptual Data Type 'userDefined' has Abstract SQL Type 'CHARACTER VARYING'.
 
 ### Constraint Kinds (#747)
 
+<!--
 Each Constraint Kind code below names one alethic constraint dispatch
 arm in `compile.rs`. The Family groups codes that share an evaluation
 shape (ring, set-comparison, subset/equality, value, frequency,
@@ -954,6 +973,7 @@ uniqueness, mandatory) so tooling — OpenAPI, docs, MCP introspection —
 can enumerate the inventory from declared facts instead of reading the
 Rust match. AT and ANS share the antisymmetric ring kernel; ANS is
 preserved as a separate kind so the alias surfaces as a fact.
+-->
 
 Constraint Kind 'IR' has Constraint Kind Label 'Irreflexive Ring'.
 Constraint Kind 'IR' has Constraint Kind Family 'ring'.

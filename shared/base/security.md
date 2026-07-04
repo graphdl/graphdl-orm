@@ -1,5 +1,6 @@
 # Security
 
+<!--
 ## Description
 SSRF defense vocabulary (#25, #894). Each `CIDR Block` row in the
 instance fact list below is a network range that External System URLs
@@ -7,6 +8,7 @@ must NOT resolve to. The deontic constraint below makes the policy
 explicit; the engine reads the CIDR list at platform_compile time and
 rejects any `External System has URL` whose host sits inside one of
 the listed blocks.
+-->
 
 Before #894 this list lived as a `forbidden_v4 = a == 127 || …` chain
 in `crates/arest/src/parse_forml2.rs::is_forbidden_url`. The Sweep-1
@@ -15,10 +17,12 @@ ranges without touching Rust — e.g. a tenant operating inside RFC 6598
 (`100.64.0.0/10`, carrier-grade NAT) can add that prefix as one extra
 instance fact and the next compile re-derives the blocklist.
 
+<!--
 The `cidr_contains` Platform Func (`crates/arest/src/ast.rs`) is the
 membership predicate. Both the engine's SSRF check and any app's own
 access-control derivation rules call it; one implementation, both
 surfaces.
+-->
 
 ## Entity Types
 
