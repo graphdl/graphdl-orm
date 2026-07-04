@@ -125,6 +125,7 @@ Statement has Quantifier.
 Statement has Derivation Marker.
 Statement has Literal Role.
 Statement has Keyword.
+Statement has Prose Punctuation.
 Statement has Deontic Operator.
 Statement has Enum Value.
 Statement has Constraint Keyword.
@@ -237,6 +238,8 @@ Statement has Classification 'Data Type Declaration' iff Statement has Verb 'the
 
 Statement has Classification 'Derivation Rule' iff Statement has Keyword 'iff'.
 Statement has Classification 'Derivation Rule' iff Statement has Keyword 'if'.
+
+Statement has Classification 'Prose' iff Statement has Prose Punctuation.
 
 Statement has Classification 'Fact Type Reading' iff Statement has Role Reference.
 

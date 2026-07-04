@@ -64,6 +64,52 @@ def test_selfhost_compile_matches_the_seed_compiler():
     assert _fact_cells(Ds) == _fact_cells(Dm)
 
 
+def test_prose_classifies_as_prose_through_the_rules():
+    # the flip's last item: the prose posture as GRAMMAR RULES — a paragraph
+    # with structural punctuation outside literals classifies Prose (specific
+    # beats the generic Fact Type Reading) and reports as prose, never a fact
+    # type and never a bare unclassified
+    from pyarest import system as S
+    model = ("Task is an entity type.\n"
+             "Once the engine surfaces facts (issue 821), the Task readiness "
+             "derivation fires, materializing what is next.\n")
+    D, rep = forml.compile_model_selfhost(model)
+    assert any("Once the engine" in s for s in rep.get("prose", []))
+    assert not any("Once the engine" in s for s in rep.get("unclassified", []))
+    fts = [f[0] for f in S._pop_rows(D, "factType")]
+    assert not [ft for ft in fts if "Once" in ft or "readiness" in ft]
+
+
+def test_selfhost_compiles_atop_a_preloaded_base():
+    # flip item 1: the context seam — selfhost apps resolve base-declared
+    # types exactly like the seed path (compile_model's context_from)
+    from pyarest import meta, system as S
+    base_text = ("Status is a value type.\nResource is an entity type.\n"
+                 "Resource is currently in Status.\n")
+    D0, _ = forml.compile_model(base_text)
+    app_text = ("Task is an entity type.\n"
+                "Resource 'r1' is currently in Status 'open'.\n")
+    D, rep = forml.compile_model_selfhost(app_text, D=D0, context_from=D0)
+    assert rep["unclassified"] == []
+    rows = {tuple(r) for r in S._pop_rows(D, "Resource_is_currently_in_Status")}
+    assert ("r1", "open") in rows
+
+
+def test_recognizer_tokens_never_fire_inside_literals():
+    # task 916's shape: an instance fact whose LITERAL contains a recognizer
+    # token (a negation phrase) must classify as an instance fact and land —
+    # not dispatch to the negation translator and drop silently
+    model = ("Task is an entity type.\nTask Description is a value type.\n"
+             "Task has Task Description.\n"
+             "Task '916' has Task Description 'matching is not order-sensitive "
+             "for unique-role tuples'.\n")
+    from pyarest import system as S
+    D, rep = forml.compile_model_selfhost(model)
+    assert rep["unclassified"] == []
+    rows = {tuple(r) for r in S._pop_rows(D, "Task_has_Task_Description")}
+    assert ("916", "matching is not order-sensitive for unique-role tuples") in rows
+
+
 def test_class_rule_twins_equal_the_canonical_path():
     # the FAST twin is a registration; the canonical object is the meaning —
     # the whole selfhost path must answer identically with the registry cleared

@@ -123,7 +123,9 @@ _CLASSIFY = [
     ("subset", re.compile(r"^[Ii]f (.+) then (.+)\.$")),                      # 'if A then B' = subset (modus ponens)
     # grammar-as-readings recognizers (forml2-grammar.md: 'the parser is this file'):
     # a quoted-head iff rule classifies Statements from their field facts
-    ("class_rule", re.compile(r"^(\S[^']*?) has (\S[^']*?) '(.+?)' iff (.+)\.$")),
+    # a MARKED rule (* ** + ++) is never a grammar recognizer — the corpus's
+    # zero-supplying rules carry quoted head literals and a leading star
+    ("class_rule", re.compile(r"^(?![*+])(\S[^']*?) has (\S[^']*?) '(.+?)' iff (.+)\.$")),
     ("equality", re.compile(r"^(.+) if and only if (.+)\.$")),                # 'A iff B' = equality
     # the book's rule surface (Halpin ch.2 ex.4 D1): numbered variables, ' if ' head-body,
     # ' and ' conjunction; a digit in the head keeps plain readings out of this
@@ -286,29 +288,57 @@ _IMPLICIT_STOP = {"If", "When", "Then", "That", "This", "An", "A", "The",
 
 def _implicit_nouns(stmts):
     """The old corpus's implicit role nouns: a maximal run of Title-case tokens
-    inside a non-prose statement IS a noun, declared by occurrence (the old
-    engine's Role Reference extraction — its dbs bind Event Type, Fact Type and
-    Noun this way with no explicit declaration anywhere). Quoted spans are data;
-    prose and list forms (comma or parenthesis outside quotes) are never mined;
-    numeric subscripts strip per token."""
-    names = set()
+    inside a non-prose statement is a noun CANDIDATE, declared by occurrence
+    (the old engine's Role Reference extraction — its dbs bind Event Type, Fact
+    Type and Noun this way with no explicit declaration anywhere). A candidate
+    becomes a NOUN only when CORROBORATED: somewhere in the corpus its run is
+    immediately followed by a quoted literal (instance evidence — Event Type
+    'created', Target SHA 'abc'). Predicate text never is: 'Layer Affinity' in
+    'has Layer Affinity to' minted a phantom third role and starved every join
+    against the old two-wide rows (the claude verdict's root cause; this is the
+    mining boundary, resolved by evidence). Quoted spans are data; prose and
+    list forms are never mined; numeric subscripts strip per token."""
+    candidates, corroborated = set(), set()
+    # 'one' is NOT a corroborator: 'at most one Layer Affinity to Layer' is a
+    # FREQUENCY phrase over a role reading, and its 'one' re-nouned predicate
+    # text (the twelve-hypothesis operator-loaded hunt — a phantom third
+    # variable projecting column 3 of two-wide join rows)
+    quantifiers = {"each", "some", "every", "no", "any"}
     for s in stmts:
         s = re.sub(r"\s*\([^()]*\)\.$", ".", s)               # trailing annotation
-        bare = _QUOTED_SPAN.sub(" ", s)
+        bare = _QUOTED_SPAN.sub(" '' ", s)                    # keep a literal MARK
         if ("," in bare) or ("(" in bare) or (")" in bare):
             continue
-        run = []
+        run, after_quant, prev = [], False, ""
         for tok in bare.split():
+            if tok in ("''", "''."):                          # a literal stood here
+                if run:
+                    name = " ".join(run)
+                    candidates.add(name)
+                    corroborated.add(name)                    # instance evidence
+                run, after_quant = [], False
+                prev = tok
+                continue
             base = tok.strip(".;:").rstrip("0123456789")
             if base and base[0].isupper() and base not in _IMPLICIT_STOP:
+                if not run:
+                    after_quant = prev.strip(".;:").lower() in quantifiers
                 run.append(base)
+                prev = tok
                 continue
-            if len(run) >= 1:
-                names.add(" ".join(run))
-            run = []
+            if run:
+                name = " ".join(run)
+                candidates.add(name)
+                if after_quant:
+                    corroborated.add(name)                    # a quantifier names a TYPE
+            run, after_quant = [], False
+            prev = tok
         if run:
-            names.add(" ".join(run))
-    return names
+            name = " ".join(run)
+            candidates.add(name)
+            if after_quant:
+                corroborated.add(name)
+    return candidates & corroborated
 
 
 def _known(stmts):
@@ -351,6 +381,22 @@ def _num(s):
     return s
 
 
+def _atomic_run_guard(toks, i, matched, known):
+    """Title-case RUNS are atomic: a noun match whose continuation token is also
+    Title-case, with NO known name covering the extended span, is predicate text
+    ('Layer' inside 'has Layer Affinity to' must not match — the run 'Layer
+    Affinity' is uncorroborated, so the whole run is the predicate's words).
+    'Event Type' survives: the longer span IS known."""
+    j = i + len(matched.split())
+    if j >= len(toks):
+        return True
+    nxt = toks[j].strip(".;:").rstrip("0123456789")
+    if not (nxt and nxt[0].isupper() and nxt not in _IMPLICIT_STOP):
+        return True                                           # no Title-case continuation
+    ext = matched + " " + nxt
+    return any(k == ext or k.startswith(ext + " ") for k in known)
+
+
 def _reading(text, known):
     """A fact-type reading → (template, roles): a mixfix predicate template with {i} placeholders
     plus the ordered role object types (the paper's field-replacement model). Scans left to right,
@@ -365,7 +411,8 @@ def _reading(text, known):
             _pre, _, post = tok.partition("-")
             if post in known:
                 roles.append(post); out.append("{%d}" % (len(roles) - 1)); i += 1; continue
-        matched = next((k for k in kset if toks[i:i + len(k.split())] == k.split()), None)
+        matched = next((k for k in kset if toks[i:i + len(k.split())] == k.split()
+                        and _atomic_run_guard(toks, i, k, known)), None)
         if matched:
             roles.append(matched); out.append("{%d}" % (len(roles) - 1)); i += len(matched.split())
         else:
@@ -745,21 +792,35 @@ def tokenize_statement(D, stmt, nouns=(), sid="s1"):
     trail; Role References are known-noun occurrences; a quoted token is a Literal
     Role. Returns [(field_ft, (sid, value)), …]."""
     text = stmt.strip().rstrip(".")
+    # LITERAL-AWARE (the old engine's #845 scanner, and the same blindness the
+    # rule recognizers had): recognizer tokens and Role References must never
+    # fire INSIDE a quoted literal — task 916's description contained a
+    # negation token, classified the instance fact Negation Reading, and the
+    # specific-beats-generic dispatch dropped the fact silently
+    bare = _QUOTED_SPAN.sub(lambda m: " " * len(m.group(0)), text)
     out = []
     for (ftb, lit) in sorted(stage1_vocabulary(D), key=lambda p: -len(p[1])):
         # case-insensitive: Stage-1 recognises phrases at any position, 'The possible
         # values of …' included (the file's own Verb-override comment)
-        if not re.search(r"(?<![A-Za-z])" + re.escape(lit) + r"(?![A-Za-z])", text, re.IGNORECASE):
+        if not re.search(r"(?<![A-Za-z])" + re.escape(lit) + r"(?![A-Za-z])", bare, re.IGNORECASE):
             continue
-        if ftb == "Statement_has_Trailing_Marker" and not text.lower().endswith(lit.lower()):
+        if ftb == "Statement_has_Trailing_Marker" and not bare.rstrip().lower().endswith(lit.lower()):
             continue
         out.append((ftb, (sid, lit)))
     for n in nouns:
-        if re.search(r"(?<![A-Za-z])" + re.escape(n) + r"(?![A-Za-z])", text):
+        if re.search(r"(?<![A-Za-z])" + re.escape(n) + r"(?![A-Za-z])", bare):
             out.append(("Statement_has_Role_Reference", (sid, n)))
     quoted = _QUOTED.findall(text)
     if quoted:
         out.append(("Statement_has_Literal_Role", (sid, quoted[0])))
+    # the prose posture as a FIELD FACT (the flip's last item): structural
+    # punctuation OUTSIDE literals is the paragraph tell; the grammar rule
+    # 'Statement has Classification Prose iff Statement has Prose Punctuation.'
+    # classifies it, and Prose is specific so it beats Fact Type Reading
+    for mark in (",", "(", ")", ": "):
+        if mark in bare:
+            out.append(("Statement_has_Prose_Punctuation", (sid, mark)))
+            break
     return out
 
 
@@ -802,7 +863,7 @@ def classify_all_via_M(D, stmts, nouns=()):
     import pyarest.lam as _L
     for ftb, rows in by_cell.items():
         merged = {tuple(r) for r in _sys._pop_rows(D, ftb)} | set(rows)
-        pair = _L.SEQ(_L.CONS(to_lam(tuple(sorted(merged))))(_L.CONS(D)(_L.NIL)))
+        pair = _L.SEQ(_L.CONS(to_lam(_sys._rowsort(merged)))(_L.CONS(D)(_L.NIL)))
         D = _apply(ast.Store(ftb), pair)
     D = _sys.run_rules(D, changed=set(by_cell))
     by_sid = {}
@@ -923,13 +984,15 @@ _QUALIFIERS = {"that", "some", "the", "other", "a", "an"}
 def _type_span(toks, i, kset):
     """The longest known type reading left-to-right from toks[i], its LAST word
     optionally carrying a numeric subscript (Halpin's Task1 / State Machine2).
-    → (base type, subscript, token span) or None."""
+    → (base type, subscript, token span) or None. Title-case runs are ATOMIC
+    (_atomic_run_guard): a match with an uncovered Title-case continuation is
+    predicate text, not a noun occurrence."""
     for k in kset:
         kw = k.split()
         last = i + len(kw) - 1
         if last < len(toks) and toks[i:last] == kw[:-1]:
             mm = re.fullmatch(re.escape(kw[-1]) + r"(\d*)", toks[last])
-            if mm:
+            if mm and _atomic_run_guard(toks, i, k, kset):
                 return k, mm.group(1), len(kw)
     return None
 
@@ -1042,8 +1105,17 @@ def _h_rule_if(g, k, m, kind="fully-derived"):
     # bag-scoping spelling, the behavior existing models compiled against)
     clauses, neg_groups = [], []
     for frag in (c.strip() for c in body.split(" and ")):
+        mm0 = re.search(r"\bat most 0 (.+)$", frag)
         if frag.startswith("no "):
-            neg_groups.append([p.strip() for p in frag[3:].split(" where ")])
+            # (parts, subject-override): 'no X' introduces X fresh by position
+            neg_groups.append(([p.strip() for p in frag[3:].split(" where ")],
+                               None))
+        elif mm0:
+            # 'X is Yed by at most 0 Z' — negation spelled as frequency (the
+            # corpus's zero-supplying idiom): the clause minus the quantifier is
+            # the declared reading, and the COUNTED type Z is the fresh subject
+            neg_groups.append(([frag.replace("at most 0 ", "", 1)],
+                               mm0.group(1).strip()))
         elif " where " in frag:
             clauses.extend(p.strip() for p in frag.split(" where "))
         else:
@@ -1103,9 +1175,14 @@ def _h_rule_if(g, k, m, kind="fully-derived"):
         if not atoms:
             for v in avars:
                 cols.setdefault(v, len(cols) + 1)
-        elif avars and cols.get(avars[0]) == len(cols) and len(set(avars)) == len(avars):
+        elif (avars and cols.get(avars[0]) == len(cols)
+              and len(set(avars)) == len(avars)
+              and all(v not in cols for v in avars[1:])):
             # the linear chain the fragment always compiled: NatJoin on the running
-            # tuple's last column — existing models keep bit-identical plans
+            # tuple's last column — existing models keep bit-identical plans. Valid
+            # ONLY when the trailing variables are fresh: a rebound trailing variable
+            # (considers x actionable x has_rank, rank bound at atom one) needs the
+            # general pairs join, or its equality silently drops to a cross product
             joins.append(None)
             for v in avars[1:]:
                 cols.setdefault(v, len(cols) + 1)
@@ -1133,12 +1210,13 @@ def _h_rule_if(g, k, m, kind="fully-derived"):
     # the anti-join keys on the shared columns
     negs = []
     if ok and neg_groups and atoms:
-        for parts in neg_groups:
-            gatoms, gcols, gfilters, gjoins, subject = [], {}, [], [], None
+        for (parts, subject_override) in neg_groups:
+            gatoms, gcols, gfilters, gjoins = [], {}, [], []
+            subject = subject_override
             for ci, c in enumerate(parts):
                 aft, avars, alits = _rule_atom(c, k)
                 A_.append(("ruleReads", (rule_cid, aft)))
-                if ci == 0:
+                if ci == 0 and subject is None:
                     subject = avars[0] if avars else None
                 if not gatoms:
                     for v in avars:
@@ -1381,7 +1459,10 @@ def register_translators():
         ("translate_instance_facts", ["fact_type_reading"]),
         ("translate_fact_types", ["fact_type_reading"]),
         ("translate_derivation_mode_facts", ["fact_type_reading"]),
-        ("translate_derivation_rules", ["rule_if", "rule_iff", "derivation_rule", "class_rule"]),
+        # class_rule FIRST, matching _CLASSIFY's arbitration: the quote-aware
+        # rule_iff pattern would otherwise claim quoted-head classification
+        # statements and mint per-value fact types (the merge fanout)
+        ("translate_derivation_rules", ["class_rule", "rule_if", "rule_iff", "derivation_rule"]),
         ("translate_cardinality_constraints", ["uniqueness", "inverse_uc",
                                                "spanning_uc", "spanning_uc2",
                                                "frequency",
@@ -1417,7 +1498,7 @@ def grammar_D():
     return _GRAMMAR_CACHE["D"]
 
 
-def compile_model_selfhost(text, D=None):
+def compile_model_selfhost(text, D=None, context_from=None):
     """Gate two of the self-host: per statement, tokenize (Stage-1, the bootstrap
     kernel) → classify via the RULES (run_rules over the ingested grammar) → dispatch
     via the ingested Classification-has-Translator table → translate (Stage-1 field
@@ -1434,8 +1515,12 @@ def compile_model_selfhost(text, D=None):
         if len(r) >= 2:
             dispatch.setdefault(r[0], []).append(r[1])
     stmts = statements(text)
-    names = _known(stmts)
-    subs, fts, plain = _prepass_context(stmts, names)
+    # the context seam, mirroring compile_model: base-declared names, subtype
+    # edges and fact types resolve exactly like in-text declarations
+    b_names, b_edges, b_fts = ((set(), (), ()) if context_from is None
+                               else _context_of(context_from))
+    names = set(_known(stmts)) | b_names
+    subs, fts, plain = _prepass_context(stmts, names, b_edges, b_fts)
     known = _Known(names, subs, fts, plain)
     ctx = to_lam((tuple(sorted(names)),
                   tuple(sorted((s, tuple(sorted(a))) for s, a in subs.items())),
@@ -1450,8 +1535,15 @@ def compile_model_selfhost(text, D=None):
         mod, sign, inner = _split_modality(stmt)
         if sign != "possibility":
             work.append((stmt, mod, inner))
+    prose = []
     all_cls = classify_all_via_M(gD, [w[2] for w in work], nouns=known)
     for (stmt, mod, inner), cls in zip(work, all_cls):
+        if "Prose" in cls and not (cls - {"Prose"} - _GENERIC_CLASSIFICATIONS):
+            # Prose beats the GENERIC fallbacks only (the seed guard's exact
+            # semantics): an enum's separator commas or a spanning form's
+            # clause comma carry real recognizer classifications and proceed
+            prose.append(stmt)
+            continue
         specific = cls - _GENERIC_CLASSIFICATIONS
         cls = specific or cls
         translators = []
@@ -1471,7 +1563,7 @@ def compile_model_selfhost(text, D=None):
                         _L.CONS(ctx)(_L.CONS(D)(_L.NIL)))))
             with _dm.step(D):
                 D = _apply(_A(t), operand)                     # rho: dispatch through DEFS
-    return D, {"unclassified": unclassified}
+    return D, {"unclassified": unclassified, "prose": prose}
 
 
 def compile_model(text, D=None, context_from=None):

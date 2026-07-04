@@ -183,6 +183,136 @@ Task has Status. **
     assert "Person_has_Status" in rd                          # the rule still derives
 
 
+def test_sum_aggregate_with_mixed_numbering_and_lexical_values():
+    # the claude corpus's spelling (compile-perf.md): unnumbered out-variable,
+    # numbered source, 'total' as reading text — and the store carries LEXICAL
+    # values ('120'), so the sum must coerce numeric atoms (the old engine's
+    # values are conceptually typed; max matched while sum starved on this)
+    model = """Compile Run is an entity type.
+Compile Phase is an entity type.
+Duration Ms is a value type.
+Compile Run spends Duration Ms in Compile Phase.
+Compile Run has total Duration Ms.
+
+* Compile Run1 has total Duration Ms iff Duration Ms is the sum of Duration Ms1 where Compile Run1 spends Duration Ms1 in Compile Phase1.
+
+Compile Run 'r1' spends Duration Ms '120' in Compile Phase 'parse'.
+Compile Run 'r1' spends Duration Ms '30' in Compile Phase 'derive'.
+Compile Run 'r2' spends Duration Ms '5' in Compile Phase 'parse'.
+"""
+    D, rep = _derive(model)
+    assert rep["rule_diagnostics"] == []
+    got = {tuple(str(x) for x in r)
+           for r in system._pop_rows(D, "Compile_Run_has_total_Duration_Ms")}
+    assert got == {("r1", "150"), ("r2", "5")}
+
+
+def test_mixed_type_rows_in_one_cell_do_not_crash_the_derive():
+    # the migration seam: stored rows are LEXICAL ('150'), the coerced sum
+    # derives ints (150) into the same head — the union must sort type-safely
+    # (the claude rehearsal crashed here), and both rows coexist under NATEQ
+    from pyarest import ast
+    from pyarest.lam import to_lam
+    from pyarest.reduce import apply as ap
+    import pyarest.lam as L
+    model = """Compile Run is an entity type.
+Compile Phase is an entity type.
+Duration Ms is a value type.
+Compile Run spends Duration Ms in Compile Phase.
+Compile Run has total Duration Ms.
+
+* Compile Run1 has total Duration Ms iff Duration Ms is the sum of Duration Ms1 where Compile Run1 spends Duration Ms1 in Compile Phase1.
+
+Compile Run 'r1' spends Duration Ms '120' in Compile Phase 'parse'.
+"""
+    D, rep = forml.compile_model(model)
+    # a MIGRATED lexical total lands beside what the rule will derive
+    pair = L.SEQ(L.CONS(to_lam((("r1", "120"),)))(L.CONS(D)(L.NIL)))
+    D = ap(ast.Store("Compile_Run_has_total_Duration_Ms"), pair)
+    D = system.run_rules(D)                                   # must not crash
+    got = {tuple(str(x) for x in r)
+           for r in system._pop_rows(D, "Compile_Run_has_total_Duration_Ms")}
+    assert ("r1", "120") in got
+
+
+def test_a_rule_survives_its_source_becoming_a_stored_cell():
+    # the claude hunt's answer (seven falsified hypotheses deep): the rule ran
+    # while its DERIVED source cell was absent and bottomed once run_rules
+    # STORED it — the one-namespace step resolution served the CELL ROWS where
+    # the fetch machinery meets the name. Storing the source by hand must not
+    # change the rule's meaning.
+    from pyarest import ast, defs
+    from pyarest.lam import to_lam, atom as A, from_lam
+    from pyarest.reduce import apply as ap
+    import pyarest.lam as L
+    model = """Engineering Lever is an entity type.
+Layer is an entity type.
+Engineering Lever is actionable.
+Engineering Lever works Layer.
+Layer is operator-loaded by Engineering Lever.
+
+* Layer1 is operator-loaded by Engineering Lever1 iff Engineering Lever1 is actionable and Engineering Lever1 works Layer1.
+
+Engineering Lever 'e1' works Layer 'L4'.
+"""
+    D, rep = forml.compile_model(model)
+    # the source cell lands the way run_rules lands one: an explicit Store
+    pair = L.SEQ(L.CONS(to_lam((("e1",),)))(L.CONS(D)(L.NIL)))
+    D = ap(ast.Store("Engineering_Lever_is_actionable"), pair)
+    rid = [r[0] for r in system._pop_rows(D, "ruleDerives")
+           if len(r) >= 2 and r[1] == "Layer_is_operator_loaded_by_Engineering_Lever"][0]
+    with defs.step(D):
+        out = from_lam(ap(A(rid), D))
+    assert isinstance(out, tuple), f"rule bottomed: {out!r}"
+    assert ("L4", "e1") in {tuple(r) for r in out}
+
+
+def test_a_unary_first_atom_joins():
+    # the claude probe's bottom: a UNARY first atom followed by a join (every
+    # prior rule test led with a binary) — 'EL is actionable and EL has
+    # affinity to Layer' must derive, not bottom
+    model = """Engineering Lever is an entity type.
+Layer is an entity type.
+Engineering Lever is actionable.
+Engineering Lever works Layer.
+Layer is operator-loaded by Engineering Lever.
+
+* Layer1 is operator-loaded by Engineering Lever1 iff Engineering Lever1 is actionable and Engineering Lever1 works Layer1.
+
+Engineering Lever 'e1' is actionable.
+Engineering Lever 'e1' works Layer 'L4'.
+Engineering Lever 'e2' works Layer 'L5'.
+"""
+    D, rep = _derive(model)
+    assert rep["rule_diagnostics"] == []
+    got = {tuple(r) for r in system._pop_rows(
+        D, "Layer_is_operator_loaded_by_Engineering_Lever")}
+    # e1 is actionable and works L4; e2 is not actionable
+    assert got == {("L4", "e1")}
+
+
+def test_a_unary_first_join_through_a_predicate_text_reading():
+    # variant two of the claude bottom: the joined reading carries an
+    # uncorroborated Title-case run as PREDICATE TEXT ('has Layer Affinity to')
+    model = """Engineering Lever is an entity type.
+Layer is an entity type.
+Engineering Lever is actionable.
+Engineering Lever has Layer Affinity to Layer.
+Layer is operator-loaded by Engineering Lever.
+
+* Layer1 is operator-loaded by Engineering Lever1 iff Engineering Lever1 is actionable and Engineering Lever1 has Layer Affinity to Layer1.
+
+Engineering Lever 'e1' is actionable.
+Engineering Lever 'e1' has Layer Affinity to Layer 'L4'.
+Engineering Lever 'e2' has Layer Affinity to Layer 'L5'.
+"""
+    D, rep = _derive(model)
+    assert rep["rule_diagnostics"] == []
+    got = {tuple(r) for r in system._pop_rows(
+        D, "Layer_is_operator_loaded_by_Engineering_Lever")}
+    assert got == {("L4", "e1")}
+
+
 def test_numbered_rules_still_compile_the_same():
     model = """Person is an entity type.
 Person likes Person.
