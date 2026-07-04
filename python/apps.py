@@ -78,6 +78,15 @@ class Registry:
             D = persist.replay(D, self._log(name))
             D = system.run_rules(D)
         persist.save_sqlite(D, self._db(name))
+        # the RMAP projection rides in the same .db (the GraphDL contract): the
+        # relational tables downstream SQL consumers read, beside the cells
+        import sqlite3
+        from . import ddl
+        con = sqlite3.connect(self._db(name))
+        try:
+            rep["projected"] = ddl.project(D, con)
+        finally:
+            con.close()
         rep["app"] = name
         return rep
 

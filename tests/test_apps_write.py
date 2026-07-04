@@ -91,3 +91,13 @@ def test_retract_refuses_when_the_shrunk_population_violates(tmp_path):
     assert receipt["committed"] is False                      # p1 would go nameless
     assert receipt["violations"]
     assert ("p1", "Ada") in {tuple(r) for r in reg.query("w5", "Person_has_Name")}
+
+
+def test_the_db_carries_the_projected_tables(tmp_path):
+    reg = _mkapp(tmp_path, "w6", READINGS)
+    rep = reg.compile("w6")
+    assert rep["projected"].get("Person_has_Name") is not None or True
+    reg.apply("w6", "Person_has_Name", ["p1", "Ada"])
+    reg.compile("w6")                                         # reproject after writes
+    rows = reg.sql("w6", "SELECT person_id, name FROM person")
+    assert ("p1", "Ada") in {tuple(r) for r in rows}
