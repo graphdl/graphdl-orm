@@ -2,7 +2,7 @@
 from pyarest import apply, to_lam, from_lam
 from pyarest.lam import atom as A
 import pyarest.prims  # noqa: F401  (registers the base incl. cat/not/1r/tlr)
-from pyarest import theta as T
+from pyarest import canon as T
 
 def ev(op, data):
     return from_lam(apply(op, to_lam(data)))

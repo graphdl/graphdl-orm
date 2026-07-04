@@ -14,7 +14,7 @@ can refuse to commit (Def. Violation).
 from . import lam as L
 from .lam import atom as A, PHI
 from .defs import define
-from . import theta as T
+from . import canon as T
 
 def _S(*xs):
     l = L.NIL
@@ -737,7 +737,7 @@ def absorb_rows(D, table_key, partition):
     of the fact types absorbed into `table_key` (spec §4.4: functional roles on the same
     object type give one cell keyed on its id). Entities missing a functional fact drop
     from the joined rows; the optional-column (outer join) refinement is a later step."""
-    from . import theta as T
+    from . import canon as T
     from .reduce import apply as _ap
     from .lam import to_lam, from_lam
     import pyarest.lam as L
@@ -836,7 +836,7 @@ def ft_view(D, ft, partition):
     from . import ast
     from .reduce import apply as _ap
     from .lam import from_lam
-    from . import theta as T
+    from . import canon as T
     table = partition.get(ft, ft)
     if table == ft:
         return set(from_lam(_ap(ast.FetchPop(ft), D)))

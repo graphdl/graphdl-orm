@@ -1518,7 +1518,8 @@ def grammar_D():
     snapshot; the first process on a machine pays the ingest, later ones thaw in
     milliseconds — definitions are data, so the snapshot carries the rules)."""
     if "D" not in _GRAMMAR_CACHE:
-        from . import persist, paths, system as _sys
+        from . import persist, system as _sys
+        from . import canon as paths
         p = paths.shared("forml2-grammar.md")
         # the grammar BOOTSTRAPS through the seed compiler by definition
         # (Stage-1 is the bootstrap kernel): routing it through the selfhost

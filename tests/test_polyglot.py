@@ -8,7 +8,8 @@ import pytest
 import pyarest.prims  # noqa: F401
 import pyarest.lam as L
 from pyarest.lam import atom as A, to_lam, from_lam
-from pyarest import ast, forml, system, theta as T
+from pyarest import ast, forml, system
+from pyarest import canon as T
 from pyarest import polyglot
 
 pytestmark = pytest.mark.skipif(not polyglot.rust_available(),

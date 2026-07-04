@@ -189,7 +189,7 @@ def boundary():
     registered̄]) over the DEFS view, reduced by the one mu, with the names projected out
     by α(1). The informal surface of the system is a decidable fact set the algebra
     itself computes."""
-    from . import theta as T
+    from . import canon as T
     from .reduce import apply as _ap
 
     def _s(*xs):

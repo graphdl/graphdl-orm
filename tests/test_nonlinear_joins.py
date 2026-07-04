@@ -16,7 +16,8 @@ bound-role comparison)."""
 import pyarest.prims  # noqa: F401
 import pyarest.lam as L
 from pyarest.lam import to_lam, from_lam
-from pyarest import ast, forml, system, theta
+from pyarest import ast, forml, system
+from pyarest import canon as theta
 from pyarest.reduce import apply
 
 

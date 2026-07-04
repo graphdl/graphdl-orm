@@ -9,7 +9,8 @@ import pytest
 import pyarest.prims  # noqa: F401
 import pyarest.lam as L
 from pyarest.lam import to_lam, from_lam, atom as A
-from pyarest import canon, constraints as C, defs, polyglot, theta
+from pyarest import canon, constraints as C, defs, polyglot
+from pyarest import canon as theta
 from pyarest.reduce import apply
 
 

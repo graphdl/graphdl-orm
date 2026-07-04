@@ -9,7 +9,8 @@ deliberately-deontic case, so absence and emptiness are distinct encodings)."""
 import pyarest.prims  # noqa: F401
 import pyarest.lam as L
 from pyarest.lam import to_lam, from_lam, atom as A
-from pyarest import defs, system, theta
+from pyarest import defs, system
+from pyarest import canon as theta
 from pyarest.reduce import apply
 
 

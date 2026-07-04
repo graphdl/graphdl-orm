@@ -18,7 +18,7 @@ _MARKER = ".pyarest-active-app"
 
 def default_base():
     """The vendored base readings directory (shared/base), or None if absent."""
-    from . import paths
+    from . import canon as paths
     d = os.path.join(paths.root(), "shared", "base")
     return d if os.path.isdir(d) else None
 

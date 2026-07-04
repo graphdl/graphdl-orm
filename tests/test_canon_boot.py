@@ -9,7 +9,8 @@ construction, asserted here so equality tests cannot silently pass on a fork."""
 import pyarest.prims  # noqa: F401
 import pyarest.lam as L
 from pyarest.lam import to_lam, from_lam, atom as A
-from pyarest import constraints as C, defs, theta
+from pyarest import constraints as C, defs
+from pyarest import canon as theta
 from pyarest.reduce import apply
 
 

@@ -8,7 +8,7 @@ authored in Codd theta1 + the Backus base and reduced by the one mu; nothing is 
 """
 from . import lam as L
 from .lam import atom as A, to_lam
-from . import theta as T
+from . import canon as T
 from .defs import define
 from .reduce import apply
 

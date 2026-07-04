@@ -85,7 +85,7 @@ def test_the_vendored_base_is_the_old_engines_backbone():
     # (evolution + csdp — the live tasks db carries Domain Change and Rmap
     # machinery, proving the old binary compiled them in); no compile here
     # (the suite pays the base ingest only through the registry tests' tiny base)
-    from pyarest import paths
+    from pyarest import canon as paths
     d = os.path.join(paths.root(), "shared", "base")
     names = sorted(os.listdir(d))
     assert names == ["core.md", "csdp.md", "evolution.md", "induction.md",

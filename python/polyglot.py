@@ -12,7 +12,7 @@ import subprocess
 from . import defs
 from .lam import from_lam
 
-from .paths import rust_bin
+from .canon import rust_bin
 
 _BIN = rust_bin("arestlam")
 

@@ -100,7 +100,7 @@ def _engine_fingerprint():
     rules silently after a compiler edit."""
     if not _ENGINE_FP:
         import hashlib
-        from . import paths
+        from . import canon as paths
         h = hashlib.sha256()
         pkg = os.path.dirname(os.path.abspath(__file__))
         for d in (pkg, os.path.join(paths.root(), "shared")):

@@ -13,7 +13,7 @@ ruleDerives cells that ingestion wrote; nothing is tracked host-side.
 """
 from . import lam as L
 from .lam import atom as A, to_lam, from_lam
-from . import theta as T
+from . import canon as T
 from .reduce import apply
 
 

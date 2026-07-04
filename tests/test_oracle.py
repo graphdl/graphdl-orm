@@ -7,7 +7,7 @@ import pyarest.prims  # noqa: F401
 import pyarest.lam as L
 from pyarest.lam import atom as A, to_lam, from_lam
 from pyarest import reduce as R
-from pyarest import theta as T, constraints as C
+from pyarest import canon as T, constraints as C
 
 
 def S(*xs):

@@ -237,7 +237,7 @@ MODULE = None
 def _module_readings():
     global MODULE
     if MODULE is None:
-        from . import paths
+        from . import canon as paths
         MODULE = open(paths.shared("federation.md"), encoding="utf-8").read()
     return MODULE
 
