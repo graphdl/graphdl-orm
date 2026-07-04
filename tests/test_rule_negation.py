@@ -366,3 +366,65 @@ Edge 'e2' leaves Node 'n2'.
     # enters it -> not a source (with leaked variables e1==e2 fails and n2
     # would wrongly qualify).
     assert got == {("n1",)}
+
+
+def test_a_self_supporting_cycle_cannot_keep_itself_alive():
+    # the recorded residual (GMS93, the paper's recursive case): a fully-
+    # derived closure head is excluded from the whole-cell sweep because a
+    # stale mutually-supporting pair rederives itself over a store that
+    # still contains it. The paper's answer: delete the overestimate FIRST
+    # (empty the cell), then rederive from remaining support to the local
+    # fixpoint; rows with only cyclic support die, rows with base support
+    # survive.
+    model = """Node is an entity type.
+Node links Node.
+Node reaches Node. *
+
+* Node1 reaches Node2 iff Node1 links Node2.
+
+* Node1 reaches Node2 iff Node1 reaches Node3 and Node3 reaches Node2.
+
+Node 'a' links Node 'b'.
+Node 'b' links Node 'c'.
+"""
+    D, rep = _derive(model)
+    assert rep["rule_diagnostics"] == []
+    head = "Node_reaches_Node"
+    honest = {tuple(r) for r in system._pop_rows(D, head)}
+    assert honest == {("a", "b"), ("b", "c"), ("a", "c")}
+    # history injects a mutually-supporting stale pair: x reaches y and y
+    # reaches x, neither with any base support
+    stale = system._rowsort(honest | {("x", "y"), ("y", "x"),
+                                      ("x", "x"), ("y", "y")})
+    D = _store(head, stale, D)
+    D = system.run_rules(D)
+    got = {tuple(r) for r in system._pop_rows(D, head)}
+    assert got == honest
+
+
+def test_a_vanished_groups_aggregate_row_dies_on_the_full_derive():
+    # the residual's other half: per-group supersession keeps a group's fold
+    # when the group's supply VANISHES from the store entirely (nothing
+    # produces its key, so nothing supersedes it). For a FULLY-derived agg
+    # head the cell is materialization, so the full derive replaces it whole
+    # with the rules' fresh output (agg and paired plain rows together).
+    model = """Layer is an entity type.
+Engineering Lever is an entity type.
+Load is a value type.
+Layer is operator-loaded by Engineering Lever.
+Layer has Load. *
+
+* Layer1 has Load iff Load is the count of Engineering Lever1 where Layer1 is operator-loaded by Engineering Lever1.
+
+Layer 'L1' is operator-loaded by Engineering Lever 'e1'.
+"""
+    D, rep = _derive(model)
+    assert rep["rule_diagnostics"] == []
+    head = "Layer_has_Load"
+    honest = {tuple(r) for r in system._pop_rows(D, head)}
+    assert honest == {("L1", 1)}
+    # history: a fold for a layer whose levers vanished from the store
+    D = _store(head, system._rowsort(honest | {("Lgone", 7)}), D)
+    D = system.run_rules(D)
+    got = {tuple(r) for r in system._pop_rows(D, head)}
+    assert got == honest

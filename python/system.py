@@ -507,6 +507,17 @@ def run_rules(D, changed=None, stats=None):
                    if kindmap.get(h) == "fully-derived"
                    and h not in agg_heads and h not in keyed_of
                    and not _self_supporting(h))
+    # Self-supporting heads (closures) get the paper's RECURSIVE form: a
+    # stale cycle rederives itself over a store that still contains it, so
+    # whole-cell re-evaluation cannot clean it. Delete the overestimate
+    # FIRST (empty the cell), then rederive to the LOCAL least fixpoint from
+    # remaining support (GMS93; termination by the same finiteness as the
+    # main closure). Rows with only cyclic support die; base-supported rows
+    # rebuild.
+    sweep_cyclic = sorted(h for h in plain_of
+                          if kindmap.get(h) == "fully-derived"
+                          and h not in agg_heads and h not in keyed_of
+                          and _self_supporting(h))
 
     def _eval_rules(rids, Dx):
         outs = set()
@@ -546,9 +557,19 @@ def run_rules(D, changed=None, stats=None):
                 out = from_lam(_ap(_A(rid), D))
             if isinstance(out, tuple):
                 agg_rows = {tuple(r) for r in out if isinstance(r, tuple)}
-                keys = {r[:-1] for r in agg_rows}
                 before = {tuple(r) for r in _pop_rows(D, head)}
-                merged = agg_rows | {r for r in before if r[:-1] not in keys}
+                if kindmap.get(head) == "fully-derived" and dirty is None:
+                    # a FULLY-derived agg head on a FULL derive replaces
+                    # whole: the cell is materialization, and per-group
+                    # supersession cannot retire a group whose supply
+                    # VANISHED (nothing produces its key). The paired plain
+                    # rows (the zero-supply idiom) rejoin fresh.
+                    plain = _eval_rules(plain_of.get(head, []), D)
+                    merged = agg_rows | plain
+                else:
+                    keys = {r[:-1] for r in agg_rows}
+                    merged = agg_rows | {r for r in before
+                                         if r[:-1] not in keys}
                 if merged != before:
                     settled = False
                     round_changed.add(head)
@@ -580,6 +601,21 @@ def run_rules(D, changed=None, stats=None):
                 settled = False
                 round_changed.add(head)
                 D = _ap(ast.Store(head), _S(to_lam(_rowsort(outs)), D))
+        for head in sweep_cyclic:
+            if not _touched(reach.get(head, set())):
+                continue
+            current = {tuple(r) for r in _pop_rows(D, head)}
+            Dx = _ap(ast.Store(head), _S(to_lam(()), D))
+            prev = None
+            outs = set()
+            while outs != prev:
+                prev = outs
+                outs = _eval_rules(plain_of[head], Dx)
+                Dx = _ap(ast.Store(head), _S(to_lam(_rowsort(outs)), Dx))
+            if outs != current:
+                settled = False
+                round_changed.add(head)
+            D = Dx
         if settled:
             break
         dirty = round_changed
