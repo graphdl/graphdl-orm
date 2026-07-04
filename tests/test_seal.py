@@ -38,7 +38,7 @@ Data Type: Salary is Money.
 def test_sensitivity_and_mode_derive_from_the_schema():
     D, rep = forml.compile_model(MODEL)
     assert rep["unparsed"] == []
-    p = seal.plan(D)
+    p = seal.seal_plan(D)
     assert p["roles"][("Person_has_Note", 2)] == "randomized"     # sensitive, unconstrained
     assert ("Person_earns_Salary", 2) not in p["roles"]           # Money is not sensitive
     assert p["ids"]["Person"] == "deterministic"                  # the identifier IS equality

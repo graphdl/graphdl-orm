@@ -1,3 +1,611 @@
+"""The engine in ONE file (the seven-file shape): ast (cells, the store
+walk, the AST transition, DefineIn), constraints (the violation expressions,
+local and scoped), and system (the create pipeline, derive to the least
+fixed point with the joint strata, HATEOAS, machines as values). Each
+section keeps its docstring; the package init aliases the old names, and
+lazy in-body imports resolve through those aliases at call time."""
+
+# ===================== ast: cells and the store =====================
+"""The AST layer (Backus §14): the state D is a sequence of cells; a command runs as the
+single transition create_cell:⟨input, D⟩ = ⟨output, D'⟩ over ONE entity's cell (cell
+isolation — distinct entities' handlers write disjoint cells and never interfere). The
+representation is o = ⟨P'', V⟩; the state commits P'' back to the cell iff V carries no
+alethic violation (Def. Violation / completeness of state transfer). Cells and fetch ↑ /
+store ↓ are Backus's (§13.3.4); everything in the transition is an FFP object reduced by mu.
+"""
+from . import lam as L
+from .lam import atom as A, PHI
+from .reduce import apply
+
+def _S(*xs):
+    l = L.NIL
+    for x in reversed(xs):
+        l = L.CONS(x)(l)
+    return L.SEQ(l)
+
+CELL = A("CELL")
+DEFAULT = A("#")                                             # ↑ of an absent cell (Backus §13.3.4)
+_COMP, _CONS, _CONST, _COND = A("COMP"), A("CONS"), A("CONST"), A("COND")
+_1, _2, _3 = A(1), A(2), A(3)
+_APNDL, _NULL, _NOT, _EQ, _APPLY, _DISTR = A("apndl"), A("null"), A("not"), A("eq"), A("apply"), A("distr")
+# a validate that always commits: ⟨P,D⟩ → ⟨P, φ, F⟩ — empty violations, alethic flag false
+
+
+def cell(name, contents):
+    """A cell ⟨CELL, name, contents⟩ (Backus §13.3.4)."""
+    return _S(CELL, A(name), contents)
+
+
+def Fetch(name):
+    """↑name — contents (role 3) of the first cell named `name`, else # (Backus
+    §13.3.4). The canonical builder applied to the name (shared/ast.py)."""
+    return apply(A("ast:Fetch"), A(name))
+
+
+def FetchPop(name):
+    """The create pipeline's view of a cell as a POPULATION: ↑name, with an absent
+    cell an empty population — the fresh-cell default is the pipeline's explicit
+    choice (a COND on #), never a change to ↑'s meaning. Canonical."""
+    return apply(A("ast:FetchPop"), A(name))
+
+
+def Pop(name):
+    """(pop n) — remove the FIRST cell named `name`, preserving deeper ones (§13.3.4:
+    cells of one name form a LIFO stack). Canonical (a WHILE-fold over
+    ⟨removed?, acc, rest⟩ standing in for Backus's recursive definition)."""
+    return apply(A("ast:Pop"), A(name))
+
+
+def Purge(name):
+    """(purge n) — remove ALL cells named `name` (§13.3.4's other operator).
+    Canonical."""
+    return apply(A("ast:Purge"), A(name))
+
+
+def Store(name):
+    """↓name — ⟨x, D⟩ → (push n):⟨x, (pop n):D⟩ (§13.3.4 verbatim): replace the TOP
+    of the stack named `name`; deeper same-named cells survive. Canonical."""
+    return apply(A("ast:Store"), A(name))
+
+
+def DefineIn(name, obj):
+    """D → D′ with the definition stored as an ORDINARY cell ⟨CELL, name, obj⟩ of D
+    by ↓name (Backus §13.3.5: such a cell has the same effect as Def name ≡ ρobj).
+    Definitions travel with the store (Prop. tenant / Cor. closure). Canonical,
+    applied to ⟨name, obj⟩."""
+    return apply(A("ast:DefineIn"), _S(A(name), obj))
+
+
+def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_obj=None, links_obj=None,
+                 machine=None, mealy_obj=None, index_cell=None, append_cell=None):
+    """The transition create_cell:⟨I, D⟩ → ⟨⟨P'',V⟩, D'⟩ over one cell, wired with a schema's
+    validate (and optionally its resolve/derive). It touches only `cell_name` — plus, when
+    `machine=(status_cell, sm_obj)` is wired, the noun's status cell: the trigger fact entering
+    P advances the machine within the SAME step (Prop. onestep), atomically with the commit.
+    With `mealy_obj` (same input shape as sm_obj) the fired transitions' Mealy emissions are
+    appended to the representation o as its last part. With `index_cell` (the routed-write
+    case) the table's key index records I's key in the SAME commit chain, so refusal leaves
+    the index untouched and re-writes stay deduplicated. Commits iff the alethic flag is
+    false."""
+    from .lam import to_lam
+
+    def slot(v):
+        return to_lam(()) if v is None else _S(v)
+
+    m = to_lam(()) if machine is None else _S(A(machine[0]), machine[1],
+                                              *(A(r) for r in machine[2:]))
+    record = _S(A(cell_name), slot(validate_obj), slot(resolve_obj), slot(derive_obj),
+                slot(links_obj), m, slot(mealy_obj),
+                slot(A(index_cell)) if index_cell is not None else to_lam(()),
+                slot(A(append_cell)) if append_cell is not None else to_lam(()))
+    return apply(A("ast:build_system"), record)
+
+
+def step_input(x, D, fuel=None):
+    """The plain transition on an input: μ(SYSTEM:x) under D's own definitions, the
+    transition rules applied (§14.3.1), optionally fuel-supervised."""
+    from . import defs
+    with defs.step(D, fuel):
+        return _transition(apply(A("SYSTEM"), x), D)
+
+
+def reset(x, D, fuel=None):
+    """§14.3.2 verbatim: the system accepts ⟨RESET, x⟩ at any time. (a) If SYSTEM is
+    defined in the current state D, it 'aborts its current computation without altering
+    D' and treats x as a new normal input. (b) If SYSTEM is not defined, x is appended
+    to D as its first element — the bootstrap of §14.4.3."""
+    from . import defs
+    if defs._cells_of(D).get("SYSTEM") is not None:
+        return step_input(x, D, fuel)
+    return L.SEQ(L.CONS(x)(L._list(D)))
+
+
+def _cell_value(D, name):
+    from . import defs as _d
+    return _d._cells_of(D).get(name)
+
+
+def _component_step(x, Dc, fuel):
+    """One component transition for the framework forms: a store with no SYSTEM answers
+    ⟨ERROR, unchanged⟩ up front (the same check §14.3.2's RESET makes) — an unresolved
+    SYSTEM would otherwise be ⊥, which is divergence, and the framework layer is exactly
+    where Backus puts that answer (§14.3.1)."""
+    from . import defs as _d
+    if _d._cells_of(Dc).get("SYSTEM") is None:
+        from .lam import atom as _A
+        return _A("ERROR"), Dc
+    return _d._items(L._list(step_input(x, Dc, fuel)))
+
+
+def pipe(x, D, a="A", b="B", fuel=None):
+    """§14.5: a system form — the composite transition matches component A's output to
+    component B's input, the component stores riding as tenant cells of the composite
+    store (§14.7). Each component step is the ordinary μ(SYSTEM:x) under its OWN store;
+    a component ERROR aborts the composite step with the composite store unchanged
+    (§14.3.1, lifted). Backus carries the system forms no further than their existence;
+    PIPE is the load-bearing case (process pipelines)."""
+    from . import defs as _d
+    from .lam import from_lam, atom as _A
+    Da, Db = _cell_value(D, a), _cell_value(D, b)
+    if Da is None or Db is None:
+        return _S(_A("ERROR"), D)
+    oa, Da2 = _component_step(x, Da, fuel)
+    if from_lam(oa) == "ERROR":
+        return _S(_A("ERROR"), D)
+    ob, Db2 = _component_step(oa, Db, fuel)
+    if from_lam(ob) == "ERROR":
+        return _S(_A("ERROR"), D)
+    D2 = apply(Store(a), _S(Da2, D))
+    return _S(ob, apply(Store(b), _S(Db2, D2)))
+
+
+def supervise(x, D, child="CHILD", fuel=None):
+    """§14.4.4 delegation with reclaim, across a tenant cell: the child store's
+    transition runs under fuel; a runaway or erroring child answers ⟨ERROR, composite
+    unchanged⟩ — control returns to the parent with the child store intact. Supervision
+    is cell nesting plus fuel, no new mechanism."""
+    from . import defs as _d
+    from .lam import from_lam, atom as _A
+    Dc = _cell_value(D, child)
+    if Dc is None:
+        return _S(_A("ERROR"), D)
+    oc, Dc2 = _component_step(x, Dc, fuel)
+    if from_lam(oc) == "ERROR":
+        return _S(_A("ERROR"), D)
+    return _S(oc, apply(Store(child), _S(Dc2, D)))
+
+
+def child_reset(D, child, x, fuel=None):
+    """RESET into a tenant cell: §14.3.2 applied to the CHILD's store — the bootstrap
+    when the child has no SYSTEM, the child's OWN transition on x when it does. Note the
+    faithful consequence: this cannot repair a child whose SYSTEM diverges (the child
+    would just run it again) — pass fuel, or use child_install, the parent's move."""
+    Dc = _cell_value(D, child)
+    if Dc is None:
+        Dc = L.SEQ(L.NIL)
+    return apply(Store(child), _S(reset(x, Dc, fuel), D))
+
+
+def child_install(D, child, name, obj):
+    """The parent's prerogative (§14.7): a child's store is a cell of the parent's own,
+    so installing a definition in the child — including a NEW SYSTEM for a broken child
+    — is an ordinary store BY THE PARENT, no step of the child involved. This, not
+    RESET, is how a supervisor repairs a divergent subsystem."""
+    Dc = _cell_value(D, child)
+    if Dc is None:
+        Dc = L.SEQ(L.NIL)
+    return apply(Store(child), _S(apply(Store(name), _S(obj, Dc)), D))
+
+
+def child_retire(D, child):
+    """Retire a child system: its cell becomes the empty store (the paper's logical
+    deletion, applied to a whole subsystem)."""
+    return apply(Store(child), _S(L.SEQ(L.NIL), D))
+
+
+def run(input_fact, D, validate_obj=None, cell_name="FILE", resolve_obj=None, derive_obj=None, links_obj=None,
+        machine=None, mealy_obj=None, fuel=None, index_cell=None, append_cell=None):
+    """One AST transition: mu(create_cell:⟨input, D⟩) = ⟨o, D'⟩, with D's OWN definitions in
+    scope for the whole step (defs.step — frozen, Backus §14.6). Without a validate it commits
+    (V = φ); with validate_of it refuses to commit on an alethic violation; with links_obj the
+    representation o carries its HATEOAS links (Thm. hateoas); with machine=(status_cell, sm_obj
+    [, entity_role]) the trigger fact advances the noun's machine in this same step (Prop.
+    onestep) — and given the entity_role, links_obj is fed the entity's POST-step status, so
+    the returned representation offers exactly the next actions (§1: ship, no longer place)."""
+    from . import defs
+    handler = build_system(validate_obj, cell_name, resolve_obj, derive_obj, links_obj, machine, mealy_obj,
+                           index_cell, append_cell)
+    with defs.step(D, fuel):
+        return _transition(apply(handler, _S(input_fact, D)), D)
+
+
+# ============================ eq. sys — the whole system as one lambda =========
+# SYSTEM : ⟨⟨entity, op⟩, D⟩  →  (rho(↑entity : D)) : ⟨op, D⟩         (the paper's eq. sys)
+# The entire running engine is ONE lambda applied to values: D carries every entity's handler
+# as a cell (a value); a command names an entity and an operation; the transition fetches that
+# entity's handler FROM D (by runtime name), reflects it with rho, and applies it to ⟨op, D⟩.
+# An address naming no cell of D fetches # — and #:x reduces to ⊥, so wrong-tenant access is
+# not forbidden but impossible (Prop. tenant: isolation = preservation of addressability under ↑).
+
+# DynFetch : ⟨name, D⟩ → contents of the first cell of D named `name` (a runtime
+# value), else #. SYSTEM : ⟨⟨entity, op⟩, D⟩ → apply:⟨↑entity:D, ⟨op, D⟩⟩. Both are
+# the CANON's (shared/ast.py, eq. sys verbatim); this module binds them.
+from . import canon as _canon
+_C = dict(_canon.read("ast.py"))
+
+
+def DynFetch():
+    """The dynamic fetch expression over ⟨name, D⟩: contents of the first cell of D whose
+    name equals the runtime value `name`, else # (the public form of eq. sys's fetch)."""
+    return _C["ast:DynFetch"]
+
+
+SYSTEM = _C["ast:SYSTEM"]
+
+
+def dispatch(entity, op, D):
+    """One eq. sys step: route `op` to the handler that D holds for `entity`, applied to ⟨op, D⟩.
+    mu(SYSTEM:⟨⟨entity, op⟩, D⟩), with D's own DEFS in scope (defs.step). An unknown entity
+    fetches # and reduces to ⊥ (Prop. tenant)."""
+    from . import defs
+    with defs.step(D):
+        return _transition(apply(SYSTEM, _S(_S(A(entity), op), D)), D)
+
+
+def _transition(result, D):
+    """The AST transition rule (Backus §14.3.1 verbatim): 'If μ(SYSTEM:x) is not a pair,
+    the output is an error message and the state remains unchanged.' The transition rules
+    are the framework's third element (§14.3), OUTSIDE the applicative subsystem — host
+    placement of this check is the faithful placement."""
+    from . import defs
+    if len(defs._items(L._list(result))) == 2:
+        return result
+    return _S(A("ERROR"), D)
+
+
+# ===================== constraints: the violation expressions =====================
+"""Constraint families as FFP violation expressions: (rho c) : P = V_c (Def. Violation).
+
+A constraint is *implemented* as an FFP object c; rho (define + the reducer) *reflects*
+it back to the ORM layer, where (rho c) : P is the set of population tuples that violate
+it. The meta-object 'the constraint' and its FFP implementation are the same entity under
+rho — the metamodel describes it, FFP implements it, rho reflects it back. Each family is
+authored in Codd theta1 + the Backus base and reduced by the one mu; nothing is host code.
+"""
+from . import lam as L
+from .lam import atom as A, to_lam
+from . import canon as T
+from .defs import define
+from .reduce import apply
+
+def _S(*xs):
+    l = L.NIL
+    for x in reversed(xs):
+        l = L.CONS(x)(l)
+    return L.SEQ(l)
+
+_COMP, _CONS, _ALPHA, _ID, _CONST = A("COMP"), A("CONS"), A("ALPHA"), A("id"), A("CONST")
+_EQ, _NOT, _NULL, _AND, _OR, _DISTL, _DISTR = A("eq"), A("not"), A("null"), A("and"), A("or"), A("distl"), A("distr")
+_LT, _GT = A("lt"), A("gt")
+_1, _2 = A(1), A(2)
+
+
+def uniqueness(roles):
+    """Uniqueness constraint over `roles` (ORM's fundamental constraint): the
+    canonical builder (shared/constraints.py) applied to the key roles.
+        hasDup:⟨t,P⟩ = not null ( Filter(key(1)=key(2) ∧ 1≠2) : (distl:⟨t,P⟩) )
+        V_uc         = α(1) ∘ Filter(hasDup) ∘ distr ∘ [id, id]
+    """
+    from .reduce import apply as _apply
+    return _apply(A("constraints:uniqueness"), to_lam(tuple(roles)))
+
+
+def ring_irreflexive(roles=(1, 2)):
+    """Irreflexive ring on a binary fact type: no x relates to itself. V = the ⟨x,x⟩ facts."""
+    r1, r2 = A(roles[0]), A(roles[1])
+    return T.Filter(_S(_COMP, _EQ, _S(_CONS, r1, r2)))
+
+
+def ring_symmetric(roles=(1, 2)):
+    """Symmetric ring: x R y ⟹ y R x. V = the ⟨x,y⟩ (x≠y) whose reverse ⟨y,x⟩ is absent from P.
+        α(1) ∘ Filter(x≠y ∧ ⟨y,x⟩∉P) ∘ distr ∘ [id, id]"""
+    r1, r2 = A(roles[0]), A(roles[1])
+    fx, fy = _S(_COMP, r1, _1), _S(_COMP, r2, _1)            # x, y of the fact (1:pair)
+    swap = _S(_CONS, fy, fx)                                 # ⟨y, x⟩
+    swap_absent = _S(_COMP, _NOT, T.member, _S(_CONS, swap, _2))   # ⟨y,x⟩ ∉ P
+    neq = _S(_COMP, _NOT, _EQ, _S(_CONS, fx, fy))            # x ≠ y
+    viol = _S(_COMP, _AND, _S(_CONS, neq, swap_absent))
+    return _S(_COMP, _S(_ALPHA, _1), T.Filter(viol), _DISTR, _S(_CONS, _ID, _ID))
+
+
+def ring_asymmetric(roles=(1, 2)):
+    """Asymmetric ring (Halpin §7.3): xRy → ¬yRx, with x and y not necessarily distinct,
+    so reflexive pairs violate too (asymmetric = antisymmetric + irreflexive). V = the
+    facts whose swap is also in P."""
+    r1, r2 = A(roles[0]), A(roles[1])
+    fx, fy = _S(_COMP, r1, _1), _S(_COMP, r2, _1)
+    swap = _S(_CONS, fy, fx)
+    viol = _S(_COMP, T.member, _S(_CONS, swap, _2))
+    return _S(_COMP, _S(_ALPHA, _1), T.Filter(viol), _DISTR, _S(_CONS, _ID, _ID))
+
+
+def ring_antisymmetric(roles=(1, 2)):
+    """Antisymmetric ring (§7.3): x ≠ y & xRy → ¬yRx. Reflexive pairs are allowed."""
+    r1, r2 = A(roles[0]), A(roles[1])
+    fx, fy = _S(_COMP, r1, _1), _S(_COMP, r2, _1)
+    swap_in = _S(_COMP, T.member, _S(_CONS, _S(_CONS, fy, fx), _2))
+    neq = _S(_COMP, _NOT, _EQ, _S(_CONS, fx, fy))
+    viol = _S(_COMP, _AND, _S(_CONS, neq, swap_in))
+    return _S(_COMP, _S(_ALPHA, _1), T.Filter(viol), _DISTR, _S(_CONS, _ID, _ID))
+
+
+def ring_intransitive(roles=(1, 2)):
+    """Intransitive ring (§7.3): xRy & yRz → ¬xRz. V = the facts of P that complete a
+    two-step chain, i.e. P ∩ π₁₃(P ⋈ P)."""
+    chains = _S(_COMP, T.Project([1, 3]), T.NatJoin(2), _S(_CONS, _ID, _ID))
+    in_chains = _S(_COMP, T.member, _S(_CONS, _1, _2))       # ⟨t, chains⟩ → t ∈ chains
+    return _S(_COMP, _S(_ALPHA, _1), T.Filter(in_chains), _DISTR, _S(_CONS, _ID, chains))
+
+
+def ring_acyclic(roles=(1, 2)):
+    """Acyclic ring (§7.3): "no path via the relation from an object back to itself".
+    V = the reflexive pairs of the transitive closure, the closure computed by the same
+    derive lfp that serves derivation rules (per Mapping ORM to Datalog)."""
+    from . import system as _sys
+    tc = _sys.derive_of([_sys.join_rule(2, [1, 3])])
+    return _S(_COMP, T.Filter(_S(_COMP, _EQ, _S(_CONS, _1, _2))), tc)
+
+
+def frequency(roles, lo=None, hi=None):
+    """Occurrence frequency (§7.2): "each member of pop(roles) occurs there exactly n
+    times", generalized to [lo, hi]; a local constraint on the role population, not the
+    object type, so unplayed members are fine. V = the facts whose key count is out of
+    bounds. The canonical builder applied to ⟨roles, lo?, hi?⟩ (an absent bound is the
+    empty sequence)."""
+    from .reduce import apply as _apply
+    from .lam import to_lam as _tl
+    return _apply(A("constraints:frequency"),
+                  _tl((tuple(roles),
+                       (lo,) if lo is not None else (),
+                       (hi,) if hi is not None else ())))
+
+
+def value_range(role, lo=None, hi=None, lo_open=False, hi_open=False):
+    """Value constraint over a continuous range (NORMA's value ranges). The value at
+    `role` must lie in the range with bounds lo/hi (None = unbounded, *_open =
+    exclusive). V = the facts outside it. The canonical builder applied to
+    ⟨role, ⟨lo, openflag⟩?, ⟨hi, openflag⟩?⟩."""
+    from .reduce import apply as _apply
+    from .lam import to_lam as _tl
+    return _apply(A("constraints:value_range"),
+                  _tl((role,
+                       (lo, "T" if lo_open else "F") if lo is not None else (),
+                       (hi, "T" if hi_open else "F") if hi is not None else ())))
+
+
+def value_enumeration(role, values):
+    """Value constraint over an enumeration (NORMA's 'the possible values of X are
+    …'). The value at `role` must be one of `values`. V = the facts whose value is
+    not in the set. The canonical builder applied to ⟨role, values⟩."""
+    from .reduce import apply as _apply
+    from .lam import to_lam as _tl
+    return _apply(A("constraints:value_enumeration"),
+                  _S(A(role), _tl(tuple(values))))
+
+
+_CC = None
+
+
+def _canon_c(name):
+    global _CC
+    if _CC is None:
+        from . import canon as _canon
+        _CC = dict(_canon.read("constraints.py"))
+    return _CC[name]
+
+
+def mandatory():
+    """Simple mandatory role: every entity plays the role. Input ⟨entities, players⟩;
+    V = entities ∖ players (Codd setminus) — the entities that play no fact. The
+    canon value (shared/constraints.py)."""
+    return _canon_c("constraints:mandatory")
+
+
+def subset():
+    """Subset constraint A ⊆ B (NORMA 'if A then B' — implication by modus ponens). Input ⟨A, B⟩;
+    V = A ∖ B — the antecedent facts whose consequent does not hold. The canon value."""
+    return _canon_c("constraints:subset")
+
+
+def equality():
+    """Equality constraint A = B (NORMA 'A if and only if B'). Input ⟨A, B⟩; V = (A ∖ B) ∪ (B ∖ A),
+    the symmetric difference — facts on one side without their counterpart on the other. The
+    canon value."""
+    return _canon_c("constraints:equality")
+
+
+# --- set-comparison over a participation population ⟨⟨entity, clause⟩ …⟩ (one fact per clause the
+# entity participates in). These reduce to theta1 constraints already defined. ---
+_CAT = A("cat")
+
+
+def exclusion():
+    """Exclusion — at most one of the clauses holds per entity. V = the participations whose entity
+    also appears with a DIFFERENT clause (uniqueness on the entity role, applied through the
+    apply primitive in the canon)."""
+    return _canon_c("constraints:exclusion")
+
+
+def inclusive_or():
+    """Inclusive-or / disjunctive mandatory — at least one clause holds per entity. Input
+    ⟨universe, players⟩ (players = entities in some clause); V = universe ∖ players (setminus).
+    The canon value."""
+    return _canon_c("constraints:inclusive_or")
+
+
+def exclusive_or():
+    """Exclusive-or — exactly one clause holds per entity. Input ⟨universe, participation⟩; V = the
+    entities in NO clause (universe ∖ pi1(participation)) together with those in TWO OR MORE (the
+    uniqueness violations of the participation) — everyone not holding exactly one. The canon
+    value."""
+    return _canon_c("constraints:exclusive_or")
+
+
+# ============================ scoped (cross-cell) families ====================
+# A scoped violation expression consumes ⟨P, D⟩: P is the TARGET cell's post-derive
+# population (the cell this commit writes), and every sibling population is fetched from
+# the frozen D — validate runs before the commit, so the target cell's copy in D is stale
+# and must come from P, while sibling cells are untouched by this step (Def. iso).
+
+def _pop_of(cell_name):
+    """⟨P,D⟩ → the population of a SIBLING cell, fetched from the frozen D. A non-string
+    argument is taken as a ready population EXPRESSION over D (the RMAP view seam:
+    an absorbed fact type's population reassembled through the index), composed the
+    same way."""
+    from . import ast
+    src = ast.FetchPop(cell_name) if isinstance(cell_name, str) else cell_name
+    return _S(_COMP, src, _2)
+
+
+_P = _1                                                       # ⟨P,D⟩ → the target population
+
+
+def _scoped(name, cell, host):
+    """A string cell name applies the canonical builder; a ready population
+    EXPRESSION (the RMAP view seam) keeps the host composition until system.py
+    migrates."""
+    if isinstance(cell, str):
+        from .reduce import apply as _apply
+        return _apply(A(name), A(cell))
+    return host()
+
+
+def scoped_mandatory_entities(entity_cell):
+    """Mandatory, attached to the FACT-TYPE cell (P = the fact population): the instances
+    in the entity type's own cell that play no fact. V = π1(entities) ∖ π1(P).
+    Canonical for a named sibling."""
+    def host():
+        ents = _S(_COMP, T.Project([1]), _pop_of(entity_cell))
+        players = _S(_COMP, T.Project([1]), _P)
+        return _S(_COMP, T.setminus, _S(_CONS, ents, players))
+    return _scoped("constraints:scoped_mandatory_entities", entity_cell, host)
+
+
+def scoped_mandatory_facts(ft_cell):
+    """Mandatory, attached to the ENTITY cell (P = the entity population): the entities of
+    P that play no fact in the fact-type cell. V = π1(P) ∖ π1(↑ft). Canonical for a
+    named sibling."""
+    def host():
+        ents = _S(_COMP, T.Project([1]), _P)
+        players = _S(_COMP, T.Project([1]), _pop_of(ft_cell))
+        return _S(_COMP, T.setminus, _S(_CONS, ents, players))
+    return _scoped("constraints:scoped_mandatory_facts", ft_cell, host)
+
+
+def scoped_subset(consequent_cell):
+    """Subset A ⊆ B, attached to the antecedent cell (P = A): V = P ∖ ↑B, tuple-wise —
+    the clause readings resolve to fact types whose role order matches (modus ponens).
+    Canonical for a named sibling."""
+    def host():
+        return _S(_COMP, T.setminus, _S(_CONS, _P, _pop_of(consequent_cell)))
+    return _scoped("constraints:scoped_subset", consequent_cell, host)
+
+
+def scoped_equality_side(other_cell):
+    """Equality A = B, attached to ONE side (P = this side): the symmetric difference
+    (P ∖ ↑other) ∪ (↑other ∖ P). Canonical for a named sibling."""
+    def host():
+        ab = _S(_COMP, T.setminus, _S(_CONS, _P, _pop_of(other_cell)))
+        ba = _S(_COMP, T.setminus, _S(_CONS, _pop_of(other_cell), _P))
+        return _S(_COMP, _CAT, _S(_CONS, ab, ba))
+    return _scoped("constraints:scoped_equality_side", other_cell, host)
+
+
+def value_comparison(op, col, lit):
+    """The value-comparison family expression (paper Def. Schema; NORMA
+    ValueComparisonConstraint). RESERVED for the canonical role-vs-role verbalization
+    when it lands; a LITERAL bound is canonically a VALUE CONSTRAINT range ('The
+    possible values of X are at most 5.'), already wired — no non-canonical FORML."""
+    return T.Filter(_S(_COMP, A("not"), A(op), _S(_CONS, A(col), _S(_CONST, A(lit)))))
+
+
+def _participation(clause_fts, target_ft, pops=None):
+    """⟨P,D⟩ → ⟨⟨entity, clause⟩ …⟩ over ALL clause cells: the target clause reads from P,
+    the sibling clauses from D. Each row is tagged with its clause's fact-type id. `pops`
+    overrides a clause's population with an expression over D (the RMAP view seam)."""
+    parts = []
+    for ft in clause_fts:
+        src = _P if ft == target_ft else _pop_of((pops or {}).get(ft, ft))
+        tag = _S(_ALPHA, _S(_CONS, _1, _S(_CONST, A(ft))))    # row → ⟨entity, clause⟩
+        parts.append(_S(_COMP, tag, src))
+    return _S(_COMP, T.flatten, _S(_CONS, *parts))
+
+
+def scoped_exclusion(clause_fts, target_ft, pops=None):
+    """Exclusion over clause fact types, attached to `target_ft`'s cell: at most one clause
+    per entity — uniqueness on the entity role of the participation. Canonical unless a
+    pops override (the view seam) rides along."""
+    if not pops:
+        from .reduce import apply as _apply
+        from .lam import to_lam as _tl
+        return _apply(A("constraints:scoped_exclusion"),
+                      _S(_tl(tuple(clause_fts)), A(target_ft)))
+    return _S(_COMP, exclusion(), _participation(clause_fts, target_ft, pops))
+
+
+def scoped_exclusive_or(subject_cell, clause_fts, target_ft, pops=None):
+    """Exactly one clause per entity: exclusive_or over ⟨universe, participation⟩, the
+    universe being the subject type's own instance cell. Canonical unless a pops
+    override rides along."""
+    if not pops and isinstance(subject_cell, str):
+        from .reduce import apply as _apply
+        from .lam import to_lam as _tl
+        return _apply(A("constraints:scoped_exclusive_or"),
+                      _S(A(subject_cell), _tl(tuple(clause_fts)), A(target_ft)))
+    pair = _S(_CONS, _pop_of(subject_cell), _participation(clause_fts, target_ft, pops))
+    return _S(_COMP, exclusive_or(), pair)
+
+
+def scoped_external_uniqueness(other_ft, cols):
+    """External uniqueness over two fact types (Halpin §10.3, Fig. 10.21 verbatim:
+    "equivalent to an internal uniqueness constraint spanning [the columns] in the
+    natural join of the two tables"). ⟨P, D⟩: join the target population with the
+    sibling cell on the shared key (role 1 = role 1), then the internal UC over `cols`
+    of the joined tuples. Canonical for a named sibling."""
+    if isinstance(other_ft, str):
+        from .reduce import apply as _apply
+        from .lam import to_lam as _tl
+        return _apply(A("constraints:scoped_external_uniqueness"),
+                      _S(A(other_ft), _tl(tuple(cols))))
+    join = _S(_COMP, T.NatJoin(1), _S(_CONS, _P, _pop_of(other_ft)))
+    return _S(_COMP, uniqueness(cols), join)
+
+
+def scoped_inclusive_or(subject_cell, clause_fts, target_ft, pops=None):
+    """At least one clause per entity (disjunctive mandatory): universe ∖ players.
+    Canonical unless a pops override rides along."""
+    if not pops and isinstance(subject_cell, str):
+        from .reduce import apply as _apply
+        from .lam import to_lam as _tl
+        return _apply(A("constraints:scoped_inclusive_or"),
+                      _S(A(subject_cell), _tl(tuple(clause_fts)), A(target_ft)))
+    players = _S(_COMP, T.Project([1]), _participation(clause_fts, target_ft, pops))
+    pair = _S(_CONS, _S(_COMP, T.Project([1]), _pop_of(subject_cell)), players)
+    return _S(_COMP, T.setminus, pair)
+
+
+def violations(constraint_obj, population):
+    """(rho c) : P — reduce the violation object against a population (an FFP object)."""
+    return apply(constraint_obj, population)
+
+
+def register_constraint(name, constraint_obj):
+    """Reflect a constraint into the ORM layer under `name`: define(name,c) makes rho(name)
+    denote (rho c), so apply(atom(name), P) = V_c. The meta-object IS the reflected FFP."""
+    define(name, constraint_obj)
+
+
+# ===================== system: the pipeline and derive =====================
 """The AREST command pipeline as FFP objects (Def. Command, eq. create), on the kernel.
 
     create = emit ∘ validate ∘ derive ∘ resolve                         (eq. create)
@@ -1346,14 +1954,14 @@ _step    = _S(_CONS, _1, _new_acc, _new_rem)                 # ⟨t, acc', rem'�
 _hasmore = _S(_COMP, _NOT, _NULL, _3)                        # remaining non-empty?
 _loop    = _S(_WHILE, _hasmore, _step)
 _init    = _S(_CONS, _1, _S(_COMP, _1, _2), _S(_COMP, _2, _2))       # ⟨t, acc0, inputs⟩
-run = _S(_COMP, _2, _loop, _init)                            # 2:(loop:(init:arg)) = the final acc
-define("run", run)
+machine_run = _S(_COMP, _2, _loop, _init)                            # 2:(loop:(init:arg)) = the final acc
+define("run", machine_run)
 
 
 def run_machine(transition, acc0, inputs):
     """Fold a transition VALUE over `inputs` from `acc0` — via the one `run` lambda."""
     from .reduce import apply
-    return apply(run, _S(transition, _S(acc0, inputs)))
+    return apply(machine_run, _S(transition, _S(acc0, inputs)))
 
 
 # ---- RMAP as a value (Halpin §10.3): the two grouping rules, as a transition relation. ----

@@ -38,3 +38,19 @@ canon.load_all()                                             # the INTERSECTION 
                                                              # canonical names resolve everywhere
 from .kernel import ATOM, SEQ, BOT, PHI, to_lam, from_lam, atom
 from .kernel import apply, meaning, mkapp
+from . import engine as _engine
+for _n in ("ast", "constraints", "system"):
+    _sys.modules[__name__ + "." + _n] = _engine
+ast = constraints = system = _engine
+from . import compiler as _compiler
+for _n in ("meta", "forml"):
+    _sys.modules[__name__ + "." + _n] = _compiler
+meta = forml = _compiler
+from . import protocol as _protocol
+for _n in ("persist", "ddl", "migrate", "federate", "apps", "mcp_server"):
+    _sys.modules[__name__ + "." + _n] = _protocol
+persist = ddl = migrate = federate = apps = mcp_server = _protocol
+from . import tools as _tools
+for _n in ("optimize", "polyglot"):
+    _sys.modules[__name__ + "." + _n] = _tools
+optimize = polyglot = _tools
