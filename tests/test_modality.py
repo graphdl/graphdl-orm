@@ -21,6 +21,8 @@ def _file(Dpy):
 
 # ---- modality parsing ----
 def test_modality_is_tagged():
+    # kinds are the GRAMMAR's after the seed deletion; the seed still
+    # tags MODALITY (its bootstrap job), asserted on the catch-all kind
     assert forml.analyze("Each Student has at most one Email.")[2] == "alethic"
     kind, _g, mod = forml.analyze("It is obligatory that each Student has at most one Email.")
     assert kind == "uniqueness" and mod == "deontic"

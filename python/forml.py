@@ -77,6 +77,17 @@ def _split_modality(stmt):
 
 
 # ---- classification of the (modality-stripped) inner statement ----
+# _CLASSIFY is TWO things after the flip: the PRODUCTION REGISTRY every
+# registered translator extracts fields through (all kinds, shared with the
+# grammar-classified path), and the BOOTSTRAP CLASSIFIER (the seed). The seed
+# half is restricted to _BOOTSTRAP_KINDS: the five kinds
+# shared/forml2-grammar.md exercises, measured 2026-07-04. Every other
+# statement form classifies through the grammar rules; analyze() refuses what
+# the bootstrap does not need, so the seed cannot silently claim corpus
+# statements again.
+_BOOTSTRAP_KINDS = {"fact_type_reading", "class_rule", "value_type",
+                    "value_constraint", "entity_type"}
+
 _CLASSIFY = [
     ("entity_type", re.compile(r"^(.+) is an entity type\.$")),
     ("value_type", re.compile(r"^(.+) is a value type\.$")),
@@ -1378,6 +1389,13 @@ def compile(stmt, D, known=()):
     from .reduce import apply as _apply
     from .lam import atom as _A
     kind, g, modality = analyze(stmt)
+    if kind not in _BOOTSTRAP_KINDS:
+        # the seed DISPATCHES only its five bootstrap kinds (the grammar file's
+        # measured footprint); analyze stays the full classifier because the
+        # PREPASS and the translators share its table as the production
+        # registry. A non-bootstrap statement reaching the seed is unparsed,
+        # never silently translated by the dead branch.
+        kind, g = "UNPARSED", (stmt,)
     if kind == "fact_type_reading" and _prose_suspect(g[0], known):
         # a readings PARAGRAPH, not a reading: report it, never declare it (the
         # old engine's check warns the author; silence was the data loss)
@@ -1548,10 +1566,10 @@ def compile_model_selfhost(text, D=None, context_from=None):
     for stmt in stmts:
         mod, sign, inner = _split_modality(stmt)
         if sign != "possibility":
-            work.append((stmt, mod, inner))
+            work.append((stmt, mod, inner, sign))
     prose = []
     all_cls = classify_all_via_M(gD, [w[2] for w in work], nouns=known)
-    for (stmt, mod, inner), cls in zip(work, all_cls):
+    for (stmt, mod, inner, sign), cls in zip(work, all_cls):
         if "Prose" in cls and not (cls - {"Prose"} - _GENERIC_CLASSIFICATIONS
                                    - {"Derivation Rule"}):
             # Prose beats the generics AND the rule claim (the seed's
@@ -1563,6 +1581,13 @@ def compile_model_selfhost(text, D=None, context_from=None):
             prose.append(stmt)
             continue
         specific = cls - _GENERIC_CLASSIFICATIONS
+        if not specific and sign == "negative":
+            # a NEGATIVE-modality statement is a constraint by definition
+            # (ORM: modality qualifies constraints); the generic fallbacks
+            # must never declare a fact type from it (the junk shape:
+            # any_Person_was_born_in_no_Country). Unclaimed means reported.
+            unclassified.append(stmt)
+            continue
         cls = specific or cls
         translators = []
         for c in sorted(cls):
@@ -1591,14 +1616,11 @@ def compile_model(text, D=None, context_from=None):
     dispatches, and the seed's regex arbitration survives only behind
     PYAREST_SEED=1 as the migration escape hatch until its deletion. The report
     keeps the seed's contract: total, kinds, unparsed, rule_diagnostics."""
-    import os
-    if not os.environ.get("PYAREST_SEED"):
-        D2, rep = compile_model_selfhost(text, D=D, context_from=context_from)
-        diags = [tuple(r) for r in system._pop_rows(D2, "ruleDiag")]
-        return D2, {"total": len(statements(text)), "kinds": {},
-                    "unparsed": rep["unclassified"], "prose": rep["prose"],
-                    "rule_diagnostics": diags}
-    return _compile_model_seed(text, D=D, context_from=context_from)
+    D2, rep = compile_model_selfhost(text, D=D, context_from=context_from)
+    diags = [tuple(r) for r in system._pop_rows(D2, "ruleDiag")]
+    return D2, {"total": len(statements(text)), "kinds": {},
+                "unparsed": rep["unclassified"], "prose": rep["prose"],
+                "rule_diagnostics": diags}
 
 
 def _compile_model_seed(text, D=None, context_from=None):
