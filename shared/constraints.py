@@ -204,5 +204,5 @@ DEF("constraints:scoped_external_uniqueness",
        S4(A("CONS"), K(A("COMP")), K(A("theta:natjoin1")),
           S4(A("CONS"), K(A("CONS")), K(N(1)),
              S4(A("CONS"), K(A("COMP")),
-                S3(A("COMP"), A("ast:FetchPop"), N(1)), K(N(2))))))),
+                S3(A("COMP"), A("ast:FetchPop"), N(1)), K(N(2)))))))
 )

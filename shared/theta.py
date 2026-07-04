@@ -138,5 +138,5 @@ DEF("theta:AntiRestrict",
              S3(A("COMP"), A("theta:Project"), N(2)), K(N(2)))))),
 
 DEF("theta:proj1",
-    S3(A("COMP"), A("theta:dedup"), S2(A("ALPHA"), S2(A("CONS"), N(1))))),
+    S3(A("COMP"), A("theta:dedup"), S2(A("ALPHA"), S2(A("CONS"), N(1)))))
 )

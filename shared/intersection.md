@@ -13,7 +13,11 @@ first element may be a double-quoted string (the file's own description); every
 other element is a DEF(name, tree) call. Nothing else: no imports, no assignments,
 no host functions, no comments (the comment syntaxes do not intersect), and
 double-quoted strings only, since a multi-character single-quoted string is a broken
-char literal to the C-family tokenizers.
+char literal to the C-family tokenizers. No trailing comma before the file's closing
+paren: the C# and Java hosts consume the same bytes as a varargs method call (a
+generated `T` + file + `;` wrap, their include!), and neither language accepts a
+trailing comma in an argument list. Python and Rust accept both forms, so the
+strictest reader sets the rule.
 
 ## The vocabulary, per platform
 

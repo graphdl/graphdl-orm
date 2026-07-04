@@ -237,5 +237,5 @@ DEF("ast:SYSTEM",
        S3(A("CONS"),
           S3(A("COMP"), A("ast:DynFetch"),
              S3(A("CONS"), S3(A("COMP"), N(1), N(1)), N(2))),
-          S3(A("CONS"), S3(A("COMP"), N(2), N(1)), N(2))))),
+          S3(A("CONS"), S3(A("COMP"), N(2), N(1)), N(2)))))
 )
