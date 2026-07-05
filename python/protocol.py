@@ -521,10 +521,18 @@ def project(D, con):
             counts[ft] = 0
             continue
         marks = ", ".join("?" for _ in rs)
+        narrow = 0
         for row in rows:
+            if len(row) < len(rs):
+                # a row narrower than its role count cannot bind; skip it and
+                # say so in the count rather than crash the whole projection
+                # (messy corpora exist; the population cell keeps the row)
+                narrow += 1
+                continue
             con.execute(f"INSERT OR REPLACE INTO {_q(_sql_name(ft))} VALUES ({marks})",
                         list(row[:len(rs)]))
-        counts[ft] = len(rows)
+        counts[ft] = (len(rows) - narrow if not narrow
+                      else {"projected": len(rows) - narrow, "narrow": narrow})
     con.commit()
     return counts
 

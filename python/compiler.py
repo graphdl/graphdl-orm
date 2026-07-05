@@ -500,6 +500,14 @@ def _known(stmts):
             names.add(g[0]); names.add(g[1])
         elif k == "objectification":
             names.add(g[1])
+        elif k == "subtype_of":
+            # a subtype clause DECLARES both names (message-vetting's 'API
+            # Product is a subtype of API.': the old engine's ternary schema
+            # proves API Product is a role noun)
+            names.add(g[0]); names.add(g[1])
+        elif k == "brace_subtypes":
+            names.update(x.strip() for x in g[0].split(","))
+            names.add(g[2])
     names |= _implicit_nouns(stmts)
     return sorted(names, key=len, reverse=True)
 
@@ -1720,11 +1728,15 @@ def compile_model_selfhost(text, D=None, context_from=None):
             prose.append(stmt)
             continue
         specific = cls - _GENERIC_CLASSIFICATIONS
-        if not specific and sign == "negative":
-            # a NEGATIVE-modality statement is a constraint by definition
-            # (ORM: modality qualifies constraints); the generic fallbacks
-            # must never declare a fact type from it (the junk shape:
-            # any_Person_was_born_in_no_Country). Unclaimed means reported.
+        if not specific and (sign == "negative" or mod == "deontic"):
+            # a NEGATIVE-modality or DEONTIC statement is a constraint by
+            # definition (ORM: modality qualifies constraints); the generic
+            # fallbacks must never declare a fact type from it (the junk
+            # shape: any_Person_was_born_in_no_Country) nor mint instance
+            # rows from a deontic proposition (message-vetting's
+            # 'It is obligatory that Message names ... by Field Name
+            # 'Title'.' is a flag on the population, not a member of it).
+            # Unclaimed means reported.
             unclassified.append(stmt)
             continue
         cls = specific or cls

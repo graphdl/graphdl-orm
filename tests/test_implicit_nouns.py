@@ -90,6 +90,45 @@ Engineering Lever 'e1' has Layer Affinity to Layer 'SPD1-4'.
     assert roles == ["Engineering Lever", "Layer"]
 
 
+def test_a_subtype_declaration_names_a_role_noun():
+    # message-vetting's rehearsal crash, root cause: 'API Product is a
+    # subtype of API.' DECLARES API Product, so the ternary reading must
+    # mine three roles exactly as the old engine's schema has it
+    # (message_id, api_product_id, field_name)
+    model = """API is an entity type.
+Message is an entity type.
+Field Name is a value type.
+API Product is a subtype of API.
+Message names API Product by Field Name.
+"""
+    stmts = forml.statements(model)
+    names = set(forml._known(stmts))
+    assert "API Product" in names
+    t, roles = forml._reading("Message names API Product by Field Name",
+                              names)
+    assert roles == ["Message", "API Product", "Field Name"]
+
+
+def test_deontic_statements_never_mint_instance_rows():
+    # the same rehearsal's second defect: 'It is obligatory that Message
+    # names API Product by Field Name 'Title'.' is a CONSTRAINT (ORM:
+    # modality qualifies constraints), and the old engine's population for
+    # this fact type is empty; the generic fallbacks must not turn the
+    # deontic proposition into a partial instance row
+    model = """API is an entity type.
+Message is an entity type.
+Field Name is a value type.
+API Product is a subtype of API.
+Message names API Product by Field Name.
+
+It is obligatory that Message names API Product by Field Name 'Title'.
+It is forbidden that Message names API Product by Field Name 'EndpointSlug'.
+"""
+    D, rep = forml.compile_model(model)
+    rows = system._pop_rows(D, "Message_names_API_Product_by_Field_Name")
+    assert rows == []
+
+
 def test_implicit_nouns_do_not_mine_prose_or_literals():
     model = """Task is an entity type.
 Rule Statement is a value type.
