@@ -1203,6 +1203,7 @@ class Registry:
             D = persist.replay(D, self._log(name))
             D = system.run_rules(D)
         persist.save_sqlite(D, self._db(name))
+        self._sidecar(name, D)
         # the RMAP projection rides in the same .db (the GraphDL contract): the
         # relational tables downstream SQL consumers read, beside the cells
         import sqlite3
@@ -1214,6 +1215,26 @@ class Registry:
             con.close()
         rep["app"] = name
         return rep
+
+    def _sidecar(self, name, D):
+        """<name>.store.json beside the .db: one serve-protocol line persisted
+        (set_store's payload — d, process, overrides, cases), the Rust
+        resident's boot food. The resident feeds the file through the same
+        ingestion path a --serve line takes, so writing it at every snapshot
+        site keeps the sidecar and the .db in lockstep by construction."""
+        from .lam import from_lam
+        from .polyglot import _conv
+        from . import defs as _defs
+        process = [[n, _conv(from_lam(obj))]
+                   for n, (kind, obj) in _defs.latest.items()
+                   if kind == "compiled"]
+        payload = {"d": _conv(from_lam(D)), "process": process,
+                   "overrides": 1, "cases": []}
+        path = os.path.join(self._app_dir(name), f"{name}.store.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, path)
 
     # ---- the write side: eq. create against the app's store ----
     def apply(self, name, fact_type, fact):
@@ -1250,6 +1271,7 @@ class Registry:
                 f.write(json.dumps({"ft": fact_type, "fact": list(row)},
                                    ensure_ascii=False) + "\n")
             persist.save_sqlite(D2, self._db(name))
+            self._sidecar(name, D2)
         receipt = {"app": name, "fact_type": fact_type, "fact": list(row),
                    "committed": not refused, "violations": violations}
         self.last_receipt = receipt
