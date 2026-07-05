@@ -381,6 +381,42 @@ def value_enumeration(role, values):
                   _S(A(role), _tl(tuple(values))))
 
 
+def deontic_forbidden(values=None):
+    """The forbidden family's validate object (Def. Violation, deontic: flags,
+    never blocks). Population form (no values): EVERY row of the forbidden
+    fact type violates, so the object is the identity over P (an empty
+    population answers no violations). Value form (the old DF_cwa kind): the
+    rows carrying any forbidden value violate; setminus leaves exactly those
+    rows changed, so sigma selects them."""
+    from .reduce import apply as _apply
+    from .lam import to_lam as _tl
+    if not values:
+        return A("id")
+    pred = _S(A("COMP"), A("not"), A("eq"),
+              _S(A("CONS"),
+                 _S(A("COMP"), A("theta:setminus"),
+                    _S(A("CONS"), A("id"),
+                       _S(A("CONST"), _tl(tuple(values))))),
+                 A("id")))
+    return _apply(A("theta:Filter"), pred)
+
+
+def deontic_obligatory_value(values):
+    """The obligatory value form's validate object (the old DO_pop kind,
+    deontic: flags, never blocks): a row that LACKS every obligated value
+    violates. setminus leaves exactly those rows unchanged, so sigma selects
+    the complement of deontic_forbidden's set."""
+    from .reduce import apply as _apply
+    from .lam import to_lam as _tl
+    pred = _S(A("COMP"), A("eq"),
+              _S(A("CONS"),
+                 _S(A("COMP"), A("theta:setminus"),
+                    _S(A("CONS"), A("id"),
+                       _S(A("CONST"), _tl(tuple(values))))),
+                 A("id")))
+    return _apply(A("theta:Filter"), pred)
+
+
 _CC = None
 
 

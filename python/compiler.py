@@ -1526,8 +1526,49 @@ _PLAN = {
 }
 
 
-def _plan(kind, g, known, modality="alethic"):
-    """Dispatch the reading kind to its handler (application by key), never an if/elif chain."""
+def _plan(kind, g, known, modality="alethic", sign=""):
+    """Dispatch the reading kind to its handler (application by key), never an
+    if/elif chain. A DEONTIC fact_type_reading transforms (the old engine's
+    encoding, read off the message-vetting store): the inner proposition
+    DECLARES its fact type (dequoted, so the declaration path runs and no
+    instance rows mint) and one constraint row rides with the operator, the
+    fact type span, the quoted values if any, and the deontic modality tail.
+    Deontic flags, never blocks (Def. Violation)."""
+    if modality == "deontic" and kind == "fact_type_reading":
+        reading = _strip_derivation(g[0])[1]
+        # a leading universal quantifier scopes the obligation, never the
+        # shape (the old store: 'each Message is natural' declares
+        # Message_is_natural while the constraint text keeps the statement)
+        if reading.lower().startswith("each "):
+            reading = reading[5:]
+        ids = tuple(_QUOTED.findall(reading))
+        dequoted = (re.sub(r"\s+", " ", _QUOTED.sub("", reading)).strip()
+                    if ids else reading)
+        facts, objs = _PLAN["fact_type_reading"]((dequoted,), known, modality)
+        ft, _decl = _fact_type(dequoted, known)
+        op = ("deontic_obligatory" if sign == "positive"
+              else "deontic_forbidden")
+        prefix = ("It is obligatory that " if sign == "positive"
+                  else "It is forbidden that ")
+        row = (prefix + g[0], op, ft) + ((ids,) if ids else ()) + ("deontic",)
+        if sign != "positive":
+            # the forbidden check object rides DEFS like every other
+            # constraint object
+            objs = objs + [(row[0] + "_df", C.deontic_forbidden(ids or None))]
+        elif ids:
+            # the obligatory VALUE form checks locally: rows lacking every
+            # obligated value flag
+            objs = objs + [(row[0] + "_do", C.deontic_obligatory_value(ids))]
+        else:
+            # the BARE obligatory form IS a mandatory constraint with
+            # deontic modality (the old DO_obl kind): every subject
+            # instance must play the obligated fact type, and
+            # validate_modal already routes deontic to flags
+            subject = _subject(dequoted, known)[0]
+            mfacts, mobjs = _mandatory_parts(ft, subject, modality)
+            return (facts + [("constraint", row)] + mfacts,
+                    objs + mobjs)
+        return facts + [("constraint", row)], objs
     return _PLAN.get(kind, lambda g, k, m: ([], []))(g, known, modality)
 
 
@@ -1588,7 +1629,9 @@ def _stmt_translator_impl(kinds):
             from .reduce import apply as _apply
             from .lam import atom as _A, from_lam as _fl
             stmt = _fl(_apply(_A(1), operand))
-            mod = _fl(_apply(_A(2), operand)) or None
+            raw = _fl(_apply(_A(2), operand)) or ""
+            mod, _sep, msign = raw.partition(":")
+            mod = mod or None
             unpacked = _fl(_apply(_A(3), operand))
             names, subs, fts = unpacked[0], unpacked[1], unpacked[2]
             # the PLAIN set rides the seam too: a head the model declares
@@ -1603,7 +1646,8 @@ def _stmt_translator_impl(kinds):
                            if p.match(stmt)), None)
                 if mm is None:
                     continue
-                asserts, objs = _plan(kind, mm.groups(), known, mod)
+                asserts, objs = _plan(kind, mm.groups(), known, mod,
+                                      sign=msign)
                 for cell, fact in asserts:
                     D = _apply(_A(2), ast.run(to_lam(fact), D, cell_name=cell))
                 for name, obj in objs:
@@ -1728,15 +1772,15 @@ def compile_model_selfhost(text, D=None, context_from=None):
             prose.append(stmt)
             continue
         specific = cls - _GENERIC_CLASSIFICATIONS
-        if not specific and (sign == "negative" or mod == "deontic"):
-            # a NEGATIVE-modality or DEONTIC statement is a constraint by
-            # definition (ORM: modality qualifies constraints); the generic
-            # fallbacks must never declare a fact type from it (the junk
-            # shape: any_Person_was_born_in_no_Country) nor mint instance
-            # rows from a deontic proposition (message-vetting's
-            # 'It is obligatory that Message names ... by Field Name
-            # 'Title'.' is a flag on the population, not a member of it).
-            # Unclaimed means reported.
+        if not specific and sign == "negative" and mod == "alethic":
+            # a NEGATIVE alethic statement is a constraint by definition
+            # (ORM: modality qualifies constraints); the generic fallbacks
+            # must never declare a fact type from it (the junk shape:
+            # any_Person_was_born_in_no_Country). Unclaimed means reported.
+            # A DEONTIC statement proceeds instead: the old engine's encoding
+            # (message-vetting's store) DECLARES the inner proposition's fact
+            # type and mints a deontic constraint row; _plan's deontic
+            # transform does exactly that and never mints instance rows.
             unclassified.append(stmt)
             continue
         cls = specific or cls
@@ -1751,9 +1795,13 @@ def compile_model_selfhost(text, D=None, context_from=None):
         for t in translators:
             if _dm.latest.get(t, ("",))[0] != "registered":
                 continue                                       # a name M declares, this
+            # deontic carries its operator sign through the modality field
+            # (deontic:positive = obligatory, deontic:negative = forbidden);
+            # the translator impl splits it back before handlers see it
+            mfield = (mod + ":" + sign) if mod == "deontic" else (mod or "")
             operand = _L.SEQ(                                  # host lacks: skipped, the
                 _L.CONS(_A(inner))(                            # boundary's graceful absence
-                    _L.CONS(_A(mod or ""))(
+                    _L.CONS(_A(mfield))(
                         _L.CONS(ctx)(_L.CONS(D)(_L.NIL)))))
             with _dm.step(D):
                 D = _apply(_A(t), operand)                     # rho: dispatch through DEFS
@@ -1832,6 +1880,14 @@ _ATTACH = {
     "exclusion":             lambda f, ft: [(f[0] + "@" + ft, False)] if ft in f[3] else [],
     "exclusive_or":          lambda f, ft: [(f[0] + "@" + ft, False)] if ft in f[3] else [],
     "disjunctive_mandatory": lambda f, ft: [(f[0] + "@" + ft, False)] if ft in f[3] else [],
+    # the deontic family (Def. Violation: flags, never blocks): forbidden
+    # attaches its local check; obligatory is the arc's named remainder
+    "deontic_forbidden":     lambda f, ft: [(f[0] + "_df", True)] if f[2] == ft else [],
+    # the value form (row carries the obligated values at index 3) checks
+    # locally; the bare form is the arc's named remainder
+    "deontic_obligatory":    lambda f, ft: ([(f[0] + "_do", True)]
+                                            if f[2] == ft and len(f) >= 5
+                                            else []),
 }
 
 
