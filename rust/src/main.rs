@@ -2042,7 +2042,7 @@ fn delegate_read(tool: &str, args: &J, apps: &Apps) -> Result<String, (i64, Stri
     let keys: &[&str] = match tool {
         "get" | "actions" => &["noun", "id"],
         "sql" => &["statement"],
-        "explain" => &["id"],
+        "explain" | "synthesize" => &["id"],
         _ => &[],
     };
     let mut tail: Vec<String> = Vec::new();
@@ -2100,17 +2100,22 @@ fn mcp_call(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Result<Stri
             Ok(r)
         }
         "apply" | "retract" | "apps_compile" => delegate_verb(tool, args, apps, srv),
-        "get" | "schema" | "sql" | "explain" | "validate" | "verify" | "actions" => {
+        // synthesize delegates for now: the canonical verbalize over the
+        // daily driver's store reduces in minutes on this path where the
+        // Python host's native twins answer in seconds (measured 2026-07-05
+        // on the claude scratch: 264 s canonical Rust against 10.9 s
+        // delegated). Plumbing the native carrier into op_answer is the
+        // priced lever that brings it home.
+        "get" | "schema" | "sql" | "explain" | "validate" | "verify" | "actions"
+        | "synthesize" => {
             delegate_read(tool, args, apps)
         }
-        "query" | "cells" | "synthesize" => {
+        "query" | "cells" => {
             if apps.current.is_none() {
                 return Err((-32602, format!("no app loaded; call apps_use before {}", tool)));
             }
-            // The MCP arguments object IS the op request body; only the
-            // synthesize name maps, because the resident op is synthesize_pairs.
-            let op = if tool == "synthesize" { "synthesize_pairs" } else { tool };
-            op_answer(op, args, srv).map_err(|m| (-32602, m))
+            // The MCP arguments object IS the op request body.
+            op_answer(tool, args, srv).map_err(|m| (-32602, m))
         }
         _ => Err((-32601, format!("unknown tool {:?}", tool))),
     }

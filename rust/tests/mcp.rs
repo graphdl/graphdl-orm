@@ -207,19 +207,11 @@ fn mcp_mode_serves_the_apps_registry_over_stdio() {
             r#""text":"{\"fact_type\":\"Ticket_has_Status\",\"rows\":[[\"t1\",\"open\"]]}"}]}}"#
         )
     );
-    // synthesize routes to the resident synthesize_pairs op. The canonical
-    // verbalize dispatches populations through the rmapColumns layout cell,
-    // so the absorbed fact type's row answers as a real reading pair.
-    assert_eq!(
-        c.rpc(concat!(
-            r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":"#,
-            r#"{"name":"synthesize","arguments":{"id":"t1"}}}"#
-        )),
-        concat!(
-            r#"{"jsonrpc":"2.0","id":11,"result":{"content":[{"type":"text","#,
-            r#""text":"{\"id\":\"t1\",\"pairs\":[[\"{0} has {1}\",[\"t1\",\"open\"]]]}"}]}}"#
-        )
-    );
+    // synthesize now DELEGATES like the read tail (the canonical Rust path
+    // reduces in minutes at daily-driver scale where the Python host's
+    // native twins answer in seconds), so its answer assertion lives in the
+    // python-guarded write-flow test; here it needs only the no-crash gate,
+    // which the delegation machinery's own errors cover.
 
     // ---- an unknown tool is a JSON-RPC error, not a crash ----
     assert_eq!(
@@ -399,6 +391,15 @@ fn mcp_write_verbs_delegate_to_the_cli_and_reload_the_sidecar() {
         None => panic!("sql must answer rows of rows: {r}"),
     };
     assert!(r.as_bytes()[open + 2].is_ascii_digit(), "sql must answer a count: {r}");
+    // synthesize delegates too (measured 2026-07-05: the canonical Rust path
+    // reduces in minutes at daily-driver scale where the Python host's
+    // native twins answer in seconds), so the entity's facts answer in the
+    // Registry's rendered shape.
+    let r = c.rpc(concat!(
+        r#"{"jsonrpc":"2.0","id":15,"method":"tools/call","params":"#,
+        r#"{"name":"synthesize","arguments":{"id":"t1"}}}"#
+    ));
+    assert!(r.contains("t1 has open"), "synthesize must render the fact: {r}");
 
     drop(c);
     let _ = std::fs::remove_dir_all(&tmp);
