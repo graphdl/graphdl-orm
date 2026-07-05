@@ -292,6 +292,12 @@ thread_local! {
     // the INTERSECTION SOURCE definitions (shared/*.py, include!d verbatim below):
     // loaded once at startup, resolved by name like any compiled definition
     static CANON: RefCell<Vec<(String, V)>> = RefCell::new(Vec::new());
+    // the native mirror of CANON: the same intersection-source definitions
+    // converted to N once at startup, so the native carrier NEval resolves a
+    // canon def (theta/ast/system/constraints) the same way the Scott mu does
+    // when a partial process list does not carry it. It is the native twin of
+    // the Scott path's CANON fallback, never a Scott fallback in disguise.
+    static NCANON: RefCell<Vec<(String, N)>> = RefCell::new(Vec::new());
 }
 
 fn leaf_key(l: &Leaf) -> Option<String> {
@@ -924,6 +930,21 @@ impl NEval {
                     if let Some((_, obj)) = self.process.iter().rev().find(|(n, _)| *n == k) {
                         return self.mu(napp(obj.clone(), x));
                     }
+                    // the intersection-source fallback: the native mirror of the
+                    // Scott mu's CANON step (make_mu resolves cells, then the
+                    // base, then process, then canon). A rule body that reaches a
+                    // theta/ast/system/constraints def a partial process list
+                    // does not carry still resolves, exactly as Scott resolves
+                    // it, so a hand-built store without a process field derives
+                    // the same rows as a fully compiled one. When the process
+                    // list already carries the canon def (the compiled apps and
+                    // the differential), that match wins above and this branch is
+                    // never reached, so the certified machine step is unchanged.
+                    if let Some(obj) = NCANON.with(|c| {
+                        c.borrow().iter().rev().find(|(n, _)| *n == k).map(|(_, o)| o.clone())
+                    }) {
+                        return self.mu(napp(obj, x));
+                    }
                 }
                 N::Bot
             }
@@ -1172,6 +1193,50 @@ fn n_cells_of(d: &N) -> Vec<(Leaf, N)> {
         }
     }
     out
+}
+
+// v_to_n and n_to_v carry a value between the Scott carrier V and the native
+// carrier N, shape for shape: an atom over the same Leaf, a sequence over the
+// converted elements, and bottom for bottom. They mirror to_v and j_to_n (an
+// array becomes a SEQ, a scalar an ATOM, nothing else appears) so a value
+// reduced on one carrier reads identically on the other. run_rules evaluates
+// every rule body on N and reads the rows back on V through this pair.
+fn v_to_n(v: &V) -> N {
+    match shape(v) {
+        Shape::Atom(l) => N::A(l),
+        Shape::Seq(l) => N::S(Rc::new(items(&l).iter().map(v_to_n).collect())),
+        Shape::Bot => N::Bot,
+    }
+}
+fn n_to_v(n: &N) -> V {
+    match n {
+        N::A(l) => atom((**l).clone()),
+        N::S(v) => seq(from_vec(v.iter().map(n_to_v).collect())),
+        N::Bot => bot(),
+    }
+}
+
+// atom_n is the native atom addressing a cell by its leaf, the N twin of atom.
+fn atom_n(l: &Leaf) -> N {
+    N::A(Rc::new(l.clone()))
+}
+
+// neval_rule reduces ONE rule body on the native carrier: it builds an NEval
+// over the current native store view (the maintained cells and defs, the
+// resident process defs, unbounded fuel as run_rules always passes None) and
+// answers the reduced rows back on V, so every pass around it (dedup by key,
+// sort, store) is byte for byte the Scott path it replaces. The rule id (or a
+// "~d" delta variant) resolves through the native cells exactly as it resolved
+// through D's DEFS cells under Scott; the operand is the native store, or the
+// native pair the delta variants take.
+fn neval_rule(ncells: &[(Leaf, N)], nprocess: &[(String, N)], nd: &N, rid: &Leaf, operand: N) -> V {
+    let ev = NEval {
+        cells: ncells.to_vec(),
+        process: nprocess.to_vec(),
+        defs_n: nd.clone(),
+        fuel: std::cell::Cell::new(-1), // None means unbounded; -1 is the native carrier's unbounded
+    };
+    n_to_v(&ev.mu(napp(atom_n(rid), operand)))
 }
 
 // ============================ JSON (hand-rolled, zero deps) ==================
@@ -1755,7 +1820,17 @@ fn pop_rows(cells: &[(Leaf, V)], name: &Leaf) -> Vec<V> {
 // ast:named key), prepend the fresh CELL triple, and keep the cached index
 // consistent with the new D. Real stores hold only CELL triples, so the
 // index and the pop agree by construction.
-fn store_into(d: &mut V, cells: &mut Vec<(Leaf, V)>, name: &Leaf, contents: V) {
+fn store_into(
+    d: &mut V,
+    cells: &mut Vec<(Leaf, V)>,
+    nd: &mut N,
+    ncells: &mut Vec<(Leaf, N)>,
+    name: &Leaf,
+    contents: V,
+) {
+    // the native mirror of the fresh contents, taken before contents moves into
+    // the V store below, so the native view updates for this head in lockstep
+    let ncontents = v_to_n(&contents);
     let mut entries = items(&list_of(d));
     if let Some(pos) = entries.iter().position(|c| {
         let it = items(&list_of(c));
@@ -1776,6 +1851,34 @@ fn store_into(d: &mut V, cells: &mut Vec<(Leaf, V)>, name: &Leaf, contents: V) {
         Some(slot) => slot.1 = contents,
         None => cells.push((name.clone(), contents)),
     }
+    // The SAME pop-then-push on the parallel N store: drop the head's old cell,
+    // prepend its fresh CELL triple at position zero (so D and the native view
+    // agree on cell order, and FetchPop's first match agrees on both), and keep
+    // the native cell index consistent. A rule stored mid-round is thus visible
+    // to the next rule's NEval the instant it lands, exactly as D threads the
+    // fresh cell to the next Scott reduction.
+    let mut nentries: Vec<N> = match nd {
+        N::S(v) => v.to_vec(),
+        _ => Vec::new(),
+    };
+    if let Some(pos) = nentries.iter().position(|c| {
+        matches!(c, N::S(it) if it.len() >= 2 && matches!(&it[1], N::A(k) if k.nateq(name)))
+    }) {
+        nentries.remove(pos);
+    }
+    nentries.insert(
+        0,
+        N::S(Rc::new(vec![
+            N::A(Rc::new(Leaf::S("CELL".into()))),
+            N::A(Rc::new(name.clone())),
+            ncontents.clone(),
+        ])),
+    );
+    *nd = N::S(Rc::new(nentries));
+    match ncells.iter_mut().find(|(k, _)| k.nateq(name)) {
+        Some(slot) => slot.1 = ncontents,
+        None => ncells.push((name.clone(), ncontents)),
+    }
 }
 
 // eval_rules is engine.py's _eval_rules (line 1188): the UNION of the given
@@ -1785,12 +1888,14 @@ fn store_into(d: &mut V, cells: &mut Vec<(Leaf, V)>, name: &Leaf, contents: V) {
 // own compiled definition exactly as the agg pass reduces one aggregate rule.
 // Python's rule twins are a host FAST-path held observationally equal to this
 // reduction, so the port takes the reduce path for every rule.
-fn eval_rules(mu: &V, cells: &[(Leaf, V)], d: &V, rids: &[Leaf]) -> Vec<V> {
+fn eval_rules(ncells: &[(Leaf, N)], nprocess: &[(String, N)], nd: &N, rids: &[Leaf]) -> Vec<V> {
     use std::collections::HashSet;
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<V> = Vec::new();
     for rid in rids {
-        let res = reduce_in(mu, cells, d, atom(rid.clone()), d.clone(), None);
+        // the rule body evaluates on the native carrier over the current store;
+        // its operand is the native store, exactly the D the Scott path passed
+        let res = neval_rule(ncells, nprocess, nd, rid, nd.clone());
         if let Shape::Seq(l) = shape(&res) {
             for r in items(&l) {
                 if matches!(shape(&r), Shape::Seq(_)) && seen.insert(key_of(&r)) {
@@ -1909,9 +2014,18 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
             )
         }
     };
-    let mu = srv.mu.clone();
     let mut d = srv.d.clone();
     let mut cells = srv.cells.clone();
+    // The native view of the current store, built fresh from d (srv.nd may be
+    // stale: a prior run_rules replaced srv.d without refreshing the mirror).
+    // Every rule body evaluates through the native carrier NEval over this view
+    // instead of the Scott mu, the measured fast path, and store_into keeps it
+    // in lockstep with d/cells so a head is visible to later rules the instant
+    // it is stored. The resident process defs carry the compiled canon; a
+    // hand-built store without them falls through to NCANON in NEval.
+    let mut nd = v_to_n(&d);
+    let mut ncells = n_cells_of(&nd);
+    let nprocess = srv.nprocess.clone();
     let mut changed: BTreeSet<String> = BTreeSet::new();
     let leaf = |s: &str| Leaf::S(s.to_string());
     // reads: rule id key to the set of cell keys its body reads (ruleReads
@@ -1997,7 +2111,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
         }
         if !out.is_empty() && pop_rows(&cells, &leaf(MIRROR)).is_empty() {
             sort_rows(&mut out);
-            store_into(&mut d, &mut cells, &leaf(MIRROR), seq(from_vec(out)));
+            store_into(&mut d, &mut cells, &mut nd, &mut ncells, &leaf(MIRROR), seq(from_vec(out)));
             changed.insert(MIRROR.to_string());
         }
     }
@@ -2018,7 +2132,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
         }
         if !out.is_empty() && pop_rows(&cells, &leaf(FTR)).is_empty() {
             sort_rows(&mut out);
-            store_into(&mut d, &mut cells, &leaf(FTR), seq(from_vec(out)));
+            store_into(&mut d, &mut cells, &mut nd, &mut ncells, &leaf(FTR), seq(from_vec(out)));
             changed.insert(FTR.to_string());
         }
     }
@@ -2094,8 +2208,8 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
         let mut fired = false;
         let mut next_delta: HashMap<String, Vec<V>> = HashMap::new();
         for rr in &rules {
-            let full = |d: &V, cells: &Vec<(Leaf, V)>| -> Option<Vec<V>> {
-                let res = reduce_in(&mu, cells, d, atom(rr.rid.clone()), d.clone(), None);
+            let full = |nd: &N, ncells: &Vec<(Leaf, N)>| -> Option<Vec<V>> {
+                let res = neval_rule(ncells, &nprocess, nd, &rr.rid, nd.clone());
                 match shape(&res) {
                     Shape::Seq(l) => Some(items(&l)),
                     // the rule is not compiled (M-facts only) or bottomed
@@ -2113,7 +2227,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                             continue;
                         }
                     }
-                    match full(&d, &cells) {
+                    match full(&nd, &ncells) {
                         Some(c) => c,
                         None => continue,
                     }
@@ -2137,10 +2251,15 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                             sort_rows(&mut drows);
                             let vid =
                                 Leaf::S(format!("{}~d{}", leaf_text(&rr.rid), p));
+                            // the native operand mirrors the V pair ⟨sorted delta
+                            // rows, D⟩ exactly: a two-element SEQ of the delta rows
+                            // as N and the maintained native store, built directly
+                            // so D is not re-converted each hit. seq never collapses
+                            // on bottom, so the rows use N::S, not nseq.
+                            let drows_n: Vec<N> = drows.iter().map(v_to_n).collect();
                             let operand =
-                                seq(from_vec(vec![seq(from_vec(drows)), d.clone()]));
-                            let res =
-                                reduce_in(&mu, &cells, &d, atom(vid), operand, None);
+                                N::S(Rc::new(vec![N::S(Rc::new(drows_n)), nd.clone()]));
+                            let res = neval_rule(&ncells, &nprocess, &nd, &vid, operand);
                             if let Shape::Seq(l) = shape(&res) {
                                 c.extend(items(&l));
                             }
@@ -2153,7 +2272,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                     {
                         // a rule without atom facts falls back to its full
                         // body in rounds where its reads changed
-                        match full(&d, &cells) {
+                        match full(&nd, &ncells) {
                             Some(c) => c,
                             None => continue,
                         }
@@ -2167,7 +2286,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                         // The compiler records ruleReads for every rule it
                         // compiles, so on compiled stores this branch never
                         // fires and the loop is exactly Python's.
-                        match full(&d, &cells) {
+                        match full(&nd, &ncells) {
                             Some(c) => c,
                             None => continue,
                         }
@@ -2197,7 +2316,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
             }
             if !added.is_empty() {
                 sort_rows(&mut merged);
-                store_into(&mut d, &mut cells, &rr.head, seq(from_vec(merged)));
+                store_into(&mut d, &mut cells, &mut nd, &mut ncells, &rr.head, seq(from_vec(merged)));
                 fired = true;
                 changed.insert(leaf_text(&rr.head));
                 closure_keys.insert(rr.head_key.clone());
@@ -2392,7 +2511,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                     continue;
                 }
             }
-            let res = reduce_in(&mu, &cells, &d, atom(rr.rid.clone()), d.clone(), None);
+            let res = neval_rule(&ncells, &nprocess, &nd, &rr.rid, nd.clone());
             let outs = match shape(&res) {
                 Shape::Seq(l) => items(&l),
                 // an uncompiled aggregate (M-facts only) stores nothing
@@ -2420,8 +2539,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 // rows ARE the cell; nothing older survives
                 for rid in plain_of.get(&rr.head_key).map(|v| v.as_slice()).unwrap_or(&[])
                 {
-                    let res =
-                        reduce_in(&mu, &cells, &d, atom(rid.clone()), d.clone(), None);
+                    let res = neval_rule(&ncells, &nprocess, &nd, rid, nd.clone());
                     if let Shape::Seq(l) = shape(&res) {
                         for r in items(&l) {
                             if matches!(shape(&r), Shape::Seq(_))
@@ -2449,7 +2567,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 round_changed.insert(rr.head_key.clone());
                 changed.insert(leaf_text(&rr.head));
                 sort_rows(&mut merged);
-                store_into(&mut d, &mut cells, &rr.head, seq(from_vec(merged)));
+                store_into(&mut d, &mut cells, &mut nd, &mut ncells, &rr.head, seq(from_vec(merged)));
             }
         }
         // ---- THE KEYED-UPSERT PASS (engine.py lines 1243 through 1260):
@@ -2472,7 +2590,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 }
             }
             let rids: Vec<Leaf> = rls.iter().map(|(rid, _)| rid.clone()).collect();
-            let outs = eval_rules(&mu, &cells, &d, &rids);
+            let outs = eval_rules(&ncells, &nprocess, &nd, &rids);
             let mut prod_keys: HashSet<String> = HashSet::new();
             for r in &outs {
                 prod_keys.insert(keyed_key(r, key_pos));
@@ -2502,7 +2620,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 round_changed.insert(hk.clone());
                 changed.insert(leaf_text(hl));
                 sort_rows(&mut merged);
-                store_into(&mut d, &mut cells, hl, seq(from_vec(merged)));
+                store_into(&mut d, &mut cells, &mut nd, &mut ncells, hl, seq(from_vec(merged)));
             }
         }
         // ---- THE SWEEP PASS (engine.py lines 1261 through 1269): a
@@ -2517,7 +2635,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 continue;
             }
             let rids = plain_of.get(hk).map(|v| v.as_slice()).unwrap_or(&[]);
-            let outs = eval_rules(&mu, &cells, &d, rids);
+            let outs = eval_rules(&ncells, &nprocess, &nd, rids);
             let stored = pop_rows(&cells, hl);
             let mut oks: HashSet<String> = HashSet::new();
             for r in &outs {
@@ -2534,7 +2652,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 changed.insert(leaf_text(hl));
                 let mut m = outs;
                 sort_rows(&mut m);
-                store_into(&mut d, &mut cells, hl, seq(from_vec(m)));
+                store_into(&mut d, &mut cells, &mut nd, &mut ncells, hl, seq(from_vec(m)));
             }
         }
         // ---- THE DRED SWEEP FOR CYCLES (engine.py lines 1270 through 1284):
@@ -2555,7 +2673,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
             for r in &stored {
                 cur_keys.insert(key_of(r));
             }
-            store_into(&mut d, &mut cells, hl, seq(from_vec(Vec::new())));
+            store_into(&mut d, &mut cells, &mut nd, &mut ncells, hl, seq(from_vec(Vec::new())));
             let rids: Vec<Leaf> = plain_of.get(hk).cloned().unwrap_or_default();
             let mut prev: Option<HashSet<String>> = None;
             let mut outs_keys: HashSet<String> = HashSet::new();
@@ -2564,11 +2682,11 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                     break;
                 }
                 prev = Some(outs_keys.clone());
-                let outs = eval_rules(&mu, &cells, &d, &rids);
+                let outs = eval_rules(&ncells, &nprocess, &nd, &rids);
                 outs_keys = outs.iter().map(|r| key_of(r)).collect();
                 let mut m = outs;
                 sort_rows(&mut m);
-                store_into(&mut d, &mut cells, hl, seq(from_vec(m)));
+                store_into(&mut d, &mut cells, &mut nd, &mut ncells, hl, seq(from_vec(m)));
             }
             let same = outs_keys.len() == cur_keys.len()
                 && outs_keys.iter().all(|k| cur_keys.contains(k));
@@ -2584,10 +2702,15 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
         dirty = Some(round_changed);
     }
     // REPLACE the retained store with the fixpoint, the retain protocol's
-    // commit: d and its cell index move together (the native-carrier mirror
-    // refreshes on the next store ingestion, exactly as a retained case)
+    // commit: d and its cell index move together, and the native-carrier mirror
+    // moves with them (nd was maintained in lockstep through the passes, so it
+    // already IS the fixpoint; ncells rebuilds from it once so its canonical
+    // order matches n_cells_of). Keeping the mirror current here means a native
+    // machine step after a derive reads the derived store, not a stale one.
     srv.d = d;
     srv.cells = cells;
+    srv.nd = nd;
+    srv.ncells = n_cells_of(&srv.nd);
     let mut r = String::from("{\"rounds\":");
     r.push_str(&rounds.to_string());
     r.push_str(",\"changed\":[");
@@ -3292,6 +3415,16 @@ fn run() {
     // reduction thread must hold it)
     CANON.with(|c| {
         *c.borrow_mut() = canon_defs();
+    });
+    // the native mirror of the canon, converted once: the native carrier NEval
+    // resolves a canon def through it when a partial process list does not carry
+    // it (a hand-built store), exactly where the Scott mu resolves through CANON.
+    // canon_defs builds only data terms (atoms and sequences, never closures),
+    // so v_to_n converts each faithfully.
+    NCANON.with(|nc| {
+        *nc.borrow_mut() = CANON.with(|c| {
+            c.borrow().iter().map(|(n, v)| (n.clone(), v_to_n(v))).collect()
+        });
     });
     register_base();
     register_overrides();                                     // twins on by default
