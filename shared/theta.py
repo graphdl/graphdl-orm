@@ -138,5 +138,16 @@ DEF("theta:AntiRestrict",
              S3(A("COMP"), A("theta:Project"), N(2)), K(N(2)))))),
 
 DEF("theta:proj1",
-    S3(A("COMP"), A("theta:dedup"), S2(A("ALPHA"), S2(A("CONS"), N(1)))))
+    S3(A("COMP"), A("theta:dedup"), S2(A("ALPHA"), S2(A("CONS"), N(1))))),
+
+DEF("theta:iota",
+    S4(A("COMP"), N(3),
+       S3(A("WHILE"),
+          S3(A("COMP"), A("le"), S3(A("CONS"), N(2), N(1))),
+          S4(A("CONS"), N(1),
+             S3(A("COMP"), A("+"),
+                S3(A("CONS"), N(2), S2(A("CONST"), N(1)))),
+             S3(A("COMP"), A("apndr"),
+                S3(A("CONS"), N(3), N(2))))),
+       S4(A("CONS"), A("id"), K(N(1)), K(PHI()))))
 )

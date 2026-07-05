@@ -1413,23 +1413,15 @@ def table_columns(partition, table):
 
 
 def row_resolve(col, width, unary=False):
-    """resolve for an entity-cell write: ⟨I, row⟩ → row′, where I = ⟨key, value⟩ and the
-    cell holds the entity's 3NF row (a fresh entity gets holes, the default object #). A
-    conflicting functional write makes the column ⊥, the row collapses (§11.2.1), and the
-    step's transition rule refuses it atomically: absorption makes the UC structural."""
-    key = _S(_COMP, _1, _1)
-    val = _S(_CONST, A("T")) if unary else _S(_COMP, _2, _1)   # unary: the boolean column
-    hole = _S(_CONST, A("#"))
-    bot = _S(_COMP, _1, _S(_CONST, A("x")))                  # a selector on an atom is ⊥
-    fresh = _S(_CONS, key, *[val if j == col else hole for j in range(2, width + 1)])
-    old = _S(_COMP, A(col), _2)
-    ok = _S(_COMP, A("or"), _S(_CONS,
-             _S(_COMP, _EQ, _S(_CONS, old, hole)),
-             _S(_COMP, _EQ, _S(_CONS, old, val))))
-    upd = _S(_CONS, _S(_COMP, A(1), _2),
-             *[_S(_COND, ok, val, bot) if j == col else _S(_COMP, A(j), _2)
-               for j in range(2, width + 1)])
-    return _S(_COND, _S(_COMP, A("null"), _2), fresh, upd)
+    """resolve for an entity-cell write: ⟨I, row⟩ → row′, where I = ⟨key, value⟩
+    and the cell holds the entity's 3NF row (a fresh entity gets holes, the
+    default object #). A conflicting functional write makes the column ⊥, the
+    row collapses (§11.2.1), and the step's transition rule refuses it
+    atomically: absorption makes the UC structural. The canonical
+    system:row_resolve applied to ⟨col, width, unary?⟩."""
+    from .reduce import apply as _apply
+    return _apply(A("system:row_resolve"),
+                  _S(A(col), A(width), A("T" if unary else "F")))
 
 
 def create_routed(D, ft, fact, partition, machine=None, mealy_obj=None, validate_obj=None):

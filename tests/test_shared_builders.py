@@ -271,3 +271,28 @@ Person 'p2' has Name 'Bo'.
     assert ("{0} has {1}", ("p1", "Ada")) in pairs
     assert ("{0} keeps {1}", ("p1", "rex")) in pairs
     assert not any("Bo" in str(p) for p in pairs)
+
+
+def test_iota_generates_the_selector_sequence():
+    # the missing tool for width-parameterized builders (row_resolve,
+    # checked_apply): n to ⟨1..n⟩, the WHILE countdown growing the sequence
+    got = from_lam(_ap(A("theta:iota"), A(4)))
+    assert got == (1, 2, 3, 4)
+    assert from_lam(_ap(A("theta:iota"), A(1))) == (1,)
+    assert from_lam(_ap(A("theta:iota"), A(0))) == ()
+
+
+def test_row_resolve_canonical_matches_the_python_builder():
+    # the entity-cell write resolver: fresh rows hole-padded, compatible
+    # updates land, conflicting functional writes collapse the row (the UC
+    # made structural); the quasiquote pattern builds the per-column
+    # expressions from the width through theta:iota
+    from pyarest import system
+    op = _ap(_ap(A("system:row_resolve"), _S(A(3), A(4), A("F"))),
+             _S(_S(A("k1"), A("v1")), to_lam(())))
+    assert from_lam(op) == ("k1", "#", "v1", "#")
+    py = system.row_resolve(3, 4)
+    canon = _ap(A("system:row_resolve"), _S(A(3), A(4), A("F")))
+    for case in (_S(_S(A("k1"), A("v1")), to_lam(("k1", "a", "#", "b"))),
+                 _S(_S(A("k1"), A("v1")), to_lam(("k1", "a", "OTHER", "b")))):
+        assert from_lam(_ap(canon, case)) == from_lam(_ap(py, case))
