@@ -112,8 +112,11 @@ architecturally excluded per target.
     sources live as _book_*.txt siblings under C:\Users\lippe\Repos.
     pyarest disposition: ARCHIVED 2026-07-05, tracked at paper/
     (source and PDF verbatim with a provenance note). The book
-    source siblings under C:\Users\lippe\Repos remain outside any
-    repo and deserve their own home decision.
+    source siblings under C:\Users\lippe\Repos are WAIVED (Samuel,
+    2026-07-05): they are public works, the whitepaper's
+    bibliography is the reference of record for them, and his
+    personal drive is home enough. The punchlist's first explicit
+    waiver.
 
 13. THE DOCS SUITE. Eighteen numbered reference docs (01-introduction
     through 24-ui-toolkit-decision) plus cli.md, cloud.md,
