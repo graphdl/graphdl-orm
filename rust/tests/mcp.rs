@@ -177,22 +177,26 @@ fn mcp_mode_serves_the_apps_registry_over_stdio() {
         )),
         concat!(
             r#"{"jsonrpc":"2.0","id":9,"result":{"content":[{"type":"text","#,
-            r#""text":"{\"cells\":[{\"name\":\"Ticket_status\",\"rows\":1}]}"}]}}"#
+            r#""text":"{\"cells\":[{\"name\":\"Ticket\",\"rows\":1},"#,
+            r#"{\"name\":\"Ticket:t1\",\"rows\":3},"#,
+            r#"{\"name\":\"Ticket_has_Note_uc\",\"rows\":5},"#,
+            r#"{\"name\":\"Ticket_has_Status\",\"rows\":1},"#,
+            r#"{\"name\":\"Ticket_has_Status_uc\",\"rows\":5}]}"}]}}"#
         )
     );
     assert_eq!(
         c.rpc(concat!(
             r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":"#,
-            r#"{"name":"query","arguments":{"fact_type":"Ticket_status"}}}"#
+            r#"{"name":"query","arguments":{"fact_type":"Ticket_has_Status"}}}"#
         )),
         concat!(
             r#"{"jsonrpc":"2.0","id":10,"result":{"content":[{"type":"text","#,
-            r#""text":"{\"fact_type\":\"Ticket_status\",\"rows\":[[\"t1\",\"open\"]]}"}]}}"#
+            r#""text":"{\"fact_type\":\"Ticket_has_Status\",\"rows\":[[\"t1\",\"open\"]]}"}]}}"#
         )
     );
-    // synthesize routes to the resident synthesize_pairs op; over this
-    // compiled store the engine answers null pairs (the factType names differ
-    // from the absorbed cell names), and the routing is what this pins.
+    // synthesize routes to the resident synthesize_pairs op. The canonical
+    // verbalize dispatches populations through the rmapColumns layout cell,
+    // so the absorbed fact type's row answers as a real reading pair.
     assert_eq!(
         c.rpc(concat!(
             r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":"#,
@@ -200,7 +204,7 @@ fn mcp_mode_serves_the_apps_registry_over_stdio() {
         )),
         concat!(
             r#"{"jsonrpc":"2.0","id":11,"result":{"content":[{"type":"text","#,
-            r#""text":"{\"id\":\"t1\",\"pairs\":null}"}]}}"#
+            r#""text":"{\"id\":\"t1\",\"pairs\":[[\"{0} has {1}\",[\"t1\",\"open\"]]]}"}]}}"#
         )
     );
 

@@ -212,6 +212,17 @@ public class Reducer {
         }
         if (name.equals("eq"))
             return val(o != null && o.length == 2 ? (eqObj(o[0], o[1]) ? T : F) : BOT);
+        if (name.equals("cellkey")) {
+            // The cell-naming boundary op (spec D5): a pair of atoms answers the
+            // atom "a:b". Strings pass through, integers stringify, anything else
+            // bottoms, mirroring the Python and Rust twins.
+            if (o == null || o.length != 2) return val(BOT);
+            String a = o[0] instanceof String ? (String) o[0]
+                     : o[0] instanceof Long ? o[0].toString() : null;
+            String b = o[1] instanceof String ? (String) o[1]
+                     : o[1] instanceof Long ? o[1].toString() : null;
+            return val(a == null || b == null ? BOT : a + ":" + b);
+        }
         if (name.equals("apndl")) {
             if (o == null || o.length != 2 || !isSeq(o[1])) return val(BOT);
             Object[] ys = (Object[]) o[1];

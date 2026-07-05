@@ -1361,6 +1361,25 @@ def rmap_partition(D):
     return {ft: key for (key, ft) in pairs}
 
 
+def layout_cells(D):
+    """Materialize the RMAP layout AS DATA: the rmapColumns cell, rows
+    ⟨table, col, ft⟩ for every absorbed fact type, the knowledge
+    system:vb_fetch dispatches on (facts all the way down: the partition
+    is knowledge about the store, so it rides in the store as a cell).
+    Recompile replaces the cell wholesale; a store without it reads as
+    all-own-table, which is exactly what a raw compile_model store is."""
+    from .lam import to_lam, from_lam
+    part = rmap_partition(D)
+    rows = []
+    for table in sorted({t for ft, t in part.items() if t != ft}):
+        for j, ft in enumerate(table_columns(part, table)):
+            rows.append((table, 2 + j, ft))
+    cells = tuple(c for c in from_lam(D)
+                  if not (isinstance(c, tuple) and len(c) >= 2
+                          and c[1] == "rmapColumns"))
+    return to_lam(cells + (("CELL", "rmapColumns", tuple(rows)),))
+
+
 def absorb_rows(D, table_key, partition):
     """The 3NF row population of one RMAP table: the θ₁ natural join on the key (role 1)
     of the fact types absorbed into `table_key` (spec §4.4: functional roles on the same

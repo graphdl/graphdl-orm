@@ -107,6 +107,33 @@ def test_the_verbs_ride_the_first_class_table(tmp_path):
         {"app": "v5", "checks": []}
 
 
+def test_synthesize_answers_over_the_absorbed_layout(tmp_path):
+    # the resident seam's root fix: a Registry store absorbs functional fact
+    # types into entity cells, so verbalize must dispatch populations through
+    # the materialized layout (rmapColumns) instead of fetching by the fact
+    # type key and bottoming on the missing cell
+    base = tmp_path / "apps"
+    (base / "flow" / "readings").mkdir(parents=True)
+    (base / "flow" / "readings" / "app.md").write_text(
+        "Status is a value type.\nNote is a value type.\n"
+        "Ticket is an entity type.\n"
+        "Ticket has Status.\nTicket has Note.\n"
+        "Each Ticket has at most one Status.\n"
+        "Each Ticket has at most one Note.\n", encoding="utf-8")
+    from pyarest import apps as _apps
+    reg = _apps.Registry(str(base), cache_dir=str(tmp_path / "fz"))
+    reg.compile("flow")
+    receipt = reg.apply("flow", "Ticket_has_Status", ("t1", "open"))
+    assert receipt["committed"]
+    out = reg.synthesize("flow", "t1")
+    assert {"reading": "{0} has {1}", "row": ["t1", "open"],
+            "text": "t1 has open"} in out["facts"]
+    # the unwritten Note fact type contributes nothing instead of bottoming
+    # the fold, and the absorbed hole does not verbalize as a fact
+    assert not any("Note" in f["text"] or "#" in str(f["row"])
+                   for f in out["facts"])
+
+
 def test_actions_answers_the_legal_transitions(tmp_path):
     # HATEOAS's verb half: the machine binding, the current status, and the
     # event/to pairs available from it (sm_triples, the canonical join)

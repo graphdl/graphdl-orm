@@ -8,16 +8,26 @@ The Rust resident boots the app by feeding this file through the same ingestion
 path a `--serve` stdin line takes.
 
 The store compiles this model with a base-free Registry and then applies one
-fact:
+fact to the declared fact type, which the partition routes into the absorbed
+layout (the entity cell `Ticket:t1` plus the `Ticket` index), beside the
+per-fact-type append cell:
 
     Status is a value type.
+    Note is a value type.
     Ticket is an entity type.
     Ticket has Status.
+    Ticket has Note.
+    Each Ticket has at most one Status.
+    Each Ticket has at most one Note.
 
-    apply("flow", "Ticket_status", ("t1", "open"))
+    apply("flow", "Ticket_has_Status", ("t1", "open"))
 
-The resulting cells are `FILE`, `Ticket_status` (one row, `["t1", "open"]`),
-`factType`, `instanceOf`, and `role`.
+The uniqueness constraints make both fact types functional, so the compile
+materializes the `rmapColumns` layout cell, and the canonical
+`system:verbalize` dispatches population fetches through it. That is what the
+mcp test's synthesize assertion pins: real reading pairs over the absorbed
+layout, with the never-written Note fact type contributing nothing instead of
+bottoming the fold.
 
 ## Regenerating
 
@@ -31,14 +41,18 @@ repository root:
     import pyarest.prims  # noqa: F401
     from pyarest import apps
 
-    MODEL = "Status is a value type.\nTicket is an entity type.\nTicket has Status.\n"
+    MODEL = ("Status is a value type.\nNote is a value type.\n"
+             "Ticket is an entity type.\n"
+             "Ticket has Status.\nTicket has Note.\n"
+             "Each Ticket has at most one Status.\n"
+             "Each Ticket has at most one Note.\n")
     work = pathlib.Path(tempfile.mkdtemp())
     ap = work / "apps"
     (ap / "flow" / "readings").mkdir(parents=True)
     (ap / "flow" / "readings" / "app.md").write_text(MODEL, encoding="utf-8")
     reg = apps.Registry(str(ap), cache_dir=str(work / "fz"))
     reg.compile("flow")
-    receipt = reg.apply("flow", "Ticket_status", ("t1", "open"))
+    receipt = reg.apply("flow", "Ticket_has_Status", ("t1", "open"))
     assert receipt["committed"], receipt
     dest = pathlib.Path("rust/tests/fixtures/apps/flow")
     dest.mkdir(parents=True, exist_ok=True)

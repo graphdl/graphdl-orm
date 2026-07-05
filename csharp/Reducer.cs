@@ -285,6 +285,17 @@ static class Reducer
                 return Enumerable.Range(0, w).Select(i =>
                     (object)rows.Select(r => ((object[])r)[i]).ToArray()).ToArray();
             }
+            case "cellkey":
+            {
+                // The cell-naming boundary op (spec D5): ⟨a, b⟩ to the atom "a:b".
+                // Strings pass through, integers stringify, anything else bottoms,
+                // mirroring the Python and Rust twins.
+                var o = Pair();
+                if (o is not { Length: 2 }) return Bot.Value;
+                var a = o[0] is string sa ? sa : o[0] is long ia ? ia.ToString() : null;
+                var b = o[1] is string sb ? sb : o[1] is long ib ? ib.ToString() : null;
+                return a is null || b is null ? Bot.Value : a + ":" + b;
+            }
             case "+":
             {
                 var o = Pair();

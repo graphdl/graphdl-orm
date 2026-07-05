@@ -248,6 +248,32 @@ def test_row_validate_canonical_matches_the_python_builder():
         assert got[1] == want_v and got[2] == want_flag, (got, want_v, want_flag)
 
 
+def test_vb_fetch_dispatches_the_layout():
+    # verbalize's population fetch rides the layout: an rmapColumns row routes
+    # an absorbed fact type through the index reassembly (ftpop_absorbed); an
+    # own-table fact type reads its cell TOTALLY (ast:FetchPop's COND-on-#,
+    # absent cell = empty population), so a declared-but-unwritten fact type
+    # contributes nothing instead of bottoming the whole verbalization
+    from pyarest import ast
+    from pyarest.reduce import apply as _apply
+    D = _apply(ast.Store("rmapColumns"),
+               _S(to_lam((("Person", 2, "Person_has_Name"),)),
+                  _apply(ast.Store("Person"),
+                         _S(to_lam((("p1",), ("p2",))),
+                            _apply(ast.Store("Person:p1"),
+                                   _S(to_lam(("p1", "Ada")),
+                                      _apply(ast.Store("Person:p2"),
+                                             _S(to_lam(("p2", "#")),
+                                                _apply(ast.Store("Pet_likes_Person"),
+                                                       _S(to_lam((("rex", "p1"),)),
+                                                          to_lam(())))))))))))
+    def fetch(ft):
+        return from_lam(_apply(A("system:vb_fetch"), _S(A(ft), D)))
+    assert set(fetch("Person_has_Name")) == {("p1", "Ada")}   # absorbed; holes drop
+    assert set(fetch("Pet_likes_Person")) == {("rex", "p1")}  # own table
+    assert fetch("Never_written") == ()                       # total, not bottom
+
+
 def test_verbalize_pairs_canonical_over_the_entity_facts():
     # synthesize's engine half (the old verb's contract: the engine
     # guarantees content, the LLM only shapes wording): the entity's facts

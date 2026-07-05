@@ -40,5 +40,13 @@ DEF("case:cond", S2(S4(A("COND"), A("null"), S2(A("CONST"), A("empty")), S2(A("C
 DEF("case:alpha", S2(S2(A("ALPHA"), A("tl")), S2(S2(A("a"), A("b")), S2(A("c"), A("d"))))),
 DEF("case:insert-max", S2(S2(A("INSERT"), A("system:max2")), S4(A("2"), A("19"), A("7"), A("4")))),
 DEF("case:while-count", S2(S3(A("WHILE"), S3(A("COMP"), A("gt"), S3(A("CONS"), A("id"), S2(A("CONST"), N(0)))), S3(A("COMP"), A("-"), S3(A("CONS"), A("id"), S2(A("CONST"), N(1))))), N(5))),
-DEF("case:bu", S2(S3(A("BU"), A("+"), N(10)), N(7)))
+DEF("case:bu", S2(S3(A("BU"), A("+"), N(10)), N(7))),
+DEF("case:vb-fetch-absorbed", S2(A("system:vb_fetch"), S2(A("P_has_N"), S3(S3(A("CELL"), A("rmapColumns"), S1(S3(A("P"), N(2), A("P_has_N")))), S3(A("CELL"), A("P"), S1(S1(A("p1")))), S3(A("CELL"), A("P:p1"), S2(A("p1"), A("Ada"))))))),
+DEF("case:vb-fetch-total", S2(A("system:vb_fetch"), S2(A("Nope"), S1(S3(A("CELL"), A("x"), S1(S1(A("y")))))))),
+DEF("case:dynfetch", S2(A("ast:DynFetch"), S2(A("P:p1"), S1(S3(A("CELL"), A("P:p1"), S2(A("p1"), A("Ada"))))))),
+DEF("case:vb-colrow", S2(A("system:vb_colrow"), S2(A("P_has_N"), S1(S3(A("CELL"), A("rmapColumns"), S1(S3(A("P"), N(2), A("P_has_N")))))))),
+DEF("case:ftpop-absorbed-mini", S2(S3(A("COMP"), A("apply"), S3(A("CONS"), S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("system:ftpop_absorbed")), K(S2(A("P"), N(2))))), A("id"))), S2(S3(A("CELL"), A("P"), S1(S1(A("p1")))), S3(A("CELL"), A("P:p1"), S2(A("p1"), A("Ada")))))),
+DEF("case:sel-str", S2(A("2"), S3(A("x"), A("y"), A("z")))),
+DEF("case:ftpop-fetch-mini", S2(S3(A("COMP"), A("apply"), S3(A("CONS"), S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("system:ftpop_fetch")), K(S2(A("P"), N(2))))), A("id"))), S1(S3(A("CELL"), A("P"), S1(S1(A("p1"))))))),
+DEF("case:ftpop-pairsel-mini", S2(S3(A("COMP"), A("apply"), S3(A("CONS"), S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("system:ftpop_pairsel")), K(S2(A("P"), N(2))))), A("id"))), S2(S1(A("p1")), S1(S3(A("CELL"), A("P:p1"), S2(A("p1"), A("Ada")))))))
 )
