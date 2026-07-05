@@ -12,6 +12,10 @@
 //!   {"d": V, "process": [[name, V], ...], "cases": [{"f": V, "x": V, "fuel": N}, ...]}
 //! where V is string (a string atom) | integer | float | array (a sequence); fuel 0
 //! means unbounded. One JSON per case on stdout: the reduced value, or null for bottom.
+//! Under --serve the same scenarios stream one per line against a RETAINED store
+//! (one JSON array of case results per line), and a line carrying "op" is a verb
+//! request instead — the system's verb surface (python/protocol.py's table),
+//! answered as one {"op", "result"|"error"} object; see "the verb surface" below.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -1408,6 +1412,12 @@ fn handle(j: &J, srv: &mut Srv, serve: bool) -> String {
         srv.nd = j_to_n(dj);
         srv.ncells = n_cells_of(&srv.nd);
     }
+    if let Some(J::S(op)) = jget(j, "op") {
+        // a verb request: the store preamble above has already applied, so
+        // {"d": .., "op": ..} sets the resident store and asks in one line
+        // (an op line answers the op alone; cases ride their own lines)
+        return handle_op(op, j, srv);
+    }
     let native = matches!(jget(j, "engine"), Some(J::S(s)) if s == "native");
     let mut outs: Vec<String> = Vec::new();
     if jget(j, "dump").is_some() {
@@ -1479,6 +1489,183 @@ fn handle(j: &J, srv: &mut Srv, serve: bool) -> String {
     } else {
         outs.join("
 ")
+    }
+}
+
+// ============================ the verb surface ================================
+// The system's verb table (python/protocol.py: SESSION_VERBS + APP_VERBS, with
+// the Registry-backed synthesize/explain) is surface-agnostic — every binding
+// lists the SAME verbs. The resident kernel mirrors it as JSON-RPC-style
+// requests on the serve loop, one object per line:
+//   {"op": "verbs"}                        -> the table + the resident subset
+//   {"op": "query", "fact_type": NAME}     -> (ast:FetchPop : NAME) : D
+//   {"op": "cells", "pattern": SUBSTR?}    -> cell names + row counts over D
+//   {"op": "synthesize_pairs", "id": ID}   -> (system:verbalize : ID) : D
+// answered as {"op": .., "result": ..} or {"op": .., "error": ..}. Every
+// reduction runs over the RESIDENT store the loop already holds (set and
+// evolved via the d / retain ops) through the canonical definitions the kernel
+// loads (canon_defs) — no engine semantics re-live here. Verbs needing the
+// apps registry (readings compile, sqlite) stay host-side: the table names
+// them; the resident subset serves what the store alone can answer.
+const SESSION_VERBS: [&str; 6] =
+    ["apps_compile", "apps_current", "apps_list", "apps_use", "context", "orient"];
+const APP_VERBS: [&str; 9] =
+    ["apply", "cells", "explain", "get", "query", "retract", "schema", "sql", "synthesize"];
+const RESIDENT_OPS: [&str; 4] = ["cells", "query", "synthesize_pairs", "verbs"];
+
+fn reduce_over(srv: &Srv, f: V, x: V, fuel: Option<i64>) -> V {
+    // one reduction over the resident store, the case path's frame discipline
+    FRAME.with(|fr| {
+        fr.borrow_mut().push(Frame { cells: srv.cells.clone(), d: srv.d.clone(), fuel })
+    });
+    let res = srv.mu.app(mkapp(f, x));
+    FRAME.with(|fr| {
+        fr.borrow_mut().pop();
+    });
+    res
+}
+
+fn scalar_atom(j: &J) -> Option<V> {
+    // a scalar request parameter as the atom the canon addresses cells by
+    match j {
+        J::S(s) => Some(atom(Leaf::S(s.clone()))),
+        J::I(i) => Some(atom(Leaf::I(*i))),
+        J::F(f) => Some(atom(Leaf::F(*f))),
+        _ => None,
+    }
+}
+
+fn op_ok(op: &str, result: &str) -> String {
+    let mut s = String::from("{\"op\":");
+    esc(op, &mut s);
+    s.push_str(",\"result\":");
+    s.push_str(result);
+    s.push('}');
+    s
+}
+
+fn op_err(op: &str, msg: &str) -> String {
+    let mut s = String::from("{\"op\":");
+    esc(op, &mut s);
+    s.push_str(",\"error\":");
+    esc(msg, &mut s);
+    s.push('}');
+    s
+}
+
+fn handle_op(op: &str, j: &J, srv: &Srv) -> String {
+    let fuel = match jget(j, "fuel") {
+        Some(J::I(n)) if *n > 0 => Some(*n),
+        _ => None,
+    };
+    match op {
+        "verbs" => {
+            let list = |xs: &[&str], out: &mut String| {
+                out.push('[');
+                for (i, x) in xs.iter().enumerate() {
+                    if i > 0 { out.push(','); }
+                    esc(x, out);
+                }
+                out.push(']');
+            };
+            // the flat list mirrors protocol.verbs(): sorted session + sorted app
+            let mut all: Vec<&str> = Vec::new();
+            all.extend_from_slice(&SESSION_VERBS);
+            all.extend_from_slice(&APP_VERBS);
+            let mut r = String::from("{\"verbs\":");
+            list(&all, &mut r);
+            r.push_str(",\"session\":");
+            list(&SESSION_VERBS, &mut r);
+            r.push_str(",\"app\":");
+            list(&APP_VERBS, &mut r);
+            r.push_str(",\"resident\":");
+            list(&RESIDENT_OPS, &mut r);
+            r.push('}');
+            op_ok(op, &r)
+        }
+        "query" => {
+            // FetchPop of the named cell over the resident store:
+            // (ast:FetchPop : name) : D — an absent cell answers PHI, never ⊥
+            let ft = match jget(j, "fact_type").and_then(scalar_atom) {
+                Some(a) => a,
+                None => return op_err(op, "query needs a scalar fact_type"),
+            };
+            let f = mkapp(atom(Leaf::S("ast:FetchPop".into())), ft.clone());
+            let res = reduce_over(srv, f, srv.d.clone(), fuel);
+            let mut r = String::from("{\"fact_type\":");
+            write_v(&ft, &mut r);
+            r.push_str(",\"rows\":");
+            write_v(&res, &mut r);
+            r.push('}');
+            op_ok(op, &r)
+        }
+        "cells" => {
+            // the store surface: addressable cell names (first match wins, as
+            // FetchPop sees them) with row counts, optional substring pattern
+            let pat = match jget(j, "pattern") {
+                Some(J::S(p)) => Some(p.to_lowercase()),
+                _ => None,
+            };
+            let mut entries: Vec<(String, String)> = Vec::new();
+            for (k, contents) in &srv.cells {
+                let name = match k {
+                    Leaf::S(s) => s.clone(),
+                    Leaf::I(i) => i.to_string(),
+                    Leaf::F(f) => format!("{}", f),
+                    Leaf::AppTag => continue,
+                };
+                if let Some(p) = &pat {
+                    if !name.to_lowercase().contains(p.as_str()) {
+                        continue;
+                    }
+                }
+                let mut e = String::from("{\"name\":");
+                match k {
+                    Leaf::S(s) => esc(s, &mut e),
+                    _ => e.push_str(&name),                   // numeric names stay numbers
+                }
+                e.push_str(",\"rows\":");
+                match shape(contents) {
+                    Shape::Seq(l) => e.push_str(&items(&l).len().to_string()),
+                    _ => e.push_str("null"),                  // an atom cell has no rows
+                }
+                e.push('}');
+                entries.push((name, e));
+            }
+            entries.sort();
+            let mut r = String::from("{\"cells\":[");
+            for (i, (_n, e)) in entries.iter().enumerate() {
+                if i > 0 { r.push(','); }
+                r.push_str(e);
+            }
+            r.push_str("]}");
+            op_ok(op, &r)
+        }
+        "synthesize_pairs" => {
+            // synthesize's engine half over the resident store: the canonical
+            // (system:verbalize : id) : D — the entity's facts paired with
+            // their fact types' reading templates; wording stays the caller's
+            let id = match jget(j, "id").and_then(scalar_atom) {
+                Some(a) => a,
+                None => return op_err(op, "synthesize_pairs needs a scalar id"),
+            };
+            let f = mkapp(atom(Leaf::S("system:verbalize".into())), id.clone());
+            let res = reduce_over(srv, f, srv.d.clone(), fuel);
+            let mut r = String::from("{\"id\":");
+            write_v(&id, &mut r);
+            r.push_str(",\"pairs\":");
+            write_v(&res, &mut r);
+            r.push('}');
+            op_ok(op, &r)
+        }
+        _ => {
+            if SESSION_VERBS.contains(&op) || APP_VERBS.contains(&op) {
+                op_err(op, "verb needs the apps registry (host-side); resident ops: \
+                            cells, query, synthesize_pairs, verbs")
+            } else {
+                op_err(op, "unknown op; resident ops: cells, query, synthesize_pairs, verbs")
+            }
+        }
     }
 }
 

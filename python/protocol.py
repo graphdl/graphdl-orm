@@ -1436,6 +1436,88 @@ class Registry:
         return {"app": name, "id": id, "chains": chains,
                 "audit": trail[-20:]}
 
+    def validate(self, name):
+        """The old engine's validate verb: the app's constraint validation over
+        the SETTLED store. eq. create judges candidates, so a write never lands
+        an alethic offender — but instance facts in readings ingest unvalidated
+        and deontic violations commit by design, so a compiled store can carry
+        drift. This walks the declared fact types, applies each one's validate
+        (forml.validate_for — the same object create runs) to ⟨P, D⟩, and
+        reports the non-empty violation sets. An empty list is a clean bill."""
+        from .lam import to_lam, from_lam
+        from .reduce import apply as _ap
+        from . import defs
+        import pyarest.lam as L
+        D = self._load(name)
+        partition = system.rmap_partition(D)
+        # constraint kinds by scoped fact type: rows are (cid, kind, …scope…,
+        # modality) — the scope columns name fact types (the exclusion family
+        # scopes a clause TUPLE), the tail column is the modality
+        kinds = {}
+        for c in system._pop_rows(D, "constraint"):
+            if len(c) < 3:
+                continue
+            scope = c[2:-1] if c[-1] in ("alethic", "deontic") else c[2:]
+            for part in scope:
+                for t in (part if isinstance(part, tuple) else (part,)):
+                    if isinstance(t, str):
+                        kinds.setdefault(t, set()).add(c[1])
+        violations = []
+        for f in system._pop_rows(D, "factType"):
+            if not f:
+                continue
+            ft = f[0]
+            val = forml.validate_for(ft, D, partition)
+            pop = tuple(tuple(r) for r in system._pop_rows(D, ft))
+            pair = L.SEQ(L.CONS(to_lam(pop))(L.CONS(D)(L.NIL)))
+            with defs.step(D):
+                _p, v, flag = from_lam(_ap(val, pair))
+            if v:
+                violations.append(
+                    {"fact_type": ft,
+                     "kinds": sorted(kinds.get(ft, ())),
+                     "offenders": [list(x) if isinstance(x, tuple) else [x]
+                                   for x in v],
+                     "alethic": flag == "T"})
+        return {"app": name, "violations": violations}
+
+    def verify(self, name):
+        """The migration report's derived-population check, IN PLACE (the swap
+        tool's parity evidence turned self-audit): for each fully-derived head
+        with rules, re-evaluate the rules over the settled store (rho within
+        the step's D, as explain does) and compare with the stored cell. A
+        mismatch is a materialization the current rules do not reproduce —
+        a tampered .db, or a store saved before the rules changed."""
+        from .reduce import apply as _apply
+        from .kernel import atom as A, from_lam
+        from . import defs
+        D = self._load(name)
+        kinds = {r[0]: r[1] for r in system._pop_rows(D, "derivation")
+                 if len(r) >= 2}
+        rules = {}
+        for r in system._pop_rows(D, "ruleDerives"):
+            if len(r) >= 2:
+                rules.setdefault(r[1], []).append(r[0])
+        checks = []
+        for head in sorted(h for h, k in kinds.items()
+                           if k == "fully-derived" and h in rules):
+            recomputed = set()
+            for rid in sorted(rules[head]):
+                try:
+                    with defs.step(D):
+                        out = from_lam(_apply(A(rid), D))
+                    if isinstance(out, tuple):
+                        recomputed |= {tuple(x) for x in out
+                                       if isinstance(x, tuple)}
+                except Exception:
+                    pass                                      # an unevaluable rule
+                                                              # reads as a mismatch
+            stored = {tuple(r) for r in system._pop_rows(D, head)}
+            checks.append({"head": head, "stored": len(stored),
+                           "recomputed": len(recomputed),
+                           "match": stored == recomputed})
+        return {"app": name, "checks": checks}
+
     def schema(self, name):
         """The model surface: object types, fact types with readings and roles,
         and the constraint inventory."""
@@ -1577,6 +1659,8 @@ APP_VERBS = {
                                       app, pattern=a.get("pattern"),
                                       cell=a.get("cell"))},
     "schema": lambda reg, app, a: reg.schema(app),
+    "validate": lambda reg, app, a: reg.validate(app),
+    "verify": lambda reg, app, a: reg.verify(app),
 }
 
 
