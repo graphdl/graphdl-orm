@@ -1723,13 +1723,13 @@ def ftpop_expr(ft, partition):
 
 
 def row_validate(D, ft, partition):
-    """Step 5's constraint mapping (Halpin §10.3): schema constraints move with the
-    partitioned layout. A value constraint on an absorbed fact type's value player
-    checks the ROW's column on the routed write — the named vc object (already a
-    definition, resolved by ρ in-step) applied to the singleton ⟨row[col]⟩, skipped
-    while the column is a # hole (fresh rows), the flag alethic per the constraint's
-    modality. None when nothing maps."""
-    from .lam import PHI
+    """Step 5's constraint mapping (Halpin §10.3): schema constraints move with
+    the partitioned layout. A value constraint on an absorbed fact type's value
+    player checks the ROW's column on the routed write, holes skipped, the flag
+    alethic per modality. The canonical system:row_validate applied to
+    ⟨col, vc-name, alethic?⟩; the M-fact lookups stay host as this applier.
+    None when nothing maps."""
+    from .reduce import apply as _apply
     table = partition.get(ft, ft)
     if table == ft:
         return None
@@ -1740,12 +1740,9 @@ def row_validate(D, ft, partition):
     if not hits:
         return None
     vt, _spec, modality = hits[0][0], hits[0][1], hits[0][2]
-    vcell = _S(_COMP, A(col), _1)
-    is_hole = _S(_COMP, _EQ, _S(_CONS, vcell, _S(_CONST, A("#"))))
-    V = _S(_COND, is_hole, _S(_CONST, PHI),
-           _S(_COMP, A(vt + "_vc"), _S(_CONS, _S(_CONS, vcell))))
-    flag = _S(_COMP, A("not"), A("null"), V) if modality == "alethic" else _S(_CONST, A("F"))
-    return _S(_CONS, _1, V, flag)
+    return _apply(A("system:row_validate"),
+                  _S(A(col), A(vt + "_vc"),
+                     A("T" if modality == "alethic" else "F")))
 
 
 def facts_about(D, entity):

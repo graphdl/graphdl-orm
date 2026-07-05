@@ -225,3 +225,24 @@ def test_ftpop_absorbed_canonical_matches_the_python_builder():
     via_def = _apply(_apply(A("system:ftpop_absorbed"),
                             _S(A("Person"), A(col))), D)
     assert set(from_lam(via_def)) == got
+
+
+def test_row_validate_canonical_matches_the_python_builder():
+    # the routed write's value check: the row's column against the named vc,
+    # holes skipped, the flag alethic per modality
+    from pyarest import system, defs
+    from pyarest.reduce import apply as _apply
+    from pyarest import canon as T
+    defs.define("Mood_vc", T.Filter(_S(A("COMP"), A("not"), A("eq"),
+                                       _S(A("CONS"), A(1),
+                                          _S(A("CONST"), A("calm"))))))
+    row_ok = to_lam(("t1", "calm"))
+    row_bad = to_lam(("t1", "wild"))
+    row_hole = to_lam(("t1", "#"))
+    via_def = _apply(A("system:row_validate"),
+                     _S(A(2), A("Mood_vc"), A("T")))
+    for row, want_v, want_flag in ((row_ok, (), "F"),
+                                   (row_bad, (("wild",),), "T"),
+                                   (row_hole, (), "F")):
+        got = from_lam(_apply(via_def, _S(row, to_lam(()))))
+        assert got[1] == want_v and got[2] == want_flag, (got, want_v, want_flag)
