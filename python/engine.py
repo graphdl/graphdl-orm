@@ -1416,6 +1416,69 @@ def layout_cells(D):
     return to_lam(cells + (("CELL", "rmapColumns", tuple(rows)),))
 
 
+def generator_cells(D):
+    """The generator family's first member (punchlist entry 8): dsl:<Noun>
+    cells, the per-noun model summary the old engine persists (noun, object
+    type, reading texts, verbalized constraints as kind-text pairs, machine
+    transitions). Computed from M at compile time beside the layout cells;
+    recompile replaces the family wholesale."""
+    from .lam import to_lam, from_lam
+    kinds = {}
+    for r in _pop_rows(D, "instanceOf"):
+        if len(r) >= 2 and r[1] in ("ObjectType", "ValueType"):
+            kinds[r[0]] = "entity" if r[1] == "ObjectType" else "value"
+    roles = {}
+    for r in _pop_rows(D, "role"):
+        if len(r) >= 4:
+            roles.setdefault(r[1], []).append((r[2], r[3]))
+    readings = {}
+    for f in _pop_rows(D, "factType"):
+        if len(f) >= 2 and f[0] in roles:
+            players = [p for (_i, p) in sorted(roles[f[0]])]
+            try:
+                readings[f[0]] = str(f[1]).format(*players)
+            except (IndexError, KeyError):
+                readings[f[0]] = str(f[1])
+    cons = []
+    for c in _pop_rows(D, "constraint"):
+        if len(c) < 3:
+            continue
+        ft, players = c[2], [p for (_i, p) in sorted(roles.get(c[2], []))]
+        if c[1] == "uniqueness" and len(players) >= 2:
+            cons.append((ft, players, ("UC", "Each %s has at most one %s."
+                                       % (players[0], players[1]))))
+        elif c[1] == "mandatory" and len(players) >= 2:
+            cons.append((ft, players, ("MC", "Each %s has some %s."
+                                       % (players[0], players[1]))))
+        elif str(c[1]).startswith("deontic"):
+            cons.append((ft, players, ("UC", str(c[0]) + ".")))
+    # the machine triples per governed noun; a triple does not carry its
+    # machine id, so with several machines every governed noun sees the
+    # union (the single-machine case, every app in the fleet today, is
+    # exact; the defined-in link refines it when a multi-machine app lands)
+    sms = {}
+    triples = [(trig, frm, to) for (frm, trig, to) in sm_triples(D)]
+    for r in _pop_rows(D, "smDef"):
+        if len(r) >= 2:
+            sms.setdefault(r[1], []).extend(triples)
+    cells = {}
+    for noun, kind in sorted(kinds.items()):
+        my_fts = [ft for ft, ps in roles.items()
+                  if any(p == noun for (_i, p) in ps)]
+        my_readings = tuple(sorted(readings[ft] for ft in my_fts
+                                   if ft in readings))
+        my_cons = tuple(pair for (ft, players, pair) in cons
+                        if noun in players)
+        my_trans = tuple(sorted(set(sms.get(noun, ()))))
+        cells["dsl:" + noun] = ((noun, kind, my_readings, my_cons,
+                                 my_trans),)
+    keep = tuple(c for c in from_lam(D)
+                 if not (isinstance(c, tuple) and len(c) >= 2
+                         and str(c[1]).startswith("dsl:")))
+    fresh = tuple(("CELL", name, rows) for name, rows in sorted(cells.items()))
+    return to_lam(keep + fresh)
+
+
 def absorb_rows(D, table_key, partition):
     """The 3NF row population of one RMAP table: the θ₁ natural join on the key (role 1)
     of the fact types absorbed into `table_key` (spec §4.4: functional roles on the same

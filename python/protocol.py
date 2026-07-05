@@ -1221,6 +1221,7 @@ class Registry:
             D = persist.replay(D, self._log(name))
             D = system.run_rules(D)
         D = system.layout_cells(D)
+        D = system.generator_cells(D)
         persist.save_sqlite(D, self._db(name))
         self._sidecar(name, D)
         # the RMAP projection rides in the same .db (the GraphDL contract): the
