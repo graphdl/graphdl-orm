@@ -76,6 +76,23 @@ architecturally excluded per target.
    pyarest status: NOT PORTED. The actions verb answers the legal
    transitions (the HATEOAS half as data) but no HTTP server exists.
 
+7b. UI.DO, THE ABSTRACT UI PATTERN (Samuel, 2026-07-05). ui.do lays
+    an abstract UI pattern on top of AREST the way iFactr is built on
+    MonoCross: the developer authors against the abstraction, and
+    per-platform targets realize it. The shipped target is React (the
+    web glue at the old repo's apps/ui.do, MIT-licensed with its own
+    LICENSE-MIT so applications built on AREST stay unencumbered);
+    the OS would ship a Slint target, a Windows app a WPF target, and
+    so on per platform. A broader UI workspace also lives at
+    C:\Users\lippe\Repos\ui (admin, builder-domains, mdxui.dev, and
+    e2e apps), and the iFactr family on disk is the studied prior
+    art for the whole pattern.
+    pyarest disposition: NOT PORTED and inside the old repo, so the
+    nuke would take the React target with it. The iFactr study in
+    flight feeds the design language; the ui.do port or re-home is
+    its own arc, dependency-wise a leaf on the REST surface (the
+    target renders what the verbs answer).
+
 ## Engine subsystems catalogued in the old docs
 
 8. GENERATORS (docs/07-generators.md). The old engine generates, per
