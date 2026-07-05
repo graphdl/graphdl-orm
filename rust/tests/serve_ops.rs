@@ -83,7 +83,7 @@ fn verb_ops_answer_over_a_store_built_via_serve_ops() {
             r#""apply","cells","explain","get","query","retract","schema","sql","synthesize"],"#,
             r#""session":["apps_compile","apps_current","apps_list","apps_use","context","orient"],"#,
             r#""app":["apply","cells","explain","get","query","retract","schema","sql","synthesize"],"#,
-            r#""resident":["cells","query","synthesize_pairs","verbs"]}}"#
+            r#""resident":["cells","query","run_rules","synthesize_pairs","verbs"]}}"#
         )
     );
 

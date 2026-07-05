@@ -1565,6 +1565,7 @@ fn handle(j: &J, srv: &mut Srv, serve: bool) -> String {
 //   {"op": "query", "fact_type": NAME}     -> (ast:FetchPop : NAME) : D
 //   {"op": "cells", "pattern": SUBSTR?}    -> cell names + row counts over D
 //   {"op": "synthesize_pairs", "id": ID}   -> (system:verbalize : ID) : D
+//   {"op": "run_rules"}                    -> the derivation fixpoint over D
 // answered as {"op": .., "result": ..} or {"op": .., "error": ..}. Every
 // reduction runs over the RESIDENT store the loop already holds (set and
 // evolved via the d / retain ops) through the canonical definitions the kernel
@@ -1575,18 +1576,25 @@ const SESSION_VERBS: [&str; 6] =
     ["apps_compile", "apps_current", "apps_list", "apps_use", "context", "orient"];
 const APP_VERBS: [&str; 9] =
     ["apply", "cells", "explain", "get", "query", "retract", "schema", "sql", "synthesize"];
-const RESIDENT_OPS: [&str; 4] = ["cells", "query", "synthesize_pairs", "verbs"];
+const RESIDENT_OPS: [&str; 5] = ["cells", "query", "run_rules", "synthesize_pairs", "verbs"];
 
-fn reduce_over(srv: &Srv, f: V, x: V, fuel: Option<i64>) -> V {
-    // one reduction over the resident store, the case path's frame discipline
+fn reduce_in(mu: &V, cells: &[(Leaf, V)], d: &V, f: V, x: V, fuel: Option<i64>) -> V {
+    // one reduction under a given store binding, the case path's frame
+    // discipline: the frame carries the store's cells (so compiled defs in D
+    // resolve first, Backus 14.6) and the whole D (for the DEFS accessor)
     FRAME.with(|fr| {
-        fr.borrow_mut().push(Frame { cells: srv.cells.clone(), d: srv.d.clone(), fuel })
+        fr.borrow_mut().push(Frame { cells: cells.to_vec(), d: d.clone(), fuel })
     });
-    let res = srv.mu.app(mkapp(f, x));
+    let res = mu.app(mkapp(f, x));
     FRAME.with(|fr| {
         fr.borrow_mut().pop();
     });
     res
+}
+
+fn reduce_over(srv: &Srv, f: V, x: V, fuel: Option<i64>) -> V {
+    // one reduction over the resident store
+    reduce_in(&srv.mu, &srv.cells, &srv.d, f, x, fuel)
 }
 
 fn scalar_atom(j: &J) -> Option<V> {
@@ -1597,6 +1605,344 @@ fn scalar_atom(j: &J) -> Option<V> {
         J::F(f) => Some(atom(Leaf::F(*f))),
         _ => None,
     }
+}
+
+// ============================ the derivation fixpoint =========================
+// Phase one of the run_rules port (python/engine.py run_rules): the NAIVE
+// positive-rule fixpoint over the retained store. Every round evaluates every
+// non-aggregate rule's FULL body against the current D through the same mu
+// and frame the ops use; a rule id resolves to its compiled object through
+// D's OWN DEFS cells (ast:DefineIn stored it there at compile time), exactly
+// as Python evaluates inside defs.step(D). New rows union into the head cell
+// and the loop stops when a round adds nothing. Rules are positive and
+// monotone, so the loop reaches the least fixed point (Knaster-Tarski), and
+// finiteness bounds the rounds. Rules named by ruleAgg are SKIPPED here,
+// never mis-run: an aggregate head supersedes per group instead of unioning,
+// which is the next stratum's contract. Deferred to later phases: the
+// semi-naive ~d delta variants, the frontier bounding, the FAST rule twins,
+// the keyed upserts, the DRed sweeps, and the joint upper-strata iteration.
+
+fn float_text(f: f64) -> String {
+    if f.fract() == 0.0 && f.is_finite() {
+        format!("{:.1}", f)
+    } else {
+        format!("{}", f)
+    }
+}
+
+fn leaf_text(l: &Leaf) -> String {
+    match l {
+        Leaf::S(s) => s.clone(),
+        Leaf::I(i) => i.to_string(),
+        Leaf::F(f) => float_text(*f),
+        Leaf::AppTag => "#APP#".to_string(),
+    }
+}
+
+// set_key renders a value for SET membership the way engine.py's row sets
+// compare (Python ==): an int and a float of equal value coalesce, while a
+// numeric-looking string stays distinct from the number. Strings are length
+// prefixed so no content can imitate the structure.
+fn set_key(v: &V, out: &mut String) {
+    match shape(v) {
+        Shape::Atom(l) => match &*l {
+            Leaf::S(s) => {
+                out.push('s');
+                out.push_str(&s.len().to_string());
+                out.push(':');
+                out.push_str(s);
+            }
+            Leaf::I(i) => {
+                out.push('n');
+                out.push_str(&i.to_string());
+            }
+            Leaf::F(f) => {
+                out.push('n');
+                // an integral float keys like its int (Python 1 == 1.0);
+                // the range guard keeps the cast exact
+                if f.fract() == 0.0 && f.is_finite() && f.abs() < 9.0e18 {
+                    out.push_str(&(*f as i64).to_string());
+                } else {
+                    out.push_str(&format!("{}", f));
+                }
+            }
+            Leaf::AppTag => out.push('t'),
+        },
+        Shape::Seq(l) => {
+            out.push('(');
+            for x in items(&l) {
+                set_key(&x, out);
+                out.push(',');
+            }
+            out.push(')');
+        }
+        Shape::Bot => out.push('!'),
+    }
+}
+
+fn key_of(v: &V) -> String {
+    let mut s = String::new();
+    set_key(v, &mut s);
+    s
+}
+
+// row_sort_key mirrors engine.py's _rowsort: type name then lexical text per
+// element, so mixed-type cells (a lexical '150' beside a derived 150) order
+// deterministically with no cross-type comparison.
+fn row_sort_key(row: &V) -> Vec<(&'static str, String)> {
+    fn elem(v: &V) -> (&'static str, String) {
+        match shape(v) {
+            Shape::Atom(l) => match &*l {
+                Leaf::S(s) => ("str", s.clone()),
+                Leaf::I(i) => ("int", i.to_string()),
+                Leaf::F(f) => ("float", float_text(*f)),
+                Leaf::AppTag => ("AppTag", String::new()),
+            },
+            Shape::Seq(_) => ("tuple", key_of(v)),
+            Shape::Bot => ("bot", String::new()),
+        }
+    }
+    match shape(row) {
+        Shape::Seq(l) => items(&l).iter().map(elem).collect(),
+        _ => vec![elem(row)],
+    }
+}
+
+fn sort_rows(rows: &mut Vec<V>) {
+    let mut keyed: Vec<(Vec<(&'static str, String)>, V)> =
+        rows.drain(..).map(|r| (row_sort_key(&r), r)).collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    rows.extend(keyed.into_iter().map(|(_, r)| r));
+}
+
+// pop_rows is FetchPop's view over the cached cell index: the named cell's
+// rows, with an absent cell or an atom-valued cell the empty population.
+fn pop_rows(cells: &[(Leaf, V)], name: &Leaf) -> Vec<V> {
+    match cells.iter().find(|(k, _)| k.nateq(name)) {
+        Some((_, contents)) => match shape(contents) {
+            Shape::Seq(l) => items(&l),
+            _ => Vec::new(),
+        },
+        None => Vec::new(),
+    }
+}
+
+// store_into is ast:Store run natively (Backus 13.3.4, pop then push): drop
+// the first top-level entry carrying the name in its second position (the
+// ast:named key), prepend the fresh CELL triple, and keep the cached index
+// consistent with the new D. Real stores hold only CELL triples, so the
+// index and the pop agree by construction.
+fn store_into(d: &mut V, cells: &mut Vec<(Leaf, V)>, name: &Leaf, contents: V) {
+    let mut entries = items(&list_of(d));
+    if let Some(pos) = entries.iter().position(|c| {
+        let it = items(&list_of(c));
+        it.len() >= 2 && matches!(aval(&it[1]), Some(k) if k.nateq(name))
+    }) {
+        entries.remove(pos);
+    }
+    entries.insert(
+        0,
+        seq(from_vec(vec![
+            atom(Leaf::S("CELL".into())),
+            atom(name.clone()),
+            contents.clone(),
+        ])),
+    );
+    *d = seq(from_vec(entries));
+    match cells.iter_mut().find(|(k, _)| k.nateq(name)) {
+        Some(slot) => slot.1 = contents,
+        None => cells.push((name.clone(), contents)),
+    }
+}
+
+fn op_run_rules(srv: &mut Srv) -> Result<String, String> {
+    use std::collections::{BTreeSet, HashMap, HashSet};
+    let mu = srv.mu.clone();
+    let mut d = srv.d.clone();
+    let mut cells = srv.cells.clone();
+    let mut changed: BTreeSet<String> = BTreeSet::new();
+    let leaf = |s: &str| Leaf::S(s.to_string());
+    // Does ANY rule's body read the named cell? ruleReads rows are
+    // ⟨rule id, read cell⟩; the two mirror blocks below quantify over all
+    // rules, so a flat scan answers exactly Python's any() over its map.
+    let reads_rows = pop_rows(&cells, &leaf("ruleReads"));
+    let any_reads = |target: &str| {
+        reads_rows.iter().any(|r| {
+            let it = items(&list_of(r));
+            it.len() >= 2
+                && matches!(aval(&it[1]).as_deref(), Some(Leaf::S(s)) if s == target)
+        })
+    };
+    // THE INSTANCE MIRROR (engine.py proposal B): when any rule reads
+    // Resource_is_instance_of_Noun and that cell is EMPTY, derive it fresh
+    // from the role facts and the noun kinds: every id playing one of a
+    // noun's roles is an instance of that noun. Asserted rows win; the
+    // mirror serves only the empty cell.
+    const MIRROR: &str = "Resource_is_instance_of_Noun";
+    if any_reads(MIRROR) {
+        let mut nouns: HashSet<String> = HashSet::new();
+        for r in pop_rows(&cells, &leaf("instanceOf")) {
+            let it = items(&list_of(&r));
+            if it.len() >= 2
+                && matches!(aval(&it[1]).as_deref(), Some(Leaf::S(s)) if s == "ObjectType")
+            {
+                nouns.insert(key_of(&it[0]));
+            }
+        }
+        // group the role rows ⟨role id, fact type, position, player⟩ by
+        // fact type, in first-appearance order like the Python dict; a
+        // position outside the int leaves its row out (Python would have
+        // faulted on it, and the resident must not)
+        let mut order: Vec<V> = Vec::new();
+        let mut groups: HashMap<String, Vec<(usize, V)>> = HashMap::new();
+        for r in pop_rows(&cells, &leaf("role")) {
+            let it = items(&list_of(&r));
+            if it.len() >= 4 {
+                if let Some(Leaf::I(p)) = aval(&it[2]).as_deref() {
+                    if *p >= 1 {
+                        let k = key_of(&it[1]);
+                        if !groups.contains_key(&k) {
+                            order.push(it[1].clone());
+                        }
+                        groups.entry(k).or_default().push((*p as usize, it[3].clone()));
+                    }
+                }
+            }
+        }
+        let mut out: Vec<V> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for ft in &order {
+            let grp = &groups[&key_of(ft)];
+            let mut ft_rows: Option<Vec<V>> = None;
+            for (p, player) in grp {
+                if nouns.contains(&key_of(player)) {
+                    if ft_rows.is_none() {
+                        // the fact type name addresses its own cell
+                        let name = match aval(ft) {
+                            Some(l) => (*l).clone(),
+                            None => continue,
+                        };
+                        ft_rows = Some(pop_rows(&cells, &name));
+                    }
+                    for row in ft_rows.as_ref().unwrap() {
+                        let rit = items(&list_of(row));
+                        if rit.len() >= *p {
+                            let pair =
+                                seq(from_vec(vec![rit[*p - 1].clone(), player.clone()]));
+                            if seen.insert(key_of(&pair)) {
+                                out.push(pair);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !out.is_empty() && pop_rows(&cells, &leaf(MIRROR)).is_empty() {
+            sort_rows(&mut out);
+            store_into(&mut d, &mut cells, &leaf(MIRROR), seq(from_vec(out)));
+            changed.insert(MIRROR.to_string());
+        }
+    }
+    // THE ROLE MIRROR: Fact_Type_has_Role derives from the role M-facts the
+    // same way (the role facts ARE the knowledge); only the empty cell fills.
+    const FTR: &str = "Fact_Type_has_Role";
+    if any_reads(FTR) {
+        let mut out: Vec<V> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for r in pop_rows(&cells, &leaf("role")) {
+            let it = items(&list_of(&r));
+            if it.len() >= 2 {
+                let pair = seq(from_vec(vec![it[1].clone(), it[0].clone()]));
+                if seen.insert(key_of(&pair)) {
+                    out.push(pair);
+                }
+            }
+        }
+        if !out.is_empty() && pop_rows(&cells, &leaf(FTR)).is_empty() {
+            sort_rows(&mut out);
+            store_into(&mut d, &mut cells, &leaf(FTR), seq(from_vec(out)));
+            changed.insert(FTR.to_string());
+        }
+    }
+    // the rule table: ruleDerives rows ⟨rule id, head cell⟩ in cell order,
+    // minus the aggregate rules (ruleAgg names them; their stratum is owed
+    // to a later phase)
+    let mut aggids: HashSet<String> = HashSet::new();
+    for r in pop_rows(&cells, &leaf("ruleAgg")) {
+        let it = items(&list_of(&r));
+        if !it.is_empty() {
+            aggids.insert(key_of(&it[0]));
+        }
+    }
+    let mut rules: Vec<(Leaf, Leaf)> = Vec::new();
+    for r in pop_rows(&cells, &leaf("ruleDerives")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 && !aggids.contains(&key_of(&it[0])) {
+            if let (Some(rid), Some(head)) = (aval(&it[0]), aval(&it[1])) {
+                rules.push(((*rid).clone(), (*head).clone()));
+            }
+        }
+    }
+    // the naive loop: every round evaluates every rule's full body against
+    // the CURRENT store (a head stored mid-round is visible to the next
+    // rule, exactly as Python threads D through its round), unions the new
+    // rows into the head cell, and stops when a full round adds nothing
+    let mut rounds: i64 = 0;
+    loop {
+        rounds += 1;
+        let mut fired = false;
+        for (rid, head) in &rules {
+            let res = reduce_in(&mu, &cells, &d, atom(rid.clone()), d.clone(), None);
+            let outs = match shape(&res) {
+                Shape::Seq(l) => items(&l),
+                // the rule is not compiled (M-facts only) or bottomed: skip it
+                _ => continue,
+            };
+            let old = pop_rows(&cells, head);
+            let mut merged: Vec<V> = Vec::new();
+            let mut keys: HashSet<String> = HashSet::new();
+            for r in &old {
+                if keys.insert(key_of(r)) {
+                    merged.push(r.clone());
+                }
+            }
+            let before = merged.len();
+            for r in outs {
+                // only sequence rows count, as Python keeps only tuples
+                if !matches!(shape(&r), Shape::Seq(_)) {
+                    continue;
+                }
+                if keys.insert(key_of(&r)) {
+                    merged.push(r);
+                }
+            }
+            if merged.len() > before {
+                sort_rows(&mut merged);
+                store_into(&mut d, &mut cells, head, seq(from_vec(merged)));
+                fired = true;
+                changed.insert(leaf_text(head));
+            }
+        }
+        if !fired {
+            break;
+        }
+    }
+    // REPLACE the retained store with the fixpoint, the retain protocol's
+    // commit: d and its cell index move together (the native-carrier mirror
+    // refreshes on the next store ingestion, exactly as a retained case)
+    srv.d = d;
+    srv.cells = cells;
+    let mut r = String::from("{\"rounds\":");
+    r.push_str(&rounds.to_string());
+    r.push_str(",\"changed\":[");
+    for (i, name) in changed.iter().enumerate() {
+        if i > 0 {
+            r.push(',');
+        }
+        esc(name, &mut r);
+    }
+    r.push_str("]}");
+    Ok(r)
 }
 
 fn op_ok(op: &str, result: &str) -> String {
@@ -1617,7 +1963,7 @@ fn op_err(op: &str, msg: &str) -> String {
     s
 }
 
-fn handle_op(op: &str, j: &J, srv: &Srv) -> String {
+fn handle_op(op: &str, j: &J, srv: &mut Srv) -> String {
     match op_answer(op, j, srv) {
         Ok(r) => op_ok(op, &r),
         Err(m) => op_err(op, &m),
@@ -1627,8 +1973,9 @@ fn handle_op(op: &str, j: &J, srv: &Srv) -> String {
 // op_answer computes a verb's bare answer from the request object; the serve
 // loop wraps it in the {"op", "result"|"error"} envelope (handle_op) and the
 // MCP binding wraps it in the tools/call content envelope, so both surfaces
-// serve the ONE resident op table.
-fn op_answer(op: &str, j: &J, srv: &Srv) -> Result<String, String> {
+// serve the ONE resident op table. The store is mutable because run_rules
+// REPLACES the retained store with its fixpoint; the read ops leave it alone.
+fn op_answer(op: &str, j: &J, srv: &mut Srv) -> Result<String, String> {
     let fuel = match jget(j, "fuel") {
         Some(J::I(n)) if *n > 0 => Some(*n),
         _ => None,
@@ -1733,13 +2080,20 @@ fn op_answer(op: &str, j: &J, srv: &Srv) -> Result<String, String> {
             r.push('}');
             Ok(r)
         }
+        "run_rules" => {
+            // the derivation fixpoint over the retained store (phase one:
+            // the naive positive-rule closure); the answer names the rounds
+            // and the head cells that gained rows, and the retained store is
+            // REPLACED by the derived result
+            op_run_rules(srv)
+        }
         _ => {
             if SESSION_VERBS.contains(&op) || APP_VERBS.contains(&op) {
                 Err("verb needs the apps registry (host-side); resident ops: \
-                     cells, query, synthesize_pairs, verbs".to_string())
+                     cells, query, run_rules, synthesize_pairs, verbs".to_string())
             } else {
-                Err("unknown op; resident ops: cells, query, synthesize_pairs, verbs"
-                    .to_string())
+                Err("unknown op; resident ops: cells, query, run_rules, \
+                     synthesize_pairs, verbs".to_string())
             }
         }
     }
@@ -1791,6 +2145,9 @@ const MCP_TOOLS: &str = concat!(
     r#"{"name":"synthesize","#,
     r#""description":"Answers an entity's facts paired with their fact types' reading templates; the caller words the prose.","#,
     r#""inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},"#,
+    r#"{"name":"derive","#,
+    r#""description":"Runs the derivation rules over the retained store to the least fixed point and answers the rounds and the changed head cells.","#,
+    r#""inputSchema":{"type":"object","properties":{}}},"#,
     r#"{"name":"apply","#,
     r#""description":"Delegates one fact-row commit to the Python compiler host and answers its receipt; a refused write answers committed false with the violations.","#,
     r#""inputSchema":{"type":"object","properties":{"app":{"type":"string"},"fact_type":{"type":"string"},"fact":{"type":"array","items":{"type":"string"}}},"required":["app","fact_type","fact"]}},"#,
@@ -2116,6 +2473,17 @@ fn mcp_call(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Result<Stri
             }
             // The MCP arguments object IS the op request body.
             op_answer(tool, args, srv).map_err(|m| (-32602, m))
+        }
+        "derive" => {
+            if apps.current.is_none() {
+                return Err((-32602, format!("no app loaded; call apps_use before {}", tool)));
+            }
+            // derive is the run_rules op under the daily driver's tool name:
+            // the naive fixpoint runs natively over the retained store and
+            // replaces it in place. The sidecar stays untouched (a compiled
+            // sidecar is already at the fixpoint, and the delegated writes
+            // keep rewriting it through the Python host).
+            op_answer("run_rules", args, srv).map_err(|m| (-32602, m))
         }
         _ => Err((-32601, format!("unknown tool {:?}", tool))),
     }

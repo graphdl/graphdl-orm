@@ -110,7 +110,7 @@ fn mcp_mode_serves_the_apps_registry_over_stdio() {
     let r = c.rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
     assert!(r.contains(r#""id":2"#), "the notification must produce no line: {r}");
     for tool in ["orient", "apps_list", "apps_current", "apps_use", "query", "cells",
-                 "synthesize", "apply", "retract", "apps_compile",
+                 "synthesize", "derive", "apply", "retract", "apps_compile",
                  "get", "schema", "sql", "explain", "validate", "verify", "actions"] {
         assert!(r.contains(&format!(r#""name":"{tool}""#)), "missing tool {tool}: {r}");
     }
