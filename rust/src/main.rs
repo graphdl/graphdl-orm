@@ -2929,7 +2929,7 @@ const MCP_TOOLS: &str = concat!(
     r#""description":"Runs the derivation rules over the retained store to the least fixed point and answers the rounds and the changed head cells; changed optionally bounds round one to the rules reading those cells.","#,
     r#""inputSchema":{"type":"object","properties":{"changed":{"type":"array","items":{"type":"string"}}}}},"#,
     r#"{"name":"apply","#,
-    r#""description":"Delegates one fact-row commit to the Python compiler host and answers its receipt; a refused write answers committed false with the violations.","#,
+    r#""description":"Commits one fact row (eq. create) and answers its receipt: an own-table fact type computes and persists natively in the resident, an absorbed fact type delegates to the Python compiler host; a refused write answers committed false with the violations.","#,
     r#""inputSchema":{"type":"object","properties":{"app":{"type":"string"},"fact_type":{"type":"string"},"fact":{"type":"array","items":{"type":"string"}}},"required":["app","fact_type","fact"]}},"#,
     r#"{"name":"retract","#,
     r#""description":"Delegates one fact-row retraction to the Python compiler host and answers its receipt; a refused retraction answers committed false with the violations.","#,
@@ -3195,6 +3195,190 @@ fn delegate_read(tool: &str, args: &J, apps: &Apps) -> Result<String, (i64, Stri
     Ok(r)
 }
 
+// append_event writes one committed step to the app's event log in
+// FileEventSink's format: a single line {"ft": <fact type>, "fact": [<row>..]}
+// at <app_dir>/<app>.events.jsonl, byte for byte the json.dumps(entry) + "\n"
+// the Python sink appends (the default separators carry the ", " and ": "
+// spaces). The log is the durable source of truth a recompile replays through
+// the same create, so a native write lands in the same stream the delegated
+// write does, and a mixed history replays clean.
+fn append_event(apps: &Apps, app: &str, ft: &str, fact: &[J]) -> std::io::Result<()> {
+    use std::io::Write;
+    let path = apps.dir.join(app).join(format!("{}.events.jsonl", app));
+    let mut line = String::from("{\"ft\": ");
+    esc(ft, &mut line);
+    line.push_str(", \"fact\": [");
+    for (i, e) in fact.iter().enumerate() {
+        if i > 0 {
+            line.push_str(", ");
+        }
+        write_j(e, &mut line);
+    }
+    line.push_str("]}\n");
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+    f.write_all(line.as_bytes())
+}
+
+// write_sidecar refreshes the app's store sidecar with the retained store,
+// Registry._sidecar's payload: {"d": <store>, "process": [[name, obj]..],
+// "overrides": 1, "cases": []}. The d field is the whole retained store; the
+// process field is the resident's compiled defs, unchanged across a write, so
+// it re-serializes what apps_use loaded (write_n is j_to_n's inverse, so a
+// fresh boot reconstructs the same process table). The write is
+// tmp-then-rename, so a concurrent reader never sees a torn file, exactly as
+// _sidecar's os.replace. A fresh resident boots this file through the same
+// ingestion apps_use takes, so the native write is durable to the resident.
+fn write_sidecar(apps: &Apps, app: &str, srv: &Srv) -> std::io::Result<()> {
+    let mut payload = String::from("{\"d\":");
+    write_v(&srv.d, &mut payload);
+    payload.push_str(",\"process\":[");
+    for (i, (name, obj)) in srv.nprocess.iter().enumerate() {
+        if i > 0 {
+            payload.push(',');
+        }
+        payload.push('[');
+        esc(name, &mut payload);
+        payload.push(',');
+        write_n(obj, &mut payload);
+        payload.push(']');
+    }
+    payload.push_str("],\"overrides\":1,\"cases\":[]}");
+    let path = apps.sidecar(app);
+    let mut tmp = path.clone().into_os_string();
+    tmp.push(".tmp"); // <app>.store.json.tmp, matching _sidecar's path + ".tmp"
+    let tmp = std::path::PathBuf::from(tmp);
+    std::fs::write(&tmp, payload.as_bytes())?;
+    std::fs::rename(&tmp, &path)
+}
+
+// native_apply is the resident's own write path for an OWN-TABLE fact type: the
+// fact type carries a create:<ft> handler cell (engine.py create_handlers
+// stores one per own-table fact type; an absorbed fact type has none, phase
+// two), so the resident computes the create in process instead of delegating
+// to the Python CLI. It reduces that handler over the pair of the fact and the
+// retained store through the resident's own evaluator — the same
+// apply(handler, ⟨fact, D⟩) under D's DEFS that engine.py's ast.run reduces —
+// extracts the receipt exactly as protocol.py Registry.apply does (committed
+// iff the representation is not the ERROR atom and D' differs from D, the
+// violation set read from the representation's second part), and on a commit
+// retains D', runs the native derive bounded to the written fact type, and
+// persists natively (the event log line and the refreshed store sidecar). It
+// answers None to fall back to CLI delegation when the fact type is absorbed
+// (no handler cell), when the target app is not the retained one, or when the
+// reduction does not yield a proper ⟨representation, D'⟩ pair — the bare-ERROR
+// refusal, where Python re-runs validate for the offenders, stays the
+// delegate's job.
+fn native_apply(args: &J, apps: &Apps, srv: &mut Srv) -> Option<Result<String, (i64, String)>> {
+    // the target app must be the retained store; a write to any other app
+    // delegates, exactly as the delegated path only reloads the current app
+    let app = match jget(args, "app") {
+        Some(J::S(a)) => a.clone(),
+        _ => return None,
+    };
+    if apps.current.as_deref() != Some(app.as_str()) {
+        return None;
+    }
+    let ft = match jget(args, "fact_type") {
+        Some(J::S(f)) => f.clone(),
+        _ => return None,
+    };
+    let fact = match jget(args, "fact") {
+        Some(J::A(xs)) => xs.clone(),
+        _ => return None,
+    };
+    // OWN-TABLE iff a create:<ft> handler cell is present (create_handlers
+    // stores it for own-table fact types only); its absence is the absorbed
+    // case, which delegates
+    let cell_name = Leaf::S(format!("create:{}", ft));
+    let handler = match srv.cells.iter().find(|(k, _)| k.nateq(&cell_name)) {
+        Some((_, c)) => c.clone(),
+        None => return None,
+    };
+    // the operand ⟨fact_as_v, D⟩: the fact a sequence of atoms paired with the
+    // retained store, exactly the ⟨input_fact, D⟩ ast.run reduces
+    let fact_v = seq(from_vec(fact.iter().map(to_v).collect()));
+    let operand = seq(from_vec(vec![fact_v, srv.d.clone()]));
+    // reduce apply(handler, ⟨fact, D⟩) under D's DEFS (the frame carries the
+    // store's cells and D, Backus 14.6), then apply the transition rule: a
+    // result that is not a two-part pair is the ERROR case (engine.py
+    // _transition), which delegates so validate_for names the offenders
+    let res = reduce_over(srv, handler, operand, None);
+    let it = items(&list_of(&res));
+    if it.len() != 2 {
+        return None;
+    }
+    let o = it[0].clone();
+    let d2 = it[1].clone();
+    // the bare ERROR atom (an alethic refusal answering the atom, or an
+    // authorization refusal) has no ⟨P'', V⟩ to read; Python re-runs validate
+    // for the receipt's offenders, so this path delegates
+    if matches!(aval(&o), Some(l) if matches!(&*l, Leaf::S(s) if s == "ERROR")) {
+        return None;
+    }
+    // committed iff the store changed (a refused own-table step, e.g. a
+    // duplicate the population already holds, answers D' == D)
+    let refused = eqobj(&d2, &srv.d);
+    // the violation set is the representation's second part (o = ⟨P'', V⟩); a
+    // committed step carries the empty V (φ), read as []
+    let mut violations: Vec<V> = Vec::new();
+    if let Shape::Seq(_) = shape(&o) {
+        let oi = items(&list_of(&o));
+        if oi.len() >= 2 {
+            if let Shape::Seq(_) = shape(&oi[1]) {
+                violations = items(&list_of(&oi[1]));
+            }
+        }
+    }
+    if !refused {
+        // retain D' as the resident store, then run the native derive bounded
+        // to the written fact type (Registry.apply's run_rules(D2,
+        // changed=[ft])), which replaces the retained store with the fixpoint
+        srv.d = d2;
+        srv.cells = cells_of(&srv.d);
+        let derive_req = J::O(vec![("changed".to_string(), J::A(vec![J::S(ft.clone())]))]);
+        let _ = op_run_rules(&derive_req, srv);
+        // persist natively: the committed step to the event log, then the
+        // store sidecar refreshed so a fresh resident boots the written store
+        if let Err(e) = append_event(apps, &app, &ft, &fact) {
+            return Some(Err((
+                -32603,
+                format!("native apply committed but could not append the event log: {}", e),
+            )));
+        }
+        if let Err(e) = write_sidecar(apps, &app, srv) {
+            return Some(Err((
+                -32603,
+                format!("native apply committed but could not write the store sidecar: {}", e),
+            )));
+        }
+    }
+    // the receipt, protocol.py Registry.apply's shape and key order, compact
+    // like the delegated path (run_cli re-serializes the CLI receipt the same
+    // way through write_j)
+    let mut r = String::from("{\"app\":");
+    esc(&app, &mut r);
+    r.push_str(",\"fact_type\":");
+    esc(&ft, &mut r);
+    r.push_str(",\"fact\":[");
+    for (i, e) in fact.iter().enumerate() {
+        if i > 0 {
+            r.push(',');
+        }
+        write_j(e, &mut r);
+    }
+    r.push_str("],\"committed\":");
+    r.push_str(if refused { "false" } else { "true" });
+    r.push_str(",\"violations\":[");
+    for (i, v) in violations.iter().enumerate() {
+        if i > 0 {
+            r.push(',');
+        }
+        write_v(v, &mut r);
+    }
+    r.push_str("]}");
+    Some(Ok(r))
+}
+
 // A tool call answers its bare JSON, or a JSON-RPC error pair: -32601 names
 // an unknown tool and -32602 names invalid or unusable parameters.
 fn mcp_call(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Result<String, (i64, String)> {
@@ -3236,7 +3420,16 @@ fn mcp_call(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Result<Stri
             r.push_str(",\"ok\":true}");
             Ok(r)
         }
-        "apply" | "retract" | "apps_compile" => delegate_verb(tool, args, apps, srv),
+        // apply flips native for OWN-TABLE: a fact type carrying a create:<ft>
+        // handler cell computes and persists in process (native_apply); an
+        // absorbed fact type, a non-retained target app, or a bare-ERROR
+        // refusal answers None and falls through to the CLI delegate. retract
+        // and apps_compile still delegate whole.
+        "apply" => match native_apply(args, apps, srv) {
+            Some(res) => res,
+            None => delegate_verb(tool, args, apps, srv),
+        },
+        "retract" | "apps_compile" => delegate_verb(tool, args, apps, srv),
         // synthesize delegates for now: the canonical verbalize over the
         // daily driver's store reduces in minutes on this path where the
         // Python host's native twins answer in seconds (measured 2026-07-05
