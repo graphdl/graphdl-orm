@@ -1693,9 +1693,22 @@ def create(D, fact_type, fact, fuel=None, actor=None, operation="create"):
         allowed = {tuple(r) for r in _pop_rows(D, _AUTH_FT)}
         if (actor, operation, table) not in allowed:
             return _S(A("ERROR"), D)
-    row_col = None
-    if table != fact_type:
-        row_col = 2 + table_columns(part, table).index(fact_type)
+    return _create_from_spec(D, fact_type, fact, create_spec(D, fact_type, part), fuel)
+
+
+def create_spec(D, fact_type, part=None):
+    """The SCHEMA-determined create recipe for a fact type, stable across writes
+    (the goal: full native for every part but lambda and defs, so create is a def
+    the resident reduces, not host orchestration). Returns the objects and params
+    create computes MINUS the fact and its key: the routing (table, absorbed
+    column, width, unary), the value validate object, and the machine, mealy, and
+    links objects, each a canonical lambda tree or None. Stored as create:<ft> at
+    compile so any host builds the handler and reduces it natively on apply."""
+    if part is None:
+        part = rmap_partition(D)
+    table = part.get(fact_type, fact_type)
+    absorbed = table != fact_type
+    row_col = 2 + table_columns(part, table).index(fact_type) if absorbed else None
     machine = mealy = links = None
     if any(r[1] == fact_type for r in _pop_rows(D, "smTrigger")):
         noun = _governed_player(D, fact_type)
@@ -1704,16 +1717,38 @@ def create(D, fact_type, fact, fuel=None, actor=None, operation="create"):
                              if len(r) >= 4 and r[1] == fact_type and r[3] == noun), None)
             machine = (noun + "_status", machine_step(fact_type, row_col), role_pos)
             mealy = mealy_step(fact_type, row_col)
-            if table == fact_type and role_pos is not None:
-                # Thm. hateoas at the ORM level: the representation offers exactly the
-                # next transitions from the POST-step status, no caller wiring
+            if not absorbed and role_pos is not None:
                 from .lam import to_lam
                 links = transitions_of(to_lam(sm_triples(D)), 2)
-    if table != fact_type:
-        return create_routed(D, fact_type, fact, part, machine=machine, mealy_obj=mealy,
-                             validate_obj=row_validate(D, fact_type, part))
-    return ast.run(fact, D, cell_name=fact_type, machine=machine, mealy_obj=mealy,
-                   links_obj=links, fuel=fuel)
+    spec = {"table": table, "absorbed": absorbed,
+            "machine": machine, "mealy": mealy, "links": links}
+    if absorbed:
+        cols = table_columns(part, table)
+        spec["col"] = 2 + cols.index(fact_type)
+        spec["width"] = 1 + len(cols)
+        spec["unary"] = max((r[2] for r in _pop_rows(D, "role")
+                             if len(r) >= 3 and r[1] == fact_type), default=2) == 1
+        spec["validate"] = row_validate(D, fact_type, part)
+    return spec
+
+
+def _create_from_spec(D, fact_type, fact, spec, fuel=None):
+    """Build the create handler from the schema recipe and reduce it over the
+    fact: an own-table fact type writes its own cell; an absorbed one writes the
+    entity's cell table:key, the key read from the fact at write time (the one
+    fact-dependent piece, the dynamic store the resident computes)."""
+    from . import ast
+    from .lam import from_lam
+    machine, mealy = spec["machine"], spec["mealy"]
+    if not spec["absorbed"]:
+        return ast.run(fact, D, cell_name=fact_type, machine=machine,
+                       mealy_obj=mealy, links_obj=spec["links"], fuel=fuel)
+    key = from_lam(fact)[0]
+    resolve = row_resolve(spec["col"], spec["width"], spec["unary"])
+    return ast.run(fact, D, cell_name=f"{spec['table']}:{key}",
+                   resolve_obj=resolve, machine=machine, mealy_obj=mealy,
+                   validate_obj=spec["validate"], index_cell=spec["table"],
+                   append_cell=fact_type, fuel=fuel)
 
 
 def create_stamped(D, ft, fact, tx):
