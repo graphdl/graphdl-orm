@@ -1819,27 +1819,14 @@ def declare_sig(D, name, dom, cod):
 
 
 def checked_apply(name):
-    """The typed boundary application (Def. reg dom/cod): ⟨args, D⟩ applies registered
-    `name` iff every argument at a declared dom position is an instance of its object
-    type (membership in the type's index cell, read from D in-step), else the ERROR atom
-    the transition rule refuses (§14.3.1). Undeclared names apply unchecked (dom
-    unconstrained); a sig naming an absent type cell fails closed (⊥ → ERROR). cod is
-    declared at position 0 and enforced by the receiving cell's own constraints."""
-    from . import ast
-    named = _S(_CONST, A(name))
-    sig = _S(_COMP, T.Filter(_S(_COMP, A("gt"), _S(_CONS, A(2), _S(_CONST, A(0))))),
-             T.Filter(_S(_COMP, _EQ, _S(_CONS, _1, named))),
-             ast.FetchPop("defSig"), _2)
-    pairs = _S(_COMP, _DISTR, _S(_CONS, sig, _ID))           # ⟨⟨(n,p,t), ⟨args,D⟩⟩ …⟩
-    arg = _S(_COMP, A("apply"), _S(_CONS, _S(_COMP, A(2), _1), _S(_COMP, _1, _2)))
-    tpop = _S(_COMP, _S(_ALPHA, A(1)), ast.DynFetch(), _S(_CONS, _S(_COMP, A(3), _1),
-                                                          _S(_COMP, _2, _2)))
-    chk = _S(_COMP, T.member, _S(_CONS, arg, tpop))
-    checks = _S(_COMP, _S(_ALPHA, chk), pairs)
-    allok = _S(_COND, _S(_COMP, A("null"), checks), _S(_CONST, A("T")),
-               _S(_COMP, _S(_INSERT, A("and")), checks))
-    out = _S(_COMP, A("apply"), _S(_CONS, named, _1))
-    return _S(_COND, allok, out, _S(_CONST, A("ERROR")))
+    """The typed boundary application (Def. reg dom/cod): ⟨args, D⟩ applies
+    registered `name` iff every argument at a declared dom position is an
+    instance of its object type (membership in the type's index cell, read
+    from D in-step), else the ERROR atom the transition rule refuses
+    (§14.3.1). Undeclared names apply unchecked; a sig naming an absent type
+    cell fails closed. The canonical system:checked_apply applied to name."""
+    from .reduce import apply as _apply
+    return _apply(A("system:checked_apply"), A(name))
 
 
 def finiteness_check(D):

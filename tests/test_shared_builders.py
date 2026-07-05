@@ -296,3 +296,22 @@ def test_row_resolve_canonical_matches_the_python_builder():
     for case in (_S(_S(A("k1"), A("v1")), to_lam(("k1", "a", "#", "b"))),
                  _S(_S(A("k1"), A("v1")), to_lam(("k1", "a", "OTHER", "b")))):
         assert from_lam(_ap(canon, case)) == from_lam(_ap(py, case))
+
+
+def test_checked_apply_canonical_matches_the_python_builder():
+    # the typed boundary (Def. reg dom/cod), the last pipeline mover: apply
+    # iff every declared dom position holds an instance of its type, else the
+    # ERROR atom the transition rule refuses
+    from pyarest import system, ast, defs
+    from pyarest.reduce import apply as _apply
+    defs.define("double", _S(A("COMP"), A("+"),
+                             _S(A("CONS"), A(1), A(1))))
+    D = _apply(ast.Store("defSig"),
+               _S(to_lam((("double", 1, "Num"),)),
+                  _apply(ast.Store("Num"),
+                         _S(to_lam((("3",), ("4",))), to_lam(())))))
+    py = system.checked_apply("double")
+    canon = _apply(A("system:checked_apply"), A("double"))
+    for case in (_S(to_lam(("3",)), D), _S(to_lam(("9",)), D)):
+        assert from_lam(_apply(canon, case)) == from_lam(_apply(py, case))
+    assert from_lam(_apply(canon, _S(to_lam(("9",)), D))) == "ERROR"
