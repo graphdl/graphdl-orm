@@ -187,7 +187,15 @@ def replay(D, path):
     source of truth; set semantics make replay idempotent). A retract entry removes
     its row from the base population; derived rows recompute in the caller's
     run_rules pass after replay."""
-    for entry in read_log(path):
+    return replay_entries(D, read_log(path))
+
+
+def replay_entries(D, entries):
+    """Replay an event ENTRY LIST, sink-agnostic: the file sink reads them from
+    jsonl, a memory or broadcast sink from its own store. The event STREAM is an
+    interface (EventSink); reconstruction reads whatever the sink yields, never a
+    file path."""
+    for entry in entries:
         if entry.get("op") == "retract":
             ft = entry["ft"]
             row = _untuple(entry["fact"])
@@ -207,6 +215,80 @@ def replay(D, path):
             continue
         D = _ap(_A(2), system.create(D, entry["ft"], to_lam(_untuple(entry["fact"]))))
     return D
+
+
+# ============================ the event sink interface =======================
+# The event stream is an INTERFACE, not a file (Samuel, 2026-07-05: the jsonl
+# was an undesigned implementation choice). A committed step is APPENDED and the
+# stream is READ back for reconstruction, the Connector's two names, and the
+# implementation swaps by registration exactly like the rule engines, the
+# storage layer, and the UI: the file is one sink, and a broadcast Durable
+# Object (the arest tier), a memory buffer, or any backend is another.
+class EventSink:
+    """append(entry) commits one step to the stream; read() yields the entry
+    list for replay_entries. A refused step appends nothing (the caller only
+    logs a changed state), so the sink never sees non-events."""
+
+    def append(self, entry):
+        raise NotImplementedError
+
+    def read(self):
+        raise NotImplementedError
+
+
+class FileEventSink(EventSink):
+    """The default sink: newline-delimited JSON at <app_dir>/<app>.events.jsonl.
+    One implementation of the interface; the format is not the design."""
+
+    def __init__(self, app_dir, app_name):
+        self.path = os.path.join(app_dir, f"{app_name}.events.jsonl")
+
+    def append(self, entry):
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def read(self):
+        return read_log(self.path)
+
+
+class MemoryEventSink(EventSink):
+    """An ephemeral process-global sink, per app name: the event stream with no
+    disk (tests, transient apps, and the model for a broadcast sink that keeps
+    its own store)."""
+
+    _store = {}
+
+    def __init__(self, app_dir, app_name):
+        self.app = app_name
+        MemoryEventSink._store.setdefault(app_name, [])
+
+    def append(self, entry):
+        MemoryEventSink._store.setdefault(self.app, []).append(entry)
+
+    def read(self):
+        return list(MemoryEventSink._store.get(self.app, []))
+
+    @classmethod
+    def clear(cls):
+        cls._store.clear()
+
+
+# name -> factory(app_dir, app_name) -> EventSink; register to swap the stream,
+# the same discipline as defs.register for the rule-engine overrides
+_EVENT_SINKS = {"file": FileEventSink, "memory": MemoryEventSink}
+
+
+def register_event_sink(name, factory):
+    """Bind an event-sink implementation under `name`; a registry selects it by
+    name (Registry.event_sink), so swapping the stream is one registration."""
+    _EVENT_SINKS[name] = factory
+
+
+def resolve_event_sink(name, app_dir, app_name):
+    """The active sink for an app: the registered factory applied to the app's
+    directory and name. Unknown names fall back to the file sink."""
+    factory = _EVENT_SINKS.get(name, FileEventSink)
+    return factory(app_dir, app_name)
 
 
 # =====================================================================
@@ -798,13 +880,11 @@ def replay_into(registry, app, old_db):
     registry.compile(app)
     D = registry._load(app)
     p = plan(D, read_cells(old_db))
-    log = os.path.join(registry._app_dir(app), f"{app}.events.jsonl")
-    with open(log, "a", encoding="utf-8") as f:
-        for ft, rows in sorted(p["asserted"].items()):
-            if rows:
-                f.write(json.dumps({"op": "migrate", "ft": ft,
-                                    "facts": [list(r) for r in rows]},
-                                   ensure_ascii=False) + "\n")
+    sink = registry._sink(app)                                # the event stream, not a file
+    for ft, rows in sorted(p["asserted"].items()):
+        if rows:
+            sink.append({"op": "migrate", "ft": ft,
+                         "facts": [list(r) for r in rows]})
     registry.compile(app)
     D = registry._load(app)
     verify = {}
@@ -1140,10 +1220,17 @@ class Registry:
         self.base_dir = base_dir
         self.cache_dir = cache_dir
         self.last_receipt = None                              # the context tool replays it
+        self.event_sink = "file"                              # the active sink name; swap it
 
     # ---- inventory ----
     def _app_dir(self, name):
         return os.path.join(self.root, name)
+
+    def _sink(self, name):
+        """The app's event sink, resolved by the active name (default file):
+        the event stream is an interface, so a registry can serve a broadcast
+        or memory sink instead by setting event_sink."""
+        return persist.resolve_event_sink(self.event_sink, self._app_dir(name), name)
 
     def _db(self, name):
         return os.path.join(self._app_dir(name), f"{name}.db")
@@ -1215,10 +1302,12 @@ class Registry:
         D, rep = forml.compile_model("\n\n".join(texts), D=base,
                                      context_from=base)
         D = system.run_rules(D)
-        # the event log replays through the SAME create (facts are the source of
-        # truth; the .db is disposable, set semantics make replay idempotent)
-        if os.path.exists(self._log(name)):
-            D = persist.replay(D, self._log(name))
+        # the event stream replays through the SAME create (facts are the source
+        # of truth; the .db is disposable, set semantics make replay idempotent),
+        # read from whatever sink the registry holds, never a file path
+        entries = self._sink(name).read()
+        if entries:
+            D = persist.replay_entries(D, entries)
             D = system.run_rules(D)
         D = system.layout_cells(D)
         D = system.generator_cells(D)
@@ -1287,9 +1376,7 @@ class Registry:
             violations = [list(x) if isinstance(x, tuple) else [x] for x in v]
         if not refused:
             D2 = system.run_rules(D2, changed=[fact_type])
-            with open(self._log(name), "a", encoding="utf-8") as f:
-                f.write(json.dumps({"ft": fact_type, "fact": list(row)},
-                                   ensure_ascii=False) + "\n")
+            self._sink(name).append({"ft": fact_type, "fact": list(row)})
             persist.save_sqlite(D2, self._db(name))
             self._sidecar(name, D2)
         receipt = {"app": name, "fact_type": fact_type, "fact": list(row),
@@ -1328,9 +1415,8 @@ class Registry:
                                       for x in v]}
             self.last_receipt = receipt
             return receipt
-        with open(self._log(name), "a", encoding="utf-8") as f:
-            f.write(json.dumps({"op": "retract", "ft": fact_type,
-                                "fact": list(row)}, ensure_ascii=False) + "\n")
+        self._sink(name).append({"op": "retract", "ft": fact_type,
+                                 "fact": list(row)})
         self.compile(name)                                    # rebuild: log applied
         receipt = {"app": name, "fact_type": fact_type, "fact": list(row),
                    "committed": True, "violations": []}
