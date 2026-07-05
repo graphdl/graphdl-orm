@@ -301,59 +301,47 @@ def uniqueness(roles):
 
 
 def ring_irreflexive(roles=(1, 2)):
-    """Irreflexive ring on a binary fact type: no x relates to itself. V = the ⟨x,x⟩ facts."""
-    r1, r2 = A(roles[0]), A(roles[1])
-    return T.Filter(_S(_COMP, _EQ, _S(_CONS, r1, r2)))
+    """Irreflexive ring on a binary fact type: no x relates to itself. V = the
+    ⟨x,x⟩ facts. The canonical constraints:ring_irreflexive applied to roles."""
+    from .reduce import apply as _apply
+    return _apply(A("constraints:ring_irreflexive"), to_lam(tuple(roles)))
 
 
 def ring_symmetric(roles=(1, 2)):
-    """Symmetric ring: x R y ⟹ y R x. V = the ⟨x,y⟩ (x≠y) whose reverse ⟨y,x⟩ is absent from P.
-        α(1) ∘ Filter(x≠y ∧ ⟨y,x⟩∉P) ∘ distr ∘ [id, id]"""
-    r1, r2 = A(roles[0]), A(roles[1])
-    fx, fy = _S(_COMP, r1, _1), _S(_COMP, r2, _1)            # x, y of the fact (1:pair)
-    swap = _S(_CONS, fy, fx)                                 # ⟨y, x⟩
-    swap_absent = _S(_COMP, _NOT, T.member, _S(_CONS, swap, _2))   # ⟨y,x⟩ ∉ P
-    neq = _S(_COMP, _NOT, _EQ, _S(_CONS, fx, fy))            # x ≠ y
-    viol = _S(_COMP, _AND, _S(_CONS, neq, swap_absent))
-    return _S(_COMP, _S(_ALPHA, _1), T.Filter(viol), _DISTR, _S(_CONS, _ID, _ID))
+    """Symmetric ring: x R y implies y R x. V = the ⟨x,y⟩ (x≠y) whose reverse is
+    absent from P. The canonical constraints:ring_symmetric applied to roles."""
+    from .reduce import apply as _apply
+    return _apply(A("constraints:ring_symmetric"), to_lam(tuple(roles)))
 
 
 def ring_asymmetric(roles=(1, 2)):
-    """Asymmetric ring (Halpin §7.3): xRy → ¬yRx, with x and y not necessarily distinct,
-    so reflexive pairs violate too (asymmetric = antisymmetric + irreflexive). V = the
-    facts whose swap is also in P."""
-    r1, r2 = A(roles[0]), A(roles[1])
-    fx, fy = _S(_COMP, r1, _1), _S(_COMP, r2, _1)
-    swap = _S(_CONS, fy, fx)
-    viol = _S(_COMP, T.member, _S(_CONS, swap, _2))
-    return _S(_COMP, _S(_ALPHA, _1), T.Filter(viol), _DISTR, _S(_CONS, _ID, _ID))
+    """Asymmetric ring (Halpin §7.3): xRy implies not yRx, reflexive pairs
+    violating too. The canonical constraints:ring_asymmetric applied to roles."""
+    from .reduce import apply as _apply
+    return _apply(A("constraints:ring_asymmetric"), to_lam(tuple(roles)))
 
 
 def ring_antisymmetric(roles=(1, 2)):
-    """Antisymmetric ring (§7.3): x ≠ y & xRy → ¬yRx. Reflexive pairs are allowed."""
-    r1, r2 = A(roles[0]), A(roles[1])
-    fx, fy = _S(_COMP, r1, _1), _S(_COMP, r2, _1)
-    swap_in = _S(_COMP, T.member, _S(_CONS, _S(_CONS, fy, fx), _2))
-    neq = _S(_COMP, _NOT, _EQ, _S(_CONS, fx, fy))
-    viol = _S(_COMP, _AND, _S(_CONS, neq, swap_in))
-    return _S(_COMP, _S(_ALPHA, _1), T.Filter(viol), _DISTR, _S(_CONS, _ID, _ID))
+    """Antisymmetric ring (Halpin §7.3): x ≠ y & xRy implies not yRx; reflexive
+    pairs allowed. The canonical constraints:ring_antisymmetric applied to roles."""
+    from .reduce import apply as _apply
+    return _apply(A("constraints:ring_antisymmetric"), to_lam(tuple(roles)))
 
 
 def ring_intransitive(roles=(1, 2)):
-    """Intransitive ring (§7.3): xRy & yRz → ¬xRz. V = the facts of P that complete a
-    two-step chain, i.e. P ∩ π₁₃(P ⋈ P)."""
-    chains = _S(_COMP, T.Project([1, 3]), T.NatJoin(2), _S(_CONS, _ID, _ID))
-    in_chains = _S(_COMP, T.member, _S(_CONS, _1, _2))       # ⟨t, chains⟩ → t ∈ chains
-    return _S(_COMP, _S(_ALPHA, _1), T.Filter(in_chains), _DISTR, _S(_CONS, _ID, chains))
+    """Intransitive ring (Halpin §7.3): xRy & yRz implies not xRz. V = P joined
+    with its two-step chains. The canonical constraints:ring_intransitive."""
+    from .reduce import apply as _apply
+    return _apply(A("constraints:ring_intransitive"), to_lam(tuple(roles)))
 
 
 def ring_acyclic(roles=(1, 2)):
-    """Acyclic ring (§7.3): "no path via the relation from an object back to itself".
-    V = the reflexive pairs of the transitive closure, the closure computed by the same
-    derive lfp that serves derivation rules (per Mapping ORM to Datalog)."""
-    from . import system as _sys
-    tc = _sys.derive_of([_sys.join_rule(2, [1, 3])])
-    return _S(_COMP, T.Filter(_S(_COMP, _EQ, _S(_CONS, _1, _2))), tc)
+    """Acyclic ring (§7.3): no path via the relation from an object back to
+    itself. V = the reflexive pairs of the transitive closure, the closure the
+    canonical system:derive_of computes (per Mapping ORM to Datalog). The
+    canonical constraints:ring_acyclic."""
+    from .reduce import apply as _apply
+    return _apply(A("constraints:ring_acyclic"), to_lam(tuple(roles)))
 
 
 def frequency(roles, lo=None, hi=None):
@@ -887,25 +875,23 @@ def compile_rule_delta(atom_fts, head_positions, delta_at, widths=None, filters=
 
 
 def class_rule(clauses, head_const):
-    """A grammar recognizer as one FFP object over D (the parser is the file): each
-    clause ⟨field_ft, literal-or-None⟩ selects the Statements whose field cell holds
-    the literal (or holds anything, when literal-less — the existence test); clauses
-    intersect; the head pairs each surviving Statement with the constant
-    classification."""
-    from . import ast
-
-    def subj(ftb, lit):
-        pop = ast.FetchPop(ftb)
-        if lit is not None:
-            pop = _S(_COMP, T.Filter(_S(_COMP, _EQ, _S(_CONS, A(2), _S(_CONST, A(lit))))), pop)
-        return _S(_COMP, _S(_ALPHA, A(1)), pop)
-
-    s = subj(*clauses[0])
-    for (ftb, lit) in clauses[1:]:
-        keep = _S(_COMP, T.member, _S(_CONS, _1, _2))
-        s = _S(_COMP, _S(_ALPHA, _1), T.Filter(keep), _DISTR, _S(_CONS, s, subj(ftb, lit)))
-    row = _S(_CONS, _ID, _S(_CONST, A(head_const)))
-    return _S(_COMP, _S(_ALPHA, row), T.dedup, s)
+    """A grammar recognizer as one FFP object over D (the parser is the file):
+    each clause ⟨field_ft, literal-or-None⟩ selects the Statements whose field
+    cell holds the literal (or holds anything); clauses intersect; the head
+    pairs survivors with the classification constant. The canonical
+    system:class_rule applied to ⟨clauses-with-pred-trees, head⟩; a literal
+    becomes the eq-predicate data tree here (the canonical form is the more
+    general one: any predicate over the field row)."""
+    from .reduce import apply as _apply
+    cl = []
+    for (ftb, lit) in clauses:
+        if lit is None:
+            cl.append(_S(A(ftb), _S()))
+        else:
+            pred = _S(_COMP, _EQ, _S(_CONS, A(2), _S(_CONST, A(lit))))
+            cl.append(_S(A(ftb), pred))
+    return _apply(A("system:class_rule"),
+                  _S(_S(*cl), A(head_const)))
 
 
 def compile_agg_rule(atom_fts, group_positions, over_position, op,
@@ -1009,9 +995,18 @@ def run_rules(D, changed=None, stats=None):
                     for _mrow in _mrows:
                         if len(_mrow) >= _mpos:
                             _mout.add((_mrow[_mpos - 1], _mplayer))
-        if _mout:
-            _mout |= {tuple(r) for r in _pop_rows(D, _MIRROR)}
+        if _mout and not _pop_rows(D, _MIRROR):
+            # asserted wins: a model carrying its own membership rows keeps
+            # them untouched; the mirror serves only the empty cell (the
+            # post-migration world, where no reflection row ever lands)
             D = _ap(ast.Store(_MIRROR), _S(to_lam(_rowsort(_mout)), D))
+    _FTR = "Fact_Type_has_Role"
+    if any(_FTR in rs for rs in reads.values()):
+        # the same principle for the role mirror (verdict fourteen's lesson:
+        # the arity rule counts it): the role M-facts ARE the knowledge
+        _frows = {(r[1], r[0]) for r in _pop_rows(D, "role") if len(r) >= 2}
+        if _frows and not _pop_rows(D, _FTR):
+            D = _ap(ast.Store(_FTR), _S(to_lam(_rowsort(_frows)), D))
     for r in _pop_rows(D, "ruleAtom"):
         if len(r) >= 3:
             atomsof.setdefault(r[0], []).append((r[1], r[2]))
@@ -1463,28 +1458,19 @@ def create_routed(D, ft, fact, partition, machine=None, mealy_obj=None, validate
 
 
 def ft_view(D, ft, partition):
-    """Reassemble an absorbed fact type's ⟨key, value⟩ population from the entity cells:
-    a θ₁ expression over ⟨index, D⟩ pairing each key with its row's column through the
-    dynamic fetch and the cellkey op, then dropping the # holes. An own-table fact type
-    reads its own cell."""
+    """Reassemble an absorbed fact type's ⟨key, value⟩ population from the
+    entity cells, through the same canonical expression the pipeline reads
+    (system:ftpop_absorbed via ftpop_expr); an own-table fact type reads its
+    own cell. Unary fact types reshape their boolean column back host-side."""
     from . import ast
     from .reduce import apply as _ap
     from .lam import from_lam
-    from . import canon as T
     table = partition.get(ft, ft)
     if table == ft:
         return set(from_lam(_ap(ast.FetchPop(ft), D)))
-    col = 2 + table_columns(partition, table).index(ft)
     unary = max((r[2] for r in _pop_rows(D, "role") if len(r) >= 3 and r[1] == ft),
                 default=2) == 1
-    key = _S(_COMP, _1, _1)                                  # of ⟨⟨key⟩, D⟩: the key scalar
-    name = _S(_COMP, A("cellkey"), _S(_CONS, _S(_CONST, A(table)), key))
-    row = _S(_COMP, ast.DynFetch(), _S(_CONS, name, _2))
-    pair = _S(_CONS, key, _S(_COMP, A(col), row))
-    nonhole = _S(_COMP, A("not"), _EQ, _S(_CONS, A(2), _S(_CONST, A("#"))))
-    expr = _S(_COMP, T.Filter(nonhole), _S(_ALPHA, pair), _DISTR)
-    idx = _ap(ast.FetchPop(table), D)
-    pairs = set(from_lam(_ap(expr, _S(idx, D))))
+    pairs = set(from_lam(_ap(ftpop_expr(ft, partition), D)))
     if unary:
         return {(k,) for (k, v) in pairs if v == "T"}         # the boolean column, back
     return pairs
@@ -1722,26 +1708,18 @@ def step_and_wake(D, fact_type, fact):
 
 
 def ftpop_expr(ft, partition):
-    """The fact type's population as one FFP expression over D, whatever the layout:
-    an own-table fact type reads its cell; an absorbed one reassembles ⟨key, value⟩
-    through the index and the dynamic fetch (ft_view's expression, composed over D).
-    The seam the RMAP plan recorded: scoped constraints read through the VIEW."""
+    """The fact type's population as one FFP expression over D, whatever the
+    layout: an own-table fact type reads its cell; an absorbed one reassembles
+    ⟨key, value⟩ through the index and the dynamic fetch (the canonical
+    system:ftpop_absorbed applied to ⟨table, col⟩). The seam the RMAP plan
+    recorded: scoped constraints read through the VIEW."""
     from . import ast
+    from .reduce import apply as _apply
     table = partition.get(ft, ft)
     if table == ft:
         return ast.FetchPop(ft)
     col = 2 + table_columns(partition, table).index(ft)
-    key = _S(_COMP, _1, _1)
-    hole = _S(_CONST, A("#"))
-    name = _S(_COMP, A("cellkey"), _S(_CONS, _S(_CONST, A(table)), key))
-    row = _S(_COMP, ast.DynFetch(), _S(_CONS, name, _2))
-    # an index entry whose entity cell is absent contributes a hole (outer-join style),
-    # which the filter drops — never ⊥, since validate runs over arbitrary D
-    pair = _S(_COND, _S(_COMP, A("atom"), row), _S(_CONS, key, hole),
-              _S(_CONS, key, _S(_COMP, A(col), row)))
-    nonhole = _S(_COMP, A("not"), _EQ, _S(_CONS, A(2), hole))
-    inner = _S(_COMP, T.Filter(nonhole), _S(_ALPHA, pair), _DISTR)
-    return _S(_COMP, inner, _S(_CONS, ast.FetchPop(table), _ID))
+    return _apply(A("system:ftpop_absorbed"), _S(A(table), A(col)))
 
 
 def row_validate(D, ft, partition):

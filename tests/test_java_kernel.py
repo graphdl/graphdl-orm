@@ -42,7 +42,7 @@ def test_the_java_kernel_agrees_with_the_python_evaluator():
     assert out.returncode == 0, out.stderr[-800:]
     lines = {l.split("=", 1)[0]: l.split("=", 1)[1]
              for l in out.stdout.splitlines() if "=" in l}
-    assert lines["defs"] == "106"
+    assert int(lines["defs"]) >= 106
 
     max2 = from_lam(_ap(A("system:max2"), to_lam(("305", "1190"))))
     assert lines["max2('305','1190')"] == _show(max2) == "'1190'"

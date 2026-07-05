@@ -106,3 +106,122 @@ def test_resolve_minting_canonical_builder_matches_the_python_builder():
     got = from_lam(via_def)
     # the minted fact ⟨4, alice⟩ prepends to the population
     assert got[0] == (4, "alice") and len(got) == 3
+
+
+RING_POP = (("a", "a"), ("a", "b"), ("b", "a"), ("b", "c"))
+
+
+def test_ring_irreflexive_canonical_matches_the_python_builder():
+    from pyarest import system
+    via_def = _ap(_ap(A("constraints:ring_irreflexive"), to_lam((1, 2))),
+                  to_lam(RING_POP))
+    via_python = _ap(system.ring_irreflexive((1, 2)), to_lam(RING_POP))
+    assert set(from_lam(via_def)) == set(from_lam(via_python))
+    assert set(from_lam(via_def)) == {("a", "a")}
+
+
+def test_ring_symmetric_canonical_matches_the_python_builder():
+    from pyarest import system
+    via_def = _ap(_ap(A("constraints:ring_symmetric"), to_lam((1, 2))),
+                  to_lam(RING_POP))
+    via_python = _ap(system.ring_symmetric((1, 2)), to_lam(RING_POP))
+    assert set(from_lam(via_def)) == set(from_lam(via_python))
+    # (b,c) lacks its reverse; (a,b)/(b,a) satisfy each other; (a,a) is its own
+    assert set(from_lam(via_def)) == {("b", "c")}
+
+
+def test_ring_asymmetric_canonical_matches_the_python_builder():
+    from pyarest import system
+    via_def = _ap(_ap(A("constraints:ring_asymmetric"), to_lam((1, 2))),
+                  to_lam(RING_POP))
+    via_python = _ap(system.ring_asymmetric((1, 2)), to_lam(RING_POP))
+    assert set(from_lam(via_def)) == set(from_lam(via_python))
+    # (a,a) swaps to itself; (a,b)/(b,a) swap to each other: all three violate
+    assert set(from_lam(via_def)) == {("a", "a"), ("a", "b"), ("b", "a")}
+
+
+def test_ring_antisymmetric_canonical_matches_the_python_builder():
+    from pyarest import system
+    via_def = _ap(_ap(A("constraints:ring_antisymmetric"), to_lam((1, 2))),
+                  to_lam(RING_POP))
+    via_python = _ap(system.ring_antisymmetric((1, 2)), to_lam(RING_POP))
+    assert set(from_lam(via_def)) == set(from_lam(via_python))
+    # reflexive (a,a) allowed; the (a,b)/(b,a) pair violates both ways
+    assert set(from_lam(via_def)) == {("a", "b"), ("b", "a")}
+
+
+def test_ring_intransitive_canonical_matches_the_python_builder():
+    from pyarest import system
+    pop = (("a", "b"), ("b", "c"), ("a", "c"), ("c", "d"))
+    via_def = _ap(_ap(A("constraints:ring_intransitive"), to_lam((1, 2))),
+                  to_lam(pop))
+    via_python = _ap(system.ring_intransitive((1, 2)), to_lam(pop))
+    assert set(from_lam(via_def)) == set(from_lam(via_python))
+    assert set(from_lam(via_def)) == {("a", "c")}
+
+
+def test_ring_acyclic_canonical_matches_the_python_builder():
+    from pyarest import system
+    pop = (("a", "b"), ("b", "c"), ("c", "a"), ("x", "y"))
+    via_def = _ap(_ap(A("constraints:ring_acyclic"), to_lam((1, 2))),
+                  to_lam(pop))
+    via_python = _ap(system.ring_acyclic((1, 2)), to_lam(pop))
+    assert set(from_lam(via_def)) == set(from_lam(via_python))
+    assert set(from_lam(via_def)) == {("a", "a"), ("b", "b"), ("c", "c")}
+
+
+def test_class_rule_canonical_matches_the_python_builder():
+    # the grammar recognizer as one FFP object: clauses intersect statement
+    # ids by field value (or existence), the head pairs survivors with the
+    # classification constant
+    from pyarest import system, ast
+    from pyarest.reduce import apply as _apply
+    D = _apply(ast.Store("Statement_has_Keyword"),
+               _S(to_lam((("s1", "iff"), ("s2", "iff"), ("s3", "if"))),
+                  _apply(ast.Store("Statement_has_Verb"),
+                         _S(to_lam((("s1", "has"), ("s3", "has"))),
+                            to_lam(())))))
+    clauses = (("Statement_has_Keyword", "iff"), ("Statement_has_Verb", None))
+    via_python = _apply(system.class_rule(list(clauses), "Derivation Rule"), D)
+    pred = _S(A("COMP"), A("eq"),
+              _S(A("CONS"), A(2), _S(A("CONST"), A("iff"))))
+    cl = _S(_S(A("Statement_has_Keyword"), pred),
+            _S(A("Statement_has_Verb"), to_lam(())))
+    via_def = _apply(_apply(A("system:class_rule"),
+                            _S(cl, A("Derivation Rule"))), D)
+    assert set(from_lam(via_def)) == set(from_lam(via_python))
+    # s1 has both; s2 lacks the verb; s3 has the wrong keyword
+    assert set(from_lam(via_def)) == {("s1", "Derivation Rule")}
+
+
+def _S(*xs):
+    import pyarest.lam as L
+    l = L.NIL
+    for x in reversed(xs):
+        l = L.CONS(x)(l)
+    return L.SEQ(l)
+
+
+def test_ftpop_absorbed_canonical_matches_the_python_builder():
+    # the absorbed fact type's population reassembled through the index and
+    # the dynamic fetch (the create pipeline's layout: the entity cell holds
+    # the flat 3NF row, holes as '#'); a holed column drops outer-join style
+    from pyarest import system, ast
+    from pyarest.reduce import apply as _apply
+    partition = {"Person_has_Name": "Person", "Person": "Person"}
+    D = _apply(ast.Store("Person"),
+               _S(to_lam((("p1",), ("p2",), ("p3",))),
+                  _apply(ast.Store("Person:p1"),
+                         _S(to_lam(("p1", "Ada")),
+                            _apply(ast.Store("Person:p2"),
+                                   _S(to_lam(("p2", "Bo")),
+                                      _apply(ast.Store("Person:p3"),
+                                             _S(to_lam(("p3", "#")),
+                                                to_lam(())))))))))
+    via_python = _apply(system.ftpop_expr("Person_has_Name", partition), D)
+    got = set(from_lam(via_python))
+    assert got == {("p1", "Ada"), ("p2", "Bo")}, got
+    col = 2 + system.table_columns(partition, "Person").index("Person_has_Name")
+    via_def = _apply(_apply(A("system:ftpop_absorbed"),
+                            _S(A("Person"), A(col))), D)
+    assert set(from_lam(via_def)) == got
