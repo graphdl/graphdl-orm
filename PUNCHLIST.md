@@ -1,12 +1,31 @@
-# The old repo's punchlist, archived
+# The arest capability inventory (the 0.9.0 merge map)
 
-This document archives every capability, target, and thread the old repo
-(C:\Users\lippe\Repos\arest, github.com/graphdl/arest) carries, so that
-deleting it loses nothing by forgetting. Each entry records what exists
-there, where it lives, and its disposition in pyarest. The old repo must
-not be deleted until Samuel has reviewed this list and every entry he
-wants carried forward has either landed here or been explicitly waived.
-Archived 2026-07-05 from a direct survey of the old repo's tree and docs.
+MERGE PLAN, superseding the earlier nuke framing (Samuel, 2026-07-05):
+pyarest is NEVER pushed as its own repo. Its polyglot engine is IMPORTED
+INTO arest (C:\Users\lippe\Repos\arest, github.com/graphdl/arest) as the
+0.9.0 release. arest is NOT deleted; it absorbs the new engine as
+internals and KEEPS its outer shell. So this document is no longer a
+deletion gate. It is the interop map: every capability the arest repo
+carries, sorted into what the pyarest import REPLACES (the engine
+internals) and what arest RETAINS (the outer shell the imported engine
+must sit under). A retained-shell entry is not a porting burden; it
+persists in arest, and the only work it implies is INTEROP, its binding
+calling the new engine's verb surface. Surveyed 2026-07-05 from the arest
+tree and docs; each entry's disposition below is being re-read against
+this plan (originals kept where still accurate).
+
+RECLASSIFICATION (2026-07-05): REPLACED-by-import are the engine
+internals, the old TS and Rust reducer, the compiler and translators,
+run_rules, the runtime generators, the derivation; pyarest supplies these
+cleaner. RETAINED-shell, persisting in arest and needing only interop,
+are entries 1 (Cloudflare Worker), 2 (WASM build), 3 (kernel OS), 4
+(FPGA goal), 5 (Solidity), 6 (MCP long tail, joined by the resident), 7
+(REST and HATEOAS and OpenAPI and SSE), 7b (ui.do and its React target),
+8 (the generator family, now also a pyarest runtime arc), 9 (federation),
+12 (the paper), 13 (the docs suite), and 14 (the npm and GitHub identity).
+The per-entry text below predates this reclassification in places; the
+dispositions that say NOT PORTED now mostly mean RETAINED IN AREST, a
+very different thing from a blocker.
 
 ## Deployment targets (the portability matrix, docs/11-portability.md)
 
