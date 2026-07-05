@@ -308,6 +308,26 @@ def test_iota_generates_the_selector_sequence():
     assert from_lam(_ap(A("theta:iota"), A(0))) == ()
 
 
+def test_table_columns_canonical_matches_the_python_builder():
+    # the absorbed fact types of a table, in declaration order: the RMAP
+    # partition pairs ⟨ft, table⟩ filtered to the target table with its own
+    # entity fact type excluded, then projected to the fact type. the von
+    # Neumann comprehension becomes alpha-over-a-double-filter, the table baked
+    # into each predicate by quasiquotation (the parameter reached through id)
+    from pyarest import system
+    partition = {"Person_has_Name": "Person", "Person_has_Age": "Person",
+                 "Person": "Person", "Pet_has_Name": "Pet", "Pet": "Pet"}
+    pairs = to_lam(tuple(partition.items()))
+    canon = _ap(A("system:table_columns"), A("Person"))
+    via_def = _ap(canon, pairs)
+    via_python = system.table_columns(partition, "Person")
+    assert list(from_lam(via_def)) == list(via_python)
+    assert list(from_lam(via_def)) == ["Person_has_Name", "Person_has_Age"]
+    # a table with no absorbed fact types answers the empty sequence
+    assert from_lam(_ap(_ap(A("system:table_columns"), A("Pet")), pairs)) \
+        == ("Pet_has_Name",)
+
+
 def test_row_resolve_canonical_matches_the_python_builder():
     # the entity-cell write resolver: fresh rows hole-padded, compatible
     # updates land, conflicting functional writes collapse the row (the UC

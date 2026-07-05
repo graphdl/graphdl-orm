@@ -1526,8 +1526,15 @@ _register_cellkey()
 
 def table_columns(partition, table):
     """The fact types absorbed into `table`, in declaration order; column j of the 3NF row
-    ⟨key, v1, v2, …⟩ holds the (1+j)th entry's value."""
-    return [ft for ft, key in partition.items() if key == table and ft != table]
+    ⟨key, v1, v2, …⟩ holds the (1+j)th entry's value. The meaning is the canonical
+    system:table_columns (shared/system.py), the RMAP partition pairs filtered to the
+    target table with its own entity fact type excluded, then projected to the fact type.
+    This host binding applies that def through the reducer, so every host reads one
+    definition; the twin is pinned in test_shared_builders."""
+    from .lam import atom as A, to_lam, from_lam
+    from .reduce import apply as _apply
+    pairs = to_lam(tuple(partition.items()))
+    return list(from_lam(_apply(_apply(A("system:table_columns"), A(table)), pairs)))
 
 
 def row_resolve(col, width, unary=False):
