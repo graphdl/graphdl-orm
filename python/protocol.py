@@ -291,6 +291,116 @@ def resolve_event_sink(name, app_dir, app_name):
     return factory(app_dir, app_name)
 
 
+# ============================ the 3NF storage driver =========================
+# Storage is a swappable DRIVER (Samuel, 2026-07-05: swappable between sqlite,
+# R2, postgresql, clickhouse, anything usable as a 3NF storage driver). The
+# interface mirrors arest's own StorageBackend (crates/arest/src/storage.rs),
+# the whole-store form over cells: save commits the cell store (arest's commit),
+# load rehydrates it (arest's open). SQL backends (sqlite, postgres, clickhouse)
+# additionally serve the 3NF relational projection and query the RMAP tables;
+# object backends (R2, memory) store cells and skip the SQL surface. The cell
+# store is the source of truth; the 3NF is the relational consumer projection.
+class StorageDriver:
+    sql = False                                               # serves the 3NF query surface?
+
+    def save(self, D):
+        raise NotImplementedError
+
+    def load(self):
+        raise NotImplementedError                            # -> D (lam) or None if absent
+
+    def exists(self):
+        raise NotImplementedError
+
+    def project(self, D):
+        """Materialize the 3NF relational projection (SQL backends). An object
+        backend has no relational surface and returns None."""
+        return None
+
+    def query(self, statement):
+        raise ValueError("this storage backend has no SQL surface")
+
+
+class SqliteStorage(StorageDriver):
+    """The default driver: cells one-to-one in a sqlite .db, with the RMAP 3NF
+    tables projected beside them (the GraphDL contract). One driver of the
+    interface; the backend is not the design."""
+
+    sql = True
+
+    def __init__(self, app_dir, app_name, seal_key=None):
+        self.path = os.path.join(app_dir, f"{app_name}.db")
+        self.seal_key = seal_key
+
+    def save(self, D):
+        save_sqlite(D, self.path, self.seal_key)
+
+    def load(self):
+        if not os.path.exists(self.path):
+            return None
+        return load_sqlite(self.path, self.seal_key)
+
+    def exists(self):
+        return os.path.exists(self.path)
+
+    def project(self, D):
+        import sqlite3
+        from . import ddl
+        con = sqlite3.connect(self.path)
+        try:
+            return ddl.project(D, con)
+        finally:
+            con.close()
+
+    def query(self, statement):
+        import sqlite3
+        con = sqlite3.connect(self.path)
+        try:
+            return con.execute(statement).fetchall()
+        finally:
+            con.close()
+
+
+class MemoryStorage(StorageDriver):
+    """An ephemeral process-global cell store, per app: storage with no disk
+    and no relational surface (tests, transient apps, the model for an R2 or
+    Durable Object backend that keeps cells as objects, not 3NF rows)."""
+
+    _store = {}
+
+    def __init__(self, app_dir, app_name):
+        self.app = app_name
+
+    def save(self, D):
+        MemoryStorage._store[self.app] = _conv(from_lam(D))
+
+    def load(self):
+        native = MemoryStorage._store.get(self.app)
+        return to_lam(_untuple(native)) if native is not None else None
+
+    def exists(self):
+        return self.app in MemoryStorage._store
+
+    @classmethod
+    def clear(cls):
+        cls._store.clear()
+
+
+_STORAGE_DRIVERS = {"sqlite": SqliteStorage, "memory": MemoryStorage}
+
+
+def register_storage_driver(name, factory):
+    """Bind a 3NF storage driver under `name`; a registry selects it by name
+    (Registry.storage). One registration swaps sqlite for postgres, clickhouse,
+    R2, or any 3NF driver."""
+    _STORAGE_DRIVERS[name] = factory
+
+
+def resolve_storage_driver(name, app_dir, app_name):
+    factory = _STORAGE_DRIVERS.get(name, SqliteStorage)
+    return factory(app_dir, app_name)
+
+
 # =====================================================================
 # Field-level encryption at rest (merged from seal.py, 2026-07-04, the
 # fewer-files push: persistence owns what persists sealed). Sensitivity
@@ -1221,6 +1331,7 @@ class Registry:
         self.cache_dir = cache_dir
         self.last_receipt = None                              # the context tool replays it
         self.event_sink = "file"                              # the active sink name; swap it
+        self.storage = "sqlite"                               # the active 3NF driver; swap it
 
     # ---- inventory ----
     def _app_dir(self, name):
@@ -1231,6 +1342,12 @@ class Registry:
         the event stream is an interface, so a registry can serve a broadcast
         or memory sink instead by setting event_sink."""
         return persist.resolve_event_sink(self.event_sink, self._app_dir(name), name)
+
+    def _storage(self, name):
+        """The app's storage driver, resolved by the active name (default
+        sqlite): a swappable 3NF driver, so a registry can serve postgres,
+        clickhouse, R2, or memory instead by setting storage."""
+        return persist.resolve_storage_driver(self.storage, self._app_dir(name), name)
 
     def _db(self, name):
         return os.path.join(self._app_dir(name), f"{name}.db")
@@ -1259,11 +1376,11 @@ class Registry:
             d = self._app_dir(name)
             if not os.path.isdir(d) or not os.path.isdir(os.path.join(d, "readings")):
                 continue
-            db = self._db(name)
+            db = self._db(name)                               # mtime is a file nicety
             out.append({
                 "name": name,
                 "root": d,
-                "compiled": os.path.exists(db),
+                "compiled": self._storage(name).exists(),     # the driver, not a file
                 "last_compile": os.path.getmtime(db) if os.path.exists(db) else None,
             })
         return out
@@ -1308,17 +1425,14 @@ class Registry:
             D = system.run_rules(D)
         D = system.layout_cells(D)
         D = system.generator_cells(D)
-        persist.save_sqlite(D, self._db(name))
+        drv = self._storage(name)
+        drv.save(D)                                           # the cell store, through the driver
         self._sidecar(name, D)
-        # the RMAP projection rides in the same .db (the GraphDL contract): the
-        # relational tables downstream SQL consumers read, beside the cells
-        import sqlite3
-        from . import ddl
-        con = sqlite3.connect(self._db(name))
-        try:
-            rep["projected"] = ddl.project(D, con)
-        finally:
-            con.close()
+        # the RMAP 3NF projection rides with a SQL backend (the GraphDL
+        # contract: the relational tables downstream consumers read); an object
+        # backend has no relational surface and skips it
+        if drv.sql:
+            rep["projected"] = drv.project(D)
         rep["app"] = name
         return rep
 
@@ -1374,7 +1488,7 @@ class Registry:
         if not refused:
             D2 = system.run_rules(D2, changed=[fact_type])
             self._sink(name).append({"ft": fact_type, "fact": list(row)})
-            persist.save_sqlite(D2, self._db(name))
+            self._storage(name).save(D2)
             self._sidecar(name, D2)
         receipt = {"app": name, "fact_type": fact_type, "fact": list(row),
                    "committed": not refused, "violations": violations}
@@ -1422,22 +1536,18 @@ class Registry:
 
     # ---- reads ----
     def _load(self, name):
-        db = self._db(name)
-        if not os.path.exists(db):
-            raise FileNotFoundError(f"app {name!r} is not compiled (no {db})")
-        return persist.load_sqlite(db)
+        drv = self._storage(name)
+        D = drv.load()
+        if D is None:
+            raise FileNotFoundError(f"app {name!r} is not compiled (no store)")
+        return D
 
     def query(self, name, fact_type):
         D = self._load(name)
         return [tuple(r) for r in system._pop_rows(D, fact_type)]
 
     def sql(self, name, statement):
-        import sqlite3
-        con = sqlite3.connect(self._db(name))
-        try:
-            return con.execute(statement).fetchall()
-        finally:
-            con.close()
+        return self._storage(name).query(statement)          # the 3NF surface (SQL backends)
 
     def get(self, name, noun, entity_id):
         """The 3NF per-entity view: the key, absorbed functional values, unary
