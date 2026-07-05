@@ -89,6 +89,19 @@ def test_cli_read_verbs_answer_json(tmp_path):
     assert json.loads(out.stdout)["app"] == "flow"
 
 
+def test_cli_sql_user_error_answers_an_error_envelope(tmp_path):
+    # a syntactically bad statement is the CALLER'S error, not a crash: the
+    # CLI answers {"error": ...} at exit 0 so the resident relays it as a
+    # result (the old MCP's envelope behavior), reserving nonzero exits for
+    # real crashes
+    base = _mk(tmp_path)
+    assert _run("compile", "--apps-dir", base, "flow").returncode == 0
+    out = _run("sql", "--apps-dir", base, "flow", "SELEC nonsense FROM")
+    assert out.returncode == 0, out.stderr[-300:]
+    got = json.loads(out.stdout)
+    assert "error" in got and "syntax" in got["error"].lower()
+
+
 def test_cli_unknown_verb_is_a_usage_error(tmp_path):
     out = _run("frobnicate", "--apps-dir", str(tmp_path), "x")
     assert out.returncode == 2

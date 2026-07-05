@@ -57,7 +57,16 @@ def main(argv):
         print(json.dumps(out, default=str))
         return 0 if out.get("committed") else 1
     if verb in _READS and len(rest) == _READS[verb]:
-        out = getattr(reg, verb)(*rest)
+        try:
+            out = getattr(reg, verb)(*rest)
+        except Exception as e:
+            # a read verb's failure on caller input (a bad SQL statement, an
+            # unknown noun) is the CALLER'S error, answered as an envelope at
+            # exit 0 so the resident relays it as a result; real crashes in
+            # the write path keep their nonzero exits
+            print(json.dumps({"error": f"{type(e).__name__}: {e}"},
+                             default=str))
+            return 0
         print(json.dumps(out, default=str))
         return 0
     sys.stderr.write(_USAGE)
