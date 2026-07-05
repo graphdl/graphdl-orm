@@ -105,3 +105,28 @@ def test_the_verbs_ride_the_first_class_table(tmp_path):
     assert out["app"] == "v5" and out["violations"]
     assert mcp_server._dispatch(reg, "verify", {"app": "v5"}) == \
         {"app": "v5", "checks": []}
+
+
+def test_actions_answers_the_legal_transitions(tmp_path):
+    # HATEOAS's verb half: the machine binding, the current status, and the
+    # event/to pairs available from it (sm_triples, the canonical join)
+    base = tmp_path / "apps"
+    (base / "flow" / "readings").mkdir(parents=True)
+    model = """Status is a value type.
+Ticket is an entity type.
+State Machine Definition 'Flow' is for Noun 'Ticket'.
+Status 'open' is initial in State Machine Definition 'Flow'.
+Transition 'close' is from Status 'open'.
+Transition 'close' is to Status 'done'.
+Transition 'close' is triggered by Fact Type 'close'.
+"""
+    (base / "flow" / "readings" / "app.md").write_text(model,
+                                                       encoding="utf-8")
+    from pyarest import apps as _apps
+    reg = _apps.Registry(str(base), cache_dir=str(tmp_path / "fz"))
+    reg.compile("flow")
+    reg.apply("flow", "Ticket_status", ("t1", "open"))
+    out = reg.actions("flow", "Ticket", "t1")
+    assert out["machine"] == "Flow"
+    assert out["status"] == "open"
+    assert {(a["event"], a["to"]) for a in out["actions"]} == {("close", "done")}

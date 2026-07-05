@@ -1538,6 +1538,32 @@ class Registry:
                            "match": stored == recomputed})
         return {"app": name, "checks": checks}
 
+    def actions(self, name, noun, id):
+        """The old engine's actions verb: the legal transitions from the
+        entity's current status (HATEOAS: the representation carries its own
+        links; the machine read off M, sm_triples the canonical join). Answers
+        the machine binding, the current status, and the ⟨event, to⟩ pairs
+        available from it."""
+        from . import system as _sys
+        D = self._load(name)
+        smd = _sys.machine_for(D, noun)
+        if smd is None:
+            return {"app": name, "noun": noun, "id": id, "machine": None,
+                    "actions": []}
+        status = None
+        for r in _sys._pop_rows(D, f"{noun}_status"):
+            if len(r) >= 2 and r[0] == id:
+                status = r[1]
+        if status is None:
+            for r in _sys._pop_rows(D, "Resource_is_currently_in_Status"):
+                if len(r) >= 2 and r[0] == id:
+                    status = r[1]
+        triples = _sys.sm_triples(D)
+        acts = [{"event": t[1], "to": t[2]} for t in triples
+                if status is not None and t[0] == status]
+        return {"app": name, "noun": noun, "id": id, "machine": smd,
+                "status": status, "actions": acts}
+
     def schema(self, name):
         """The model surface: object types, fact types with readings and roles,
         and the constraint inventory."""
