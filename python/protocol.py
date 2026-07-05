@@ -1282,9 +1282,6 @@ class Registry:
             return None
         return open(p, encoding="utf-8").read().strip() or None
 
-    def _log(self, name):
-        return os.path.join(self._app_dir(name), f"{name}.events.jsonl")
-
     def _base_D(self):
         """The preloaded base, thawed (frozen ingestion pays the compile once per
         engine fingerprint; every later registry thaws in milliseconds)."""
@@ -1571,16 +1568,10 @@ class Registry:
                     except Exception:
                         pass
                 chains.append(entry)
-        log = os.path.join(self._app_dir(name), f"{name}.events.jsonl")
         trail = []
-        if os.path.exists(log):
-            for line in open(log, encoding="utf-8"):
-                try:
-                    e = json.loads(line)
-                except ValueError:
-                    continue
-                if id in json.dumps(e, ensure_ascii=False):
-                    trail.append(e)
+        for e in self._sink(name).read():                     # the stream, not a file
+            if id in json.dumps(e, ensure_ascii=False):
+                trail.append(e)
         return {"app": name, "id": id, "chains": chains,
                 "audit": trail[-20:]}
 

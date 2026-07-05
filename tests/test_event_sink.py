@@ -51,6 +51,11 @@ def test_swapping_the_sink_redirects_the_whole_stream(tmp_path):
     rows = {tuple(r) for r in system._pop_rows(D, "Ticket_has_Status")}
     assert ("t1", "open") in rows
 
+    # explain's audit trail reads the SINK, not a file: the memory-sink event
+    # for t1 shows up in the trail
+    out = reg.explain("flow", "t1")
+    assert any(e.get("fact") == ["t1", "open"] for e in out["audit"])
+
 
 def test_the_sink_interface_is_two_operations(tmp_path):
     # the interface is exactly append and read, the Connector's two names
