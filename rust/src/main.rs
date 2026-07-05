@@ -1756,9 +1756,16 @@ fn op_answer(op: &str, j: &J, srv: &Srv) -> Result<String, String> {
 // (Registry._sidecar writes it; tests/test_store_sidecar.py pins the
 // contract). apps_use boots an app by feeding that file through handle, the
 // SAME ingestion path a --serve stdin line takes, so no ingestion logic lives
-// here. The read verbs route through op_answer over the retained store; the
-// write verbs and apps_compile need the compiler host and stay with the
-// Python binding.
+// here. The native read verbs route through op_answer over the retained
+// store. The write verbs, apps_compile, and the read long tail (get, schema,
+// sql, explain, validate, verify, actions) need the compiler host, so the
+// binding spawns the repository's one-shot CLI (cli.py at the repository
+// root, found by walking up from the running executable, with --py-cli
+// naming it directly and --python naming the interpreter) and answers the
+// one JSON value the CLI prints; after a write, the app's sidecar re-ingests
+// through the same path apps_use takes, so the retained store stays the
+// sidecar's equal, while the delegated reads change nothing and reload
+// nothing.
 
 // The tool table is static JSON; the descriptor shapes and argument names
 // mirror python/protocol.py's TOOLS for the verbs this binding serves.
@@ -1783,12 +1790,48 @@ const MCP_TOOLS: &str = concat!(
     r#""inputSchema":{"type":"object","properties":{"pattern":{"type":"string"}}}},"#,
     r#"{"name":"synthesize","#,
     r#""description":"Answers an entity's facts paired with their fact types' reading templates; the caller words the prose.","#,
-    r#""inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}]"#
+    r#""inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},"#,
+    r#"{"name":"apply","#,
+    r#""description":"Delegates one fact-row commit to the Python compiler host and answers its receipt; a refused write answers committed false with the violations.","#,
+    r#""inputSchema":{"type":"object","properties":{"app":{"type":"string"},"fact_type":{"type":"string"},"fact":{"type":"array","items":{"type":"string"}}},"required":["app","fact_type","fact"]}},"#,
+    r#"{"name":"retract","#,
+    r#""description":"Delegates one fact-row retraction to the Python compiler host and answers its receipt; a refused retraction answers committed false with the violations.","#,
+    r#""inputSchema":{"type":"object","properties":{"app":{"type":"string"},"fact_type":{"type":"string"},"fact":{"type":"array","items":{"type":"string"}}},"required":["app","fact_type","fact"]}},"#,
+    r#"{"name":"apps_compile","#,
+    r#""description":"Delegates a readings compile to the Python compiler host, rebuilding the app's database and store sidecar, and answers the compile report.","#,
+    r#""inputSchema":{"type":"object","properties":{"app":{"type":"string"}},"required":["app"]}},"#,
+    r#"{"name":"get","#,
+    r#""description":"Answers the per-entity view of the retained app through the Python compiler host: the key, the absorbed values, and the facts the id participates in.","#,
+    r#""inputSchema":{"type":"object","properties":{"noun":{"type":"string"},"id":{"type":"string"}},"required":["noun","id"]}},"#,
+    r#"{"name":"schema","#,
+    r#""description":"Answers the retained app's model surface through the Python compiler host: object types, fact types with readings and roles, and constraints.","#,
+    r#""inputSchema":{"type":"object","properties":{}}},"#,
+    r#"{"name":"sql","#,
+    r#""description":"Runs read-only SQL over the retained app's snapshot database through the Python compiler host and answers the rows.","#,
+    r#""inputSchema":{"type":"object","properties":{"statement":{"type":"string"}},"required":["statement"]}},"#,
+    r#"{"name":"explain","#,
+    r#""description":"Answers an id's provenance in the retained app through the Python compiler host: the derivation chains and the audit trail of its facts.","#,
+    r#""inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},"#,
+    r#"{"name":"validate","#,
+    r#""description":"Answers the retained app's alethic violations through the Python compiler host; an empty list means the population satisfies the schema.","#,
+    r#""inputSchema":{"type":"object","properties":{}}},"#,
+    r#"{"name":"verify","#,
+    r#""description":"Runs the retained app's verification checks through the Python compiler host and answers them.","#,
+    r#""inputSchema":{"type":"object","properties":{}}},"#,
+    r#"{"name":"actions","#,
+    r#""description":"Answers a noun id's state machine and available actions in the retained app through the Python compiler host.","#,
+    r#""inputSchema":{"type":"object","properties":{"noun":{"type":"string"},"id":{"type":"string"}},"required":["noun","id"]}}]"#
 );
 
 struct Apps {
     dir: std::path::PathBuf,
     current: Option<String>,
+    // The CLI delegate: the interpreter and the one-shot script the binding
+    // spawns for the write verbs, apps_compile, and the read long tail. The
+    // script path comes from the startup walk-up unless --py-cli names it;
+    // None means the walk missed, and only the delegated verbs mind.
+    python: String,
+    cli: Option<std::path::PathBuf>,
 }
 
 impl Apps {
@@ -1832,6 +1875,189 @@ fn parse_json(text: &str) -> Option<J> {
     .ok()
 }
 
+// find_cli walks up from the running executable toward the filesystem root
+// and answers the first ancestor directory's cli.py; the exe lives at
+// <root>/rust/target/<profile>/arestlam.exe, so the repository root is the
+// first hit. The --py-cli flag overrides the walk entirely.
+fn find_cli() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    for dir in exe.ancestors().skip(1) {
+        let cand = dir.join("cli.py");
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+// tail_text answers the last few hundred characters of a child's stderr,
+// enough to name a failure inside one protocol line without flooding it.
+fn tail_text(s: &str) -> String {
+    let t = s.trim();
+    let n = t.chars().count();
+    if n <= 300 {
+        t.to_string()
+    } else {
+        t.chars().skip(n - 300).collect()
+    }
+}
+
+// load_sidecar feeds an app's persisted store through handle, the SAME
+// ingestion path a --serve stdin line takes; apps_use rides it to boot an
+// app, and the delegated write verbs ride it to reload one. It never touches
+// the current-app marker, so a reload cannot switch apps.
+fn load_sidecar(apps: &Apps, name: &str, srv: &mut Srv) -> Result<(), String> {
+    let path = apps.sidecar(name);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => {
+            return Err(format!("no app {:?} under {} (no store sidecar)",
+                               name, apps.dir.display()))
+        }
+    };
+    let payload = match parse_json(&text) {
+        Some(p) if jget(&p, "d").is_some() => p,
+        _ => return Err(format!("unparseable store sidecar for {:?}", name)),
+    };
+    handle(&payload, srv, true);
+    Ok(())
+}
+
+// run_cli spawns the repository's one-shot Python CLI:
+//   <python> <cli.py> <verb> --apps-dir <dir> <app> [tail...]
+// and answers the exit code beside the ONE JSON value the CLI prints on
+// stdout. An exit code outside ok answers -32603 carrying the tail of
+// stderr, as do a spawn failure, a missing cli.py, and unparseable stdout.
+// The parse both proves an answer arrived and lets the caller re-serialize
+// it compactly through write_j.
+fn run_cli(apps: &Apps, verb: &str, app: &str, tail: &[String], ok: &[i32])
+    -> Result<(i32, J), (i64, String)>
+{
+    let cli = match &apps.cli {
+        Some(p) => p.clone(),
+        None => {
+            return Err((-32603,
+                "no cli.py found walking up from the executable; pass --py-cli <path>"
+                    .to_string()))
+        }
+    };
+    let mut cmd = std::process::Command::new(&apps.python);
+    cmd.arg(&cli).arg(verb).arg("--apps-dir").arg(&apps.dir).arg(app);
+    for t in tail {
+        cmd.arg(t);
+    }
+    let out = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            return Err((-32603,
+                format!("could not spawn {} for {}: {}", apps.python, verb, e)))
+        }
+    };
+    let code = out.status.code().unwrap_or(-1);
+    let err_tail = tail_text(&String::from_utf8_lossy(&out.stderr));
+    if !ok.contains(&code) {
+        let mut msg = format!("cli.py {} exited {}", verb, code);
+        if !err_tail.is_empty() {
+            msg.push_str(": ");
+            msg.push_str(&err_tail);
+        }
+        return Err((-32603, msg));
+    }
+    let stdout_text = String::from_utf8_lossy(&out.stdout);
+    match parse_json(stdout_text.trim()) {
+        Some(v) => Ok((code, v)),
+        None => {
+            let mut msg = format!("cli.py {} answered no parseable receipt", verb);
+            if !err_tail.is_empty() {
+                msg.push_str(": ");
+                msg.push_str(&err_tail);
+            }
+            Err((-32603, msg))
+        }
+    }
+}
+
+// The write verbs and apps_compile delegate through run_cli. The CLI exits 0
+// on a committed write or a clean compile and 1 on a refusal; both answer
+// the receipt as the tool result, because a refusal is an answer the caller
+// reads, not a protocol failure. A write receipt is always an object, so a
+// value of any other shape is a contract break and answers -32603.
+fn delegate_verb(tool: &str, args: &J, apps: &Apps, srv: &mut Srv)
+    -> Result<String, (i64, String)>
+{
+    let app = match jget(args, "app") {
+        Some(J::S(a)) => a.clone(),
+        _ => return Err((-32602, format!("{} needs a string app", tool))),
+    };
+    // The registry-facing tool name carries the apps_ prefix; the CLI names
+    // the verb bare.
+    let verb = if tool == "apps_compile" { "compile" } else { tool };
+    let mut tail: Vec<String> = Vec::new();
+    if verb != "compile" {
+        match jget(args, "fact_type") {
+            Some(J::S(f)) => tail.push(f.clone()),
+            _ => return Err((-32602, format!("{} needs a string fact_type", tool))),
+        }
+        match jget(args, "fact") {
+            Some(a @ J::A(_)) => {
+                let mut s = String::new();
+                write_j(a, &mut s);
+                tail.push(s);
+            }
+            _ => return Err((-32602, format!("{} needs an array fact", tool))),
+        }
+    }
+    let (code, receipt) = run_cli(apps, verb, &app, &tail, &[0, 1])?;
+    if !matches!(receipt, J::O(_)) {
+        return Err((-32603, format!("cli.py {} answered no object receipt", verb)));
+    }
+    // A committed verb rewrote the sidecar; re-ingesting keeps the retained
+    // store its equal. A refused apply or retract reloads the unchanged file
+    // for the same consistency, a compile reloads only on success, and no
+    // reload runs unless the delegated app IS the retained one, so a write
+    // to another app never switches or loads anything. A reload miss is
+    // skipped rather than masking the receipt the caller must read.
+    if (code == 0 || verb != "compile") && apps.current.as_deref() == Some(app.as_str()) {
+        let _ = load_sidecar(apps, &app, srv);
+    }
+    let mut r = String::new();
+    write_j(&receipt, &mut r);
+    Ok(r)
+}
+
+// The read long tail rides the same delegation: get, schema, sql, explain,
+// validate, verify, and actions need the compiler host's Registry but write
+// nothing, so no sidecar reload follows. Each one scopes to the RETAINED
+// app, so the caller names no app. A read never refuses, so only exit 0
+// passes, and the answer is whatever one JSON value the CLI prints; sql
+// answers an array of arrays, so no object envelope is assumed. synthesize
+// stays native over the retained store and never routes here.
+fn delegate_read(tool: &str, args: &J, apps: &Apps) -> Result<String, (i64, String)> {
+    let app = match &apps.current {
+        Some(n) => n.clone(),
+        None => {
+            return Err((-32602, format!("no app loaded; call apps_use before {}", tool)))
+        }
+    };
+    let keys: &[&str] = match tool {
+        "get" | "actions" => &["noun", "id"],
+        "sql" => &["statement"],
+        "explain" => &["id"],
+        _ => &[],
+    };
+    let mut tail: Vec<String> = Vec::new();
+    for key in keys {
+        match jget(args, key) {
+            Some(J::S(v)) => tail.push(v.clone()),
+            _ => return Err((-32602, format!("{} needs a string {}", tool, key))),
+        }
+    }
+    let (_code, value) = run_cli(apps, tool, &app, &tail, &[0])?;
+    let mut r = String::new();
+    write_j(&value, &mut r);
+    Ok(r)
+}
+
 // A tool call answers its bare JSON, or a JSON-RPC error pair: -32601 names
 // an unknown tool and -32602 names invalid or unusable parameters.
 fn mcp_call(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Result<String, (i64, String)> {
@@ -1866,24 +2092,16 @@ fn mcp_call(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Result<Stri
                 Some(J::S(n)) => n.clone(),
                 _ => return Err((-32602, "apps_use needs a string name".to_string())),
             };
-            let path = apps.sidecar(&name);
-            let text = match std::fs::read_to_string(&path) {
-                Ok(t) => t,
-                Err(_) => {
-                    return Err((-32602, format!("no app {:?} under {} (no store sidecar)",
-                                                name, apps.dir.display())))
-                }
-            };
-            let payload = match parse_json(&text) {
-                Some(p) if jget(&p, "d").is_some() => p,
-                _ => return Err((-32602, format!("unparseable store sidecar for {:?}", name))),
-            };
-            handle(&payload, srv, true); // the same ingestion path a --serve line takes
+            load_sidecar(apps, &name, srv).map_err(|m| (-32602, m))?;
             apps.current = Some(name.clone());
             let mut r = String::from("{\"app\":");
             esc(&name, &mut r);
             r.push_str(",\"ok\":true}");
             Ok(r)
+        }
+        "apply" | "retract" | "apps_compile" => delegate_verb(tool, args, apps, srv),
+        "get" | "schema" | "sql" | "explain" | "validate" | "verify" | "actions" => {
+            delegate_read(tool, args, apps)
         }
         "query" | "cells" | "synthesize" => {
             if apps.current.is_none() {
@@ -1900,23 +2118,34 @@ fn mcp_call(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Result<Stri
 
 fn run_mcp() {
     use std::io::{BufRead, Write};
-    let dir = {
+    let (dir, python, py_cli) = {
         let mut args = std::env::args();
         let mut dir = None;
+        let mut python = None;
+        let mut py_cli = None;
         while let Some(a) = args.next() {
             if a == "--apps-dir" {
                 dir = args.next();
+            } else if a == "--python" {
+                python = args.next();
+            } else if a == "--py-cli" {
+                py_cli = args.next();
             }
         }
         match dir {
-            Some(d) => d,
+            Some(d) => (d, python, py_cli),
             None => {
                 eprintln!("--mcp needs --apps-dir <path>");
                 std::process::exit(2);
             }
         }
     };
-    let mut apps = Apps { dir: std::path::PathBuf::from(dir), current: None };
+    let mut apps = Apps {
+        dir: std::path::PathBuf::from(dir),
+        current: None,
+        python: python.unwrap_or_else(|| "python".to_string()),
+        cli: py_cli.map(std::path::PathBuf::from).or_else(find_cli),
+    };
     let mut srv = Srv { d: phi(), cells: Vec::new(), mu: make_mu(),
                         nd: N::Bot, ncells: Vec::new(), nprocess: Vec::new() };
     let stdin = std::io::stdin();
