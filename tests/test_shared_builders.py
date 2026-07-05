@@ -315,3 +315,35 @@ def test_checked_apply_canonical_matches_the_python_builder():
     for case in (_S(to_lam(("3",)), D), _S(to_lam(("9",)), D)):
         assert from_lam(_apply(canon, case)) == from_lam(_apply(py, case))
     assert from_lam(_apply(canon, _S(to_lam(("9",)), D))) == "ERROR"
+
+
+def test_explain_canonical_walks_the_derivation_chain():
+    # the derivation chain in the canon (GMS93's derivation notion): per
+    # deriving rule, whether its evaluation supports the fact row and which
+    # cells it reads; the reads filter builds its predicate at run with the
+    # rule id embedded (quasiquotation)
+    from pyarest import forml, system, defs
+    from pyarest.reduce import apply as _apply
+    model = """Status is a value type.
+Resource is an entity type.
+State Machine is an entity type.
+State Machine is for Resource.
+State Machine is currently in Status.
+Resource is currently in Status.
+
+* Resource is currently in Status iff some State Machine is for that Resource and that State Machine is currently in that Status.
+
+State Machine 'sm1' is for Resource 'r1'.
+State Machine 'sm1' is currently in Status 'open'.
+"""
+    D, rep = forml.compile_model(model)
+    D = system.run_rules(D)
+    with defs.step(D):
+        got = from_lam(_apply(_apply(A("system:explain"),
+                                     _S(A("Resource_is_currently_in_Status"),
+                                        to_lam(("r1", "open")))), D))
+    assert len(got) == 1
+    rid, fired, reads = got[0]
+    assert fired == "T"
+    assert set(reads) == {"State_Machine_is_for_Resource",
+                          "State_Machine_is_currently_in_Status"}

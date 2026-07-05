@@ -1386,6 +1386,13 @@ class Registry:
                           "text": text})
         return {"app": name, "id": id, "facts": facts}
 
+    @staticmethod
+    def _pair(head, row):
+        from .kernel import atom as A, to_lam
+        import pyarest.lam as L
+        l = L.CONS(to_lam(tuple(row)))(L.NIL)
+        return L.SEQ(L.CONS(A(head))(l))
+
     def explain(self, name, id, fact=None):
         """The old engine's explain verb: the derivation chain for the
         entity's facts (which rules fired, supporting which rows, reading
@@ -1406,12 +1413,12 @@ class Registry:
             if len(r) >= 2:
                 reads.setdefault(r[0], []).append(r[1])
         chains = []
+        from . import defs as _defs
         for (rid, head) in derives:
             if fact is not None and head != fact:
                 continue
             rows = []
             try:
-                from . import defs as _defs
                 with _defs.step(D):                          # rho: the rule
                     out = from_lam(_apply(A(rid), D))        # lives in D's DEFS
                 if isinstance(out, tuple):
@@ -1420,9 +1427,22 @@ class Registry:
                 rows = []
             mine = [list(x) for x in rows if id in x]
             if mine or (fact is not None and head == fact):
-                chains.append({"rule": rid, "head": head,
-                               "supports": mine,
-                               "reads": sorted(reads.get(rid, []))})
+                entry = {"rule": rid, "head": head, "supports": mine,
+                         "reads": sorted(reads.get(rid, []))}
+                if mine:
+                    # the canonical chain corroborates the host walk (the
+                    # same computation any host performs over the canon)
+                    try:
+                        with _defs.step(D):
+                            c = from_lam(_apply(_apply(
+                                A("system:explain"),
+                                self._pair(head, mine[0])), D))
+                        entry["canonical"] = [
+                            {"rule": x[0], "fired": x[1] == "T",
+                             "reads": sorted(x[2])} for x in c]
+                    except Exception:
+                        pass
+                chains.append(entry)
         log = os.path.join(self._app_dir(name), f"{name}.events.jsonl")
         trail = []
         if os.path.exists(log):
