@@ -2552,6 +2552,564 @@ DEF("system:ftpop_absorbed",
              S3(A("CONS"), K(A("system:ftpop_fetch")), A("id"))),
           K(A("id"))))),
 
+DEF("system:rmap_top",
+    S3(
+        A("COMP"), N(1),
+        S3(
+            A("WHILE"),
+            S4(
+                A("COND"),
+                S3(
+                    A("COMP"), A("not"),
+                    S3(
+                        A("COMP"), A("null"),
+                        S3(
+                            A("COMP"), A("apply"),
+                            S3(
+                                A("CONS"),
+                                S3(
+                                    A("COMP"), A("apply"),
+                                    S3(
+                                        A("CONS"), K(A("theta:Filter")),
+                                        S4(
+                                            A("CONS"), K(A("COMP")), K(A("eq")),
+                                            S4(A("CONS"), K(A("CONS")), K(N(1)), S3(A("CONS"), K(A("CONST")), N(1)))))),
+                                N(2))))),
+                S3(
+                    A("COMP"), A("not"),
+                    S3(
+                        A("COMP"), A("theta:member"),
+                        S3(
+                            A("CONS"),
+                            S3(
+                                A("CONS"), N(1),
+                                S3(
+                                    A("COMP"), N(2),
+                                    S3(
+                                        A("COMP"), N(1),
+                                        S3(
+                                            A("COMP"), A("apply"),
+                                            S3(
+                                                A("CONS"),
+                                                S3(
+                                                    A("COMP"), A("apply"),
+                                                    S3(
+                                                        A("CONS"), K(A("theta:Filter")),
+                                                        S4(
+                                                            A("CONS"), K(A("COMP")), K(A("eq")),
+                                                            S4(A("CONS"), K(A("CONS")), K(N(1)), S3(A("CONS"), K(A("CONST")), N(1)))))),
+                                                N(2)))))),
+                            N(3)))),
+                K(A("F"))),
+            S4(
+                A("CONS"),
+                S3(
+                    A("COMP"), N(2),
+                    S3(
+                        A("COMP"), N(1),
+                        S3(
+                            A("COMP"), A("apply"),
+                            S3(
+                                A("CONS"),
+                                S3(
+                                    A("COMP"), A("apply"),
+                                    S3(
+                                        A("CONS"), K(A("theta:Filter")),
+                                        S4(
+                                            A("CONS"), K(A("COMP")), K(A("eq")),
+                                            S4(A("CONS"), K(A("CONS")), K(N(1)), S3(A("CONS"), K(A("CONST")), N(1)))))),
+                                N(2))))),
+                N(2), N(3))))),
+
+DEF("system:rmap_subject",
+    S3(
+        A("COMP"),
+        S2(
+            A("ALPHA"),
+            S3(
+                A("CONS"), S3(A("COMP"), N(2), N(2)),
+                S3(
+                    A("COMP"), A("system:rmap_top"),
+                    S4(
+                        A("CONS"), S3(A("COMP"), N(4), N(2)), S3(A("COMP"), N(1), N(1)),
+                        S3(A("COMP"), N(2), N(1)))))),
+        S3(
+            A("COMP"), A("distl"),
+            S3(
+                A("CONS"),
+                S3(
+                    A("CONS"),
+                    S3(
+                        A("COMP"), A("apply"),
+                        S3(
+                            A("CONS"),
+                            S3(
+                                A("COMP"), A("apply"),
+                                S3(A("CONS"), K(A("ast:FetchPop")), K(A("subtype")))),
+                            A("id"))),
+                    S3(
+                        A("COMP"), S2(A("ALPHA"), S3(A("CONS"), N(1), N(2))),
+                        S3(
+                            A("COMP"), A("apply"),
+                            S3(
+                                A("CONS"),
+                                S3(
+                                    A("COMP"), A("apply"),
+                                    S3(A("CONS"), K(A("ast:FetchPop")), K(A("subtypePartition")))),
+                                A("id"))))),
+                S3(
+                    A("COMP"), A("apply"),
+                    S3(
+                        A("CONS"),
+                        S3(
+                            A("COMP"), A("apply"),
+                            S3(
+                                A("CONS"), K(A("theta:Filter")),
+                                K(S3(A("COMP"), A("eq"), S3(A("CONS"), N(3), S2(A("CONST"), N(1))))))),
+                        S3(
+                            A("COMP"), A("apply"),
+                            S3(
+                                A("CONS"),
+                                S3(
+                                    A("COMP"), A("apply"),
+                                    S3(A("CONS"), K(A("ast:FetchPop")), K(A("role")))),
+                                A("id"))))))))),
+
+DEF("system:rmap_role2",
+    S3(
+        A("COMP"),
+        S2(
+            A("ALPHA"),
+            S3(
+                A("CONS"), S3(A("COMP"), N(2), N(2)),
+                S3(
+                    A("COMP"), A("system:rmap_top"),
+                    S4(
+                        A("CONS"), S3(A("COMP"), N(4), N(2)), S3(A("COMP"), N(1), N(1)),
+                        S3(A("COMP"), N(2), N(1)))))),
+        S3(
+            A("COMP"), A("distl"),
+            S3(
+                A("CONS"),
+                S3(
+                    A("CONS"),
+                    S3(
+                        A("COMP"), A("apply"),
+                        S3(
+                            A("CONS"),
+                            S3(
+                                A("COMP"), A("apply"),
+                                S3(A("CONS"), K(A("ast:FetchPop")), K(A("subtype")))),
+                            A("id"))),
+                    S3(
+                        A("COMP"), S2(A("ALPHA"), S3(A("CONS"), N(1), N(2))),
+                        S3(
+                            A("COMP"), A("apply"),
+                            S3(
+                                A("CONS"),
+                                S3(
+                                    A("COMP"), A("apply"),
+                                    S3(A("CONS"), K(A("ast:FetchPop")), K(A("subtypePartition")))),
+                                A("id"))))),
+                S3(
+                    A("COMP"), A("apply"),
+                    S3(
+                        A("CONS"),
+                        S3(
+                            A("COMP"), A("apply"),
+                            S3(
+                                A("CONS"), K(A("theta:Filter")),
+                                K(S3(A("COMP"), A("eq"), S3(A("CONS"), N(3), S2(A("CONST"), N(2))))))),
+                        S3(
+                            A("COMP"), A("apply"),
+                            S3(
+                                A("CONS"),
+                                S3(
+                                    A("COMP"), A("apply"),
+                                    S3(A("CONS"), K(A("ast:FetchPop")), K(A("role")))),
+                                A("id"))))))))),
+
+DEF("system:rmap_mand",
+    S3(
+        A("COMP"),
+        S2(
+            A("ALPHA"),
+            S3(
+                A("CONS"), S3(A("COMP"), N(3), N(2)),
+                S3(
+                    A("COMP"), A("system:rmap_top"),
+                    S4(
+                        A("CONS"), S3(A("COMP"), N(4), N(2)), S3(A("COMP"), N(1), N(1)),
+                        S3(A("COMP"), N(2), N(1)))))),
+        S3(
+            A("COMP"), A("distl"),
+            S3(
+                A("CONS"),
+                S3(
+                    A("CONS"),
+                    S3(
+                        A("COMP"), A("apply"),
+                        S3(
+                            A("CONS"),
+                            S3(
+                                A("COMP"), A("apply"),
+                                S3(A("CONS"), K(A("ast:FetchPop")), K(A("subtype")))),
+                            A("id"))),
+                    S3(
+                        A("COMP"), S2(A("ALPHA"), S3(A("CONS"), N(1), N(2))),
+                        S3(
+                            A("COMP"), A("apply"),
+                            S3(
+                                A("CONS"),
+                                S3(
+                                    A("COMP"), A("apply"),
+                                    S3(A("CONS"), K(A("ast:FetchPop")), K(A("subtypePartition")))),
+                                A("id"))))),
+                S3(
+                    A("COMP"), A("apply"),
+                    S3(
+                        A("CONS"),
+                        S3(
+                            A("COMP"), A("apply"),
+                            S3(
+                                A("CONS"), K(A("theta:Filter")),
+                                K(
+                                    S3(
+                                        A("COMP"), A("eq"),
+                                        S3(A("CONS"), N(2), S2(A("CONST"), A("mandatory"))))))),
+                        S3(
+                            A("COMP"), A("apply"),
+                            S3(
+                                A("CONS"),
+                                S3(
+                                    A("COMP"), A("apply"),
+                                    S3(A("CONS"), K(A("ast:FetchPop")), K(A("constraint")))),
+                                A("id"))))))))),
+
+DEF("system:rmap_oneone",
+    S3(
+        A("COMP"), A("theta:dedup"),
+        S3(
+            A("COMP"), S2(A("ALPHA"), S3(A("COMP"), A("id"), N(2))),
+            S3(
+                A("COMP"), A("apply"),
+                S3(
+                    A("CONS"),
+                    S3(
+                        A("COMP"), A("apply"),
+                        S3(
+                            A("CONS"), K(A("theta:Filter")),
+                            K(
+                                S3(
+                                    A("COMP"), A("theta:member"),
+                                    S3(A("CONS"), S3(A("COMP"), A("id"), N(2)), N(1)))))),
+                    S3(
+                        A("COMP"), A("distl"),
+                        S3(
+                            A("CONS"),
+                            S3(
+                                A("COMP"), A("theta:dedup"),
+                                S3(
+                                    A("COMP"), S2(A("ALPHA"), S3(A("COMP"), N(3), N(2))),
+                                    S3(
+                                        A("COMP"), A("apply"),
+                                        S3(
+                                            A("CONS"),
+                                            S3(
+                                                A("COMP"), A("apply"),
+                                                S3(
+                                                    A("CONS"), K(A("theta:Filter")),
+                                                    K(
+                                                        S3(
+                                                            A("COMP"), A("theta:member"),
+                                                            S3(A("CONS"), S3(A("COMP"), N(1), N(2)), N(1)))))),
+                                            S3(
+                                                A("COMP"), A("distl"),
+                                                S3(
+                                                    A("CONS"),
+                                                    S3(
+                                                        A("COMP"), S2(A("ALPHA"), N(1)),
+                                                        S3(
+                                                            A("COMP"), A("apply"),
+                                                            S3(
+                                                                A("CONS"),
+                                                                S3(
+                                                                    A("COMP"), A("apply"),
+                                                                    S3(
+                                                                        A("CONS"),
+                                                                        K(A("theta:Filter")),
+                                                                        K(S3(A("COMP"), A("eq"), S3(A("CONS"), N(2), S2(A("CONST"), N(1))))))),
+                                                                S3(
+                                                                    A("COMP"), A("apply"),
+                                                                    S3(
+                                                                        A("CONS"),
+                                                                        S3(
+                                                                            A("COMP"),
+                                                                            A("apply"),
+                                                                            S3(A("CONS"), K(A("ast:FetchPop")), K(A("spans")))),
+                                                                        A("id")))))),
+                                                    S3(
+                                                        A("COMP"), A("apply"),
+                                                        S3(
+                                                            A("CONS"),
+                                                            S3(
+                                                                A("COMP"), A("apply"),
+                                                                S3(
+                                                                    A("CONS"),
+                                                                    K(A("theta:Filter")),
+                                                                    K(
+                                                                        S3(
+                                                                            A("COMP"), A("eq"),
+                                                                            S3(A("CONS"), N(2), S2(A("CONST"), A("uniqueness"))))))),
+                                                            S3(
+                                                                A("COMP"), A("apply"),
+                                                                S3(
+                                                                    A("CONS"),
+                                                                    S3(
+                                                                        A("COMP"), A("apply"),
+                                                                        S3(A("CONS"), K(A("ast:FetchPop")), K(A("constraint")))),
+                                                                    A("id"))))))))))),
+                            S3(
+                                A("COMP"), A("theta:dedup"),
+                                S3(
+                                    A("COMP"), S2(A("ALPHA"), S3(A("COMP"), N(3), N(2))),
+                                    S3(
+                                        A("COMP"), A("apply"),
+                                        S3(
+                                            A("CONS"),
+                                            S3(
+                                                A("COMP"), A("apply"),
+                                                S3(
+                                                    A("CONS"), K(A("theta:Filter")),
+                                                    K(
+                                                        S3(
+                                                            A("COMP"), A("theta:member"),
+                                                            S3(A("CONS"), S3(A("COMP"), N(1), N(2)), N(1)))))),
+                                            S3(
+                                                A("COMP"), A("distl"),
+                                                S3(
+                                                    A("CONS"),
+                                                    S3(
+                                                        A("COMP"), S2(A("ALPHA"), N(1)),
+                                                        S3(
+                                                            A("COMP"), A("apply"),
+                                                            S3(
+                                                                A("CONS"),
+                                                                S3(
+                                                                    A("COMP"), A("apply"),
+                                                                    S3(
+                                                                        A("CONS"),
+                                                                        K(A("theta:Filter")),
+                                                                        K(S3(A("COMP"), A("eq"), S3(A("CONS"), N(2), S2(A("CONST"), N(2))))))),
+                                                                S3(
+                                                                    A("COMP"), A("apply"),
+                                                                    S3(
+                                                                        A("CONS"),
+                                                                        S3(
+                                                                            A("COMP"),
+                                                                            A("apply"),
+                                                                            S3(A("CONS"), K(A("ast:FetchPop")), K(A("spans")))),
+                                                                        A("id")))))),
+                                                    S3(
+                                                        A("COMP"), A("apply"),
+                                                        S3(
+                                                            A("CONS"),
+                                                            S3(
+                                                                A("COMP"), A("apply"),
+                                                                S3(
+                                                                    A("CONS"),
+                                                                    K(A("theta:Filter")),
+                                                                    K(
+                                                                        S3(
+                                                                            A("COMP"), A("eq"),
+                                                                            S3(A("CONS"), N(2), S2(A("CONST"), A("uniqueness"))))))),
+                                                            S3(
+                                                                A("COMP"), A("apply"),
+                                                                S3(
+                                                                    A("CONS"),
+                                                                    S3(
+                                                                        A("COMP"), A("apply"),
+                                                                        S3(A("CONS"), K(A("ast:FetchPop")), K(A("constraint")))),
+                                                                    A("id")))))))))))))))))),
+
+DEF("system:rmap_side",
+    S3(
+        A("COMP"),
+        S2(
+            A("ALPHA"),
+            S3(
+                A("CONS"), S3(A("COMP"), N(1), N(2)),
+                S4(
+                    A("COND"),
+                    S3(
+                        A("COMP"), A("theta:member"),
+                        S3(A("CONS"), S3(A("COMP"), N(1), N(2)), S3(A("COMP"), N(2), N(1)))),
+                    S4(
+                        A("COND"),
+                        S3(
+                            A("COMP"), A("theta:member"),
+                            S3(
+                                A("CONS"),
+                                S3(
+                                    A("CONS"), S3(A("COMP"), N(1), N(2)),
+                                    S3(
+                                        A("COMP"), N(2),
+                                        S3(
+                                            A("COMP"), N(1),
+                                            S3(
+                                                A("COMP"), A("apply"),
+                                                S3(
+                                                    A("CONS"),
+                                                    S3(
+                                                        A("COMP"), A("apply"),
+                                                        S3(
+                                                            A("CONS"), K(A("theta:Filter")),
+                                                            S4(
+                                                                A("CONS"), K(A("COMP")),
+                                                                K(A("eq")),
+                                                                S4(
+                                                                    A("CONS"), K(A("CONS")),
+                                                                    K(N(1)),
+                                                                    S3(A("CONS"), K(A("CONST")), S3(A("COMP"), N(1), N(2))))))),
+                                                    S3(A("COMP"), N(1), N(1))))))),
+                                S3(A("COMP"), N(3), N(1)))),
+                        S4(
+                            A("COND"),
+                            S3(
+                                A("COMP"), A("theta:member"),
+                                S3(
+                                    A("CONS"),
+                                    S3(A("CONS"), S3(A("COMP"), N(1), N(2)), S3(A("COMP"), N(2), N(2))),
+                                    S3(A("COMP"), N(3), N(1)))),
+                            S3(A("COMP"), N(2), N(2)),
+                            S3(
+                                A("COMP"), N(2),
+                                S3(
+                                    A("COMP"), N(1),
+                                    S3(
+                                        A("COMP"), A("apply"),
+                                        S3(
+                                            A("CONS"),
+                                            S3(
+                                                A("COMP"), A("apply"),
+                                                S3(
+                                                    A("CONS"), K(A("theta:Filter")),
+                                                    S4(
+                                                        A("CONS"), K(A("COMP")), K(A("eq")),
+                                                        S4(
+                                                            A("CONS"), K(A("CONS")), K(N(1)),
+                                                            S3(A("CONS"), K(A("CONST")), S3(A("COMP"), N(1), N(2))))))),
+                                            S3(A("COMP"), N(1), N(1))))))),
+                        S3(A("COMP"), N(2), N(2))),
+                    S3(A("COMP"), N(2), N(2))))),
+        S3(
+            A("COMP"), A("distl"),
+            S3(
+                A("CONS"),
+                S4(
+                    A("CONS"), A("system:rmap_role2"), A("system:rmap_oneone"),
+                    A("system:rmap_mand")),
+                A("system:rmap_subject"))))),
+
+DEF("system:partition",
+    S3(
+        A("COMP"), A("reverse"),
+        S3(
+            A("COMP"),
+            S2(
+                A("ALPHA"),
+                S3(
+                    A("CONS"),
+                    S4(
+                        A("COND"),
+                        S3(
+                            A("COMP"), A("eq"),
+                            S3(A("CONS"), N(3), S2(A("CONST"), A("functional")))),
+                        N(2), N(1)),
+                    N(1))),
+            S3(
+                A("COMP"),
+                S2(
+                    A("ALPHA"),
+                    S4(
+                        A("CONS"), S3(A("COMP"), N(1), N(2)), S3(A("COMP"), N(2), N(2)),
+                        S4(
+                            A("COND"),
+                            S3(
+                                A("COMP"), A("not"),
+                                S3(
+                                    A("COMP"), A("theta:member"),
+                                    S3(A("CONS"), S3(A("COMP"), N(1), N(2)), S3(A("COMP"), N(3), N(1))))),
+                            K(A("functional")),
+                            S4(
+                                A("COND"),
+                                S3(
+                                    A("COMP"), A("theta:member"),
+                                    S3(A("CONS"), S3(A("COMP"), N(1), N(2)), S3(A("COMP"), N(1), N(1)))),
+                                S4(
+                                    A("COND"),
+                                    S3(
+                                        A("COMP"), A("theta:member"),
+                                        S3(A("CONS"), S3(A("COMP"), N(1), N(2)), S3(A("COMP"), N(2), N(1)))),
+                                    K(A("spanning")), K(A("functional"))),
+                                K(A("spanning")))))),
+                S3(
+                    A("COMP"), A("distl"),
+                    S3(
+                        A("CONS"),
+                        S4(
+                            A("CONS"),
+                            S3(
+                                A("COMP"), A("theta:dedup"),
+                                S3(
+                                    A("COMP"), S2(A("ALPHA"), N(3)),
+                                    S3(
+                                        A("COMP"), A("apply"),
+                                        S3(
+                                            A("CONS"),
+                                            S3(
+                                                A("COMP"), A("apply"),
+                                                S3(
+                                                    A("CONS"), K(A("theta:Filter")),
+                                                    K(
+                                                        S3(
+                                                            A("COMP"), A("eq"),
+                                                            S3(A("CONS"), N(2), S2(A("CONST"), A("uniqueness"))))))),
+                                            S3(
+                                                A("COMP"), A("apply"),
+                                                S3(
+                                                    A("CONS"),
+                                                    S3(
+                                                        A("COMP"), A("apply"),
+                                                        S3(A("CONS"), K(A("ast:FetchPop")), K(A("constraint")))),
+                                                    A("id"))))))),
+                            S3(
+                                A("COMP"), A("theta:dedup"),
+                                S3(
+                                    A("COMP"), S2(A("ALPHA"), N(3)),
+                                    S3(
+                                        A("COMP"), A("apply"),
+                                        S3(
+                                            A("CONS"),
+                                            S3(
+                                                A("COMP"), A("apply"),
+                                                S3(
+                                                    A("CONS"), K(A("theta:Filter")),
+                                                    K(
+                                                        S3(
+                                                            A("COMP"), A("eq"),
+                                                            S3(A("CONS"), N(2), S2(A("CONST"), A("spanning_uniqueness"))))))),
+                                            S3(
+                                                A("COMP"), A("apply"),
+                                                S3(
+                                                    A("CONS"),
+                                                    S3(
+                                                        A("COMP"), A("apply"),
+                                                        S3(A("CONS"), K(A("ast:FetchPop")), K(A("constraint")))),
+                                                    A("id"))))))),
+                            S3(A("COMP"), S2(A("ALPHA"), N(1)), A("system:rmap_role2"))),
+                        A("system:rmap_side"))))))),
+
 DEF("system:table_columns",
     S4(A("CONS"), K(A("COMP")),
        K(S2(A("ALPHA"), N(1))),

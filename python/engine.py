@@ -1337,63 +1337,16 @@ def _pop_rows(D, name):
 
 
 def rmap_partition(D):
-    """M-facts → the cell partition {fact type: table key}, by the RMAP grouping rules run
-    as the one machine fold. The kind of each fact type is READ OFF M's constraint facts:
-    a spanning UC (or no UC at all, the m:n case) gives the fact type its own table (rule 1);
-    a single-role UC makes it functional, absorbed into its role-1 player's table (rule 2)."""
-    from .lam import to_lam, from_lam
-    fts = [f[0] for f in reversed(_pop_rows(D, "factType"))]          # declaration order
-    cons = _pop_rows(D, "constraint")
-    spanning = {c[2] for c in cons if len(c) >= 3 and c[1] == "spanning_uniqueness"}
-    functional = {c[2] for c in cons if len(c) >= 3 and c[1] == "uniqueness"}
-    subs = {r[0]: r[1] for r in _pop_rows(D, "subtype")}
-    partitioned = {tuple(r[:2]) for r in _pop_rows(D, "subtypePartition") if len(r) >= 2}
-
-    def _top(o):                                             # RMAP step 0 (§10.3): absorb
-        seen = set()                                         # subtypes into their top
-        while o in subs and o not in seen:                   # supertype — STOPPING at a
-            if (o, subs[o]) in partitioned:                  # partitioned edge (Halpin's
-                break                                        # partition mapping: mutually
-            seen.add(o)                                      # exclusive families keep
-            o = subs[o]                                      # their own tables)
-        return o
-
-    arity = {}
-    for r in _pop_rows(D, "role"):
-        if len(r) >= 3:
-            arity[r[1]] = max(arity.get(r[1], 0), r[2])
-    subject = {r[1]: _top(r[3]) for r in reversed(_pop_rows(D, "role")) if r[2] == 1}
-    role2 = {r[1]: _top(r[3]) for r in reversed(_pop_rows(D, "role")) if r[2] == 2}
-    spans = {}
-    for r in _pop_rows(D, "spans"):
-        if len(r) == 2:
-            spans.setdefault(r[0], set()).add(r[1])
-    ucpos, mand = {}, {}
-    for c in cons:
-        if len(c) >= 3 and c[1] == "uniqueness":
-            ucpos.setdefault(c[2], set()).update(spans.get(c[0], {1}))
-        if len(c) >= 4 and c[1] == "mandatory":
-            mand.setdefault(c[2], set()).add(_top(c[3]))
-
-    def _side(ft):
-        # 1:1 grouping favors fewer nulls (Halpin §10.3): a doubly-functional fact type
-        # absorbs into the MANDATORY side — every instance there plays, so no # holes
-        s1 = subject.get(ft, ft)
-        if {1, 2} <= ucpos.get(ft, set()):
-            s2 = role2.get(ft)
-            if s2 and s2 in mand.get(ft, set()) and s1 not in mand.get(ft, set()):
-                return s2
-        return s1
-
-    # a UNARY is functional by definition (its internal UC spans its one role —
-    # Halpin's boolean-column mapping; NORMA auto-creates that UC), so it absorbs
-    # with no declaration at all
-    triples = tuple((ft, _side(ft),
-                     "functional" if (arity.get(ft) == 1 or
-                                      (ft in functional and ft not in spanning))
-                     else "spanning")
-                    for ft in fts)
-    pairs = from_lam(run_machine(rmap, to_lam(()), to_lam(triples)))
+    """M-facts → the cell partition {fact type: table key}, by the RMAP grouping rules. The
+    meaning is the canonical system:partition (shared/system.py), the sub-DEF family
+    rmap_top/subject/role2/mand/oneone/side folded to ⟨table, fact type⟩ pairs (Halpin
+    ch.10): a spanning UC or none at all gives the fact type its own table (rule 1); a
+    single-role UC absorbs it into its role-1 player's top supertype, or the mandatory
+    side for a 1:1 (rule 2, §10.3). This host binding applies that def through the reducer,
+    so every host reads one definition; the twin is pinned in test_shared_builders."""
+    from .lam import atom as A, from_lam
+    from .reduce import apply as _apply
+    pairs = from_lam(_apply(A("system:partition"), D))
     return {ft: key for (key, ft) in pairs}
 
 

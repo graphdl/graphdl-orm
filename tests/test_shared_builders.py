@@ -364,6 +364,49 @@ Transition 'place' is triggered by Fact Type 'Customer places Order'.
     assert canon("Party_thing", D2) == "Party"                 # governed via closure
 
 
+def test_partition_canonical_matches_rmap_partition():
+    # RMAP as canonical lambda (Halpin ch.10): subtype absorption to the top
+    # supertype, the functional/spanning grouping, and the 1:1 mandatory-side
+    # rule, folded to ⟨table, fact type⟩ pairs. The whole partition matches the
+    # Python engine, sub-DEF by sub-DEF up to system:partition.
+    from pyarest import forml, system, ast
+    model = ("Party is an entity type.\n"
+             "Person is a subtype of Party.\n"
+             "Age is a value type.\n"
+             "Order is an entity type.\n"
+             "Customer is an entity type.\n"
+             "Product is an entity type.\n"
+             "Date is a value type.\n"
+             "Person has Age.\n"
+             "Order includes Product.\n"
+             "Each Order was placed on at most one Date.\n"
+             "Each Order is placed by exactly one Customer.\n"
+             "In each population of Order includes Product, each Order, Product "
+             "combination occurs at most once.\n")
+    D, _ = forml.compile_model(model)
+    got = {ft: k for (k, ft) in from_lam(_ap(A("system:partition"), D))}
+    assert got == system.rmap_partition(D)
+    assert got["Order_is_placed_by_Customer"] == "Order"       # functional, absorbed
+    assert got["Order_includes_Product"] == "Order_includes_Product"  # m:n, own table
+    assert got["Person_has_Age"] == "Person_has_Age"           # spanning, own table
+
+    def store(d, name, pop):
+        return _ap(ast.Store(name), _S(to_lam(pop), d))
+    # the 1:1 mandatory-side override (Halpin §10.3): a fact type unique on both
+    # roles absorbs into the mandatory far role, not the role-1 subject
+    D2 = to_lam(())
+    D2 = store(D2, "factType", (("Holds",),))
+    D2 = store(D2, "role", (("Holds.1", "Holds", 1, "Person"),
+                            ("Holds.2", "Holds", 2, "Passport")))
+    D2 = store(D2, "constraint", (("uc1", "uniqueness", "Holds", "alethic"),
+                                  ("uc2", "uniqueness", "Holds", "alethic"),
+                                  ("m1", "mandatory", "Holds", "Passport", "alethic")))
+    D2 = store(D2, "spans", (("uc1", 1), ("uc2", 2)))
+    got2 = {ft: k for (k, ft) in from_lam(_ap(A("system:partition"), D2))}
+    assert got2 == system.rmap_partition(D2)
+    assert got2 == {"Holds": "Passport"}                       # mandatory side, not Person
+
+
 def test_row_resolve_canonical_matches_the_python_builder():
     # the entity-cell write resolver: fresh rows hole-padded, compatible
     # updates land, conflicting functional writes collapse the row (the UC
