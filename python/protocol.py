@@ -1386,6 +1386,56 @@ class Registry:
                           "text": text})
         return {"app": name, "id": id, "facts": facts}
 
+    def explain(self, name, id, fact=None):
+        """The old engine's explain verb: the derivation chain for the
+        entity's facts (which rules fired, supporting which rows, reading
+        which cells; GMS93's derivation notion made queryable) plus the audit
+        trail from the events journal. Host-walked over the rule M-facts for
+        now; the canonical core follows the quasiquote pattern (building the
+        filter predicate tree at run with the rule id embedded)."""
+        from .reduce import apply as _apply
+        from .kernel import atom as A, from_lam
+        import json
+        import os
+        D = self._load(name)
+        from . import system as _sys
+        derives = [tuple(r) for r in _sys._pop_rows(D, "ruleDerives")
+                   if len(r) >= 2]
+        reads = {}
+        for r in _sys._pop_rows(D, "ruleReads"):
+            if len(r) >= 2:
+                reads.setdefault(r[0], []).append(r[1])
+        chains = []
+        for (rid, head) in derives:
+            if fact is not None and head != fact:
+                continue
+            rows = []
+            try:
+                from . import defs as _defs
+                with _defs.step(D):                          # rho: the rule
+                    out = from_lam(_apply(A(rid), D))        # lives in D's DEFS
+                if isinstance(out, tuple):
+                    rows = [tuple(x) for x in out if isinstance(x, tuple)]
+            except Exception:
+                rows = []
+            mine = [list(x) for x in rows if id in x]
+            if mine or (fact is not None and head == fact):
+                chains.append({"rule": rid, "head": head,
+                               "supports": mine,
+                               "reads": sorted(reads.get(rid, []))})
+        log = os.path.join(self._app_dir(name), f"{name}.events.jsonl")
+        trail = []
+        if os.path.exists(log):
+            for line in open(log, encoding="utf-8"):
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if id in json.dumps(e, ensure_ascii=False):
+                    trail.append(e)
+        return {"app": name, "id": id, "chains": chains,
+                "audit": trail[-20:]}
+
     def schema(self, name):
         """The model surface: object types, fact types with readings and roles,
         and the constraint inventory."""
