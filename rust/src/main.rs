@@ -1565,7 +1565,7 @@ fn handle(j: &J, srv: &mut Srv, serve: bool) -> String {
 //   {"op": "query", "fact_type": NAME}     -> (ast:FetchPop : NAME) : D
 //   {"op": "cells", "pattern": SUBSTR?}    -> cell names + row counts over D
 //   {"op": "synthesize_pairs", "id": ID}   -> (system:verbalize : ID) : D
-//   {"op": "run_rules"}                    -> the derivation fixpoint over D
+//   {"op": "run_rules", "changed": [..]?}  -> the derivation fixpoint over D
 // answered as {"op": .., "result": ..} or {"op": .., "error": ..}. Every
 // reduction runs over the RESIDENT store the loop already holds (set and
 // evolved via the d / retain ops) through the canonical definitions the kernel
@@ -1608,18 +1608,24 @@ fn scalar_atom(j: &J) -> Option<V> {
 }
 
 // ============================ the derivation fixpoint =========================
-// Phase one of the run_rules port (python/engine.py run_rules): the NAIVE
-// positive-rule fixpoint over the retained store. Every round evaluates every
-// non-aggregate rule's FULL body against the current D through the same mu
-// and frame the ops use; a rule id resolves to its compiled object through
+// Phase two of the run_rules port (python/engine.py run_rules, lines 1046
+// through 1110): the SEMI-NAIVE positive-rule fixpoint with frontier
+// bounding (Bancilhon-Ramakrishnan 1986). Round one evaluates full rule
+// bodies against the current D, bounded by the optional "changed" frontier
+// (only rules whose ruleReads intersect it fire); every later round joins
+// only each head's per-round delta through the stored ~d variants, one per
+// atom position from the ruleAtom facts, each applied to the pair of the
+// sorted delta rows and D. Rules without atom facts fall back to full
+// evaluation in rounds where their reads changed. A rule id (and each of its
+// "<rule id>~d<position>" variants) resolves to its compiled object through
 // D's OWN DEFS cells (ast:DefineIn stored it there at compile time), exactly
-// as Python evaluates inside defs.step(D). New rows union into the head cell
-// and the loop stops when a round adds nothing. Rules are positive and
-// monotone, so the loop reaches the least fixed point (Knaster-Tarski), and
-// finiteness bounds the rounds. Rules named by ruleAgg are SKIPPED here,
-// never mis-run: an aggregate head supersedes per group instead of unioning,
-// which is the next stratum's contract. Deferred to later phases: the
-// semi-naive ~d delta variants, the frontier bounding, the FAST rule twins,
+// as Python evaluates inside defs.step(D), and every reduction runs through
+// the same mu and frame the ops use. New rows union into the head cell and
+// the loop stops when a round adds nothing. Rules are positive and monotone,
+// so the loop reaches the least fixed point (Knaster-Tarski), and finiteness
+// bounds the rounds. Rules named by ruleAgg are SKIPPED here, never mis-run:
+// an aggregate head supersedes per group instead of unioning, which is the
+// next stratum's contract. Deferred to later phases: the FAST rule twins,
 // the keyed upserts, the DRed sweeps, and the joint upper-strata iteration.
 
 fn float_text(f: f64) -> String {
@@ -1755,23 +1761,58 @@ fn store_into(d: &mut V, cells: &mut Vec<(Leaf, V)>, name: &Leaf, contents: V) {
     }
 }
 
-fn op_run_rules(srv: &mut Srv) -> Result<String, String> {
+fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     use std::collections::{BTreeSet, HashMap, HashSet};
+    // the optional frontier: an array of cell names bounding ROUND ONE to
+    // the rules whose ruleReads intersect it (Python's changed argument);
+    // absent means a full round one. It parses before anything runs so a
+    // malformed request mutates nothing.
+    let frontier: Option<HashSet<String>> = match jget(j, "changed") {
+        None => None,
+        Some(J::A(xs)) => {
+            let mut set: HashSet<String> = HashSet::new();
+            for x in xs {
+                match scalar_atom(x) {
+                    Some(a) => {
+                        set.insert(key_of(&a));
+                    }
+                    None => {
+                        return Err(
+                            "run_rules changed must be an array of scalar cell names"
+                                .to_string(),
+                        )
+                    }
+                }
+            }
+            Some(set)
+        }
+        Some(_) => {
+            return Err(
+                "run_rules changed must be an array of scalar cell names".to_string(),
+            )
+        }
+    };
     let mu = srv.mu.clone();
     let mut d = srv.d.clone();
     let mut cells = srv.cells.clone();
     let mut changed: BTreeSet<String> = BTreeSet::new();
     let leaf = |s: &str| Leaf::S(s.to_string());
-    // Does ANY rule's body read the named cell? ruleReads rows are
-    // ⟨rule id, read cell⟩; the two mirror blocks below quantify over all
-    // rules, so a flat scan answers exactly Python's any() over its map.
-    let reads_rows = pop_rows(&cells, &leaf("ruleReads"));
+    // reads: rule id key to the set of cell keys its body reads (ruleReads
+    // rows are ⟨rule id, read cell⟩). The mirror blocks quantify over all
+    // rules through it, round one intersects it with the frontier, and the
+    // later rounds' full fallback intersects it with the delta.
+    let mut reads: HashMap<String, HashSet<String>> = HashMap::new();
+    for r in pop_rows(&cells, &leaf("ruleReads")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            reads.entry(key_of(&it[0])).or_default().insert(key_of(&it[1]));
+        }
+    }
+    // The mirror blocks run BEFORE the loop and ignore the frontier, exactly
+    // as Python's run before its frontier is even consulted.
     let any_reads = |target: &str| {
-        reads_rows.iter().any(|r| {
-            let it = items(&list_of(r));
-            it.len() >= 2
-                && matches!(aval(&it[1]).as_deref(), Some(Leaf::S(s)) if s == target)
-        })
+        let k = key_of(&atom(Leaf::S(target.to_string())));
+        reads.values().any(|rs| rs.contains(&k))
     };
     // THE INSTANCE MIRROR (engine.py proposal B): when any rule reads
     // Resource_is_instance_of_Noun and that cell is EMPTY, derive it fresh
@@ -1864,6 +1905,22 @@ fn op_run_rules(srv: &mut Srv) -> Result<String, String> {
             changed.insert(FTR.to_string());
         }
     }
+    // atomsof: rule id key to its body atoms as ⟨position text, atom cell
+    // key⟩ in ruleAtom row order; the stored delta variant for an atom rides
+    // the DEFS cell named "<rule id>~d<position>", exactly the name Python
+    // formats
+    let mut atomsof: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for r in pop_rows(&cells, &leaf("ruleAtom")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 3 {
+            if let Some(p) = aval(&it[1]) {
+                atomsof
+                    .entry(key_of(&it[0]))
+                    .or_default()
+                    .push((leaf_text(&p), key_of(&it[2])));
+            }
+        }
+    }
     // the rule table: ruleDerives rows ⟨rule id, head cell⟩ in cell order,
     // minus the aggregate rules (ruleAgg names them; their stratum is owed
     // to a later phase)
@@ -1874,31 +1931,124 @@ fn op_run_rules(srv: &mut Srv) -> Result<String, String> {
             aggids.insert(key_of(&it[0]));
         }
     }
-    let mut rules: Vec<(Leaf, Leaf)> = Vec::new();
+    struct RuleRow {
+        rid: Leaf,
+        head: Leaf,
+        key: String,
+        head_key: String,
+    }
+    let mut rules: Vec<RuleRow> = Vec::new();
     for r in pop_rows(&cells, &leaf("ruleDerives")) {
         let it = items(&list_of(&r));
         if it.len() >= 2 && !aggids.contains(&key_of(&it[0])) {
             if let (Some(rid), Some(head)) = (aval(&it[0]), aval(&it[1])) {
-                rules.push(((*rid).clone(), (*head).clone()));
+                rules.push(RuleRow {
+                    rid: (*rid).clone(),
+                    head: (*head).clone(),
+                    key: key_of(&it[0]),
+                    head_key: key_of(&it[1]),
+                });
             }
         }
     }
-    // the naive loop: every round evaluates every rule's full body against
-    // the CURRENT store (a head stored mid-round is visible to the next
-    // rule, exactly as Python threads D through its round), unions the new
-    // rows into the head cell, and stops when a full round adds nothing
+    // the semi-naive loop, Python's delta threading exactly: round one runs
+    // full bodies (bounded by the frontier when given); each later round
+    // sees the PREVIOUS round's per-head delta, and a rule whose atoms
+    // intersect it joins each stored ~d variant over the pair of that atom's
+    // sorted delta rows and D, while a rule without atom facts re-runs whole
+    // when its reads changed. A head stored mid-round is visible to the next
+    // rule, exactly as Python threads D through its round. Only genuinely
+    // new rows fire, and the round's additions become the next delta.
     let mut rounds: i64 = 0;
+    let mut delta: Option<HashMap<String, Vec<V>>> = None;
     loop {
         rounds += 1;
         let mut fired = false;
-        for (rid, head) in &rules {
-            let res = reduce_in(&mu, &cells, &d, atom(rid.clone()), d.clone(), None);
-            let outs = match shape(&res) {
-                Shape::Seq(l) => items(&l),
-                // the rule is not compiled (M-facts only) or bottomed: skip it
-                _ => continue,
+        let mut next_delta: HashMap<String, Vec<V>> = HashMap::new();
+        for rr in &rules {
+            let full = |d: &V, cells: &Vec<(Leaf, V)>| -> Option<Vec<V>> {
+                let res = reduce_in(&mu, cells, d, atom(rr.rid.clone()), d.clone(), None);
+                match shape(&res) {
+                    Shape::Seq(l) => Some(items(&l)),
+                    // the rule is not compiled (M-facts only) or bottomed
+                    _ => None,
+                }
             };
-            let old = pop_rows(&cells, head);
+            let cand: Vec<V> = match &delta {
+                None => {
+                    // round one: the full body, bounded by the frontier
+                    if let Some(fr) = &frontier {
+                        let hit = reads
+                            .get(&rr.key)
+                            .map_or(false, |rs| rs.iter().any(|k| fr.contains(k)));
+                        if !hit {
+                            continue;
+                        }
+                    }
+                    match full(&d, &cells) {
+                        Some(c) => c,
+                        None => continue,
+                    }
+                }
+                Some(dl) => {
+                    let hits: Vec<(String, String)> = match atomsof.get(&rr.key) {
+                        Some(av) => av
+                            .iter()
+                            .filter(|(_p, ftk)| dl.contains_key(ftk))
+                            .cloned()
+                            .collect(),
+                        None => Vec::new(),
+                    };
+                    if !hits.is_empty() {
+                        // the semi-naive inner join: each hit's ~d variant
+                        // applied to ⟨sorted delta rows, D⟩; a variant that
+                        // is missing or bottoms contributes nothing
+                        let mut c: Vec<V> = Vec::new();
+                        for (p, ftk) in &hits {
+                            let mut drows = dl[ftk].clone();
+                            sort_rows(&mut drows);
+                            let vid =
+                                Leaf::S(format!("{}~d{}", leaf_text(&rr.rid), p));
+                            let operand =
+                                seq(from_vec(vec![seq(from_vec(drows)), d.clone()]));
+                            let res =
+                                reduce_in(&mu, &cells, &d, atom(vid), operand, None);
+                            if let Shape::Seq(l) = shape(&res) {
+                                c.extend(items(&l));
+                            }
+                        }
+                        c
+                    } else if !atomsof.contains_key(&rr.key)
+                        && reads
+                            .get(&rr.key)
+                            .map_or(false, |rs| rs.iter().any(|k| dl.contains_key(k)))
+                    {
+                        // a rule without atom facts falls back to its full
+                        // body in rounds where its reads changed
+                        match full(&d, &cells) {
+                            Some(c) => c,
+                            None => continue,
+                        }
+                    } else if !atomsof.contains_key(&rr.key)
+                        && !reads.contains_key(&rr.key)
+                    {
+                        // Conservative widening beyond Python for HAND-BUILT
+                        // stores: a rule carrying neither atom facts nor read
+                        // facts has an unknown read set, so it re-evaluates
+                        // fully rather than going dormant after round one.
+                        // The compiler records ruleReads for every rule it
+                        // compiles, so on compiled stores this branch never
+                        // fires and the loop is exactly Python's.
+                        match full(&d, &cells) {
+                            Some(c) => c,
+                            None => continue,
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+            };
+            let old = pop_rows(&cells, &rr.head);
             let mut merged: Vec<V> = Vec::new();
             let mut keys: HashSet<String> = HashSet::new();
             for r in &old {
@@ -1906,26 +2056,32 @@ fn op_run_rules(srv: &mut Srv) -> Result<String, String> {
                     merged.push(r.clone());
                 }
             }
-            let before = merged.len();
-            for r in outs {
+            let mut added: Vec<V> = Vec::new();
+            for r in cand {
                 // only sequence rows count, as Python keeps only tuples
                 if !matches!(shape(&r), Shape::Seq(_)) {
                     continue;
                 }
                 if keys.insert(key_of(&r)) {
-                    merged.push(r);
+                    merged.push(r.clone());
+                    added.push(r);
                 }
             }
-            if merged.len() > before {
+            if !added.is_empty() {
                 sort_rows(&mut merged);
-                store_into(&mut d, &mut cells, head, seq(from_vec(merged)));
+                store_into(&mut d, &mut cells, &rr.head, seq(from_vec(merged)));
                 fired = true;
-                changed.insert(leaf_text(head));
+                changed.insert(leaf_text(&rr.head));
+                next_delta
+                    .entry(rr.head_key.clone())
+                    .or_default()
+                    .extend(added);
             }
         }
         if !fired {
             break;
         }
+        delta = Some(next_delta);
     }
     // REPLACE the retained store with the fixpoint, the retain protocol's
     // commit: d and its cell index move together (the native-carrier mirror
@@ -2081,11 +2237,12 @@ fn op_answer(op: &str, j: &J, srv: &mut Srv) -> Result<String, String> {
             Ok(r)
         }
         "run_rules" => {
-            // the derivation fixpoint over the retained store (phase one:
-            // the naive positive-rule closure); the answer names the rounds
-            // and the head cells that gained rows, and the retained store is
+            // the derivation fixpoint over the retained store (the
+            // semi-naive positive-rule closure, with the optional "changed"
+            // frontier bounding round one); the answer names the rounds and
+            // the head cells that gained rows, and the retained store is
             // REPLACED by the derived result
-            op_run_rules(srv)
+            op_run_rules(j, srv)
         }
         _ => {
             if SESSION_VERBS.contains(&op) || APP_VERBS.contains(&op) {
@@ -2146,8 +2303,8 @@ const MCP_TOOLS: &str = concat!(
     r#""description":"Answers an entity's facts paired with their fact types' reading templates; the caller words the prose.","#,
     r#""inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},"#,
     r#"{"name":"derive","#,
-    r#""description":"Runs the derivation rules over the retained store to the least fixed point and answers the rounds and the changed head cells.","#,
-    r#""inputSchema":{"type":"object","properties":{}}},"#,
+    r#""description":"Runs the derivation rules over the retained store to the least fixed point and answers the rounds and the changed head cells; changed optionally bounds round one to the rules reading those cells.","#,
+    r#""inputSchema":{"type":"object","properties":{"changed":{"type":"array","items":{"type":"string"}}}}},"#,
     r#"{"name":"apply","#,
     r#""description":"Delegates one fact-row commit to the Python compiler host and answers its receipt; a refused write answers committed false with the violations.","#,
     r#""inputSchema":{"type":"object","properties":{"app":{"type":"string"},"fact_type":{"type":"string"},"fact":{"type":"array","items":{"type":"string"}}},"required":["app","fact_type","fact"]}},"#,

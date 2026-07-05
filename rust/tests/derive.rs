@@ -250,6 +250,135 @@ fn asserted_mirror_rows_win_over_the_derivation() {
 }
 
 #[test]
+fn later_rounds_run_the_stored_delta_variants_not_the_full_bodies() {
+    // The semi-naive proof: chain_rule's ~d1 variant REVERSES each delta row,
+    // while its full body copies rows unchanged. Round one evaluates the full
+    // body over an empty Dst (deriving nothing into Chain); round two must
+    // join through the variant over Dst's round-one delta, so Chain ends with
+    // ONLY the reversed row. A loop that re-ran full bodies in round two
+    // would put the unreversed row there instead (or beside it), and a loop
+    // that never ran the variant would leave Chain empty.
+    let mut s = Serve::spawn();
+    assert_eq!(s.rpc(r#"{"d": []}"#), "[]");
+    let r = s.rpc(&store_case("Src", r#"[["a","x"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "Src store step: {r}");
+    let r = s.rpc(&store_case(
+        "ruleDerives",
+        r#"[["chain_rule","Chain"],["copy_rule","Dst"]]"#,
+    ));
+    assert!(r.starts_with(r#"[["ok","#), "ruleDerives store step: {r}");
+    let r = s.rpc(&store_case(
+        "ruleReads",
+        r#"[["chain_rule","Dst"],["copy_rule","Src"]]"#,
+    ));
+    assert!(r.starts_with(r#"[["ok","#), "ruleReads store step: {r}");
+    // ruleAtom rows are ⟨rule id, atom position, atom fact type⟩; the stored
+    // variant rides the cell named "<rule id>~d<position>"
+    let r = s.rpc(&store_case(
+        "ruleAtom",
+        r#"[["chain_rule",1,"Dst"],["copy_rule",1,"Src"]]"#,
+    ));
+    assert!(r.starts_with(r#"[["ok","#), "ruleAtom store step: {r}");
+    let r = s.rpc(&store_case("copy_rule", &copy_rule("Src")));
+    assert!(r.starts_with(r#"[["ok","#), "copy_rule store step: {r}");
+    // the identity delta variant: selector 1 answers the delta rows themselves
+    let r = s.rpc(&store_case("copy_rule~d1", "1"));
+    assert!(r.starts_with(r#"[["ok","#), "copy_rule~d1 store step: {r}");
+    let r = s.rpc(&store_case("chain_rule", &copy_rule("Dst")));
+    assert!(r.starts_with(r#"[["ok","#), "chain_rule store step: {r}");
+    // the observable delta variant: ⟨COMP, ⟨ALPHA, reverse⟩, 1⟩ : ⟨Δ, D⟩
+    // reverses each delta row, so its output is distinguishable from the
+    // full body's
+    let r = s.rpc(&store_case(
+        "chain_rule~d1",
+        r#"["COMP",["ALPHA","reverse"],1]"#,
+    ));
+    assert!(r.starts_with(r#"[["ok","#), "chain_rule~d1 store step: {r}");
+
+    // round one: full bodies (Chain stays empty, Dst fills); round two: the
+    // chain variant joins Dst's delta and derives the reversed row; round
+    // three is quiet
+    assert_eq!(
+        s.rpc(r#"{"op":"run_rules"}"#),
+        r#"{"op":"run_rules","result":{"rounds":3,"changed":["Chain","Dst"]}}"#
+    );
+    assert_eq!(
+        s.rpc(r#"{"op":"query","fact_type":"Dst"}"#),
+        r#"{"op":"query","result":{"fact_type":"Dst","rows":[["a","x"]]}}"#
+    );
+    assert_eq!(
+        s.rpc(r#"{"op":"query","fact_type":"Chain"}"#),
+        r#"{"op":"query","result":{"fact_type":"Chain","rows":[["x","a"]]}}"#
+    );
+}
+
+#[test]
+fn the_frontier_bounds_round_one_to_the_rules_reading_it() {
+    let mut s = Serve::spawn();
+    assert_eq!(s.rpc(r#"{"d": []}"#), "[]");
+    let r = s.rpc(&store_case("Src", r#"[["a","x"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "Src store step: {r}");
+    let r = s.rpc(&store_case("ruleDerives", r#"[["copy_rule","Dst"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "ruleDerives store step: {r}");
+    let r = s.rpc(&store_case("ruleReads", r#"[["copy_rule","Src"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "ruleReads store step: {r}");
+    let r = s.rpc(&store_case("copy_rule", &copy_rule("Src")));
+    assert!(r.starts_with(r#"[["ok","#), "copy_rule store step: {r}");
+
+    // a frontier naming a cell no rule reads evaluates nothing: one quiet
+    // round, no changes, and the head cell stays underived
+    assert_eq!(
+        s.rpc(r#"{"op":"run_rules","changed":["Unrelated"]}"#),
+        r#"{"op":"run_rules","result":{"rounds":1,"changed":[]}}"#
+    );
+    assert_eq!(
+        s.rpc(r#"{"op":"query","fact_type":"Dst"}"#),
+        r#"{"op":"query","result":{"fact_type":"Dst","rows":[]}}"#
+    );
+    // a malformed frontier is an answerable error, never a crash
+    assert_eq!(
+        s.rpc(r#"{"op":"run_rules","changed":"Src"}"#),
+        concat!(
+            r#"{"op":"run_rules","error":"#,
+            r#""run_rules changed must be an array of scalar cell names"}"#
+        )
+    );
+    // a frontier naming a read cell fires the dependent rule in round one
+    assert_eq!(
+        s.rpc(r#"{"op":"run_rules","changed":["Src"]}"#),
+        r#"{"op":"run_rules","result":{"rounds":2,"changed":["Dst"]}}"#
+    );
+    assert_eq!(
+        s.rpc(r#"{"op":"query","fact_type":"Dst"}"#),
+        r#"{"op":"query","result":{"fact_type":"Dst","rows":[["a","x"]]}}"#
+    );
+
+    // the mirror blocks run BEFORE the loop and ignore the frontier, exactly
+    // as Python's run before its frontier is even consulted
+    let r = s.rpc(&store_case("role", r#"[["r1","Person_has_Name",1,"Person"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "role store step: {r}");
+    let r = s.rpc(&store_case(
+        "ruleReads",
+        r#"[["copy_rule","Src"],["mirror_reader","Fact_Type_has_Role"]]"#,
+    ));
+    assert!(r.starts_with(r#"[["ok","#), "ruleReads re-store step: {r}");
+    assert_eq!(
+        s.rpc(r#"{"op":"run_rules","changed":["Unrelated"]}"#),
+        concat!(
+            r#"{"op":"run_rules","result":{"rounds":1,"#,
+            r#""changed":["Fact_Type_has_Role"]}}"#
+        )
+    );
+    assert_eq!(
+        s.rpc(r#"{"op":"query","fact_type":"Fact_Type_has_Role"}"#),
+        concat!(
+            r#"{"op":"query","result":{"fact_type":"Fact_Type_has_Role","#,
+            r#""rows":[["Person_has_Name","r1"]]}}"#
+        )
+    );
+}
+
+#[test]
 fn the_rust_fixpoint_rederives_an_emptied_head_from_python_compiled_rules() {
     // Idempotence alone cannot tell evaluation from silent skipping (both
     // answer changed []), so this test EMPTIES a derived head cell on a store
