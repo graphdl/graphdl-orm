@@ -96,7 +96,9 @@ fn run_rules_reaches_the_least_fixed_point_and_replaces_the_retained_store() {
         ),
     ));
     assert!(r.starts_with(r#"[["ok","#), "ruleDerives store step: {r}");
-    // agg_rule is marked aggregate: phase one must SKIP it entirely.
+    // agg_rule is marked aggregate: the CLOSURE loop must never run it (its
+    // head unions would be wrong); it derives through the agg stratum after
+    // the closure settles.
     let r = s.rpc(&store_case("ruleAgg", r#"[["agg_rule"]]"#));
     assert!(r.starts_with(r#"[["ok","#), "ruleAgg store step: {r}");
     let r = s.rpc(&store_case("copy_rule", &copy_rule("Src")));
@@ -109,10 +111,11 @@ fn run_rules_reaches_the_least_fixed_point_and_replaces_the_retained_store() {
 
     // ---- the fixpoint: round one fills Dst (and Chain with the asserted
     //      row), round two chains Dst's derived rows into Chain, round three
-    //      is quiet ----
+    //      is quiet; the agg stratum then derives AggHead (per-group, since
+    //      the head declares no derivation kind) ----
     assert_eq!(
         s.rpc(r#"{"op":"run_rules"}"#),
-        r#"{"op":"run_rules","result":{"rounds":3,"changed":["Chain","Dst"]}}"#
+        r#"{"op":"run_rules","result":{"rounds":3,"changed":["AggHead","Chain","Dst"]}}"#
     );
 
     // ---- the retained store is REPLACED: query answers the derived rows ----
@@ -124,10 +127,11 @@ fn run_rules_reaches_the_least_fixed_point_and_replaces_the_retained_store() {
         s.rpc(r#"{"op":"query","fact_type":"Chain"}"#),
         r#"{"op":"query","result":{"fact_type":"Chain","rows":[["a","x"],["b","y"],["z","w"]]}}"#
     );
-    // the aggregate rule was skipped and the uncompiled rule fired nothing
+    // the aggregate rule derived through its own stratum, not the closure,
+    // and the uncompiled rule fired nothing
     assert_eq!(
         s.rpc(r#"{"op":"query","fact_type":"AggHead"}"#),
-        r#"{"op":"query","result":{"fact_type":"AggHead","rows":[]}}"#
+        r#"{"op":"query","result":{"fact_type":"AggHead","rows":[["a","x"],["b","y"]]}}"#
     );
     assert_eq!(
         s.rpc(r#"{"op":"query","fact_type":"Ghost"}"#),
@@ -375,6 +379,116 @@ fn the_frontier_bounds_round_one_to_the_rules_reading_it() {
             r#"{"op":"query","result":{"fact_type":"Fact_Type_has_Role","#,
             r#""rows":[["Person_has_Name","r1"]]}}"#
         )
+    );
+}
+
+#[test]
+fn a_fully_derived_agg_head_whole_replaces_so_vanished_groups_die() {
+    // The supersession pin that separates the agg stratum from union: on a
+    // FULL derive a fully-derived aggregate head is REPLACED whole by its
+    // rules' rows, so a group whose supply vanished dies (per-group
+    // supersession could never retire it, because nothing produces its key).
+    // On an INCREMENTAL derive (a changed frontier given) the same head
+    // supersedes per group only, so the orphan survives until the next full
+    // derive. The rule object here is a copy of the base cell: the stratum's
+    // routing and supersession are what is under test, not the fold.
+    let mut s = Serve::spawn();
+    assert_eq!(s.rpc(r#"{"d": []}"#), "[]");
+    let r = s.rpc(&store_case("Src", r#"[["g1","a"],["g2","b"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "Src store step: {r}");
+    let r = s.rpc(&store_case("derivation", r#"[["Tot","fully-derived"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "derivation store step: {r}");
+    let r = s.rpc(&store_case("ruleAgg", r#"[["agg1"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "ruleAgg store step: {r}");
+    let r = s.rpc(&store_case("ruleDerives", r#"[["agg1","Tot"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "ruleDerives store step: {r}");
+    let r = s.rpc(&store_case("ruleReads", r#"[["agg1","Src"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "ruleReads store step: {r}");
+    let r = s.rpc(&store_case("agg1", &copy_rule("Src")));
+    assert!(r.starts_with(r#"[["ok","#), "agg1 store step: {r}");
+
+    // the aggregate derives its groups (the closure loop has no plain rules,
+    // so its one round is quiet and the stratum does the work)
+    assert_eq!(
+        s.rpc(r#"{"op":"run_rules"}"#),
+        r#"{"op":"run_rules","result":{"rounds":1,"changed":["Tot"]}}"#
+    );
+    assert_eq!(
+        s.rpc(r#"{"op":"query","fact_type":"Tot"}"#),
+        r#"{"op":"query","result":{"fact_type":"Tot","rows":[["g1","a"],["g2","b"]]}}"#
+    );
+    // g2's supply vanishes; the next FULL derive whole-replaces the head and
+    // the vanished group dies
+    let r = s.rpc(&store_case("Src", r#"[["g1","a"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "Src shrink store step: {r}");
+    assert_eq!(
+        s.rpc(r#"{"op":"run_rules"}"#),
+        r#"{"op":"run_rules","result":{"rounds":1,"changed":["Tot"]}}"#
+    );
+    assert_eq!(
+        s.rpc(r#"{"op":"query","fact_type":"Tot"}"#),
+        r#"{"op":"query","result":{"fact_type":"Tot","rows":[["g1","a"]]}}"#
+    );
+    // idempotence: the fixpoint of a fixpoint changes nothing
+    assert_eq!(
+        s.rpc(r#"{"op":"run_rules"}"#),
+        r#"{"op":"run_rules","result":{"rounds":1,"changed":[]}}"#
+    );
+    // ALL supply vanishes; an INCREMENTAL derive supersedes per group only,
+    // so the orphaned group survives it, and the next FULL derive retires it
+    let r = s.rpc(&store_case("Src", r#"[]"#));
+    assert!(r.starts_with(r#"[["ok","#), "Src empty store step: {r}");
+    assert_eq!(
+        s.rpc(r#"{"op":"run_rules","changed":["Src"]}"#),
+        r#"{"op":"run_rules","result":{"rounds":1,"changed":[]}}"#
+    );
+    assert_eq!(
+        s.rpc(r#"{"op":"query","fact_type":"Tot"}"#),
+        r#"{"op":"query","result":{"fact_type":"Tot","rows":[["g1","a"]]}}"#
+    );
+    assert_eq!(
+        s.rpc(r#"{"op":"run_rules"}"#),
+        r#"{"op":"run_rules","result":{"rounds":1,"changed":["Tot"]}}"#
+    );
+    assert_eq!(
+        s.rpc(r#"{"op":"query","fact_type":"Tot"}"#),
+        r#"{"op":"query","result":{"fact_type":"Tot","rows":[]}}"#
+    );
+}
+
+#[test]
+fn an_asserted_agg_head_supersedes_per_group_never_whole() {
+    // A head WITHOUT the fully-derived kind is not materialization: the
+    // stratum supersedes per group, so a produced group's stale row is
+    // replaced while an asserted row whose group no rule produces survives
+    // even a full derive.
+    let mut s = Serve::spawn();
+    assert_eq!(s.rpc(r#"{"d": []}"#), "[]");
+    let r = s.rpc(&store_case("Src", r#"[["g1","new"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "Src store step: {r}");
+    let r = s.rpc(&store_case("Tot", r#"[["g1","old"],["gX","keep"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "Tot store step: {r}");
+    let r = s.rpc(&store_case("ruleAgg", r#"[["agg1"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "ruleAgg store step: {r}");
+    let r = s.rpc(&store_case("ruleDerives", r#"[["agg1","Tot"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "ruleDerives store step: {r}");
+    let r = s.rpc(&store_case("ruleReads", r#"[["agg1","Src"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "ruleReads store step: {r}");
+    let r = s.rpc(&store_case("agg1", &copy_rule("Src")));
+    assert!(r.starts_with(r#"[["ok","#), "agg1 store step: {r}");
+
+    assert_eq!(
+        s.rpc(r#"{"op":"run_rules"}"#),
+        r#"{"op":"run_rules","result":{"rounds":1,"changed":["Tot"]}}"#
+    );
+    // g1's stale row superseded per group; gX's asserted row survives
+    assert_eq!(
+        s.rpc(r#"{"op":"query","fact_type":"Tot"}"#),
+        r#"{"op":"query","result":{"fact_type":"Tot","rows":[["g1","new"],["gX","keep"]]}}"#
+    );
+    assert_eq!(
+        s.rpc(r#"{"op":"run_rules"}"#),
+        r#"{"op":"run_rules","result":{"rounds":1,"changed":[]}}"#
     );
 }
 

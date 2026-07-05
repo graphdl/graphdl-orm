@@ -1721,6 +1721,23 @@ fn sort_rows(rows: &mut Vec<V>) {
     rows.extend(keyed.into_iter().map(|(_, r)| r));
 }
 
+// group_key keys a row over every column but the last (engine.py's r[:-1]),
+// the aggregate group: on supersession a produced group replaces its stored
+// row while a group no rule produced survives. It shares key_of's encoding
+// over the truncated row, so a group key never collides across arities and
+// compares exactly as the Python tuple slice does. A single-column row has
+// the empty group (a global aggregate), matching r[:-1] on a 1-tuple.
+fn group_key(row: &V) -> String {
+    match shape(row) {
+        Shape::Seq(l) => {
+            let mut cols = items(&l);
+            cols.pop();
+            key_of(&seq(from_vec(cols)))
+        }
+        _ => key_of(row),
+    }
+}
+
 // pop_rows is FetchPop's view over the cached cell index: the named cell's
 // rows, with an absent cell or an atom-valued cell the empty population.
 fn pop_rows(cells: &[(Leaf, V)], name: &Leaf) -> Vec<V> {
@@ -1922,8 +1939,10 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
         }
     }
     // the rule table: ruleDerives rows ⟨rule id, head cell⟩ in cell order,
-    // minus the aggregate rules (ruleAgg names them; their stratum is owed
-    // to a later phase)
+    // split on ruleAgg into the closure's plain rules and the AGGREGATE
+    // rules the upper stratum runs after the closure settles (an aggregate
+    // head supersedes instead of unioning, so the closure must never run
+    // one)
     let mut aggids: HashSet<String> = HashSet::new();
     for r in pop_rows(&cells, &leaf("ruleAgg")) {
         let it = items(&list_of(&r));
@@ -1938,16 +1957,22 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
         head_key: String,
     }
     let mut rules: Vec<RuleRow> = Vec::new();
+    let mut agg_rules: Vec<RuleRow> = Vec::new();
     for r in pop_rows(&cells, &leaf("ruleDerives")) {
         let it = items(&list_of(&r));
-        if it.len() >= 2 && !aggids.contains(&key_of(&it[0])) {
+        if it.len() >= 2 {
             if let (Some(rid), Some(head)) = (aval(&it[0]), aval(&it[1])) {
-                rules.push(RuleRow {
+                let row = RuleRow {
                     rid: (*rid).clone(),
                     head: (*head).clone(),
                     key: key_of(&it[0]),
                     head_key: key_of(&it[1]),
-                });
+                };
+                if aggids.contains(&row.key) {
+                    agg_rules.push(row);
+                } else {
+                    rules.push(row);
+                }
             }
         }
     }
@@ -1961,6 +1986,9 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     // new rows fire, and the round's additions become the next delta.
     let mut rounds: i64 = 0;
     let mut delta: Option<HashMap<String, Vec<V>>> = None;
+    // closure_keys collects the closure's changed head keys, feeding the
+    // upper stratum's dirty set exactly as Python's closure_changed does
+    let mut closure_keys: HashSet<String> = HashSet::new();
     loop {
         rounds += 1;
         let mut fired = false;
@@ -2072,6 +2100,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 store_into(&mut d, &mut cells, &rr.head, seq(from_vec(merged)));
                 fired = true;
                 changed.insert(leaf_text(&rr.head));
+                closure_keys.insert(rr.head_key.clone());
                 next_delta
                     .entry(rr.head_key.clone())
                     .or_default()
@@ -2082,6 +2111,129 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
             break;
         }
         delta = Some(next_delta);
+    }
+    // ---- THE AGGREGATE STRATUM (engine.py lines 1210 through 1242): the
+    // agg pass of the joint fixpoint above the positive closure, iterated
+    // until a sweep changes nothing (at most twelve rounds, as Python
+    // bounds it). Each aggregate rule evaluates its FULL body over the
+    // current D; its head then SUPERSEDES rather than unions. A
+    // fully-derived head on a FULL derive (no frontier) is REPLACED whole
+    // by the agg rows unioned with its plain rules' rows, so a group whose
+    // supply vanished dies (per-group supersession could never retire it),
+    // and the paired plain rows of the zero-supply idiom rejoin fresh. In
+    // every other case (an incremental derive, or a head that is not
+    // fully-derived) the head supersedes PER GROUP: the group is every
+    // column but the last, produced groups replace their stored rows, and
+    // stored rows whose group no rule produced survive. Dirty-set filtering
+    // keeps incremental calls proportional: round zero of a full derive
+    // evaluates every aggregate once (the idempotence guarantee), while a
+    // frontier call touches only rules whose reads intersect the frontier,
+    // the closure's changes, or this round's own stores. Still owed to a
+    // later phase: the keyed upserts and the DRed sweeps that share this
+    // joint loop in Python.
+    let mut kindmap: HashMap<String, String> = HashMap::new();
+    for r in pop_rows(&cells, &leaf("derivation")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            if let Some(k) = aval(&it[1]) {
+                if let Leaf::S(ks) = &*k {
+                    kindmap.insert(key_of(&it[0]), ks.clone());
+                }
+            }
+        }
+    }
+    let mut plain_of: HashMap<String, Vec<Leaf>> = HashMap::new();
+    for rr in &rules {
+        plain_of
+            .entry(rr.head_key.clone())
+            .or_default()
+            .push(rr.rid.clone());
+    }
+    let mut dirty: Option<HashSet<String>> = frontier
+        .as_ref()
+        .map(|fr| fr.union(&closure_keys).cloned().collect());
+    for outer in 0..12 {
+        let mut settled = true;
+        let mut round_changed: HashSet<String> = HashSet::new();
+        for rr in &agg_rules {
+            // the gate: round zero of a full derive evaluates everything;
+            // otherwise only rules whose reads touch the dirty set or this
+            // round's own changes fire
+            if outer > 0 || dirty.is_some() {
+                let touched = reads.get(&rr.key).map_or(false, |rs| {
+                    rs.iter().any(|k| {
+                        dirty.as_ref().map_or(false, |dd| dd.contains(k))
+                            || round_changed.contains(k)
+                    })
+                });
+                if !touched {
+                    continue;
+                }
+            }
+            let res = reduce_in(&mu, &cells, &d, atom(rr.rid.clone()), d.clone(), None);
+            let outs = match shape(&res) {
+                Shape::Seq(l) => items(&l),
+                // an uncompiled aggregate (M-facts only) stores nothing
+                _ => continue,
+            };
+            let mut merged: Vec<V> = Vec::new();
+            let mut mkeys: HashSet<String> = HashSet::new();
+            for r in &outs {
+                if matches!(shape(r), Shape::Seq(_)) && mkeys.insert(key_of(r)) {
+                    merged.push(r.clone());
+                }
+            }
+            let before = pop_rows(&cells, &rr.head);
+            let mut before_keys: HashSet<String> = HashSet::new();
+            let mut before_rows: Vec<V> = Vec::new();
+            for r in &before {
+                if before_keys.insert(key_of(r)) {
+                    before_rows.push(r.clone());
+                }
+            }
+            if kindmap.get(&rr.head_key).map(String::as_str) == Some("fully-derived")
+                && dirty.is_none()
+            {
+                // whole-replace: the agg rows plus the head's plain rules'
+                // rows ARE the cell; nothing older survives
+                for rid in plain_of.get(&rr.head_key).map(|v| v.as_slice()).unwrap_or(&[])
+                {
+                    let res =
+                        reduce_in(&mu, &cells, &d, atom(rid.clone()), d.clone(), None);
+                    if let Shape::Seq(l) = shape(&res) {
+                        for r in items(&l) {
+                            if matches!(shape(&r), Shape::Seq(_))
+                                && mkeys.insert(key_of(&r))
+                            {
+                                merged.push(r);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // per-group supersession: the group is every column but the
+                // last; stored rows whose group no rule produced survive
+                let groups: HashSet<String> = merged.iter().map(group_key).collect();
+                for r in &before_rows {
+                    if !groups.contains(&group_key(r)) && mkeys.insert(key_of(r)) {
+                        merged.push(r.clone());
+                    }
+                }
+            }
+            let same = mkeys.len() == before_keys.len()
+                && mkeys.iter().all(|k| before_keys.contains(k));
+            if !same {
+                settled = false;
+                round_changed.insert(rr.head_key.clone());
+                changed.insert(leaf_text(&rr.head));
+                sort_rows(&mut merged);
+                store_into(&mut d, &mut cells, &rr.head, seq(from_vec(merged)));
+            }
+        }
+        if settled {
+            break;
+        }
+        dirty = Some(round_changed);
     }
     // REPLACE the retained store with the fixpoint, the retain protocol's
     // commit: d and its cell index move together (the native-carrier mirror
