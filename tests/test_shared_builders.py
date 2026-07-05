@@ -246,3 +246,28 @@ def test_row_validate_canonical_matches_the_python_builder():
                                    (row_hole, (), "F")):
         got = from_lam(_apply(via_def, _S(row, to_lam(()))))
         assert got[1] == want_v and got[2] == want_flag, (got, want_v, want_flag)
+
+
+def test_verbalize_pairs_canonical_over_the_entity_facts():
+    # synthesize's engine half (the old verb's contract: the engine
+    # guarantees content, the LLM only shapes wording): the entity's facts
+    # paired with their fact types' reading templates, post-derive, as
+    # structured pairs; rendering is a connector concern
+    from pyarest import forml, system
+    from pyarest.reduce import apply as _apply
+    model = """Person(.nr) is an entity type.
+Name is a value type.
+Pet is an entity type.
+Person has Name.
+Person keeps Pet.
+Person 'p1' has Name 'Ada'.
+Person 'p1' keeps Pet 'rex'.
+Person 'p2' has Name 'Bo'.
+"""
+    D, rep = forml.compile_model(model)
+    D = system.run_rules(D)
+    got = from_lam(_apply(_apply(A("system:verbalize"), A("p1")), D))
+    pairs = {(r[0], tuple(r[1])) for r in got}
+    assert ("{0} has {1}", ("p1", "Ada")) in pairs
+    assert ("{0} keeps {1}", ("p1", "rex")) in pairs
+    assert not any("Bo" in str(p) for p in pairs)

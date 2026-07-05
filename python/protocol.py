@@ -1363,6 +1363,29 @@ class Registry:
             out.append({"name": nm, "rows": len(system._pop_rows(D, nm))})
         return sorted(out, key=lambda c: c["name"])
 
+    def synthesize(self, name, id, noun=None):
+        """The old engine's synthesize verb, engine half: the entity's facts
+        paired with their fact types' reading templates, post-derive (the
+        canonical system:verbalize), plus a plain rendering per pair. The
+        engine guarantees content; wording is the caller's concern (an LLM
+        shapes it, or the rendering below stands)."""
+        from .reduce import apply as _apply
+        from .kernel import atom as A, from_lam
+        D = self._load(name)
+        got = from_lam(_apply(_apply(A("system:verbalize"), A(id)), D))
+        facts = []
+        for r in got if isinstance(got, tuple) else ():
+            if not (isinstance(r, tuple) and len(r) == 2):
+                continue
+            reading, row = str(r[0]), tuple(r[1])
+            try:
+                text = reading.format(*row)
+            except (IndexError, KeyError):
+                text = reading
+            facts.append({"reading": reading, "row": list(row),
+                          "text": text})
+        return {"app": name, "id": id, "facts": facts}
+
     def schema(self, name):
         """The model surface: object types, fact types with readings and roles,
         and the constraint inventory."""
@@ -1474,39 +1497,53 @@ TOOLS = [
 ]
 
 
+# THE VERB TABLE, first-class from the system (Samuel, 2026-07-04: the
+# verbs are not MCP-specific). Every binding — MCP stdio here, the CLI, the
+# Rust resident's serve loop, an in-process caller — routes through this one
+# table: name -> fn(registry, args). Session verbs need no app; app verbs
+# resolve the override-or-active app first. New verbs (synthesize, explain)
+# land HERE as Registry-backed entries and every surface gains them at once.
+SESSION_VERBS = {
+    "orient": lambda reg, a: reg.orient(),
+    "apps_list": lambda reg, a: reg.list(),
+    "apps_current": lambda reg, a: {"current": reg.current()},
+    "apps_use": lambda reg, a: {"active_app": reg.use(a["name"])},
+    "apps_compile": lambda reg, a: reg.compile(a["name"]),
+    "context": lambda reg, a: reg.last_receipt
+        or {"note": "no mutation this session"},
+}
+
+APP_VERBS = {
+    "query": lambda reg, app, a: {"app": app, "fact_type": a["fact_type"],
+                                  "rows": reg.query(app, a["fact_type"])},
+    "sql": lambda reg, app, a: {"app": app,
+                                "rows": reg.sql(app, a["statement"])},
+    "apply": lambda reg, app, a: reg.apply(app, a["fact_type"], a["fact"]),
+    "retract": lambda reg, app, a: reg.retract(app, a["fact_type"],
+                                               a["fact"]),
+    "get": lambda reg, app, a: reg.get(app, a["noun"], a["id"]),
+    "cells": lambda reg, app, a: {"app": app,
+                                  "cells": reg.cells(
+                                      app, pattern=a.get("pattern"),
+                                      cell=a.get("cell"))},
+    "schema": lambda reg, app, a: reg.schema(app),
+}
+
+
+def verbs():
+    """Every verb the system serves, surface-agnostic."""
+    return sorted(SESSION_VERBS) + sorted(APP_VERBS)
+
+
 def _dispatch(reg, name, args):
-    if name == "orient":
-        return reg.orient()
-    if name == "apps_list":
-        return reg.list()
-    if name == "apps_current":
-        return {"current": reg.current()}
-    if name == "apps_use":
-        return {"active_app": reg.use(args["name"])}
-    if name == "apps_compile":
-        return reg.compile(args["name"])
-    if name == "context":
-        return reg.last_receipt or {"note": "no mutation this session"}
-    app = args.get("app") or reg.current()
-    if not app:
-        raise ValueError("no app given and no active app set (apps_use first)")
-    if name == "query":
-        return {"app": app, "fact_type": args["fact_type"],
-                "rows": reg.query(app, args["fact_type"])}
-    if name == "sql":
-        return {"app": app, "rows": reg.sql(app, args["statement"])}
-    if name == "apply":
-        return reg.apply(app, args["fact_type"], args["fact"])
-    if name == "retract":
-        return reg.retract(app, args["fact_type"], args["fact"])
-    if name == "get":
-        return reg.get(app, args["noun"], args["id"])
-    if name == "cells":
-        return {"app": app,
-                "cells": reg.cells(app, pattern=args.get("pattern"),
-                                   cell=args.get("cell"))}
-    if name == "schema":
-        return reg.schema(app)
+    if name in SESSION_VERBS:
+        return SESSION_VERBS[name](reg, args)
+    if name in APP_VERBS:
+        app = args.get("app") or reg.current()
+        if not app:
+            raise ValueError(
+                "no app given and no active app set (apps_use first)")
+        return APP_VERBS[name](reg, app, args)
     raise ValueError(f"unknown tool {name!r}")
 
 
