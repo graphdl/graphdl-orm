@@ -110,8 +110,10 @@ architecturally excluded per target.
     the old repo root with its build artifacts. A copy of AREST.pdf
     also sits at C:\Users\lippe\Repos\apps\AREST.pdf and the book
     sources live as _book_*.txt siblings under C:\Users\lippe\Repos.
-    pyarest disposition: the paper must move somewhere durable before
-    the nuke; pyarest has no copy today.
+    pyarest disposition: ARCHIVED 2026-07-05, tracked at paper/
+    (source and PDF verbatim with a provenance note). The book
+    source siblings under C:\Users\lippe\Repos remain outside any
+    repo and deserve their own home decision.
 
 13. THE DOCS SUITE. Eighteen numbered reference docs (01-introduction
     through 24-ui-toolkit-decision) plus cli.md, cloud.md,
