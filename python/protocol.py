@@ -1425,6 +1425,7 @@ class Registry:
             D = system.run_rules(D)
         D = system.layout_cells(D)
         D = system.generator_cells(D)
+        D = system.create_handlers(D)                         # create:<ft> defs, native apply
         drv = self._storage(name)
         drv.save(D)                                           # the cell store, through the driver
         self._sidecar(name, D)

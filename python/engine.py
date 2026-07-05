@@ -1751,6 +1751,34 @@ def _create_from_spec(D, fact_type, fact, spec, fuel=None):
                    append_cell=fact_type, fuel=fuel)
 
 
+def create_handlers(D):
+    """Store create:<ft> handler cells, the goal being full native for every part
+    but lambda and defs: a create handler is a DEF the resident reduces over the
+    fact, no host orchestration at write time. An own-table handler is
+    fact-INDEPENDENT (fixed cell name) so its handler is stored whole; an absorbed
+    handler needs the fact's key (table:key) and rides as its spec for the resident
+    to complete, phase two. Called at compile beside the layout and generator
+    cells; recompile replaces the family."""
+    from .lam import to_lam, from_lam
+    from . import ast
+    part = rmap_partition(D)
+    cells = tuple(c for c in from_lam(D)
+                  if not (isinstance(c, tuple) and len(c) >= 2
+                          and str(c[1]).startswith("create:")))
+    fresh = []
+    for f in _pop_rows(D, "factType"):
+        if not f:
+            continue
+        ft = f[0]
+        spec = create_spec(D, ft, part)
+        if spec["absorbed"]:
+            continue                                          # phase two: needs the key
+        handler = ast.build_system(cell_name=ft, machine=spec["machine"],
+                                   mealy_obj=spec["mealy"], links_obj=spec["links"])
+        fresh.append(("CELL", "create:" + ft, from_lam(handler)))
+    return to_lam(cells + tuple(fresh))
+
+
 def create_stamped(D, ft, fact, tx):
     """Bitemporal τ (Halpin §13.6): transaction time is when the SYSTEM records the fact
     — ⟨tx, …fact⟩ enters the ft@tx log beside the base fact; valid time is ordinary UoD
