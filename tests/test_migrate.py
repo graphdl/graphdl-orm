@@ -40,6 +40,19 @@ def test_parse_cell_rejects_on_roundtrip_failure():
     assert migrate.parse_cell("not cells at all") is None
 
 
+def test_parse_cell_reads_the_empty_population_phi_form():
+    # support.auto.dev's two live-unparsed cells, probed 2026-07-05: the old
+    # engine encodes an EMPTY population as 'key=φ', which contributes no
+    # rows; it must parse as empty, not fail the round trip, whether alone
+    # or beside real entries in either order
+    assert migrate.parse_cell(
+        "{Customer_accepts_current_Terms_Of_Service#74a5=φ}") == []
+    assert migrate.parse_cell("{a#1=φ, k=<<Task, 179>, <Name, Ada>>}") == [
+        ("k", (("Task", "179"), ("Name", "Ada")))]
+    assert migrate.parse_cell("{k=<<Task, 179>, <Name, Ada>>, a#1=φ}") == [
+        ("k", (("Task", "179"), ("Name", "Ada")))]
+
+
 BASE = """Status is a value type.
 Resource is an entity type.
 State Machine is an entity type.

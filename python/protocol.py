@@ -631,6 +631,14 @@ def _parse_masked(contents):
     inner = s[1:-1]
     if not inner:
         return []
+    # the EMPTY population entry: 'key=φ' is the old engine's phi for the
+    # empty object and contributes no rows; strip such entries first and
+    # run the round-trip proof over the remainder (support.auto.dev's two
+    # live cells carry exactly this form)
+    inner = re.sub(r"(?:^|(?<=, ))[^=<>{}]+=φ(, |$)", "", inner)
+    inner = inner.rstrip(", ").rstrip(",")
+    if not inner:
+        return []
     starts = [m.start() for m in re.finditer(r"=<<", inner)]
     if not starts:
         return None
@@ -661,7 +669,9 @@ def _parse_masked(contents):
     rebuilt = "{" + ", ".join(
         k + "=<" + ", ".join(f"<{r}, {v}>" for (r, v) in ps) + ">"
         for (k, ps) in entries) + "}"
-    return entries if rebuilt == s else None
+    # the proof runs over the phi-reduced inner: stripped empty entries
+    # contribute nothing to either side
+    return entries if rebuilt == "{" + inner + "}" else None
 
 
 # ---- classification and replay ----
