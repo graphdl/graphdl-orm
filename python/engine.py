@@ -1670,12 +1670,16 @@ def mealy_step(trigger_ft, row_col=None):
 
 def _governed_player(D, ft):
     """The player of `ft` whose noun a machine governs (directly via smDef, or through
-    the derived governedBy closure), and so whose status cell the trigger advances."""
-    gov = {r[1] for r in _pop_rows(D, "smDef")} | {r[0] for r in _pop_rows(D, "governedBy")}
-    for (_rid, f, _p, otype) in _pop_rows(D, "role"):
-        if f == ft and otype in gov:
-            return otype
-    return None
+    the derived governedBy closure), and so whose status cell the trigger advances. The
+    meaning is the canonical system:governed_player (shared/system.py), a D-reader over
+    the pair ⟨ft, D⟩: the union of the smDef nouns and the governedBy closure, then the
+    first role of the fact type whose player lies in that union. This host binding applies
+    that def through the reducer, so every host reads one definition; the twin is pinned
+    in test_shared_builders."""
+    from .lam import atom as A, from_lam
+    from .reduce import apply as _apply
+    r = from_lam(_apply(A("system:governed_player"), _S(A(ft), D)))
+    return None if r == () else r
 
 
 _AUTH_FT = "User_is_authorized_for_Operation_on_Resource"

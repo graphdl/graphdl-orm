@@ -328,6 +328,42 @@ def test_table_columns_canonical_matches_the_python_builder():
         == ("Pet_has_Name",)
 
 
+def test_governed_player_canonical_matches_the_python_builder():
+    # the player a machine governs, so whose status cell a trigger advances:
+    # the union of the smDef nouns (column 2) and the governedBy closure
+    # (column 1), then the first role of the fact type whose player is in that
+    # union. a D-reader, it fetches smDef, governedBy, and role from the store.
+    # the von Neumann loop-and-return becomes a double filter over the roles,
+    # with membership in the computed governed set threaded by distl
+    from pyarest import forml, system, ast
+    model = """Order(.OrderId) is an entity type.
+Customer(.Name) is an entity type.
+Customer places Order.
+State Machine Definition 'Order' is for Noun 'Order'.
+Status 'In Cart' is initial in State Machine Definition 'Order'.
+Transition 'place' is from Status 'In Cart'.
+Transition 'place' is to Status 'Placed'.
+Transition 'place' is triggered by Fact Type 'Customer places Order'.
+"""
+    D, _ = forml.compile_model(model)
+    D = system.governance_rules(D)
+
+    def canon(ft, store):
+        r = from_lam(_ap(A("system:governed_player"), _S(A(ft), store)))
+        return None if r == () else r
+
+    for ft in ("Customer_places_Order", "Order", "Customer"):
+        assert canon(ft, D) == system._governed_player(D, ft), ft
+    assert canon("Customer_places_Order", D) == "Order"        # governed via smDef
+    assert canon("Order", D) is None                           # no role names it
+    # the governedBy branch of the union: a stored closure row and a role that
+    # names its noun resolve through the same machinery
+    D2 = _ap(ast.Store("governedBy"), _S(to_lam((("Party", "Order"),)), D))
+    D2 = _ap(ast.Store("role"), _S(to_lam((("r9", "Party_thing", 1, "Party"),)), D2))
+    assert canon("Party_thing", D2) == system._governed_player(D2, "Party_thing")
+    assert canon("Party_thing", D2) == "Party"                 # governed via closure
+
+
 def test_row_resolve_canonical_matches_the_python_builder():
     # the entity-cell write resolver: fresh rows hole-padded, compatible
     # updates land, conflicting functional writes collapse the row (the UC
