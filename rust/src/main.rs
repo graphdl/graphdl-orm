@@ -16,6 +16,9 @@
 //! (one JSON array of case results per line), and a line carrying "op" is a verb
 //! request instead — the system's verb surface (python/protocol.py's table),
 //! answered as one {"op", "result"|"error"} object; see "the verb surface" below.
+//! Under --mcp the kernel serves the Model Context Protocol instead: it reads
+//! newline-delimited JSON-RPC 2.0 over stdio against an apps directory of
+//! persisted stores; see "the MCP binding" below.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -1148,7 +1151,7 @@ fn j_to_n(j: &J) -> N {
         J::I(i) => N::A(Rc::new(Leaf::I(*i))),
         J::F(f) => N::A(Rc::new(Leaf::F(*f))),
         J::A(xs) => N::S(Rc::new(xs.iter().map(j_to_n).collect())),
-        J::O(_) => N::Bot,
+        J::O(_) | J::Null | J::B(_) => N::Bot,
     }
 }
 
@@ -1174,6 +1177,10 @@ fn n_cells_of(d: &N) -> Vec<(Leaf, N)> {
 // ============================ JSON (hand-rolled, zero deps) ==================
 #[derive(Debug, Clone)]
 enum J {
+    // Null and B never appear in scenario payloads (V has no such values);
+    // the MCP transport carries them in every real client's requests.
+    Null,
+    B(bool),
     S(String),
     I(i64),
     F(f64),
@@ -1231,6 +1238,21 @@ impl<'a> P<'a> {
                     }
                 }
                 J::O(v)
+            }
+            // true, false, and null ride only the MCP transport; the parser
+            // trusts the spelling and consumes the bytes by length, extending
+            // number()'s trust in its input.
+            b't' => {
+                self.i += 4;
+                J::B(true)
+            }
+            b'f' => {
+                self.i += 5;
+                J::B(false)
+            }
+            b'n' => {
+                self.i += 4;
+                J::Null
             }
             _ => self.number(),
         }
@@ -1322,7 +1344,9 @@ fn to_v(j: &J) -> V {
         J::I(i) => atom(Leaf::I(*i)),
         J::F(f) => atom(Leaf::F(*f)),
         J::A(xs) => seq(from_vec(xs.iter().map(to_v).collect())),
-        J::O(_) => bot(),
+        // Scenario values never carry objects, booleans, or null; they land
+        // as bottom, total here as everywhere.
+        J::O(_) | J::Null | J::B(_) => bot(),
     }
 }
 
@@ -1368,6 +1392,46 @@ fn write_v(v: &V, out: &mut String) {
                 write_v(x, out);
             }
             out.push(']');
+        }
+    }
+}
+
+// write_j prints any parsed J back verbatim; the MCP binding echoes request
+// ids and parameters with it (write_v serves reduced values, not requests).
+fn write_j(j: &J, out: &mut String) {
+    match j {
+        J::Null => out.push_str("null"),
+        J::B(b) => out.push_str(if *b { "true" } else { "false" }),
+        J::S(s) => esc(s, out),
+        J::I(i) => out.push_str(&i.to_string()),
+        J::F(f) => {
+            if f.fract() == 0.0 && f.is_finite() {
+                out.push_str(&format!("{:.1}", f));
+            } else {
+                out.push_str(&format!("{}", f));
+            }
+        }
+        J::A(xs) => {
+            out.push('[');
+            for (i, x) in xs.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_j(x, out);
+            }
+            out.push(']');
+        }
+        J::O(kv) => {
+            out.push('{');
+            for (i, (k, v)) in kv.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                esc(k, out);
+                out.push(':');
+                write_j(v, out);
+            }
+            out.push('}');
         }
     }
 }
@@ -1554,6 +1618,17 @@ fn op_err(op: &str, msg: &str) -> String {
 }
 
 fn handle_op(op: &str, j: &J, srv: &Srv) -> String {
+    match op_answer(op, j, srv) {
+        Ok(r) => op_ok(op, &r),
+        Err(m) => op_err(op, &m),
+    }
+}
+
+// op_answer computes a verb's bare answer from the request object; the serve
+// loop wraps it in the {"op", "result"|"error"} envelope (handle_op) and the
+// MCP binding wraps it in the tools/call content envelope, so both surfaces
+// serve the ONE resident op table.
+fn op_answer(op: &str, j: &J, srv: &Srv) -> Result<String, String> {
     let fuel = match jget(j, "fuel") {
         Some(J::I(n)) if *n > 0 => Some(*n),
         _ => None,
@@ -1581,14 +1656,14 @@ fn handle_op(op: &str, j: &J, srv: &Srv) -> String {
             r.push_str(",\"resident\":");
             list(&RESIDENT_OPS, &mut r);
             r.push('}');
-            op_ok(op, &r)
+            Ok(r)
         }
         "query" => {
             // FetchPop of the named cell over the resident store:
             // (ast:FetchPop : name) : D — an absent cell answers PHI, never ⊥
             let ft = match jget(j, "fact_type").and_then(scalar_atom) {
                 Some(a) => a,
-                None => return op_err(op, "query needs a scalar fact_type"),
+                None => return Err("query needs a scalar fact_type".to_string()),
             };
             let f = mkapp(atom(Leaf::S("ast:FetchPop".into())), ft.clone());
             let res = reduce_over(srv, f, srv.d.clone(), fuel);
@@ -1597,7 +1672,7 @@ fn handle_op(op: &str, j: &J, srv: &Srv) -> String {
             r.push_str(",\"rows\":");
             write_v(&res, &mut r);
             r.push('}');
-            op_ok(op, &r)
+            Ok(r)
         }
         "cells" => {
             // the store surface: addressable cell names (first match wins, as
@@ -1639,7 +1714,7 @@ fn handle_op(op: &str, j: &J, srv: &Srv) -> String {
                 r.push_str(e);
             }
             r.push_str("]}");
-            op_ok(op, &r)
+            Ok(r)
         }
         "synthesize_pairs" => {
             // synthesize's engine half over the resident store: the canonical
@@ -1647,7 +1722,7 @@ fn handle_op(op: &str, j: &J, srv: &Srv) -> String {
             // their fact types' reading templates; wording stays the caller's
             let id = match jget(j, "id").and_then(scalar_atom) {
                 Some(a) => a,
-                None => return op_err(op, "synthesize_pairs needs a scalar id"),
+                None => return Err("synthesize_pairs needs a scalar id".to_string()),
             };
             let f = mkapp(atom(Leaf::S("system:verbalize".into())), id.clone());
             let res = reduce_over(srv, f, srv.d.clone(), fuel);
@@ -1656,19 +1731,276 @@ fn handle_op(op: &str, j: &J, srv: &Srv) -> String {
             r.push_str(",\"pairs\":");
             write_v(&res, &mut r);
             r.push('}');
-            op_ok(op, &r)
+            Ok(r)
         }
         _ => {
             if SESSION_VERBS.contains(&op) || APP_VERBS.contains(&op) {
-                op_err(op, "verb needs the apps registry (host-side); resident ops: \
-                            cells, query, synthesize_pairs, verbs")
+                Err("verb needs the apps registry (host-side); resident ops: \
+                     cells, query, synthesize_pairs, verbs".to_string())
             } else {
-                op_err(op, "unknown op; resident ops: cells, query, synthesize_pairs, verbs")
+                Err("unknown op; resident ops: cells, query, synthesize_pairs, verbs"
+                    .to_string())
             }
         }
     }
 }
 
+
+// ============================ the MCP binding =================================
+// The daily-driver surface rides the Model Context Protocol's stdio transport
+// under --mcp --apps-dir <path>: newline-delimited JSON-RPC 2.0, one object
+// per line each way, mirroring python/protocol.py's mcp_server. This binding
+// adds the host side the serve loop lacks. An apps registry scans the apps
+// directory, where every app subdirectory <name>/ carries <name>.store.json,
+// one serve-protocol set_store payload persisted at each snapshot site
+// (Registry._sidecar writes it; tests/test_store_sidecar.py pins the
+// contract). apps_use boots an app by feeding that file through handle, the
+// SAME ingestion path a --serve stdin line takes, so no ingestion logic lives
+// here. The read verbs route through op_answer over the retained store; the
+// write verbs and apps_compile need the compiler host and stay with the
+// Python binding.
+
+// The tool table is static JSON; the descriptor shapes and argument names
+// mirror python/protocol.py's TOOLS for the verbs this binding serves.
+const MCP_TOOLS: &str = concat!(
+    r#"[{"name":"orient","#,
+    r#""description":"Answers the apps inventory and the active app in one envelope.","#,
+    r#""inputSchema":{"type":"object","properties":{}}},"#,
+    r#"{"name":"apps_list","#,
+    r#""description":"Answers every app under the apps directory; an app is a subdirectory carrying its <name>.store.json sidecar.","#,
+    r#""inputSchema":{"type":"object","properties":{}}},"#,
+    r#"{"name":"apps_current","#,
+    r#""description":"Answers the retained app name, or null before apps_use.","#,
+    r#""inputSchema":{"type":"object","properties":{}}},"#,
+    r#"{"name":"apps_use","#,
+    r#""description":"Loads an app's store sidecar through the serve ingestion path and retains it as the resident store.","#,
+    r#""inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},"#,
+    r#"{"name":"query","#,
+    r#""description":"Answers a fact type's population from the retained store.","#,
+    r#""inputSchema":{"type":"object","properties":{"fact_type":{"type":"string"}},"required":["fact_type"]}},"#,
+    r#"{"name":"cells","#,
+    r#""description":"Answers cell names with row counts over the retained store; pattern filters by substring.","#,
+    r#""inputSchema":{"type":"object","properties":{"pattern":{"type":"string"}}}},"#,
+    r#"{"name":"synthesize","#,
+    r#""description":"Answers an entity's facts paired with their fact types' reading templates; the caller words the prose.","#,
+    r#""inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}]"#
+);
+
+struct Apps {
+    dir: std::path::PathBuf,
+    current: Option<String>,
+}
+
+impl Apps {
+    fn sidecar(&self, name: &str) -> std::path::PathBuf {
+        self.dir.join(name).join(format!("{}.store.json", name))
+    }
+    fn list(&self) -> Vec<String> {
+        // An app is any subdirectory whose sidecar exists; nothing else counts.
+        let mut names: Vec<String> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if self.sidecar(&name).is_file() {
+                    names.push(name);
+                }
+            }
+        }
+        names.sort();
+        names
+    }
+}
+
+fn esc_names(names: &[String], out: &mut String) {
+    out.push('[');
+    for (i, n) in names.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        esc(n, out);
+    }
+    out.push(']');
+}
+
+fn parse_json(text: &str) -> Option<J> {
+    // P trusts protocol lines and panics on malformed bytes; the MCP transport
+    // reads the wild, so a failed parse unwinds here and answers None instead
+    // of killing the loop.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        P { b: text.as_bytes(), i: 0 }.parse()
+    }))
+    .ok()
+}
+
+// A tool call answers its bare JSON, or a JSON-RPC error pair: -32601 names
+// an unknown tool and -32602 names invalid or unusable parameters.
+fn mcp_call(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Result<String, (i64, String)> {
+    match tool {
+        "orient" => {
+            let mut r = String::from("{\"apps\":");
+            esc_names(&apps.list(), &mut r);
+            r.push_str(",\"current\":");
+            match &apps.current {
+                Some(n) => esc(n, &mut r),
+                None => r.push_str("null"),
+            }
+            r.push('}');
+            Ok(r)
+        }
+        "apps_list" => {
+            let mut r = String::new();
+            esc_names(&apps.list(), &mut r);
+            Ok(r)
+        }
+        "apps_current" => {
+            let mut r = String::from("{\"current\":");
+            match &apps.current {
+                Some(n) => esc(n, &mut r),
+                None => r.push_str("null"),
+            }
+            r.push('}');
+            Ok(r)
+        }
+        "apps_use" => {
+            let name = match jget(args, "name") {
+                Some(J::S(n)) => n.clone(),
+                _ => return Err((-32602, "apps_use needs a string name".to_string())),
+            };
+            let path = apps.sidecar(&name);
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(_) => {
+                    return Err((-32602, format!("no app {:?} under {} (no store sidecar)",
+                                                name, apps.dir.display())))
+                }
+            };
+            let payload = match parse_json(&text) {
+                Some(p) if jget(&p, "d").is_some() => p,
+                _ => return Err((-32602, format!("unparseable store sidecar for {:?}", name))),
+            };
+            handle(&payload, srv, true); // the same ingestion path a --serve line takes
+            apps.current = Some(name.clone());
+            let mut r = String::from("{\"app\":");
+            esc(&name, &mut r);
+            r.push_str(",\"ok\":true}");
+            Ok(r)
+        }
+        "query" | "cells" | "synthesize" => {
+            if apps.current.is_none() {
+                return Err((-32602, format!("no app loaded; call apps_use before {}", tool)));
+            }
+            // The MCP arguments object IS the op request body; only the
+            // synthesize name maps, because the resident op is synthesize_pairs.
+            let op = if tool == "synthesize" { "synthesize_pairs" } else { tool };
+            op_answer(op, args, srv).map_err(|m| (-32602, m))
+        }
+        _ => Err((-32601, format!("unknown tool {:?}", tool))),
+    }
+}
+
+fn run_mcp() {
+    use std::io::{BufRead, Write};
+    let dir = {
+        let mut args = std::env::args();
+        let mut dir = None;
+        while let Some(a) = args.next() {
+            if a == "--apps-dir" {
+                dir = args.next();
+            }
+        }
+        match dir {
+            Some(d) => d,
+            None => {
+                eprintln!("--mcp needs --apps-dir <path>");
+                std::process::exit(2);
+            }
+        }
+    };
+    let mut apps = Apps { dir: std::path::PathBuf::from(dir), current: None };
+    let mut srv = Srv { d: phi(), cells: Vec::new(), mu: make_mu(),
+                        nd: N::Bot, ncells: Vec::new(), nprocess: Vec::new() };
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let j = match parse_json(&line) {
+            Some(j) => j,
+            None => continue, // malformed with no recoverable id: skip the line
+        };
+        // A notification carries no id (a null id counts as none); it still
+        // computes, but it never answers, mirroring the Python binding.
+        let id = match jget(&j, "id") {
+            None | Some(J::Null) => None,
+            Some(other) => Some(other),
+        };
+        let method = match jget(&j, "method") {
+            Some(J::S(m)) => m.as_str(),
+            _ => "",
+        };
+        let answer: Option<Result<String, (i64, String)>> = match method {
+            "initialize" => {
+                let mut r = String::from("{\"protocolVersion\":");
+                match jget(&j, "params").and_then(|p| jget(p, "protocolVersion")) {
+                    Some(J::S(v)) => esc(v, &mut r),
+                    _ => r.push_str("\"2024-11-05\""),
+                }
+                r.push_str(",\"capabilities\":{\"tools\":{}},\
+                            \"serverInfo\":{\"name\":\"arestlam\",\"version\":\"0.1.0\"}}");
+                Some(Ok(r))
+            }
+            "tools/list" => Some(Ok(format!("{{\"tools\":{}}}", MCP_TOOLS))),
+            "tools/call" => {
+                let none = J::O(Vec::new());
+                let p = jget(&j, "params").unwrap_or(&none);
+                let args = jget(p, "arguments").unwrap_or(&none);
+                match jget(p, "name") {
+                    Some(J::S(t)) => Some(mcp_call(t, args, &mut apps, &mut srv).map(|a| {
+                        // the MCP content envelope: the tool's JSON answer rides as text
+                        let mut r = String::from("{\"content\":[{\"type\":\"text\",\"text\":");
+                        esc(&a, &mut r);
+                        r.push_str("}]}");
+                        r
+                    })),
+                    _ => Some(Err((-32602, "tools/call needs a tool name".to_string()))),
+                }
+            }
+            _ => {
+                if id.is_none() {
+                    None // any other notification is consumed silently
+                } else {
+                    Some(Err((-32601, format!("unknown method {:?}", method))))
+                }
+            }
+        };
+        if let (Some(ans), Some(idj)) = (answer, id) {
+            let mut out = String::from("{\"jsonrpc\":\"2.0\",\"id\":");
+            write_j(idj, &mut out);
+            match ans {
+                Ok(result) => {
+                    out.push_str(",\"result\":");
+                    out.push_str(&result);
+                }
+                Err((code, msg)) => {
+                    out.push_str(",\"error\":{\"code\":");
+                    out.push_str(&code.to_string());
+                    out.push_str(",\"message\":");
+                    esc(&msg, &mut out);
+                    out.push('}');
+                }
+            }
+            out.push('}');
+            let mut so = std::io::stdout();
+            so.write_all(out.as_bytes()).ok();
+            so.write_all(b"\n").ok();
+            so.flush().ok();
+        }
+    }
+}
 
 fn show_case(v: &V, out: &mut String) {
     match shape(v) {
@@ -1716,6 +2048,11 @@ fn run() {
             show_case(&v, &mut line);
             println!("{}={}", name, line);
         }
+        return;
+    }
+    if std::env::args().any(|a| a == "--mcp") {
+        // the MCP stdio binding over an apps directory of persisted stores
+        run_mcp();
         return;
     }
     let serve = std::env::args().any(|a| a == "--serve");
