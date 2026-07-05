@@ -1778,6 +1778,106 @@ fn store_into(d: &mut V, cells: &mut Vec<(Leaf, V)>, name: &Leaf, contents: V) {
     }
 }
 
+// eval_rules is engine.py's _eval_rules (line 1188): the UNION of the given
+// rules' outputs over the store, deduplicated by row key in first-seen order
+// and keeping only sequence rows (Python keeps only tuples). It is the shared
+// evaluator for the keyed and sweep passes; each rule id reduces through D's
+// own compiled definition exactly as the agg pass reduces one aggregate rule.
+// Python's rule twins are a host FAST-path held observationally equal to this
+// reduction, so the port takes the reduce path for every rule.
+fn eval_rules(mu: &V, cells: &[(Leaf, V)], d: &V, rids: &[Leaf]) -> Vec<V> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<V> = Vec::new();
+    for rid in rids {
+        let res = reduce_in(mu, cells, d, atom(rid.clone()), d.clone(), None);
+        if let Shape::Seq(l) = shape(&res) {
+            for r in items(&l) {
+                if matches!(shape(&r), Shape::Seq(_)) && seen.insert(key_of(&r)) {
+                    out.push(r);
+                }
+            }
+        }
+    }
+    out
+}
+
+// keyed_key is engine.py's per-head key(r) (line 1250): the row's values at the
+// sorted keyspan positions (1-indexed), taking a position only when it falls
+// within the row (Python's `if p <= len(r)`). The selected columns key as a
+// sequence through key_of, so a produced key and a stored key compare exactly
+// as the Python tuples do and never collide across arities. A row that is not
+// a sequence is treated as a single column, which real (tuple) cells never hit.
+fn keyed_key(row: &V, key_pos: &[usize]) -> String {
+    let cols = match shape(row) {
+        Shape::Seq(l) => items(&l),
+        _ => vec![row.clone()],
+    };
+    let mut sel: Vec<V> = Vec::new();
+    for &p in key_pos {
+        if p >= 1 && p <= cols.len() {
+            sel.push(cols[p - 1].clone());
+        }
+    }
+    key_of(&seq(from_vec(sel)))
+}
+
+// self_supporting is engine.py's _self_supporting (line 1160): head h is
+// reachable from itself through derived-head reads over the reach graph. The
+// walk starts at h's own reads restricted to derived heads and expands each
+// derived head it meets; reaching h proves a cycle. Such heads take the DRed
+// recursive form (empty first, then rederive) because a stale cycle would
+// otherwise rederive itself over a store that still contains it.
+fn self_supporting(
+    h: &str,
+    reach: &HashMap<String, std::collections::HashSet<String>>,
+    derived_heads: &std::collections::HashSet<String>,
+) -> bool {
+    use std::collections::HashSet;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = Vec::new();
+    if let Some(rs) = reach.get(h) {
+        for x in rs {
+            if derived_heads.contains(x) {
+                stack.push(x.clone());
+            }
+        }
+    }
+    while let Some(x) = stack.pop() {
+        if x.as_str() == h {
+            return true;
+        }
+        if !seen.insert(x.clone()) {
+            continue;
+        }
+        if let Some(rs) = reach.get(&x) {
+            for y in rs {
+                if derived_heads.contains(y) {
+                    stack.push(y.clone());
+                }
+            }
+        }
+    }
+    false
+}
+
+// touched_by is engine.py's _touched (line 1215): with no dirty set (a FULL
+// derive's first round) every read set is live; otherwise a read set is live
+// when it meets the dirty set or this round's own stores. The keyed and sweep
+// passes gate on it exactly as the agg pass does.
+fn touched_by<'a>(
+    reads: impl IntoIterator<Item = &'a String>,
+    dirty: &Option<std::collections::HashSet<String>>,
+    round_changed: &std::collections::HashSet<String>,
+) -> bool {
+    match dirty {
+        None => true,
+        Some(dd) => reads
+            .into_iter()
+            .any(|k| dd.contains(k) || round_changed.contains(k)),
+    }
+}
+
 fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     use std::collections::{BTreeSet, HashMap, HashSet};
     // the optional frontier: an array of cell names bounding ROUND ONE to
@@ -2112,25 +2212,38 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
         }
         delta = Some(next_delta);
     }
-    // ---- THE AGGREGATE STRATUM (engine.py lines 1210 through 1242): the
-    // agg pass of the joint fixpoint above the positive closure, iterated
-    // until a sweep changes nothing (at most twelve rounds, as Python
-    // bounds it). Each aggregate rule evaluates its FULL body over the
-    // current D; its head then SUPERSEDES rather than unions. A
-    // fully-derived head on a FULL derive (no frontier) is REPLACED whole
-    // by the agg rows unioned with its plain rules' rows, so a group whose
-    // supply vanished dies (per-group supersession could never retire it),
-    // and the paired plain rows of the zero-supply idiom rejoin fresh. In
-    // every other case (an incremental derive, or a head that is not
-    // fully-derived) the head supersedes PER GROUP: the group is every
-    // column but the last, produced groups replace their stored rows, and
-    // stored rows whose group no rule produced survive. Dirty-set filtering
-    // keeps incremental calls proportional: round zero of a full derive
-    // evaluates every aggregate once (the idempotence guarantee), while a
-    // frontier call touches only rules whose reads intersect the frontier,
-    // the closure's changes, or this round's own stores. Still owed to a
-    // later phase: the keyed upserts and the DRed sweeps that share this
-    // joint loop in Python.
+    // ---- THE UPPER STRATA, iterated to a JOINT fixpoint (engine.py lines
+    // 1210 through 1288): three passes share one outer loop above the
+    // positive closure, because each can invalidate the others' work through
+    // the dependency graph (loads settle, ranks rederive over them, the peak
+    // refolds over ranks), so they repeat until a full sweep changes nothing
+    // (at most twelve rounds, as Python bounds it):
+    //
+    //   agg   — each aggregate rule evaluates its FULL body over the current
+    //           D; its head then SUPERSEDES rather than unions. A
+    //           fully-derived head on a FULL derive is REPLACED whole by the
+    //           agg rows unioned with its plain rules' rows, so a group whose
+    //           supply vanished dies (per-group supersession could never
+    //           retire it) and the paired plain rows of the zero-supply idiom
+    //           rejoin fresh; otherwise the head supersedes PER GROUP (the
+    //           group is every column but the last; a stored row whose group
+    //           no rule produced survives);
+    //   keyed — a head whose fact type carries a key span re-evaluates over
+    //           the settled store and supersedes PER KEY: a produced key
+    //           replaces its stored row, an asserted row whose key no rule
+    //           produced survives (task-955 upsert);
+    //   sweep — a fully-derived plain head is materialization, never ground
+    //           truth (Gupta-Mumick-Subrahmanian 1993, delete-and-rederive).
+    //           A non-self-supporting head re-evaluates whole and REPLACES,
+    //           retiring staleness the monotone closure's union can never
+    //           remove; a self-supporting head EMPTIES first, then rederives
+    //           to a local least fixpoint, so rows with only cyclic support
+    //           die while base-supported rows rebuild.
+    //
+    // Dirty-set filtering keeps incremental calls proportional: round zero of
+    // a full derive evaluates every eligible head once (the idempotence
+    // guarantee), while a frontier call touches only heads whose reads meet
+    // the frontier, the closure's changes, or this round's own stores.
     let mut kindmap: HashMap<String, String> = HashMap::new();
     for r in pop_rows(&cells, &leaf("derivation")) {
         let it = items(&list_of(&r));
@@ -2143,12 +2256,121 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
         }
     }
     let mut plain_of: HashMap<String, Vec<Leaf>> = HashMap::new();
+    // head_leaf_of recovers a plain head's cell name (a Leaf) from its key,
+    // for the keyed and sweep passes that address cells by name.
+    let mut head_leaf_of: HashMap<String, Leaf> = HashMap::new();
     for rr in &rules {
         plain_of
             .entry(rr.head_key.clone())
             .or_default()
             .push(rr.rid.clone());
+        head_leaf_of
+            .entry(rr.head_key.clone())
+            .or_insert_with(|| rr.head.clone());
     }
+    // agg_heads: the aggregate head keys, excluded from the sweeps (they
+    // supersede per group in the agg pass, never re-materialize whole here).
+    let agg_heads: HashSet<String> =
+        agg_rules.iter().map(|rr| rr.head_key.clone()).collect();
+    // spans_of: constraint id key to its role-position set (spans rows are
+    // ⟨constraint id, position⟩). A BTreeSet keeps positions sorted, so the
+    // keyed key reads columns in Python's sorted(keyspans[head]) order.
+    let mut spans_of: HashMap<String, BTreeSet<i64>> = HashMap::new();
+    for r in pop_rows(&cells, &leaf("spans")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            if let Some(Leaf::I(p)) = aval(&it[1]).as_deref() {
+                spans_of.entry(key_of(&it[0])).or_default().insert(*p);
+            }
+        }
+    }
+    // keyspans: fact type key to the union of the spans of its uniqueness /
+    // spanning_uniqueness constraints (constraint rows are ⟨constraint id,
+    // kind, fact type, ..⟩). A fact type with a key span is a keyed head.
+    let mut keyspans: HashMap<String, BTreeSet<i64>> = HashMap::new();
+    for c in pop_rows(&cells, &leaf("constraint")) {
+        let it = items(&list_of(&c));
+        if it.len() >= 3 {
+            let is_uc = matches!(aval(&it[1]).as_deref(),
+                Some(Leaf::S(s)) if s == "uniqueness" || s == "spanning_uniqueness");
+            if is_uc {
+                if let Some(ps) = spans_of.get(&key_of(&it[0])) {
+                    if !ps.is_empty() {
+                        keyspans
+                            .entry(key_of(&it[2]))
+                            .or_default()
+                            .extend(ps.iter().copied());
+                    }
+                }
+            }
+        }
+    }
+    // keyed_of: the plain rules whose head fact type carries a key span,
+    // grouped by head, each with the rule's reads key for gating.
+    let mut keyed_of: HashMap<String, Vec<(Leaf, String)>> = HashMap::new();
+    for rr in &rules {
+        if keyspans.contains_key(&rr.head_key) {
+            keyed_of
+                .entry(rr.head_key.clone())
+                .or_default()
+                .push((rr.rid.clone(), rr.key.clone()));
+        }
+    }
+    // reach: a plain head to the union of its rules' read cells, the
+    // dependency graph the self-support test and the sweep gate walk.
+    let mut reach: HashMap<String, HashSet<String>> = HashMap::new();
+    for rr in &rules {
+        let e = reach.entry(rr.head_key.clone()).or_default();
+        if let Some(rs) = reads.get(&rr.key) {
+            e.extend(rs.iter().cloned());
+        }
+    }
+    // derived_heads: the aggregate heads plus every plain head, the vertex
+    // set the self-support walk is restricted to.
+    let mut derived_heads: HashSet<String> = agg_heads.clone();
+    for h in plain_of.keys() {
+        derived_heads.insert(h.clone());
+    }
+    // sweep / sweep_cyclic: fully-derived plain heads that are neither
+    // aggregate nor keyed, split by whether they support themselves through a
+    // cycle. Both iterate in head-name order, matching Python's sorted(...).
+    let mut sweep: Vec<(String, Leaf)> = Vec::new();
+    let mut sweep_cyclic: Vec<(String, Leaf)> = Vec::new();
+    for hk in plain_of.keys() {
+        if kindmap.get(hk).map(String::as_str) != Some("fully-derived") {
+            continue;
+        }
+        if agg_heads.contains(hk) || keyed_of.contains_key(hk) {
+            continue;
+        }
+        let hl = match head_leaf_of.get(hk) {
+            Some(l) => l.clone(),
+            None => continue,
+        };
+        if self_supporting(hk, &reach, &derived_heads) {
+            sweep_cyclic.push((hk.clone(), hl));
+        } else {
+            sweep.push((hk.clone(), hl));
+        }
+    }
+    sweep.sort_by(|a, b| leaf_text(&a.1).cmp(&leaf_text(&b.1)));
+    sweep_cyclic.sort_by(|a, b| leaf_text(&a.1).cmp(&leaf_text(&b.1)));
+    // keyed_sorted: the keyed heads in head-name order, each with its head
+    // leaf, its rules (rid and reads key), and its sorted key positions.
+    let mut keyed_sorted: Vec<(String, Leaf, Vec<(Leaf, String)>, Vec<usize>)> =
+        Vec::new();
+    for (hk, rls) in &keyed_of {
+        let hl = match head_leaf_of.get(hk) {
+            Some(l) => l.clone(),
+            None => continue,
+        };
+        let key_pos: Vec<usize> = keyspans
+            .get(hk)
+            .map(|s| s.iter().filter(|&&p| p >= 1).map(|&p| p as usize).collect())
+            .unwrap_or_default();
+        keyed_sorted.push((hk.clone(), hl, rls.clone(), key_pos));
+    }
+    keyed_sorted.sort_by(|a, b| leaf_text(&a.1).cmp(&leaf_text(&b.1)));
     let mut dirty: Option<HashSet<String>> = frontier
         .as_ref()
         .map(|fr| fr.union(&closure_keys).cloned().collect());
@@ -2228,6 +2450,132 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 changed.insert(leaf_text(&rr.head));
                 sort_rows(&mut merged);
                 store_into(&mut d, &mut cells, &rr.head, seq(from_vec(merged)));
+            }
+        }
+        // ---- THE KEYED-UPSERT PASS (engine.py lines 1243 through 1260):
+        // each keyed head, in head-name order, re-evaluates over the settled
+        // store and supersedes PER KEY. Gated like the agg pass on the union
+        // of its rules' reads. The produced union keeps every produced row;
+        // stored rows are kept only when their key is not among the produced
+        // keys, so a produced key replaces its stored row while an asserted
+        // row whose key no rule produced survives.
+        for (hk, hl, rls, key_pos) in &keyed_sorted {
+            if outer > 0 || dirty.is_some() {
+                let live = touched_by(
+                    rls.iter()
+                        .flat_map(|(_, rk)| reads.get(rk).into_iter().flatten()),
+                    &dirty,
+                    &round_changed,
+                );
+                if !live {
+                    continue;
+                }
+            }
+            let rids: Vec<Leaf> = rls.iter().map(|(rid, _)| rid.clone()).collect();
+            let outs = eval_rules(&mu, &cells, &d, &rids);
+            let mut prod_keys: HashSet<String> = HashSet::new();
+            for r in &outs {
+                prod_keys.insert(keyed_key(r, key_pos));
+            }
+            let stored = pop_rows(&cells, hl);
+            let mut merged: Vec<V> = Vec::new();
+            let mut mkeys: HashSet<String> = HashSet::new();
+            for r in &outs {
+                if mkeys.insert(key_of(r)) {
+                    merged.push(r.clone());
+                }
+            }
+            for r in &stored {
+                if !prod_keys.contains(&keyed_key(r, key_pos)) && mkeys.insert(key_of(r))
+                {
+                    merged.push(r.clone());
+                }
+            }
+            let mut cur_keys: HashSet<String> = HashSet::new();
+            for r in &stored {
+                cur_keys.insert(key_of(r));
+            }
+            let same = mkeys.len() == cur_keys.len()
+                && mkeys.iter().all(|k| cur_keys.contains(k));
+            if !same {
+                settled = false;
+                round_changed.insert(hk.clone());
+                changed.insert(leaf_text(hl));
+                sort_rows(&mut merged);
+                store_into(&mut d, &mut cells, hl, seq(from_vec(merged)));
+            }
+        }
+        // ---- THE SWEEP PASS (engine.py lines 1261 through 1269): a
+        // fully-derived, non-self-supporting plain head re-evaluates whole
+        // and REPLACES, so this call's supersessions propagate and staleness
+        // the closure's union could never remove converges. Always gated on
+        // _touched(reach), which a full derive makes true for every head.
+        for (hk, hl) in &sweep {
+            let empty = HashSet::new();
+            let rs = reach.get(hk).unwrap_or(&empty);
+            if !touched_by(rs.iter(), &dirty, &round_changed) {
+                continue;
+            }
+            let rids = plain_of.get(hk).map(|v| v.as_slice()).unwrap_or(&[]);
+            let outs = eval_rules(&mu, &cells, &d, rids);
+            let stored = pop_rows(&cells, hl);
+            let mut oks: HashSet<String> = HashSet::new();
+            for r in &outs {
+                oks.insert(key_of(r));
+            }
+            let mut sks: HashSet<String> = HashSet::new();
+            for r in &stored {
+                sks.insert(key_of(r));
+            }
+            let same = oks.len() == sks.len() && oks.iter().all(|k| sks.contains(k));
+            if !same {
+                settled = false;
+                round_changed.insert(hk.clone());
+                changed.insert(leaf_text(hl));
+                let mut m = outs;
+                sort_rows(&mut m);
+                store_into(&mut d, &mut cells, hl, seq(from_vec(m)));
+            }
+        }
+        // ---- THE DRED SWEEP FOR CYCLES (engine.py lines 1270 through 1284):
+        // a self-supporting head EMPTIES first, then rederives to a LOCAL
+        // least fixpoint over the store with the emptied head, repeatedly
+        // evaluating its plain rules until the output stops growing. Rows with
+        // only cyclic support die; base-supported rows rebuild. The
+        // emptied-then-refilled head commits unconditionally (Python's
+        // D = Dx); only a net change to the row set marks the head changed.
+        for (hk, hl) in &sweep_cyclic {
+            let empty = HashSet::new();
+            let rs = reach.get(hk).unwrap_or(&empty);
+            if !touched_by(rs.iter(), &dirty, &round_changed) {
+                continue;
+            }
+            let stored = pop_rows(&cells, hl);
+            let mut cur_keys: HashSet<String> = HashSet::new();
+            for r in &stored {
+                cur_keys.insert(key_of(r));
+            }
+            store_into(&mut d, &mut cells, hl, seq(from_vec(Vec::new())));
+            let rids: Vec<Leaf> = plain_of.get(hk).cloned().unwrap_or_default();
+            let mut prev: Option<HashSet<String>> = None;
+            let mut outs_keys: HashSet<String> = HashSet::new();
+            loop {
+                if prev.as_ref() == Some(&outs_keys) {
+                    break;
+                }
+                prev = Some(outs_keys.clone());
+                let outs = eval_rules(&mu, &cells, &d, &rids);
+                outs_keys = outs.iter().map(|r| key_of(r)).collect();
+                let mut m = outs;
+                sort_rows(&mut m);
+                store_into(&mut d, &mut cells, hl, seq(from_vec(m)));
+            }
+            let same = outs_keys.len() == cur_keys.len()
+                && outs_keys.iter().all(|k| cur_keys.contains(k));
+            if !same {
+                settled = false;
+                round_changed.insert(hk.clone());
+                changed.insert(leaf_text(hl));
             }
         }
         if settled {

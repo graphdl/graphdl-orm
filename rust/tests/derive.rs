@@ -493,6 +493,148 @@ fn an_asserted_agg_head_supersedes_per_group_never_whole() {
 }
 
 #[test]
+fn a_keyed_head_upserts_per_key_retiring_the_stale_row_and_keeping_the_orphan() {
+    // CHECKPOINT FOUR (the keyed-upsert pass, engine.py lines 1243 through
+    // 1260): a head whose fact type carries a uniqueness constraint over a
+    // role prefix re-evaluates over the settled store and supersedes PER KEY.
+    // The rule produces the row for key K1; the store already holds a STALE
+    // row for K1 (which the closure's monotone union can never retire) and an
+    // asserted row for key K2 that no rule produces. The keyed pass replaces
+    // K1 and keeps K2. The gold values are engine.py's run_rules on the same
+    // hand store.
+    let mut s = Serve::spawn();
+    assert_eq!(s.rpc(r#"{"d": []}"#), "[]");
+    let r = s.rpc(&store_case("Src", r#"[["K1","new"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "Src store step: {r}");
+    let r = s.rpc(&store_case("Assign", r#"[["K1","stale"],["K2","kept"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "Assign store step: {r}");
+    let r = s.rpc(&store_case("ruleDerives", r#"[["assign_rule","Assign"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "ruleDerives store step: {r}");
+    let r = s.rpc(&store_case("ruleReads", r#"[["assign_rule","Src"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "ruleReads store step: {r}");
+    // Assign carries a uniqueness constraint over role 1, so keyspans[Assign]
+    // = {1} and a row's key is its first column. constraint rows are
+    // ⟨constraint id, kind, fact type, modality⟩; spans rows ⟨constraint id,
+    // position⟩.
+    let r = s.rpc(&store_case(
+        "constraint",
+        r#"[["assign_uc","uniqueness","Assign","alethic"]]"#,
+    ));
+    assert!(r.starts_with(r#"[["ok","#), "constraint store step: {r}");
+    let r = s.rpc(&store_case("spans", r#"[["assign_uc",1]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "spans store step: {r}");
+    let r = s.rpc(&store_case("assign_rule", &copy_rule("Src")));
+    assert!(r.starts_with(r#"[["ok","#), "assign_rule store step: {r}");
+
+    // the closure unions K1,new (round one) and settles (round two); the
+    // keyed pass then supersedes K1, dropping the stale row, and keeps K2
+    assert_eq!(
+        s.rpc(r#"{"op":"run_rules"}"#),
+        r#"{"op":"run_rules","result":{"rounds":2,"changed":["Assign"]}}"#
+    );
+    assert_eq!(
+        s.rpc(r#"{"op":"query","fact_type":"Assign"}"#),
+        r#"{"op":"query","result":{"fact_type":"Assign","rows":[["K1","new"],["K2","kept"]]}}"#
+    );
+    // idempotence: a second derive changes nothing
+    assert_eq!(
+        s.rpc(r#"{"op":"run_rules"}"#),
+        r#"{"op":"run_rules","result":{"rounds":1,"changed":[]}}"#
+    );
+}
+
+#[test]
+fn a_fully_derived_plain_head_sweeps_whole_dropping_a_stale_row() {
+    // CHECKPOINT FIVE (a) (the non-cyclic sweep, engine.py lines 1261 through
+    // 1269): a FULLY-derived plain head that does not support itself is
+    // materialization, so it re-evaluates whole and REPLACES. Der holds the
+    // two derivable rows plus a stale extra row no rule produces; the
+    // monotone closure can never drop it, but the sweep whole-replaces Der
+    // with the rule output. The gold values are engine.py's run_rules on the
+    // same hand store.
+    let mut s = Serve::spawn();
+    assert_eq!(s.rpc(r#"{"d": []}"#), "[]");
+    let r = s.rpc(&store_case("Src", r#"[["a","p"],["b","q"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "Src store step: {r}");
+    let r = s.rpc(&store_case("Der", r#"[["a","p"],["b","q"],["stale","z"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "Der store step: {r}");
+    let r = s.rpc(&store_case("derivation", r#"[["Der","fully-derived"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "derivation store step: {r}");
+    let r = s.rpc(&store_case("ruleDerives", r#"[["der_rule","Der"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "ruleDerives store step: {r}");
+    let r = s.rpc(&store_case("ruleReads", r#"[["der_rule","Src"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "ruleReads store step: {r}");
+    let r = s.rpc(&store_case("der_rule", &copy_rule("Src")));
+    assert!(r.starts_with(r#"[["ok","#), "der_rule store step: {r}");
+
+    // the closure adds nothing (Der already holds Src's rows); the sweep
+    // whole-replaces Der with the rule output, retiring the stale row
+    assert_eq!(
+        s.rpc(r#"{"op":"run_rules"}"#),
+        r#"{"op":"run_rules","result":{"rounds":1,"changed":["Der"]}}"#
+    );
+    assert_eq!(
+        s.rpc(r#"{"op":"query","fact_type":"Der"}"#),
+        r#"{"op":"query","result":{"fact_type":"Der","rows":[["a","p"],["b","q"]]}}"#
+    );
+    assert_eq!(
+        s.rpc(r#"{"op":"run_rules"}"#),
+        r#"{"op":"run_rules","result":{"rounds":1,"changed":[]}}"#
+    );
+}
+
+#[test]
+fn a_self_supporting_head_empties_first_so_a_cyclic_only_row_is_retired() {
+    // CHECKPOINT FIVE (b) (the DRed sweep for cycles, engine.py lines 1270
+    // through 1284): a self-supporting head (reach_self reads Reach) carrying
+    // a stale row with only cyclic support. reach_self copies Reach back, so a
+    // whole-cell re-eval would keep the self-loop [s,s] forever (it is in the
+    // rule output because it is in the head); only the empty-first rederive to
+    // a local least fixpoint retires it, while the base-supported rows rebuild
+    // from Edge. The gold values are engine.py's run_rules on the same hand
+    // store.
+    let mut s = Serve::spawn();
+    assert_eq!(s.rpc(r#"{"d": []}"#), "[]");
+    let r = s.rpc(&store_case("Edge", r#"[["a","b"],["b","c"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "Edge store step: {r}");
+    let r = s.rpc(&store_case("Reach", r#"[["a","b"],["b","c"],["s","s"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "Reach store step: {r}");
+    let r = s.rpc(&store_case("derivation", r#"[["Reach","fully-derived"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "derivation store step: {r}");
+    let r = s.rpc(&store_case(
+        "ruleDerives",
+        r#"[["reach_base","Reach"],["reach_self","Reach"]]"#,
+    ));
+    assert!(r.starts_with(r#"[["ok","#), "ruleDerives store step: {r}");
+    // reach_self READS Reach: the head supports itself, so it is a cyclic
+    // sweep (empty first), never a plain whole-replace.
+    let r = s.rpc(&store_case(
+        "ruleReads",
+        r#"[["reach_base","Edge"],["reach_self","Reach"]]"#,
+    ));
+    assert!(r.starts_with(r#"[["ok","#), "ruleReads store step: {r}");
+    let r = s.rpc(&store_case("reach_base", &copy_rule("Edge")));
+    assert!(r.starts_with(r#"[["ok","#), "reach_base store step: {r}");
+    let r = s.rpc(&store_case("reach_self", &copy_rule("Reach")));
+    assert!(r.starts_with(r#"[["ok","#), "reach_self store step: {r}");
+
+    // the empty-first rederive retires [s,s] (only cyclic support) and
+    // rebuilds the base-supported rows
+    assert_eq!(
+        s.rpc(r#"{"op":"run_rules"}"#),
+        r#"{"op":"run_rules","result":{"rounds":1,"changed":["Reach"]}}"#
+    );
+    assert_eq!(
+        s.rpc(r#"{"op":"query","fact_type":"Reach"}"#),
+        r#"{"op":"query","result":{"fact_type":"Reach","rows":[["a","b"],["b","c"]]}}"#
+    );
+    assert_eq!(
+        s.rpc(r#"{"op":"run_rules"}"#),
+        r#"{"op":"run_rules","result":{"rounds":1,"changed":[]}}"#
+    );
+}
+
+#[test]
 fn the_rust_fixpoint_rederives_an_emptied_head_from_python_compiled_rules() {
     // Idempotence alone cannot tell evaluation from silent skipping (both
     // answer changed []), so this test EMPTIES a derived head cell on a store
