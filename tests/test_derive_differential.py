@@ -95,3 +95,47 @@ def test_rust_aggregate_fixpoint_matches_python():
     finally:
         s.close()
     assert got == want                                        # t1 has 2, t2 has 1
+
+
+CYCLIC_MODEL = """Node is an entity type.
+Node links to Node.
+Node reaches Node. *
+* Node1 reaches Node2 iff Node1 links to Node2.
+* Node1 reaches Node2 iff Node1 links to Node3 and Node3 reaches Node2.
+Node 'a' links to Node 'b'.
+Node 'b' links to Node 'c'.
+"""
+
+
+@pytest.mark.skipif(not polyglot.rust_available(), reason="no rust binary")
+def test_rust_self_supporting_cyclic_fixpoint_matches_python():
+    # the differential over the DRed sweep_cyclic pass: a fully-derived head
+    # that reads itself (transitive closure) takes the empty-first recursive
+    # form, and the native carrier routes it through NEval, so the cross-host
+    # check must reach it (the fleet proved it on kernel; this pins it portably)
+    D, rep = forml.compile_model(CYCLIC_MODEL)
+    assert rep["unparsed"] == []
+    heads = sorted({r[1] for r in system._pop_rows(D, "ruleDerives")
+                    if len(r) >= 2})
+    kinds = {r[0]: r[1] for r in system._pop_rows(D, "derivation")}
+    assert any(kinds.get(h) == "fully-derived" for h in heads), \
+        "the head must be fully-derived to exercise the sweep"
+    D2 = system.run_rules(D)
+    want = {h: {tuple(str(x) for x in r) for r in system._pop_rows(D2, h)}
+            for h in heads}
+    assert want["Node_reaches_Node"] == {("a", "b"), ("b", "c"), ("a", "c")}
+    s = polyglot.RustSession()
+    try:
+        s.set_store(D)
+        out = s._rpc({"op": "run_rules"})
+        err = out.get("error", "") if isinstance(out, dict) else ""
+        if "unknown op" in str(err):
+            pytest.skip("the resident lacks run_rules")
+        got = {}
+        for h in heads:
+            res = s._rpc({"op": "query", "fact_type": h})
+            rows = (res.get("result", {}) or {}).get("rows", [])
+            got[h] = {tuple(str(x) for x in r) for r in rows}
+    finally:
+        s.close()
+    assert got == want                                        # the closure, both hosts
