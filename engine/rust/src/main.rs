@@ -1821,10 +1821,12 @@ fn handle(j: &J, srv: &mut Srv, serve: bool) -> String {
 // loads (canon_defs) — no engine semantics re-live here. Verbs needing the
 // apps registry (readings compile, sqlite) stay host-side: the table names
 // them; the resident subset serves what the store alone can answer.
-const SESSION_VERBS: [&str; 6] =
-    ["apps_compile", "apps_current", "apps_list", "apps_use", "context", "orient"];
-const APP_VERBS: [&str; 9] =
-    ["apply", "cells", "explain", "get", "query", "retract", "schema", "sql", "synthesize"];
+const SESSION_VERBS: [&str; 11] =
+    ["apps_check", "apps_compile", "apps_create", "apps_current", "apps_list",
+     "apps_register", "apps_status", "apps_use", "context", "engine_version", "orient"];
+const APP_VERBS: [&str; 13] =
+    ["apply", "ask", "cells", "compile", "explain", "get", "induce", "propose",
+     "query", "retract", "schema", "sql", "synthesize"];
 const RESIDENT_OPS: [&str; 5] = ["cells", "query", "run_rules", "synthesize_pairs", "verbs"];
 
 fn reduce_in(mu: &V, cells: &[(Leaf, V)], d: &V, f: V, x: V, fuel: Option<i64>) -> V {
@@ -3141,7 +3143,37 @@ const MCP_TOOLS: &str = concat!(
     r#""inputSchema":{"type":"object","properties":{}}},"#,
     r#"{"name":"actions","#,
     r#""description":"Answers a noun id's state machine and available actions in the retained app through the Python compiler host.","#,
-    r#""inputSchema":{"type":"object","properties":{"noun":{"type":"string"},"id":{"type":"string"}},"required":["noun","id"]}}]"#
+    r#""inputSchema":{"type":"object","properties":{"noun":{"type":"string"},"id":{"type":"string"}},"required":["noun","id"]}},"#,
+    r#"{"name":"apps_status","#,
+    r#""description":"One app's posture without activating it: exists, readings count, compiled, stale. Filesystem-derived, native in the resident.","#,
+    r#""inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},"#,
+    r#"{"name":"apps_check","#,
+    r#""description":"Sweep EVERY app: per-app health (ready / stale / library / not_found) plus the rolled-up summary. Native in the resident.","#,
+    r#""inputSchema":{"type":"object","properties":{"include_ready":{"type":"boolean"}}}},"#,
+    r#"{"name":"apps_register","#,
+    r#""description":"Registration is directory-derived: re-scan the apps directory and answer the roster; nothing is written.","#,
+    r#""inputSchema":{"type":"object","properties":{}}},"#,
+    r#"{"name":"apps_create","#,
+    r#""description":"A new app skeleton: <name>/readings/core.md. Refuses on an existing app. Native in the resident.","#,
+    r#""inputSchema":{"type":"object","properties":{"name":{"type":"string"},"text":{"type":"string"}},"required":["name"]}},"#,
+    r#"{"name":"engine_version","#,
+    r#""description":"The engine and its version.","#,
+    r#""inputSchema":{"type":"object","properties":{}}},"#,
+    r#"{"name":"compile","#,
+    r#""description":"The live ADDITIVE compile: the text joins the app's readings/ (the source of truth, so a rebuild keeps it) and the app recompiles. Rides the compiler host; the retained sidecar reloads.","#,
+    r#""inputSchema":{"type":"object","properties":{"app":{"type":"string"},"text":{"type":"string"}},"required":["text"]}},"#,
+    r#"{"name":"propose","#,
+    r#""description":"The authoring dry-run: compile the candidate readings ATOP the app's model on a throwaway store - would-be declarations, classification, diagnostics - persisting nothing.","#,
+    r#""inputSchema":{"type":"object","properties":{"app":{"type":"string"},"text":{"type":"string"}},"required":["text"]}},"#,
+    r#"{"name":"induce","#,
+    r#""description":"Hypothesis-Candidate search over a fact type - the abduction primitive. Enumerate bindings for the hidden fact, gate through alethic constraints (baseline delta) and forward-chain coverage of to_explain, score by the app's Scoring Rules, answer ranked candidates. Nothing persists.","#,
+    r#""inputSchema":{"type":"object","properties":{"app":{"type":"string"},"ft_id":{"type":"string"},"to_explain":{"type":"array"},"bound":{"type":"object"}},"required":["ft_id"]}},"#,
+    r#"{"name":"context","#,
+    r#""description":"The resident's last mutation receipt, or a note when none this session.","#,
+    r#""inputSchema":{"type":"object","properties":{}}},"#,
+    r#"{"name":"ask","#,
+    r#""description":"Read-only Q&A, no LLM in the engine: pass a plan {fact_type, filter} to execute the projection query; without one the verb answers needs_plan + the model surface for the CALLER's sampler to complete.","#,
+    r#""inputSchema":{"type":"object","properties":{"app":{"type":"string"},"question":{"type":"string"},"plan":{"type":"object"}},"required":["question"]}}]"#
 );
 
 struct Apps {
@@ -3303,6 +3335,78 @@ fn run_cli(apps: &Apps, verb: &str, app: &str, tail: &[String], ok: &[i32])
 // the receipt as the tool result, because a refusal is an answer the caller
 // reads, not a protocol failure. A write receipt is always an object, so a
 // value of any other shape is a contract break and answers -32603.
+// One app's posture from the filesystem alone (the registry is
+// directory-derived): exists, readings count, compiled (<name>.db present),
+// stale (any reading newer than the .db; an uncompiled app with readings is
+// stale by definition). Mirrors protocol.Registry.status key for key.
+fn app_status_json(apps: &Apps, name: &str) -> String {
+    let d = std::path::Path::new(&apps.dir).join(name);
+    let rd = d.join("readings");
+    let mut readings = 0usize;
+    let mut newest: Option<std::time::SystemTime> = None;
+    if let Ok(entries) = std::fs::read_dir(&rd) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("md") {
+                readings += 1;
+                if let Ok(md) = e.metadata() {
+                    if let Ok(t) = md.modified() {
+                        newest = Some(match newest {
+                            Some(n) if n > t => n,
+                            _ => t,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    let db = d.join(format!("{}.db", name));
+    let compiled = db.exists();
+    let db_m = std::fs::metadata(&db).ok().and_then(|m| m.modified().ok());
+    let stale = if compiled {
+        matches!((newest, db_m), (Some(n), Some(dm)) if n > dm)
+    } else {
+        readings > 0
+    };
+    let mut r = String::from("{\"name\":");
+    esc(name, &mut r);
+    r.push_str(&format!(
+        ",\"exists\":{},\"readings\":{},\"compiled\":{},\"stale\":{}}}",
+        d.is_dir(), readings, compiled, stale));
+    r
+}
+
+// The generic delegation: any first-class verb the resident does not compute
+// natively rides cli.py's `call` form — ONE dispatch table on the Python side
+// (protocol.SESSION_VERBS / APP_VERBS), never a second verb registry here.
+// The retained app is injected when the caller names none, so the one-shot
+// process needs no marker state; `reload` re-ingests the retained sidecar
+// after a mutating verb (the live additive compile).
+fn delegate_call(verb: &str, args: &J, apps: &Apps, srv: &mut Srv, reload: bool)
+    -> Result<String, (i64, String)>
+{
+    let mut obj = match args {
+        J::O(kv) => kv.clone(),
+        _ => Vec::new(),
+    };
+    if !obj.iter().any(|(k, _)| k == "app") {
+        if let Some(cur) = &apps.current {
+            obj.push(("app".to_string(), J::S(cur.clone())));
+        }
+    }
+    let mut body = String::new();
+    write_j(&J::O(obj), &mut body);
+    let (_code, receipt) = run_cli(apps, "call", verb, &[body], &[0])?;
+    if reload {
+        if let Some(cur) = apps.current.clone() {
+            let _ = load_sidecar(apps, &cur, srv);
+        }
+    }
+    let mut r = String::new();
+    write_j(&receipt, &mut r);
+    Ok(r)
+}
+
 fn delegate_verb(tool: &str, args: &J, apps: &Apps, srv: &mut Srv)
     -> Result<String, (i64, String)>
 {
@@ -3566,8 +3670,27 @@ fn native_apply(args: &J, apps: &Apps, srv: &mut Srv) -> Option<Result<String, (
 
 // A tool call answers its bare JSON, or a JSON-RPC error pair: -32601 names
 // an unknown tool and -32602 names invalid or unusable parameters.
+thread_local! {
+    // the resident's last mutation receipt, the context verb's answer
+    // (protocol.Registry.last_receipt's analog)
+    static LAST_RECEIPT: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn mcp_call(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Result<String, (i64, String)> {
+    let out = mcp_call_inner(tool, args, apps, srv);
+    if matches!(tool, "apply" | "retract") {
+        if let Ok(r) = &out {
+            LAST_RECEIPT.with(|c| *c.borrow_mut() = Some(r.clone()));
+        }
+    }
+    out
+}
+
+fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Result<String, (i64, String)> {
     match tool {
+        "context" => Ok(LAST_RECEIPT.with(|c| c.borrow().clone())
+            .unwrap_or_else(|| "{\"note\":\"no mutation this session\"}".to_string())),
         "orient" => {
             let mut r = String::from("{\"apps\":");
             esc_names(&apps.list(), &mut r);
@@ -3643,6 +3766,81 @@ fn mcp_call(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Result<Stri
             // keep rewriting it through the Python host).
             op_answer("run_rules", args, srv).map_err(|m| (-32602, m))
         }
+        "engine_version" => Ok("{\"engine\":\"arestlam\",\"version\":\"0.9.0\"}".to_string()),
+        "apps_status" => {
+            let name = match jget(args, "name") {
+                Some(J::S(n)) => n.clone(),
+                _ => return Err((-32602, "apps_status needs a string name".to_string())),
+            };
+            Ok(app_status_json(apps, &name))
+        }
+        "apps_check" => {
+            // the registry-wide sweep, filesystem-derived like the registry
+            let include_ready = !matches!(jget(args, "include_ready"), Some(J::B(false)));
+            let (mut ready, mut stale, mut library, mut not_found) = (0u32, 0u32, 0u32, 0u32);
+            let mut rows = String::from("[");
+            let mut first = true;
+            for name in apps.list() {
+                let st = app_status_json(apps, &name);
+                let health = if st.contains("\"exists\":false") {
+                    not_found += 1; "not_found"
+                } else if st.contains("\"readings\":0") {
+                    library += 1; "library"
+                } else if st.contains("\"stale\":true") {
+                    stale += 1; "stale"
+                } else {
+                    ready += 1; "ready"
+                };
+                if health == "ready" && !include_ready {
+                    continue;
+                }
+                if !first { rows.push(','); }
+                first = false;
+                rows.push_str(&st[..st.len() - 1]);
+                rows.push_str(&format!(",\"health\":\"{}\"}}", health));
+            }
+            rows.push(']');
+            Ok(format!(
+                "{{\"summary\":{{\"ready\":{},\"stale\":{},\"library\":{},\"not_found\":{}}},\"apps\":{}}}",
+                ready, stale, library, not_found, rows))
+        }
+        "apps_register" => {
+            let mut r = String::from("{\"registered\":");
+            esc_names(&apps.list(), &mut r);
+            r.push_str(",\"note\":\"directory-derived; nothing written\"}");
+            Ok(r)
+        }
+        "apps_create" => {
+            let name = match jget(args, "name") {
+                Some(J::S(n)) => n.clone(),
+                _ => return Err((-32602, "apps_create needs a string name".to_string())),
+            };
+            let d = std::path::Path::new(&apps.dir).join(&name);
+            if d.is_dir() {
+                return Err((-32602, format!("app {:?} already exists", name)));
+            }
+            let rd = d.join("readings");
+            if let Err(e) = std::fs::create_dir_all(&rd) {
+                return Err((-32603, format!("could not create {}: {}", rd.display(), e)));
+            }
+            let text = match jget(args, "text") {
+                Some(J::S(t)) => t.clone(),
+                _ => format!("# {}
+", name),
+            };
+            if let Err(e) = std::fs::write(rd.join("core.md"), text) {
+                return Err((-32603, format!("could not write core.md: {}", e)));
+            }
+            let mut r = String::from("{\"created\":");
+            esc(&name, &mut r);
+            r.push_str(",\"readings\":1}");
+            Ok(r)
+        }
+        // the verbs needing the compiler host ride the generic call form —
+        // one Python dispatch table, never a second registry here. The live
+        // additive compile mutates the app, so the retained sidecar reloads.
+        "compile" => delegate_call("compile", args, apps, srv, true),
+        "propose" | "induce" | "ask" => delegate_call(tool, args, apps, srv, false),
         _ => Err((-32601, format!("unknown tool {:?}", tool))),
     }
 }

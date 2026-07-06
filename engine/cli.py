@@ -69,6 +69,21 @@ def main(argv):
             return 0
         print(json.dumps(out, default=str))
         return 0
+    if verb == "call" and len(rest) == 2:
+        # the generic form: EVERY first-class verb through the one dispatch
+        # (protocol.SESSION_VERBS / APP_VERBS) — the CLI is a binding like the
+        # MCP servers, never a second verb table.
+        #   cli.py call --apps-dir <dir> <verb> <json-args>
+        from pyarest import mcp_server
+        name, vargs = rest[0], json.loads(rest[1] or "{}")
+        try:
+            out = mcp_server._dispatch(reg, name, vargs)
+        except Exception as e:
+            print(json.dumps({"error": f"{type(e).__name__}: {e}"},
+                             default=str))
+            return 0
+        print(json.dumps(out, default=str))
+        return 0
     sys.stderr.write(_USAGE)
     return 2
 

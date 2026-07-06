@@ -328,3 +328,79 @@ Transition 'pay' is triggered by Fact Type 'Order is paid by Customer'.
     from pyarest import system as _sys
     assert ("o1", "Paid") in _sys.ft_view(
         D, "Order_is_currently_in_Status", _sys.rmap_partition(D))
+
+
+def test_the_resident_serves_the_full_verb_table(tmp_path):
+    """Cross-binding parity: the rust resident's tools/list names EQUAL the
+    python server's table (one verb surface, two bindings); the registry
+    verbs and engine_version answer NATIVELY (delegation disabled proves it);
+    the compiler-host verbs ride cli.py's generic `call` form — one Python
+    dispatch table, never a second registry."""
+    import json
+    import os
+    import subprocess
+    import sys as _sys
+    import pytest as _pytest
+    from pyarest import apps as _apps, canon as _canon, mcp_server
+    exe = _canon.rust_bin("arestlam")
+    if not os.path.exists(exe):
+        _pytest.skip("rust kernel not built")
+    root = str(tmp_path / "apps")
+    d = os.path.join(root, "flow", "readings")
+    os.makedirs(d)
+    with open(os.path.join(d, "app.md"), "w", encoding="utf-8") as f:
+        f.write("Task(.id) is an entity type.\nStatus is a value type.\n"
+                "Task has Status.\nTask 't1' has Status 'open'.\n")
+    reg = _apps.Registry(root, cache_dir=str(tmp_path / "fz"))
+    reg.compile("flow")
+
+    def boot(python_arg):
+        return subprocess.Popen(
+            [exe, "--mcp", "--apps-dir", root, "--python", python_arg],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            encoding="utf-8")
+
+    def rpc(proc, mid, method, params=None):
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": mid,
+                                     "method": method,
+                                     "params": params or {}}) + "\n")
+        proc.stdin.flush()
+        return json.loads(proc.stdout.readline())
+
+    # natives, with delegation DISABLED
+    proc = boot("no-such-interpreter")
+    try:
+        rpc(proc, 1, "initialize", {"protocolVersion": "2024-11-05"})
+        tools = rpc(proc, 2, "tools/list")
+        rust_names = {t["name"] for t in tools["result"]["tools"]}
+        py_names = {t["name"] for t in mcp_server.TOOLS}
+        # derive is the resident's extra (run_rules under the daily driver's
+        # name); everything else matches name for name
+        assert rust_names - {"derive"} == py_names
+        v = rpc(proc, 3, "tools/call", {"name": "engine_version",
+                                        "arguments": {}})
+        assert json.loads(v["result"]["content"][0]["text"])["version"] == "0.9.0"
+        st = rpc(proc, 4, "tools/call", {"name": "apps_status",
+                                         "arguments": {"name": "flow"}})
+        body = json.loads(st["result"]["content"][0]["text"])
+        assert body["compiled"] is True and body["stale"] is False
+        chk = rpc(proc, 5, "tools/call", {"name": "apps_check",
+                                          "arguments": {}})
+        assert json.loads(chk["result"]["content"][0]["text"])["summary"]["ready"] >= 1
+        mk = rpc(proc, 6, "tools/call", {"name": "apps_create", "arguments": {
+            "name": "fresh", "text": "Note is an entity type.\n"}})
+        assert json.loads(mk["result"]["content"][0]["text"])["created"] == "fresh"
+    finally:
+        proc.kill()
+    # a compiler-host verb through the generic call delegation, real python
+    proc = boot(_sys.executable)
+    try:
+        rpc(proc, 1, "initialize", {"protocolVersion": "2024-11-05"})
+        rpc(proc, 2, "tools/call", {"name": "apps_use",
+                                    "arguments": {"name": "flow"}})
+        pr = rpc(proc, 3, "tools/call", {"name": "propose", "arguments": {
+            "app": "flow", "text": "Task is blocked by Task.\n"}})
+        body = json.loads(pr["result"]["content"][0]["text"])
+        assert "Task_is_blocked_by_Task" in body["would_declare"]
+    finally:
+        proc.kill()

@@ -2,12 +2,16 @@
   "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/sdk/main/schemas/mcp.json",
   "mcpServers": {
     "arest": {
-      "description": "AREST engine 0.9.0 \u2014 the polyglot engine's verb surface over the apps registry (readings compile to the lfp; status(e) lives on the RMAP columns). 27 first-class verbs: orient / apps_* / query / sql / apply / retract / get / cells / schema / actions / validate / verify / synthesize / explain / compile / propose / induce / ask / context / engine_version. The binding advertises exactly what it dispatches.",
-      "command": "python",
+      "description": "AREST engine 0.9.0, served by the RUST RESIDENT (arestlam --mcp): reads, applies (own-table AND absorbed, the stored create:<ft> handlers), orient/cells/query/derive compute natively over the retained sidecar store; the compiler-host verbs (compile/propose/induce/ask, sql and the read long tail) delegate to the same engine's python through cli.py's generic call form \u2014 one first-class verb table, two bindings. 28 tools.",
+      "command": "engine/rust/target/release/arestlam.exe",
       "args": [
-        "-u",
-        "engine/mcp_boot.py",
-        "C:/Users/lippe/Repos/apps"
+        "--mcp",
+        "--apps-dir",
+        "C:/Users/lippe/Repos/apps",
+        "--python",
+        "python",
+        "--py-cli",
+        "engine/cli.py"
       ]
     },
     "arest-legacy": {
