@@ -2,9 +2,22 @@
   "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/sdk/main/schemas/mcp.json",
   "mcpServers": {
     "arest": {
-      "description": "AREST engine — FORML2 readings → REST API. Tools: apply / compile / propose / query / audit / verify, plus a built-in sandboxed tutor (tutor + tutor.* tools) that runs orthogonal to your active app. Configure your personal scope via shell env: AREST_CLI (path to arest-cli for CLI/SQLite persistence), AREST_DB, and AREST_READINGS_DIR (or AREST_APPS_DIR + AREST_APP for the app registry). For remote-worker mode, set AREST_MODE=remote plus AREST_URL and AREST_API_KEY. Without any of these, the server runs in WASM mode against the bundled metamodel.",
+      "description": "AREST engine 0.9.0 \u2014 the polyglot engine's verb surface over the apps registry (readings compile to the lfp; status(e) lives on the RMAP columns). 27 first-class verbs: orient / apps_* / query / sql / apply / retract / get / cells / schema / actions / validate / verify / synthesize / explain / compile / propose / induce / ask / context / engine_version. The binding advertises exactly what it dispatches.",
+      "command": "python",
+      "args": [
+        "-u",
+        "engine/mcp_boot.py",
+        "C:/Users/lippe/Repos/apps"
+      ]
+    },
+    "arest-legacy": {
+      "description": "The old shell, retained during 0.9.0 interop for the verbs not yet ported: tutor + tutor.* and select_component. WASM mode against its bundled metamodel \u2014 the old engine CLI is OUT of the serving path. Everything else: use 'arest' (the new engine).",
       "command": "npx",
-      "args": ["-y", "tsx", "src/mcp/server.ts"]
+      "args": [
+        "-y",
+        "tsx",
+        "src/mcp/server.ts"
+      ]
     }
   }
 }

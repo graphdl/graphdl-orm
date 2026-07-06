@@ -178,19 +178,15 @@ State Machine is for Resource. *
      "Resource is currently in Status iff some State Machine is
      for that Resource and that State Machine is currently in
      that Status."  -->
-Resource is currently in Status.
-  Each Resource is currently in at most one Status.
-
-# task-955/924: key the SM-keyed status projection so it stays single-valued.
-# The engine's imperative transition write AND the SM event-fold both write
-# `State_Machine_is_currently_in_Status`; without this UC the cell is un-keyed,
-# so the chain folds it by full tuple and the event-fold (which emits one
-# status per triggered event) ACCUMULATES every historical status — the
-# 923/924 readback artifact. Keyed by State Machine, integrate_round_facts'
-# keyed-upsert collapses the per-resource emits to last-write-wins (the latest
-# transition target, in transition_table declaration order).
-State Machine is currently in Status.
-  Each State Machine is currently in exactly one Status.
+<!-- RETIRED at 0.9.0 (adopt-new, docs/0.9.0-status-interop.md): the
+     SM-instance status metamodel — `Resource is currently in Status` (+ its
+     at-most-one UC) and `State Machine is currently in Status` (+ its
+     exactly-one UC, the task-955/924 keying) — is replaced by the new
+     engine's per-noun `<Noun> is currently in Status` fact types, generated
+     at compile and absorbed by RMAP onto each governed noun's table. The
+     abstract-Resource absorption problem this shape worked around no longer
+     exists: status absorbs into the CONCRETE governed noun. Live state was
+     bridged fleet-wide on 2026-07-06 (migrate.status_bridge). -->
 
 ### Event Caused Transition (objectification of "Event caused Transition in State Machine")
 Event caused Transition in State Machine.
