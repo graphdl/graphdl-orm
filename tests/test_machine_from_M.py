@@ -42,35 +42,45 @@ Transition 'place' is triggered by Fact Type 'Customer places Order'.
 """
 
 
-def _step(D, fact):
-    return from_lam(ast.run(to_lam(fact), D, cell_name="Customer_places_Order",
-                            machine=("Order_status", system.machine_step("Customer_places_Order"))))
+def _setup(model):
+    D, _ = forml.compile_model(model)
+    return system.layout_cells(system.status_facts(D))       # status(e) as its RMAP column
+
+
+def _create(D, ft, *rows):
+    for row in rows:
+        D = apply(A(2), system.create(D, ft, to_lam(row)))
+    return D
+
+
+def _status(D, ft):
+    return system.ft_view(D, ft, system.rmap_partition(D))
 
 
 def test_the_machine_runs_from_M_with_no_host_wiring():
-    D, _ = forml.compile_model(MODEL)
-    D = _with_pop(D, "Order_status", (("o1", "In Cart"),))
-    (_o, Dp) = _step(D, ("c1", "o1"))
-    assert _cell(Dp, "Order_status") == {("o1", "Placed")}
+    D = _setup(MODEL)
+    D = _create(D, "Order_is_currently_in_Status", ("o1", "In Cart"))
+    D = _create(D, "Customer_places_Order", ("c1", "o1"))
+    assert ("o1", "Placed") in _status(D, "Order_is_currently_in_Status")
 
 
 def test_editing_M_redirects_the_running_machine():
-    D, _ = forml.compile_model(MODEL)
-    D = _with_pop(D, "Order_status", (("o1", "In Cart"),))
+    D = _setup(MODEL)
+    D = _create(D, "Order_is_currently_in_Status", ("o1", "In Cart"))
     D = _with_pop(D, "smTo", (("place", "Held"),))            # rewrite the machine IN M
-    (_o, Dp) = _step(D, ("c1", "o1"))
-    assert _cell(Dp, "Order_status") == {("o1", "Held")}      # the same step object obeys
+    D = _create(D, "Customer_places_Order", ("c1", "o1"))
+    assert ("o1", "Held") in _status(D, "Order_is_currently_in_Status")   # same step obeys
 
 
 def test_a_guard_added_in_M_applies_with_no_rewiring():
-    D, _ = forml.compile_model(MODEL)
-    D = _with_pop(D, "Order_status", (("o1", "In Cart"),))
+    D = _setup(MODEL)
+    D = _create(D, "Order_is_currently_in_Status", ("o1", "In Cart"))
     D = _with_pop(D, "smGuard", (("place", "Order_is_paid"),))
-    (_o, Dp) = _step(D, ("c1", "o1"))
-    assert _cell(Dp, "Order_status") == {("o1", "In Cart")}   # unpaid: guard blocks
+    D1 = _create(D, "Customer_places_Order", ("c1", "o1"))
+    assert ("o1", "In Cart") in _status(D1, "Order_is_currently_in_Status")   # unpaid: blocks
     D2 = _with_pop(D, "Order_is_paid", (("o1",),))
-    (_o2, Dp2) = _step(D2, ("c1", "o1"))
-    assert _cell(Dp2, "Order_status") == {("o1", "Placed")}   # paid: fires
+    D2 = _create(D2, "Customer_places_Order", ("c1", "o1"))
+    assert ("o1", "Placed") in _status(D2, "Order_is_currently_in_Status")    # paid: fires
 
 
 SUPER = """Party is an entity type.
@@ -90,9 +100,8 @@ def test_supertype_governance_via_the_derived_closure():
     D, _ = forml.compile_model(SUPER)
     D = system.governance_rules(D)                            # governedBy, by the engine's
     D = system.run_rules(D)                                   # own rule runner
-    Dpy = from_lam(D)
-    assert ("Person", "Party") in _cell(Dpy, "governedBy")    # subtype governed via chain
-    D = _with_pop(D, "Person_status", (("p1", "New"),))
-    (_o, Dp) = from_lam(ast.run(to_lam(("p1", "a1")), D, cell_name="Person_signs_Agreement",
-                                machine=("Person_status", system.machine_step("Person_signs_Agreement"))))
-    assert _cell(Dp, "Person_status") == {("p1", "Engaged")}  # Person role found via closure
+    D = system.layout_cells(system.status_facts(D))          # Party's status column
+    assert ("Person", "Party") in _cell(from_lam(D), "governedBy")   # governed via chain
+    D = _create(D, "Party_is_currently_in_Status", ("p1", "New"))
+    D = _create(D, "Person_signs_Agreement", ("p1", "a1"))
+    assert ("p1", "Engaged") in _status(D, "Party_is_currently_in_Status")  # role via closure

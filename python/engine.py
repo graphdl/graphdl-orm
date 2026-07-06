@@ -1698,8 +1698,11 @@ def create_spec(D, fact_type, part=None):
             # (status_facts ran) it is absorbed as a column, and the machine reads
             # and overwrites that column (⟨table, col, width⟩); else the legacy
             # noun_status cell (an atom the dual-path bs_spop/bs_commit_m detect).
+            # the status fact type is on the machine's OBJECT TYPE (the smDef noun);
+            # a governed subtype player reaches it through the governedBy closure
+            gov = {r[0]: r[1] for r in _pop_rows(D, "governedBy") if len(r) >= 2}
             status_ft = next((r[1] for r in _pop_rows(D, "smStatusFt")
-                              if len(r) >= 2 and r[0] == noun), None)
+                              if len(r) >= 2 and r[0] == gov.get(noun, noun)), None)
             if status_ft is not None and status_ft in part:
                 scols = table_columns(part, part[status_ft])
                 status_target = (part[status_ft], 2 + scols.index(status_ft),
