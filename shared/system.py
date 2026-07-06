@@ -3411,6 +3411,90 @@ DEF("system:row_overwrite",
        S3(A("COMP"), A("apply"),
           S3(A("CONS"), K(A("system:rr_overwrite")), A("id"))))),
 
+DEF("system:sm_rows",
+    S4(
+        A("COND"),
+        S3(
+            A("COMP"), A("eq"), S3(A("CONS"), N(1), S2(A("CONST"), A("is for Noun")))),
+        S3(
+            A("CONS"), S3(A("CONS"), K(A("smDef")), S3(A("CONS"), N(3), N(4))),
+            S3(
+                A("CONS"), K(A("State_Machine_Definition_is_for_Noun")),
+                S3(A("CONS"), N(3), N(4)))),
+        S4(
+            A("COND"),
+            S3(
+                A("COMP"), A("eq"),
+                S3(
+                    A("CONS"), N(1),
+                    S2(A("CONST"), A("is initial in State Machine Definition")))),
+            S3(
+                A("CONS"),
+                S3(
+                    A("CONS"), K(A("smStatus")), S4(A("CONS"), N(4), N(3), K(A("initial")))),
+                S3(
+                    A("CONS"), K(A("Status_is_initial_in_State_Machine_Definition")),
+                    S3(A("CONS"), N(3), N(4)))),
+            S4(
+                A("COND"),
+                S3(
+                    A("COMP"), A("eq"),
+                    S3(A("CONS"), N(1), S2(A("CONST"), A("is from Status")))),
+                S3(
+                    A("CONS"), S3(A("CONS"), K(A("smFrom")), S3(A("CONS"), N(3), N(4))),
+                    S3(
+                        A("CONS"), K(A("Transition_is_from_Status")),
+                        S3(A("CONS"), N(3), N(4)))),
+                S4(
+                    A("COND"),
+                    S3(
+                        A("COMP"), A("eq"),
+                        S3(A("CONS"), N(1), S2(A("CONST"), A("is to Status")))),
+                    S3(
+                        A("CONS"), S3(A("CONS"), K(A("smTo")), S3(A("CONS"), N(3), N(4))),
+                        S3(
+                            A("CONS"), K(A("Transition_is_to_Status")),
+                            S3(A("CONS"), N(3), N(4)))),
+                    S4(
+                        A("COND"),
+                        S3(
+                            A("COMP"), A("eq"),
+                            S3(A("CONS"), N(1), S2(A("CONST"), A("is triggered by Fact Type")))),
+                        S2(
+                            A("CONS"),
+                            S3(A("CONS"), K(A("smTrigger")), S3(A("CONS"), N(3), N(4)))),
+                        S4(
+                            A("COND"),
+                            S3(
+                                A("COMP"), A("eq"),
+                                S3(A("CONS"), N(1), S2(A("CONST"), A("is guarded by Fact Type")))),
+                            S2(
+                                A("CONS"),
+                                S3(A("CONS"), K(A("smGuard")), S3(A("CONS"), N(3), N(4)))),
+                            S4(
+                                A("COND"),
+                                S3(
+                                    A("COMP"), A("eq"),
+                                    S3(A("CONS"), N(1), S2(A("CONST"), A("emits")))),
+                                S4(
+                                    A("COND"),
+                                    S3(
+                                        A("COMP"), A("eq"),
+                                        S3(A("CONS"), N(2), S2(A("CONST"), A("Transition")))),
+                                    S2(
+                                        A("CONS"),
+                                        S3(A("CONS"), K(A("smEmit")), S3(A("CONS"), N(3), N(4)))),
+                                    S4(
+                                        A("COND"),
+                                        S3(
+                                            A("COMP"), A("eq"),
+                                            S3(A("CONS"), N(2), S2(A("CONST"), A("Status")))),
+                                        S2(
+                                            A("CONS"),
+                                            S3(A("CONS"), K(A("smMoore")), S3(A("CONS"), N(3), N(4)))),
+                                        K(PHI()))),
+                                K(PHI()))))))))),
+
 DEF("system:ca_sig",
     S4(A("CONS"), K(A("COMP")),
        K(S3(A("COMP"), A("apply"),

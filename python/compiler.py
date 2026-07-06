@@ -1102,34 +1102,40 @@ def _h_fact(g, k, m):
 # the machine definition IS a set of facts (whitepaper §1; the old cells carry
 # Transition_is_from_Status et al. populated from these very statements), so each
 # DSL statement asserts BOTH the machinery fact and the ordinary instance fact —
-# rules like the base's rooted-status derivation read the plain cells
+# rules like the base's rooted-status derivation read the plain cells. WHICH rows
+# a statement asserts is the canonical object system:sm_rows (⟨verb, head, l1, l2⟩
+# → ⟨⟨cell, row⟩…⟩, the verb the grammar's own recognizer token, the head splitting
+# the shared 'emits' verb); the handlers are thin callers. Trigger/guard literals
+# arrive RESOLVED — reading → fact-type id is the boundary's step, not the object's.
+def _sm_rows(verb, head, l1, l2):
+    from .reduce import apply as _apply
+    from .lam import atom as _A, from_lam as _fl
+    rows = _fl(_apply(_A("system:sm_rows"), to_lam((verb, head, l1, l2))))
+    return [(cell, tuple(row)) for (cell, row) in rows], []
+
 def _h_sm_def(g, k, m):
-    return [("smDef", (g[0], g[1])),
-            ("State_Machine_Definition_is_for_Noun", (g[0], g[1]))], []
+    return _sm_rows("is for Noun", "State Machine Definition", g[0], g[1])
 
 def _h_sm_initial(g, k, m):
-    return [("smStatus", (g[1], g[0], "initial")),            # ⟨sm, status, initial⟩
-            ("Status_is_initial_in_State_Machine_Definition", (g[0], g[1]))], []
+    return _sm_rows("is initial in State Machine Definition", "Status", g[0], g[1])
 
 def _h_sm_from(g, k, m):
-    return [("smFrom", (g[0], g[1])),                         # ⟨transition, from-status⟩
-            ("Transition_is_from_Status", (g[0], g[1]))], []
+    return _sm_rows("is from Status", "Transition", g[0], g[1])
 
 def _h_sm_to(g, k, m):
-    return [("smTo", (g[0], g[1])),                           # ⟨transition, to-status⟩
-            ("Transition_is_to_Status", (g[0], g[1]))], []
+    return _sm_rows("is to Status", "Transition", g[0], g[1])
 
 def _h_sm_trigger(g, k, m):
-    return [("smTrigger", (g[0], _clause_ft(g[1], k)))], []   # ⟨transition, trigger fact type⟩
+    return _sm_rows("is triggered by Fact Type", "Transition", g[0], _clause_ft(g[1], k))
 
 def _h_sm_guard(g, k, m):
-    return [("smGuard", (g[0], _clause_ft(g[1], k)))], []     # ⟨transition, guard fact type⟩
+    return _sm_rows("is guarded by Fact Type", "Transition", g[0], _clause_ft(g[1], k))
 
 def _h_sm_emit(g, k, m):
-    return [("smEmit", (g[0], g[1]))], []                     # ⟨transition, Mealy def name⟩
+    return _sm_rows("emits", "Transition", g[0], g[1])
 
 def _h_sm_moore(g, k, m):
-    return [("smMoore", (g[0], g[1]))], []                    # ⟨status, Moore def name⟩
+    return _sm_rows("emits", "Status", g[0], g[1])
 
 # the anaphoric qualifiers, the old engine's strip_role_qualifiers set. Stripping is a
 # FALLBACK, tried only when the verbatim reading resolves to no declared fact type —
