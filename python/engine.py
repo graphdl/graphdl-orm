@@ -92,8 +92,9 @@ def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_o
     def slot(v):
         return to_lam(()) if v is None else _S(v)
 
-    m = to_lam(()) if machine is None else _S(A(machine[0]), machine[1],
-                                              *(A(r) for r in machine[2:]))
+    m = to_lam(()) if machine is None else _S(
+        to_lam(machine[0]) if isinstance(machine[0], tuple) else A(machine[0]),
+        machine[1], *(A(r) for r in machine[2:]))
     record = _S(A(cell_name), slot(validate_obj), slot(resolve_obj), slot(derive_obj),
                 slot(links_obj), m, slot(mealy_obj),
                 slot(A(index_cell)) if index_cell is not None else to_lam(()),
@@ -1679,7 +1680,19 @@ def create_spec(D, fact_type, part=None):
         if noun is not None:
             role_pos = next((r[2] for r in _pop_rows(D, "role")
                              if len(r) >= 4 and r[1] == fact_type and r[3] == noun), None)
-            machine = (noun + "_status", machine_step(fact_type, row_col), role_pos)
+            # status(e) falls out of RMAP: when the status fact type is present
+            # (status_facts ran) it is absorbed as a column, and the machine reads
+            # and overwrites that column (⟨table, col, width⟩); else the legacy
+            # noun_status cell (an atom the dual-path bs_spop/bs_commit_m detect).
+            status_ft = next((r[1] for r in _pop_rows(D, "smStatusFt")
+                              if len(r) >= 2 and r[0] == noun), None)
+            if status_ft is not None and status_ft in part:
+                scols = table_columns(part, part[status_ft])
+                status_target = (part[status_ft], 2 + scols.index(status_ft),
+                                 1 + len(scols))
+            else:
+                status_target = noun + "_status"
+            machine = (status_target, machine_step(fact_type, row_col), role_pos)
             mealy = mealy_step(fact_type, row_col)
             if not absorbed and role_pos is not None:
                 from .lam import to_lam
@@ -2052,6 +2065,36 @@ def governance_rules(D):
     D = _ap(ast.Store("ruleReads"), _S(to_lam(reads), D))
     rows = tuple(tuple(r) for r in _pop_rows(D, "ruleAtom")) + tuple(atoms)
     return _ap(ast.Store("ruleAtom"), _S(to_lam(rows), D))
+
+
+def status_facts(D):
+    """Each governed Object Type gets its "is currently in Status" fact type (the
+    machine's status fact, whitepaper Prop. onestep: status(e) is the
+    transition-fold over the entity's events, materialized per RMAP). Generated
+    through the ordinary reading path so the NAME is compiled, never hand-built,
+    and functional (each entity is currently in at most one Status) so RMAP
+    absorbs it as the status column. The marker smStatusFt ⟨Object Type, status
+    fact type⟩ is EXTRACTED from the compiled result (the new fact type's role-1
+    player), so the guarded step looks status(e) up rather than reconstruct a
+    name. Runs before layout/partition so the column is laid out."""
+    from . import forml, ast
+    from .reduce import apply as _apply
+    from .lam import to_lam
+    nouns = [r[1] for r in _pop_rows(D, "smDef") if len(r) >= 2]
+    if not nouns:
+        return D
+    values = {r[0] for r in _pop_rows(D, "instanceOf") if len(r) >= 2 and r[1] == "ValueType"}
+    lines = [] if "Status" in values else ["Status is a value type."]
+    for noun in nouns:
+        lines.append(f"{noun} is currently in Status.")
+        lines.append(f"Each {noun} is currently in at most one Status.")
+    before = {r[0] for r in _pop_rows(D, "factType")}
+    D, _rep = forml.compile_model("\n".join(lines) + "\n", D=D)
+    role1 = {r[1]: r[3] for r in _pop_rows(D, "role") if len(r) >= 4 and r[2] == 1}
+    new_fts = [r[0] for r in _pop_rows(D, "factType") if r[0] not in before]
+    markers = tuple((role1[ft], ft) for ft in new_fts if ft in role1)
+    rows = tuple(tuple(r) for r in _pop_rows(D, "smStatusFt")) + markers
+    return _apply(ast.Store("smStatusFt"), _S(to_lam(rows), D))
 
 
 

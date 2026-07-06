@@ -86,8 +86,20 @@ DEF("ast:bs_valDI",
        K(N(2)), K(N(1)))),
 
 DEF("ast:bs_spop",
-    S4(A("CONS"), K(A("COMP")),
-       S4(A("COMP"), A("ast:FetchPop"), N(1), N(6)), K(N(2)))),
+    S4(
+        A("COND"), S3(A("COMP"), A("atom"), S3(A("COMP"), N(1), N(6))),
+        S4(
+            A("CONS"), K(A("COMP")), S4(A("COMP"), A("ast:FetchPop"), N(1), N(6)), K(N(2))),
+        S4(
+            A("CONS"), K(A("COMP")),
+            S3(
+                A("COMP"), A("apply"),
+                S3(
+                    A("CONS"), K(A("system:ftpop_absorbed")),
+                    S3(
+                        A("CONS"), S4(A("COMP"), N(1), N(1), N(6)),
+                        S4(A("COMP"), N(2), N(1), N(6))))),
+            K(N(2))))),
 
 DEF("ast:bs_snew",
     S4(A("CONS"), K(A("COMP")), S3(A("COMP"), N(2), N(6)),
@@ -157,12 +169,80 @@ DEF("ast:bs_commit_base",
        S4(A("CONS"), K(A("CONS")), K(S3(A("COMP"), N(1), N(1))), K(N(2))))),
 
 DEF("ast:bs_commit_m",
-    S4(A("COND"), S3(A("COMP"), A("null"), N(6)),
-       A("ast:bs_commit_base"),
-       S4(A("CONS"), K(A("COMP")),
-          S4(A("COMP"), A("ast:Store"), N(1), N(6)),
-          S4(A("CONS"), K(A("CONS")), A("ast:bs_snew"),
-             A("ast:bs_commit_base"))))),
+    S4(
+        A("COND"), S3(A("COMP"), A("null"), N(6)), A("ast:bs_commit_base"),
+        S4(
+            A("COND"), S3(A("COMP"), A("atom"), S3(A("COMP"), N(1), N(6))),
+            S4(
+                A("CONS"), K(A("COMP")), S4(A("COMP"), A("ast:Store"), N(1), N(6)),
+                S4(
+                    A("CONS"), K(A("CONS")), A("ast:bs_snew"), A("ast:bs_commit_base"))),
+            S4(
+                A("CONS"), K(A("COMP")), S4(A("COMP"), A("ast:bs_write_pop2"), N(1), N(6)),
+                S4(
+                    A("CONS"), K(A("CONS")), A("ast:bs_snew"), A("ast:bs_commit_base")))))),
+
+DEF("ast:bs_write_one",
+    S3(
+        A("COMP"), A("apply"),
+        S3(
+            A("CONS"),
+            S3(
+                A("COMP"), A("apply"),
+                S3(
+                    A("CONS"), K(A("ast:Store")),
+                    S3(
+                        A("COMP"), A("apply"),
+                        S3(
+                            A("CONS"), K(A("cellkey")),
+                            S3(A("CONS"), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(1), N(2))))))),
+            S3(
+                A("CONS"),
+                S3(
+                    A("COMP"), A("apply"),
+                    S3(
+                        A("CONS"),
+                        S3(
+                            A("COMP"), A("apply"),
+                            S3(
+                                A("CONS"), K(A("system:row_overwrite")),
+                                S4(
+                                    A("CONS"), S3(A("COMP"), N(2), N(1)),
+                                    S3(A("COMP"), N(3), N(1)), K(A("F"))))),
+                        S3(
+                            A("CONS"), N(2),
+                            S3(
+                                A("COMP"), A("apply"),
+                                S3(
+                                    A("CONS"),
+                                    S3(
+                                        A("COMP"), A("apply"),
+                                        S3(
+                                            A("CONS"), K(A("ast:FetchPop")),
+                                            S3(
+                                                A("COMP"), A("apply"),
+                                                S3(
+                                                    A("CONS"), K(A("cellkey")),
+                                                    S3(A("CONS"), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(1), N(2))))))),
+                                    N(3)))))),
+                N(3))))),
+
+DEF("ast:bs_write_pop",
+    S3(
+        A("COMP"), N(3),
+        S3(
+            A("WHILE"), S3(A("COMP"), A("not"), S3(A("COMP"), A("null"), N(2))),
+            S4(
+                A("CONS"), N(1), S3(A("COMP"), A("tl"), N(2)),
+                S3(
+                    A("COMP"), A("ast:bs_write_one"),
+                    S4(A("CONS"), N(1), S3(A("COMP"), N(1), N(2)), N(3))))))),
+
+DEF("ast:bs_write_pop2",
+    S4(
+        A("CONS"), K(A("COMP")), K(A("ast:bs_write_pop")),
+        S5(
+            A("CONS"), K(A("CONS")), S3(A("CONS"), K(A("CONST")), A("id")), K(N(1)), K(N(2))))),
 
 DEF("ast:bs_ipop",
     S4(A("CONS"), K(A("COMP")),
