@@ -64,3 +64,49 @@ def test_the_server_speaks_mcp_over_stdio(tmp_path):
     finally:
         proc.stdin.close()
         proc.wait(timeout=15)
+
+
+def test_every_engine_verb_is_first_class(tmp_path):
+    """Samuel, 2026-07-06: all verbs are FIRST-CLASS on the engine's verb
+    surface — any binding (MCP, CLI, REST) advertises exactly the table it
+    dispatches. The Registry-implemented verbs are all exposed, and the
+    session serves engine_version, app status/create, the live additive
+    compile (readings stay the source of truth), and the authoring dry-run
+    (propose — classify and diagnose, never persist)."""
+    from pyarest import apps, mcp_server
+    tool_names = {t["name"] for t in mcp_server.TOOLS}
+    verb_names = set(mcp_server.SESSION_VERBS) | set(mcp_server.APP_VERBS)
+    assert tool_names == verb_names                           # advertise == dispatch
+    assert {"validate", "verify", "actions", "synthesize", "explain",
+            "engine_version", "apps_status", "apps_create", "compile",
+            "propose"} <= verb_names
+    root = str(tmp_path)
+    _mk_app(root, "flow", "Task(.id) is an entity type.\nStatus is a value type.\n"
+                          "Task has Status.\nTask 't1' has Status 'open'.\n")
+    reg = apps.Registry(root)
+    reg.compile("flow")
+    reg.use("flow")
+    out = mcp_server._dispatch(reg, "actions", {"noun": "Task", "id": "t1"})
+    assert out["noun"] == "Task"
+    ver = mcp_server._dispatch(reg, "engine_version", {})
+    assert ver["version"] == "0.9.0" and ver["engine"] == "pyarest"
+    st = mcp_server._dispatch(reg, "apps_status", {"name": "flow"})
+    assert st["name"] == "flow" and st["compiled"] is True and st["stale"] is False
+    # propose: the authoring dry-run — classify + diagnose, nothing lands
+    prop = mcp_server._dispatch(reg, "propose", {
+        "text": "Task is blocked by Task.\n"})
+    assert "Task_is_blocked_by_Task" in prop["would_declare"]
+    assert reg.query("flow", "Task_is_blocked_by_Task") == []
+    # compile: live ADDITIVE readings — durable (they join readings/, so a
+    # from-scratch rebuild keeps them; the source of truth stays the readings)
+    add = mcp_server._dispatch(reg, "compile", {
+        "text": "Task 't2' has Status 'open'.\n"})
+    assert add["unparsed"] == []
+    assert ["t2", "open"] in [list(r) for r in reg.query("flow", "Task_has_Status")]
+    reg.compile("flow")                                       # rebuild keeps it
+    assert ["t2", "open"] in [list(r) for r in reg.query("flow", "Task_has_Status")]
+    # apps_create: the new-app skeleton
+    made = mcp_server._dispatch(reg, "apps_create", {
+        "name": "fresh", "text": "Note is an entity type.\n"})
+    assert made["created"] == "fresh"
+    assert os.path.exists(os.path.join(root, "fresh", "readings", "core.md"))

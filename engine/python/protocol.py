@@ -204,17 +204,76 @@ def replay_entries(D, entries):
             D = _ap(ast.Store(ft), to_lam(rows) if False else _S(to_lam(rows), D))
             continue
         if entry.get("op") == "migrate":
-            # a migration BATCH: rows union in as one Store write (one derive
-            # pass rides the caller's run_rules — the old engine's atomic
-            # collection apply is the precedent; the report at migration time
-            # carried the verification)
+            # a migration BATCH. An OWN-TABLE fact type unions in as one Store
+            # write (one derive pass rides the caller's run_rules — the old
+            # engine's atomic collection apply is the precedent; the report at
+            # migration time carried the verification). An ABSORBED fact type's
+            # live population is its RMAP column — a raw cell write would strand
+            # the rows outside the columns and break view == reassembly — so its
+            # rows BULK-INSTALL the routed 3NF shape (table rows, key index, the
+            # ** view cache) in one pass: the same batch precedent, where N
+            # validated creates would cost hours on the big apps.
             ft = entry["ft"]
+            part = system.rmap_partition(D)
+            table = part.get(ft, ft)
+            if table != ft:
+                D = _bulk_absorbed_install(D, part, table, ft, entry["facts"])
+                continue
             rows = {tuple(r) for r in system._pop_rows(D, ft)}
             rows |= {_untuple(f) for f in entry["facts"]}
             D = _ap(ast.Store(ft), _S(to_lam(system._rowsort(rows)), D))
             continue
         D = _ap(_A(2), system.create(D, entry["ft"], to_lam(_untuple(entry["fact"]))))
     return D
+
+
+def _bulk_absorbed_install(D, part, table, ft, facts):
+    """The batch install of an absorbed fact type's rows: each ⟨key, value⟩
+    lands on the entity's 3NF row (fresh rows hole-padded, the row_resolve
+    shape), the key joins the table index, and the fact type's ** view cache
+    unions — one from_lam/to_lam pass instead of N routed creates. A unary
+    absorbed fact type's ⟨key⟩ sets its boolean column to T."""
+    from .lam import from_lam as _fl, to_lam as _tl
+    cols = system.table_columns(part, table)
+    col = 2 + cols.index(ft)
+    width = 1 + len(cols)
+    unary = max((r[2] for r in system._pop_rows(D, "role")
+                 if len(r) >= 3 and r[1] == ft), default=2) == 1
+    cells_l = list(_fl(D))
+    idx = {c[1]: i for i, c in enumerate(cells_l)
+           if isinstance(c, tuple) and len(c) >= 3 and c[0] == "CELL"}
+
+    def setcell(name, val):
+        if name in idx:
+            cells_l[idx[name]] = ("CELL", name, val)
+        else:
+            idx[name] = len(cells_l)
+            cells_l.append(("CELL", name, val))
+
+    tbl = list(cells_l[idx[table]][2]) if table in idx else []
+    keys = {r[0] for r in tbl if r}
+    rows = [_untuple(f) for f in facts]
+    for r in rows:
+        if not r:
+            continue
+        k = r[0]
+        v = "T" if unary else (r[1] if len(r) >= 2 else "#")
+        rc = f"{table}:{k}"
+        row = list(cells_l[idx[rc]][2]) if rc in idx else []
+        if not row:
+            row = [k] + ["#"] * (width - 1)
+        while len(row) < width:
+            row.append("#")
+        row[col - 1] = v
+        setcell(rc, tuple(row))
+        if k not in keys:
+            keys.add(k)
+            tbl.append((k,))
+    setcell(table, tuple(tbl))
+    view = {tuple(r) for r in (cells_l[idx[ft]][2] if ft in idx else ())}
+    view |= {tuple(r) for r in rows}
+    setcell(ft, tuple(system._rowsort(view)))
+    return _tl(tuple(cells_l))
 
 
 # ============================ the event sink interface =======================
@@ -978,18 +1037,70 @@ def audit_authoring(plan_out, D=None):
     return findings
 
 
+def status_bridge(D, cells):
+    """The 0.9.0 status mapping (adopt-new, arest docs/0.9.0-status-interop.md):
+    the old engine keys machine status by State Machine instance and projects
+    it per resource; the new engine's status(e) is the per-noun "is currently
+    in Status" fact type on the governed noun's RMAP column. The old CURRENT
+    state — the fold's value, Prop. onestep's s — migrates as data: each old
+    ⟨resource, status⟩ routes to the governed noun whose population carries the
+    id, membership read by ROLE OCCURRENCE (an m:n-only noun never lands in a
+    table index). Source: the old per-resource projection cell when present,
+    else the SM-keyed cell joined through State_Machine_is_for_Resource.
+    → (routed {new_ft: rows}, unrouted ids)."""
+    from . import system
+    markers = [tuple(r)[:2] for r in system._pop_rows(D, "smStatusFt")
+               if len(r) >= 2]
+    if not markers:
+        return {}, []
+
+    def rows_of(name):
+        parsed = parse_cell(cells.get(name) or "{}")
+        return [tuple(v for (_r, v) in ps) for (_k, ps) in (parsed or [])]
+
+    old = [r for r in rows_of("Resource_is_currently_in_Status") if len(r) >= 2]
+    if not old:
+        for_map = {r[0]: r[1] for r in rows_of("State_Machine_is_for_Resource")
+                   if len(r) >= 2}
+        old = [(for_map[r[0]], r[1])
+               for r in rows_of("State_Machine_is_currently_in_Status")
+               if len(r) >= 2 and r[0] in for_map]
+    if not old:
+        return {}, []
+    pops = {}
+    for (noun, _ft) in markers:
+        pop = {row[0] for row in system._pop_rows(D, noun) if row}
+        for r in system._pop_rows(D, "role"):
+            if len(r) >= 4 and r[3] == noun:
+                pos = r[2]
+                for frow in system._pop_rows(D, r[1]):
+                    if len(frow) >= pos:
+                        pop.add(frow[pos - 1])
+        pops[noun] = pop
+    routed, unrouted = {}, []
+    for (rid, status) in old:
+        ft = next((ft for (noun, ft) in markers if rid in pops[noun]), None)
+        if ft is None:
+            unrouted.append(rid)
+        else:
+            routed.setdefault(ft, []).append((rid, status))
+    return routed, unrouted
+
+
 def replay_into(registry, app, old_db):
     """Migrate an old .db's asserted populations into the app as BATCH log
     entries, recompile (the log replays through the same path every compile
     after), and answer the report — including the derived-population
-    verification, old engine versus this one."""
+    verification, old engine versus this one, and the status bridge (the old
+    CURRENT machine state landing on the new per-noun status columns)."""
     if os.path.abspath(old_db) == os.path.abspath(registry._db(app)):
         raise ValueError("old_db is the app's own database: compiling would "
                          "overwrite the source cells before they are read — "
                          "pass a snapshot copy")
     registry.compile(app)
     D = registry._load(app)
-    p = plan(D, read_cells(old_db))
+    cells = read_cells(old_db)
+    p = plan(D, cells)
     sink = registry._sink(app)                                # the event stream, not a file
     for ft, rows in sorted(p["asserted"].items()):
         if rows:
@@ -997,7 +1108,25 @@ def replay_into(registry, app, old_db):
                          "facts": [list(r) for r in rows]})
     registry.compile(app)
     D = registry._load(app)
+    # the status bridge routes against the POST-replay populations — the
+    # entities it routes to may themselves have just migrated
+    bridge, unrouted = status_bridge(D, cells)
+    if bridge:
+        for ft, rows in sorted(bridge.items()):
+            sink.append({"op": "migrate", "ft": ft,
+                         "facts": [list(r) for r in rows]})
+        registry.compile(app)
+        D = registry._load(app)
     verify = {}
+    part = system.rmap_partition(D)
+    for ft, rows in sorted(bridge.items()):
+        new_rows = {tuple(str(x) for x in r)
+                    for r in system.ft_view(D, ft, part)}
+        old_set = {tuple(str(x) for x in r) for r in rows}
+        verify[ft] = {"old": len(old_set), "new": len(new_rows),
+                      "match": old_set <= new_rows,
+                      "missing": sorted(old_set - new_rows)[:5],
+                      "extra": sorted(new_rows - old_set)[:5]}
     for ft, old_rows in sorted(p["derived"].items()):
         # compare as STRINGS: the old cells serialize every value as text, and
         # an aggregate this engine derives is a number (Fact_Type_has_Arity)
@@ -1013,6 +1142,8 @@ def replay_into(registry, app, old_db):
             "reflection": sorted(p["reflection"]),
             "verify": verify, "unknown": sorted(p["unknown"]),
             "unparsed": sorted(p["unparsed"]),
+            "status_bridge": {ft: len(rows) for ft, rows in bridge.items()},
+            "status_unrouted": sorted(set(unrouted))[:20],
             "authoring": audit_authoring(p, D)}
 
 # ===================== federate =====================
@@ -1827,6 +1958,55 @@ class Registry:
                 "fact_types": sorted(fts, key=lambda f: f["id"]),
                 "constraints": cons}
 
+    def status(self, name):
+        """One app's posture without activating it: exists, readings count,
+        compiled, and stale (any reading newer than the .db)."""
+        import glob as _glob
+        d = self._app_dir(name)
+        readings = sorted(_glob.glob(os.path.join(d, "readings", "*.md")))
+        db = self._db(name)
+        compiled = os.path.exists(db)
+        newest = max((os.path.getmtime(p) for p in readings), default=0)
+        return {"name": name, "exists": os.path.isdir(d),
+                "readings": len(readings), "compiled": compiled,
+                "stale": (compiled and newest > os.path.getmtime(db))
+                         or (not compiled and bool(readings))}
+
+    def create(self, name, text=None):
+        """A new app skeleton: <name>/readings/core.md. Refuses on an existing
+        app — creation is not mutation."""
+        d = self._app_dir(name)
+        if os.path.isdir(d):
+            raise ValueError(f"app {name!r} already exists")
+        os.makedirs(os.path.join(d, "readings"))
+        with open(os.path.join(d, "readings", "core.md"), "w",
+                  encoding="utf-8") as f:
+            f.write(text or f"# {name}\n")
+        return {"created": name, "readings": 1}
+
+    def compile_text(self, name, text):
+        """The live ADDITIVE compile: the text joins readings/ (the source of
+        truth, so a from-scratch rebuild keeps it) and the app recompiles."""
+        p = os.path.join(self._app_dir(name), "readings", "_live.md")
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(text if text.endswith("\n") else text + "\n")
+        return self.compile(name)
+
+    def propose(self, name, text):
+        """The authoring dry-run: compile the candidate text ATOP the app's
+        model on a throwaway store — classification, diagnostics, and the
+        would-be declarations — persisting nothing."""
+        from . import forml
+        D = self._load(name)
+        before = {r[0] for r in system._pop_rows(D, "factType") if r}
+        D2, rep = forml.compile_model(text, D=D, context_from=D)
+        after = {r[0] for r in system._pop_rows(D2, "factType") if r}
+        return {"app": name,
+                "would_declare": sorted(after - before),
+                "unclassified": rep.get("unparsed", []),
+                "prose": rep.get("prose", []),
+                "diagnostics": rep.get("rule_diagnostics", [])}
+
     def orient(self):
         cur = self.current()
         return {"active_app": cur, "apps": self.list()}
@@ -1912,6 +2092,64 @@ TOOLS = [
                     "and roles, constraints.",
      "inputSchema": {"type": "object", "properties": {
          "app": {"type": "string"}}}},
+    {"name": "validate",
+     "description": "Run the app's constraint validations over the live "
+                    "populations; answers the violation report.",
+     "inputSchema": {"type": "object", "properties": {
+         "app": {"type": "string"}}}},
+    {"name": "verify",
+     "description": "Re-derive every ruled head and compare against the "
+                    "stored populations; answers per-head checks.",
+     "inputSchema": {"type": "object", "properties": {
+         "app": {"type": "string"}}}},
+    {"name": "actions",
+     "description": "HATEOAS for one entity: the machine binding, the current "
+                    "status (off the RMAP status column), and the legal "
+                    "<event, to> transitions from it.",
+     "inputSchema": {"type": "object", "properties": {
+         "app": {"type": "string"}, "noun": {"type": "string"},
+         "id": {"type": "string"}}, "required": ["noun", "id"]}},
+    {"name": "synthesize",
+     "description": "One entity's full synthesized view by id.",
+     "inputSchema": {"type": "object", "properties": {
+         "app": {"type": "string"}, "id": {"type": "string"},
+         "noun": {"type": "string"}}, "required": ["id"]}},
+    {"name": "explain",
+     "description": "The derivation trace for an entity or a fact: which "
+                    "rules fired, from which premises.",
+     "inputSchema": {"type": "object", "properties": {
+         "app": {"type": "string"}, "id": {"type": "string"},
+         "fact": {"type": "array", "items": {"type": "string"}}},
+         "required": ["id"]}},
+    {"name": "compile",
+     "description": "The live ADDITIVE compile: the text joins the app's "
+                    "readings/ (the source of truth, so a rebuild keeps it) "
+                    "and the app recompiles.",
+     "inputSchema": {"type": "object", "properties": {
+         "app": {"type": "string"}, "text": {"type": "string"}},
+         "required": ["text"]}},
+    {"name": "propose",
+     "description": "The authoring dry-run: compile the candidate readings "
+                    "ATOP the app's model on a throwaway store — would-be "
+                    "declarations, classification, diagnostics — persisting "
+                    "nothing.",
+     "inputSchema": {"type": "object", "properties": {
+         "app": {"type": "string"}, "text": {"type": "string"}},
+         "required": ["text"]}},
+    {"name": "apps_status",
+     "description": "One app's posture without activating it: exists, "
+                    "readings count, compiled, stale.",
+     "inputSchema": {"type": "object", "properties": {
+         "name": {"type": "string"}}, "required": ["name"]}},
+    {"name": "apps_create",
+     "description": "A new app skeleton: <name>/readings/core.md. Refuses on "
+                    "an existing app.",
+     "inputSchema": {"type": "object", "properties": {
+         "name": {"type": "string"}, "text": {"type": "string"}},
+         "required": ["name"]}},
+    {"name": "engine_version",
+     "description": "The engine and its version.",
+     "inputSchema": {"type": "object", "properties": {}}},
 ]
 
 
@@ -1921,12 +2159,18 @@ TOOLS = [
 # table: name -> fn(registry, args). Session verbs need no app; app verbs
 # resolve the override-or-active app first. New verbs (synthesize, explain)
 # land HERE as Registry-backed entries and every surface gains them at once.
+VERSION = "0.9.0"
+
 SESSION_VERBS = {
     "orient": lambda reg, a: reg.orient(),
     "apps_list": lambda reg, a: reg.list(),
     "apps_current": lambda reg, a: {"current": reg.current()},
     "apps_use": lambda reg, a: {"active_app": reg.use(a["name"])},
     "apps_compile": lambda reg, a: reg.compile(a["name"]),
+    "apps_status": lambda reg, a: reg.status(a["name"]),
+    "apps_create": lambda reg, a: reg.create(a["name"], a.get("text")),
+    "engine_version": lambda reg, a: {"engine": "pyarest",
+                                      "version": VERSION},
     "context": lambda reg, a: reg.last_receipt
         or {"note": "no mutation this session"},
 }
@@ -1947,6 +2191,13 @@ APP_VERBS = {
     "schema": lambda reg, app, a: reg.schema(app),
     "validate": lambda reg, app, a: reg.validate(app),
     "verify": lambda reg, app, a: reg.verify(app),
+    "actions": lambda reg, app, a: reg.actions(app, a["noun"], a["id"]),
+    "synthesize": lambda reg, app, a: reg.synthesize(app, a["id"],
+                                                     noun=a.get("noun")),
+    "explain": lambda reg, app, a: reg.explain(app, a["id"],
+                                               fact=a.get("fact")),
+    "compile": lambda reg, app, a: reg.compile_text(app, a["text"]),
+    "propose": lambda reg, app, a: reg.propose(app, a["text"]),
 }
 
 
@@ -1982,7 +2233,7 @@ def serve(apps_dir, stdin=None, stdout=None):
             result = {"protocolVersion": msg["params"].get("protocolVersion",
                                                            "2024-11-05"),
                       "capabilities": {"tools": {}},
-                      "serverInfo": {"name": "pyarest", "version": "0.0.1"}}
+                      "serverInfo": {"name": "pyarest", "version": VERSION}}
         elif method == "tools/list":
             result = {"tools": TOOLS}
         elif method == "tools/call":

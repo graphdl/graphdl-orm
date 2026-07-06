@@ -196,3 +196,80 @@ def test_replay_into_migrates_asserted_and_verifies_derived(tmp_path):
     assert any(e.get("op") == "migrate" for e in log)
     reg.compile("board")                                      # idempotent
     assert reg.query("board", "Task_blocks_Task") == [("112", "113")]
+
+
+MACHINE_APP = """Task is an entity type.
+Task Subject is a value type.
+Task has Task Subject.
+Worker(.Name) is an entity type.
+Worker completes Task.
+State Machine Definition 'Task' is for Noun 'Task'.
+Status 'in_progress' is initial in State Machine Definition 'Task'.
+Transition 'complete' is from Status 'in_progress'.
+Transition 'complete' is to Status 'completed'.
+Transition 'complete' is triggered by Fact Type 'Worker completes Task'.
+"""
+
+
+def _mk_machine(tmp_path):
+    base_dir = tmp_path / "base"
+    base_dir.mkdir()
+    (base_dir / "core.md").write_text(BASE_STORED, encoding="utf-8")
+    apps_dir = tmp_path / "apps"
+    (apps_dir / "flow" / "readings").mkdir(parents=True)
+    (apps_dir / "flow" / "readings" / "app.md").write_text(MACHINE_APP,
+                                                           encoding="utf-8")
+    return apps.Registry(str(apps_dir), base_dir=str(base_dir),
+                         cache_dir=str(tmp_path / "frozen"))
+
+
+def test_the_status_bridge_routes_old_state_to_the_noun_column(tmp_path):
+    """The 0.9.0 adopt-new mapping (docs/0.9.0-status-interop.md): the old
+    engine's CURRENT machine state — its per-resource status projection —
+    migrates as data into the new per-noun "is currently in Status" fact
+    type. The entities themselves arrive through the same replay, so routing
+    runs against the POST-replay populations, by role occurrence (an m:n-only
+    noun never lands in a table index)."""
+    reg = _mk_machine(tmp_path)
+    p = str(tmp_path / "old-m.db")
+    con = sqlite3.connect(p)
+    con.execute("CREATE TABLE cells (name TEXT PRIMARY KEY, contents TEXT)")
+    con.executemany("INSERT INTO cells VALUES (?, ?)", [
+        ("Task_has_Task_Subject",
+         "{a=<<Task, 112>, <Task Subject, Ship it>>, "
+         "b=<<Task, 113>, <Task Subject, Review it>>}"),
+        ("Resource_is_currently_in_Status",
+         "{d=<<Resource, 112>, <Status, in_progress>>, "
+         "e=<<Resource, 113>, <Status, completed>>}"),
+    ])
+    con.commit()
+    con.close()
+    report = migrate.replay_into(reg, "flow", p)
+    assert report["status_bridge"] == {"Task_is_currently_in_Status": 2}
+    assert set(reg.query("flow", "Task_is_currently_in_Status")) == \
+        {("112", "in_progress"), ("113", "completed")}
+    v = report["verify"]["Task_is_currently_in_Status"]
+    assert v["match"] is True and v["old"] == 2 and v["new"] == 2
+
+
+def test_the_status_bridge_joins_the_sm_keyed_shape(tmp_path):
+    # an old db WITHOUT the per-resource projection: the SM-keyed status joins
+    # through State_Machine_is_for_Resource
+    reg = _mk_machine(tmp_path)
+    p = str(tmp_path / "old-m2.db")
+    con = sqlite3.connect(p)
+    con.execute("CREATE TABLE cells (name TEXT PRIMARY KEY, contents TEXT)")
+    con.executemany("INSERT INTO cells VALUES (?, ?)", [
+        ("Task_has_Task_Subject", "{a=<<Task, 112>, <Task Subject, Ship it>>}"),
+        ("State_Machine_is_for_Resource",
+         "{s=<<State Machine, sm1>, <Resource, 112>>}"),
+        ("State_Machine_is_currently_in_Status",
+         "{s=<<State Machine, sm1>, <Status, completed>>}"),
+    ])
+    con.commit()
+    con.close()
+    report = migrate.replay_into(reg, "flow", p)
+    assert report["status_bridge"] == {"Task_is_currently_in_Status": 1}
+    assert reg.query("flow", "Task_is_currently_in_Status") == [("112", "completed")]
+    # an id belonging to NO governed noun is reported, never guessed
+    assert report["status_unrouted"] == []
