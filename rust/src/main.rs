@@ -761,6 +761,136 @@ fn register_base() {
             _ => bot(),
         }
     }));
+    register("lex", Rc::new(|_mu, o| {
+        let t = match aval(&o).and_then(|l| leaf_str(&l)) {
+            Some(t) => t,
+            None => return bot(),
+        };
+        let rows: Vec<V> = lex_rows(&t)
+            .into_iter()
+            .map(|r| {
+                seqc(vec![
+                    atom(Leaf::S(r.0)),
+                    atom(Leaf::S(r.1)),
+                    atom(Leaf::S(r.2)),
+                    atom(Leaf::S(r.3)),
+                    atom(Leaf::S(r.4)),
+                    atom(Leaf::S(r.5)),
+                    atom(Leaf::S(if r.6 { "T".into() } else { "F".into() })),
+                    atom(Leaf::S(r.7)),
+                    atom(Leaf::S(if r.8 { "T".into() } else { "F".into() })),
+                    atom(Leaf::I(r.9)),
+                ])
+            })
+            .collect();
+        seqc(rows)
+    }));
+    register("implode", Rc::new(|_mu, o| {
+        let it = items(&list_of(&o));
+        if it.len() != 2 {
+            return bot();
+        }
+        let sep = match aval(&it[0]).and_then(|l| leaf_str(&l)) {
+            Some(s) => s,
+            None => return bot(),
+        };
+        let mut parts: Vec<String> = Vec::new();
+        for w in items(&list_of(&it[1])) {
+            match aval(&w).and_then(|l| leaf_str(&l)) {
+                Some(s) => parts.push(s),
+                None => return bot(),
+            }
+        }
+        atom(Leaf::S(parts.join(&sep)))
+    }));
+    register("slug", Rc::new(|_mu, o| {
+        match aval(&o).and_then(|l| leaf_str(&l)) {
+            Some(t) => atom(Leaf::S(slug_str(&t))),
+            None => bot(),
+        }
+    }));
+}
+
+// the tokenizer boundary (spec D5's slot, beside cellkey): ONE lexing
+// transducer shared by the scott and native worlds — per-word lexical
+// attributes only, no grammar knowledge (the vocabulary matching above it is
+// canonical sequence algebra). Mirrors python/engine.py _lex_impl exactly.
+fn leaf_str(l: &Leaf) -> Option<String> {
+    match l {
+        Leaf::S(s) => Some(s.clone()),
+        Leaf::I(i) => Some(i.to_string()),
+        _ => None,
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn lex_rows(text: &str) -> Vec<(String, String, String, String, String, String, bool, String, bool, i64)> {
+    let cs: Vec<char> = text.chars().collect();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut open: Option<usize> = None;
+    for (i, c) in cs.iter().enumerate() {
+        if *c == '\'' {
+            match open {
+                None => open = Some(i),
+                Some(a) => {
+                    spans.push((a, i + 1));
+                    open = None;
+                }
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    let mut i = 0usize;
+    while i < cs.len() {
+        if cs[i].is_whitespace() {
+            i += 1;
+            continue;
+        }
+        let s = i;
+        while i < cs.len() && !cs[i].is_whitespace() {
+            i += 1;
+        }
+        let e = i;
+        let tok: String = cs[s..e].iter().collect();
+        let k = spans
+            .iter()
+            .position(|&(a, b)| s < b && a < e)
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let qtext: String = if k > 0 {
+            let (a, b) = spans[k - 1];
+            let (lo, hi) = (s.max(a + 1), e.min(b - 1));
+            if lo < hi { cs[lo..hi].iter().collect() } else { String::new() }
+        } else {
+            String::new()
+        };
+        let nopunct: String = tok.trim_matches(|c: char| ".;:,".contains(c)).to_string();
+        let base: String = nopunct.trim_end_matches(|c: char| c.is_ascii_digit()).to_string();
+        let subscript = nopunct[base.len()..].to_string();
+        let lower = tok.to_lowercase();
+        let title = base.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+        let post = match tok.find('-') {
+            Some(p) => tok[p + 1..].to_string(),
+            None => String::new(),
+        };
+        rows.push((tok, nopunct, base, subscript, lower, qtext, title, post, k > 0, k as i64));
+    }
+    rows
+}
+
+fn slug_str(t: &str) -> String {
+    let mut out = String::new();
+    let mut run = false;
+    for c in t.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            run = false;
+        } else if !run {
+            out.push('_');
+            run = true;
+        }
+    }
+    out.trim_matches('_').to_string()
 }
 
 fn fastreg(name: &str, p: Prim) {
@@ -1136,6 +1266,60 @@ impl NEval {
                         _ => N::Bot,
                     }
                 }
+                _ => N::Bot,
+            },
+            "lex" => match x {
+                N::A(l) => match leaf_str(l) {
+                    Some(t) => {
+                        let na = |s: String| N::A(Rc::new(Leaf::S(s)));
+                        nseq(
+                            lex_rows(&t)
+                                .into_iter()
+                                .map(|r| {
+                                    nseq(vec![
+                                        na(r.0),
+                                        na(r.1),
+                                        na(r.2),
+                                        na(r.3),
+                                        na(r.4),
+                                        na(r.5),
+                                        na(if r.6 { "T".into() } else { "F".into() }),
+                                        na(r.7),
+                                        na(if r.8 { "T".into() } else { "F".into() }),
+                                        N::A(Rc::new(Leaf::I(r.9))),
+                                    ])
+                                })
+                                .collect(),
+                        )
+                    }
+                    None => N::Bot,
+                },
+                _ => N::Bot,
+            },
+            "implode" => match pairv(x) {
+                Some((N::A(sep), N::S(ws))) => {
+                    let sv = |n: &N| match n {
+                        N::A(l) => leaf_str(l),
+                        _ => None,
+                    };
+                    match leaf_str(&sep) {
+                        Some(sp) => {
+                            let parts: Option<Vec<String>> = ws.iter().map(sv).collect();
+                            match parts {
+                                Some(p) => N::A(Rc::new(Leaf::S(p.join(&sp)))),
+                                None => N::Bot,
+                            }
+                        }
+                        None => N::Bot,
+                    }
+                }
+                _ => N::Bot,
+            },
+            "slug" => match x {
+                N::A(l) => match leaf_str(l) {
+                    Some(t) => N::A(Rc::new(Leaf::S(slug_str(&t)))),
+                    None => N::Bot,
+                },
                 _ => N::Bot,
             },
             _ => return None,

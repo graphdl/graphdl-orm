@@ -296,6 +296,34 @@ static class Reducer
                 var b = o[1] is string sb ? sb : o[1] is long ib ? ib.ToString() : null;
                 return a is null || b is null ? Bot.Value : a + ":" + b;
             }
+            case "lex":
+            {
+                // The tokenizer boundary (spec D5, beside cellkey): text to
+                // per-word lexical records; the vocabulary matching above it is
+                // canonical sequence algebra. Mirrors the Python/Rust twins.
+                var t = x is string st ? st : x is long il ? il.ToString() : null;
+                return t is null ? Bot.Value : Lex(t);
+            }
+            case "implode":
+            {
+                var o = Pair();
+                if (o is not { Length: 2 } || o[1] is not object[] ws) return Bot.Value;
+                var sep = o[0] is string s0 ? s0 : o[0] is long i0 ? i0.ToString() : null;
+                if (sep is null) return Bot.Value;
+                var parts = new List<string>();
+                foreach (var w in ws)
+                {
+                    var v = w is string sw ? sw : w is long iw ? iw.ToString() : null;
+                    if (v is null) return Bot.Value;
+                    parts.Add(v);
+                }
+                return string.Join(sep, parts);
+            }
+            case "slug":
+            {
+                var t = x is string st2 ? st2 : x is long il2 ? il2.ToString() : null;
+                return t is null ? Bot.Value : Slug(t);
+            }
             case "+":
             {
                 var o = Pair();
@@ -338,5 +366,69 @@ static class Reducer
             }
             default: handled = false; return null;
         }
+    }
+
+    // the tokenizer boundary's lexer, mirroring python/engine.py _lex_impl and
+    // the rust lex_rows exactly: per-word lexical attributes, quote spans
+    // character-wise, no grammar knowledge
+    static object Lex(string text)
+    {
+        var spans = new List<(int a, int b)>();
+        var open = -1;
+        for (var i = 0; i < text.Length; i++)
+            if (text[i] == '\'')
+            {
+                if (open < 0) open = i;
+                else { spans.Add((open, i + 1)); open = -1; }
+            }
+        var rows = new List<object>();
+        var p = 0;
+        while (p < text.Length)
+        {
+            if (char.IsWhiteSpace(text[p])) { p++; continue; }
+            var s = p;
+            while (p < text.Length && !char.IsWhiteSpace(text[p])) p++;
+            var e = p;
+            var tok = text.Substring(s, e - s);
+            var k = 0;
+            for (var i = 0; i < spans.Count; i++)
+                if (s < spans[i].b && spans[i].a < e) { k = i + 1; break; }
+            var qtext = "";
+            if (k > 0)
+            {
+                var (a, b) = spans[k - 1];
+                int lo = Math.Max(s, a + 1), hi = Math.Min(e, b - 1);
+                if (lo < hi) qtext = text.Substring(lo, hi - lo);
+            }
+            var nopunct = tok.Trim('.', ';', ':', ',');
+            var bl = nopunct.Length;
+            while (bl > 0 && nopunct[bl - 1] >= '0' && nopunct[bl - 1] <= '9') bl--;
+            var basew = nopunct.Substring(0, bl);
+            var title = basew.Length > 0 && char.IsUpper(basew[0]) ? "T" : "F";
+            var hp = tok.IndexOf('-');
+            rows.Add(new object[]
+            {
+                tok, nopunct, basew, nopunct.Substring(bl), tok.ToLowerInvariant(),
+                qtext, title, hp >= 0 ? tok.Substring(hp + 1) : "",
+                k > 0 ? "T" : "F", (long)k,
+            });
+        }
+        return rows.ToArray();
+    }
+
+    static string Slug(string t)
+    {
+        var sb = new System.Text.StringBuilder();
+        var run = false;
+        foreach (var c in t)
+        {
+            if (c is >= '0' and <= '9' or >= 'A' and <= 'Z' or >= 'a' and <= 'z')
+            {
+                sb.Append(c);
+                run = false;
+            }
+            else if (!run) { sb.Append('_'); run = true; }
+        }
+        return sb.ToString().Trim('_');
     }
 }

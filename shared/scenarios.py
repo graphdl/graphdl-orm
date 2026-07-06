@@ -48,5 +48,13 @@ DEF("case:vb-colrow", S2(A("system:vb_colrow"), S2(A("P_has_N"), S1(S3(A("CELL")
 DEF("case:ftpop-absorbed-mini", S2(S3(A("COMP"), A("apply"), S3(A("CONS"), S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("system:ftpop_absorbed")), K(S2(A("P"), N(2))))), A("id"))), S2(S3(A("CELL"), A("P"), S1(S1(A("p1")))), S3(A("CELL"), A("P:p1"), S2(A("p1"), A("Ada")))))),
 DEF("case:sel-str", S2(A("2"), S3(A("x"), A("y"), A("z")))),
 DEF("case:ftpop-fetch-mini", S2(S3(A("COMP"), A("apply"), S3(A("CONS"), S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("system:ftpop_fetch")), K(S2(A("P"), N(2))))), A("id"))), S1(S3(A("CELL"), A("P"), S1(S1(A("p1"))))))),
-DEF("case:ftpop-pairsel-mini", S2(S3(A("COMP"), A("apply"), S3(A("CONS"), S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("system:ftpop_pairsel")), K(S2(A("P"), N(2))))), A("id"))), S2(S1(A("p1")), S1(S3(A("CELL"), A("P:p1"), S2(A("p1"), A("Ada")))))))
+DEF("case:ftpop-pairsel-mini", S2(S3(A("COMP"), A("apply"), S3(A("CONS"), S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("system:ftpop_pairsel")), K(S2(A("P"), N(2))))), A("id"))), S2(S1(A("p1")), S1(S3(A("CELL"), A("P:p1"), S2(A("p1"), A("Ada"))))))),
+
+DEF("case:lex-words", S2(A("lex"), A("Each Task1 occurs."))),
+DEF("case:lex-quoted", S2(A("lex"), A("Status 'In Cart' is to Status 'Placed'."))),
+DEF("case:lex-hyphen", S2(A("lex"), A("Layer has valence-Coord and adj- Type"))),
+DEF("case:implode-tpl", S2(A("implode"), S2(A(" "), S3(A("{0}"), A("was"), A("{1}"))))),
+DEF("case:implode-us", S2(A("implode"), S2(A("_"), S2(A("a"), A("b"))))),
+DEF("case:slug-reading", S2(A("slug"), A("Order was placed by Customer"))),
+DEF("case:slug-hyphen", S2(A("slug"), A("place-receipt")))
 )

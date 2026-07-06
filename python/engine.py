@@ -1478,6 +1478,86 @@ def _register_cellkey():
 _register_cellkey()
 
 
+# The tokenizer boundary (the keystone's transducer set, same D5 slot): three
+# value ops carry text into the object world — lex (text → per-word records),
+# implode (⟨sep, words⟩ → one atom; templates are strings in factType rows),
+# slug (text → id atom; ID MINTING is a boundary act, names are data). All
+# sequence algebra above them (the mixfix scan, type spans, Stage-1's
+# vocabulary matcher) is canonical territory.
+def _lex_impl(mu):
+    import re
+    from . import defs as _d
+    from .lam import to_lam
+    import pyarest.lam as L
+
+    def g(o):
+        t = _d._aval(o)
+        if t is None or isinstance(t, tuple):
+            return L.BOT
+        text = str(t)
+        spans = [m.span() for m in re.finditer(r"'[^']*'", text)]
+        rows = []
+        for m in re.finditer(r"\S+", text):
+            tok, s, e = m.group(0), m.start(), m.end()
+            k = next((i + 1 for i, (a, b) in enumerate(spans)
+                      if s < b and a < e), 0)
+            qtext = ""
+            if k:
+                a, b = spans[k - 1]
+                qtext = text[max(s, a + 1):min(e, b - 1)]
+            nopunct = tok.strip(".;:,")
+            base = nopunct.rstrip("0123456789")
+            rows.append((tok, nopunct, base, nopunct[len(base):], tok.lower(),
+                         qtext, "T" if base and base[0].isupper() else "F",
+                         tok.partition("-")[2], "T" if k else "F", k))
+        return to_lam(tuple(rows))
+    return g
+
+
+def _implode_impl(mu):
+    from . import defs as _d
+    import pyarest.lam as L
+
+    def g(o):
+        it = _d._items(L._list(o))
+        if len(it) != 2:
+            return L.BOT
+        sep = _d._aval(it[0])
+        if sep is None or isinstance(sep, tuple):
+            return L.BOT
+        parts = []
+        for w in _d._items(L._list(it[1])):
+            v = _d._aval(w)
+            if v is None or isinstance(v, tuple):
+                return L.BOT
+            parts.append(str(v))
+        return L.atom(str(sep).join(parts))
+    return g
+
+
+def _slug_impl(mu):
+    import re
+    from . import defs as _d
+    import pyarest.lam as L
+
+    def g(o):
+        t = _d._aval(o)
+        if t is None or isinstance(t, tuple):
+            return L.BOT
+        return L.atom(re.sub(r"[^0-9A-Za-z]+", "_", str(t)).strip("_"))
+    return g
+
+
+def _register_lex_boundary():
+    from .defs import register
+    register("lex", _lex_impl)
+    register("implode", _implode_impl)
+    register("slug", _slug_impl)
+
+
+_register_lex_boundary()
+
+
 def table_columns(partition, table):
     """The fact types absorbed into `table`, in declaration order; column j of the 3NF row
     ⟨key, v1, v2, …⟩ holds the (1+j)th entry's value. The meaning is the canonical

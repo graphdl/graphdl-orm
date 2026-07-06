@@ -223,6 +223,35 @@ public class Reducer {
                      : o[1] instanceof Long ? o[1].toString() : null;
             return val(a == null || b == null ? BOT : a + ":" + b);
         }
+        if (name.equals("lex")) {
+            // The tokenizer boundary (spec D5, beside cellkey): text to per-word
+            // lexical records; the vocabulary matching above it is canonical
+            // sequence algebra. Mirrors the Python/Rust/C# twins.
+            String t = x instanceof String ? (String) x
+                     : x instanceof Long ? x.toString() : null;
+            return val(t == null ? BOT : lex(t));
+        }
+        if (name.equals("implode")) {
+            if (o == null || o.length != 2 || !isSeq(o[1])) return val(BOT);
+            String sep = o[0] instanceof String ? (String) o[0]
+                       : o[0] instanceof Long ? o[0].toString() : null;
+            if (sep == null) return val(BOT);
+            Object[] ws = (Object[]) o[1];
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < ws.length; i++) {
+                String v = ws[i] instanceof String ? (String) ws[i]
+                         : ws[i] instanceof Long ? ws[i].toString() : null;
+                if (v == null) return val(BOT);
+                if (i > 0) sb.append(sep);
+                sb.append(v);
+            }
+            return val(sb.toString());
+        }
+        if (name.equals("slug")) {
+            String t = x instanceof String ? (String) x
+                     : x instanceof Long ? x.toString() : null;
+            return val(t == null ? BOT : slug(t));
+        }
         if (name.equals("apndl")) {
             if (o == null || o.length != 2 || !isSeq(o[1])) return val(BOT);
             Object[] ys = (Object[]) o[1];
@@ -358,5 +387,68 @@ public class Reducer {
             return expr(app(o[0], o[1]));
         }
         return null;
+    }
+
+    // the tokenizer boundary's lexer, mirroring python/engine.py _lex_impl and
+    // the rust lex_rows exactly: per-word lexical attributes, quote spans
+    // character-wise, no grammar knowledge
+    static Object[] lex(String text) {
+        java.util.List<int[]> spans = new java.util.ArrayList<int[]>();
+        int open = -1;
+        for (int i = 0; i < text.length(); i++)
+            if (text.charAt(i) == '\'') {
+                if (open < 0) open = i;
+                else { spans.add(new int[]{open, i + 1}); open = -1; }
+            }
+        java.util.List<Object> rows = new java.util.ArrayList<Object>();
+        int p = 0;
+        while (p < text.length()) {
+            if (Character.isWhitespace(text.charAt(p))) { p++; continue; }
+            int s = p;
+            while (p < text.length() && !Character.isWhitespace(text.charAt(p))) p++;
+            int e = p;
+            String tok = text.substring(s, e);
+            int k = 0;
+            for (int i = 0; i < spans.size(); i++)
+                if (s < spans.get(i)[1] && spans.get(i)[0] < e) { k = i + 1; break; }
+            String qtext = "";
+            if (k > 0) {
+                int a = spans.get(k - 1)[0], b = spans.get(k - 1)[1];
+                int lo = Math.max(s, a + 1), hi = Math.min(e, b - 1);
+                if (lo < hi) qtext = text.substring(lo, hi);
+            }
+            int st = 0, en = tok.length();
+            while (st < en && ".;:,".indexOf(tok.charAt(st)) >= 0) st++;
+            while (en > st && ".;:,".indexOf(tok.charAt(en - 1)) >= 0) en--;
+            String nopunct = tok.substring(st, en);
+            int bl = nopunct.length();
+            while (bl > 0 && nopunct.charAt(bl - 1) >= '0' && nopunct.charAt(bl - 1) <= '9') bl--;
+            String base = nopunct.substring(0, bl);
+            String title = base.length() > 0 && Character.isUpperCase(base.charAt(0)) ? "T" : "F";
+            int hp = tok.indexOf('-');
+            rows.add(new Object[]{
+                tok, nopunct, base, nopunct.substring(bl),
+                tok.toLowerCase(java.util.Locale.ROOT), qtext, title,
+                hp >= 0 ? tok.substring(hp + 1) : "",
+                k > 0 ? "T" : "F", Long.valueOf(k),
+            });
+        }
+        return rows.toArray();
+    }
+
+    static String slug(String t) {
+        StringBuilder sb = new StringBuilder();
+        boolean run = false;
+        for (int i = 0; i < t.length(); i++) {
+            char c = t.charAt(i);
+            if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+                sb.append(c);
+                run = false;
+            } else if (!run) { sb.append('_'); run = true; }
+        }
+        int st = 0, en = sb.length();
+        while (st < en && sb.charAt(st) == '_') st++;
+        while (en > st && sb.charAt(en - 1) == '_') en--;
+        return sb.substring(st, en);
     }
 }
