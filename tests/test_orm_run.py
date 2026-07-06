@@ -30,6 +30,21 @@ def _cell(Dpy, name):
     return set()
 
 
+def _setup(model):
+    D, _ = forml.compile_model(model)
+    return system.layout_cells(system.status_facts(D))       # status(e): RMAP column
+
+
+def _create(D, ft, *rows):
+    for row in rows:
+        D = apply(A(2), system.create(D, ft, to_lam(row)))
+    return D
+
+
+def _status(D, ft="Order_is_currently_in_Status"):
+    return system.ft_view(D, ft, system.rmap_partition(D))
+
+
 MODEL = """Order(.OrderId) is an entity type.
 Customer(.Name) is an entity type.
 Customer places Order.
@@ -44,25 +59,25 @@ Transition 'place' emits 'place-receipt'.
 
 
 def test_create_runs_the_machine_from_M_alone():
-    D, _ = forml.compile_model(MODEL)
-    D = _with_pop(D, "Order_status", (("o1", "In Cart"),))
+    D = _setup(MODEL)
+    D = _create(D, "Order_is_currently_in_Status", ("o1", "In Cart"))
     (o, Dp) = from_lam(system.create(D, "Customer_places_Order", to_lam(("c1", "o1"))))
     assert ("c1", "o1") in _cell(Dp, "Customer_places_Order")
-    assert _cell(Dp, "Order_status") == {("o1", "Placed")}    # no machine argument anywhere
+    assert ("o1", "Placed") in _status(to_lam(Dp))            # no machine argument anywhere
 
 
 def test_create_on_a_non_trigger_fact_type_has_no_machine_stage():
-    D, _ = forml.compile_model(MODEL)
-    D = _with_pop(D, "Order_status", (("o1", "In Cart"),))
+    D = _setup(MODEL)
+    D = _create(D, "Order_is_currently_in_Status", ("o1", "In Cart"))
     (o, Dp) = from_lam(system.create(D, "Customer_greets_Customer", to_lam(("c1", "c2"))))
     assert ("c1", "c2") in _cell(Dp, "Customer_greets_Customer")
-    assert _cell(Dp, "Order_status") == {("o1", "In Cart")}   # untouched
+    assert ("o1", "In Cart") in _status(to_lam(Dp))           # untouched
 
 
 def test_mealy_emission_lands_in_the_representation():
-    D, _ = forml.compile_model(MODEL)
+    D = _setup(MODEL)
     D = apply(ast.DefineIn("place-receipt", S(A("CONST"), A("RECEIPT"))), D)
-    D = _with_pop(D, "Order_status", (("o1", "In Cart"),))
+    D = _create(D, "Order_is_currently_in_Status", ("o1", "In Cart"))
     (o, _Dp) = from_lam(system.create(D, "Customer_places_Order", to_lam(("c1", "o1"))))
     assert o[-1] == (("o1", "RECEIPT"),)                      # ρ-applied on the fired step
 
@@ -89,8 +104,8 @@ Transition 'ship' is triggered by Fact Type 'Customer ships Order'.
 def test_create_carries_the_links_with_no_caller_wiring():
     # Thm. hateoas at the ORM level: the representation offers exactly the next
     # transitions from the entity's POST-step status — no links argument anywhere
-    D, _ = forml.compile_model(FLOW)
-    D = _with_pop(D, "Order_status", (("o1", "In Cart"),))
+    D = _setup(FLOW)
+    D = _create(D, "Order_is_currently_in_Status", ("o1", "In Cart"))
     (o, _Dp) = from_lam(system.create(D, "Customer_places_Order", to_lam(("c1", "o1"))))
     links = o[2]
     assert {t[1] for t in links} == {"Customer_ships_Order"}  # ship offered, place gone
@@ -101,10 +116,10 @@ def test_reasserting_a_fact_is_the_identity_on_D():
     # the ground case of the schema-derived failure model: at-least-once delivery is
     # free for asserts, and machine double-fire is structurally safe because firing
     # consumes the FROM status (a re-delivered trigger finds no transition to take).
-    D, _ = forml.compile_model(MODEL)
-    D = _with_pop(D, "Order_status", (("o1", "In Cart"),))
+    D = _setup(MODEL)
+    D = _create(D, "Order_is_currently_in_Status", ("o1", "In Cart"))
     D1 = apply(A(2), system.create(D, "Customer_places_Order", to_lam(("c1", "o1"))))
     D2 = apply(A(2), system.create(D1, "Customer_places_Order", to_lam(("c1", "o1"))))
     D2py = from_lam(D2)
     assert _rows(D2py, "Customer_places_Order") == (("c1", "o1"),)   # once, not twice
-    assert _cell(D2py, "Order_status") == {("o1", "Placed")}         # no double-fire
+    assert ("o1", "Placed") in _status(D2)                           # no double-fire

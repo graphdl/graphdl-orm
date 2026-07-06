@@ -42,20 +42,33 @@ Transition 'pay' is triggered by Fact Type 'Order is paid by Customer'.
 """
 
 
+def _setup(model):
+    D, _ = forml.compile_model(model)
+    return system.layout_cells(system.status_facts(D))       # status(e): RMAP column
+
+
+def _create(D, ft, *rows):
+    for row in rows:
+        D = apply(A(2), system.create(D, ft, to_lam(row)))
+    return D
+
+
+def _status(D, ft="Order_is_currently_in_Status"):
+    return system.ft_view(D, ft, system.rmap_partition(D))
+
+
 def test_an_absorbed_trigger_advances_the_machine_in_the_routed_step():
-    D, _ = forml.compile_model(MODEL)
+    D = _setup(MODEL)
     part = system.rmap_partition(D)
     assert part["Order_is_paid_by_Customer"] == "Order"       # functional: absorbed
-    D = _with_pop(D, "Order_status", (("o1", "In Cart"),))
-    res = system.create(D, "Order_is_paid_by_Customer", to_lam(("o1", "c1")))
-    Dp = apply(A(2), res)
-    Dpy = from_lam(Dp)
-    assert system.ft_view(Dp, "Order_is_paid_by_Customer", part) == {("o1", "c1")}
-    assert _cell(Dpy, "Order_status") == {("o1", "Paid")}     # advanced in the same step
+    D = _create(D, "Order_is_currently_in_Status", ("o1", "In Cart"))
+    D = _create(D, "Order_is_paid_by_Customer", ("o1", "c1"))
+    assert system.ft_view(D, "Order_is_paid_by_Customer", part) == {("o1", "c1")}
+    assert ("o1", "Paid") in _status(D)                       # advanced in the same step
 
 
 def test_an_absorbed_non_trigger_leaves_the_machine_alone():
-    D, _ = forml.compile_model(MODEL)
-    D = _with_pop(D, "Order_status", (("o1", "In Cart"),))
-    Dp = apply(A(2), system.create(D, "Order_is_noted_by_Customer", to_lam(("o1", "c1"))))
-    assert _cell(from_lam(Dp), "Order_status") == {("o1", "In Cart")}
+    D = _setup(MODEL)
+    D = _create(D, "Order_is_currently_in_Status", ("o1", "In Cart"))
+    D = _create(D, "Order_is_noted_by_Customer", ("o1", "c1"))
+    assert ("o1", "In Cart") in _status(D)

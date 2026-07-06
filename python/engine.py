@@ -80,8 +80,10 @@ def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_o
                  machine=None, mealy_obj=None, index_cell=None, append_cell=None):
     """The transition create_cell:⟨I, D⟩ → ⟨⟨P'',V⟩, D'⟩ over one cell, wired with a schema's
     validate (and optionally its resolve/derive). It touches only `cell_name` — plus, when
-    `machine=(status_cell, sm_obj)` is wired, the noun's status cell: the trigger fact entering
-    P advances the machine within the SAME step (Prop. onestep), atomically with the commit.
+    `machine=((table, col, width), sm_obj)` is wired, the governed entities' status COLUMN
+    (status(e) is the "is currently in Status" fact type, absorbed by RMAP onto the object
+    type's rows): the trigger fact entering P advances the machine within the SAME step
+    (Prop. onestep), atomically with the commit, through the authorized row_overwrite.
     With `mealy_obj` (same input shape as sm_obj) the fired transitions' Mealy emissions are
     appended to the representation o as its last part. With `index_cell` (the routed-write
     case) the table's key index records I's key in the SAME commit chain, so refusal leaves
@@ -93,8 +95,7 @@ def build_system(validate_obj=None, cell_name="FILE", resolve_obj=None, derive_o
         return to_lam(()) if v is None else _S(v)
 
     m = to_lam(()) if machine is None else _S(
-        to_lam(machine[0]) if isinstance(machine[0], tuple) else A(machine[0]),
-        machine[1], *(A(r) for r in machine[2:]))
+        to_lam(machine[0]), machine[1], *(A(r) for r in machine[2:]))
     record = _S(A(cell_name), slot(validate_obj), slot(resolve_obj), slot(derive_obj),
                 slot(links_obj), m, slot(mealy_obj),
                 slot(A(index_cell)) if index_cell is not None else to_lam(()),
@@ -1642,17 +1643,15 @@ def install_entity_cells(D, noun, rows):
 
 
 def _status_rows(D, noun):
-    """The noun's live status population: the "is currently in Status" fact type
-    read off its RMAP column when present (status_facts wired), else the legacy
-    noun_status cell. The one seam every status reader goes through, dual with
-    create_spec's write side."""
+    """The noun's live status population: the "is currently in Status" fact
+    type read off its RMAP column (ft_view). The one seam every status reader
+    goes through, dual with create_spec's write side; a noun with no machine
+    (no smStatusFt marker) has no statuses."""
     status_ft = next((r[1] for r in _pop_rows(D, "smStatusFt")
                       if len(r) >= 2 and r[0] == noun), None)
-    if status_ft is not None:
-        part = rmap_partition(D)
-        if status_ft in part:
-            return sorted(ft_view(D, status_ft, part))
-    return [tuple(r) for r in _pop_rows(D, f"{noun}_status")]
+    if status_ft is None:
+        return []
+    return sorted(ft_view(D, status_ft, rmap_partition(D)))
 
 
 def moore_view(D, noun):
@@ -1774,21 +1773,22 @@ def create_spec(D, fact_type, part=None):
         if noun is not None:
             role_pos = next((r[2] for r in _pop_rows(D, "role")
                              if len(r) >= 4 and r[1] == fact_type and r[3] == noun), None)
-            # status(e) falls out of RMAP: when the status fact type is present
-            # (status_facts ran) it is absorbed as a column, and the machine reads
-            # and overwrites that column (⟨table, col, width⟩); else the legacy
-            # noun_status cell (an atom the dual-path bs_spop/bs_commit_m detect).
-            # the status fact type is on the machine's OBJECT TYPE (the smDef noun);
-            # a governed subtype player reaches it through the governedBy closure
+            # status(e) falls out of RMAP: the status fact type is absorbed as a
+            # column on the machine's OBJECT TYPE (the smDef noun; a governed
+            # subtype player reaches it through the governedBy closure), and the
+            # machine reads and overwrites that column (⟨table, col, width⟩).
+            # A machine without its status column is an incomplete model.
             gov = {r[0]: r[1] for r in _pop_rows(D, "governedBy") if len(r) >= 2}
             status_ft = next((r[1] for r in _pop_rows(D, "smStatusFt")
                               if len(r) >= 2 and r[0] == gov.get(noun, noun)), None)
-            if status_ft is not None and status_ft in part:
-                scols = table_columns(part, part[status_ft])
-                status_target = (part[status_ft], 2 + scols.index(status_ft),
-                                 1 + len(scols))
-            else:
-                status_target = noun + "_status"
+            if status_ft is None or status_ft not in part:
+                raise ValueError(
+                    f"machine on {noun!r} without its status column: run "
+                    "system.status_facts (then layout_cells) before create — "
+                    "status(e) IS the '<Noun> is currently in Status' fact type")
+            scols = table_columns(part, part[status_ft])
+            status_target = (part[status_ft], 2 + scols.index(status_ft),
+                             1 + len(scols))
             machine = (status_target, machine_step(fact_type, row_col), role_pos)
             mealy = mealy_step(fact_type, row_col)
             if not absorbed and role_pos is not None:
@@ -1949,7 +1949,13 @@ def step_and_wake(D, fact_type, fact):
     if any(r[1] == fact_type for r in _pop_rows(D2, "smTrigger")):
         noun = _governed_player(D2, fact_type)
         if noun is not None:
-            changed.add(noun + "_status")
+            # the machine advanced the governed object type's status column:
+            # rules reading "<Noun> is currently in Status" re-derive
+            gov = {r[0]: r[1] for r in _pop_rows(D2, "governedBy") if len(r) >= 2}
+            sft = next((r[1] for r in _pop_rows(D2, "smStatusFt")
+                        if len(r) >= 2 and r[0] == gov.get(noun, noun)), None)
+            if sft is not None:
+                changed.add(sft)
     D2 = run_rules(D2, changed=changed)
     return _S(o, D2), wake(D2, changed)
 
@@ -2186,7 +2192,10 @@ def status_facts(D):
         lines.append(f"{noun} is currently in Status.")
         lines.append(f"Each {noun} is currently in at most one Status.")
     before = {r[0] for r in _pop_rows(D, "factType")}
-    D, _rep = forml.compile_model("\n".join(lines) + "\n", D=D)
+    # context_from=D: the model's OWN declared types (Status included, when the
+    # model declares it) resolve as role players — without it a model-declared
+    # Status is unknown to this compile and the status fact type mints UNARY
+    D, _rep = forml.compile_model("\n".join(lines) + "\n", D=D, context_from=D)
     role1 = {r[1]: r[3] for r in _pop_rows(D, "role") if len(r) >= 4 and r[2] == 1}
     new_fts = [r[0] for r in _pop_rows(D, "factType") if r[0] not in before]
     markers = tuple((role1[ft], ft) for ft in new_fts if ft in role1)

@@ -87,19 +87,15 @@ DEF("ast:bs_valDI",
 
 DEF("ast:bs_spop",
     S4(
-        A("COND"), S3(A("COMP"), A("atom"), S3(A("COMP"), N(1), N(6))),
-        S4(
-            A("CONS"), K(A("COMP")), S4(A("COMP"), A("ast:FetchPop"), N(1), N(6)), K(N(2))),
-        S4(
-            A("CONS"), K(A("COMP")),
+        A("CONS"), K(A("COMP")),
+        S3(
+            A("COMP"), A("apply"),
             S3(
-                A("COMP"), A("apply"),
+                A("CONS"), K(A("system:ftpop_absorbed")),
                 S3(
-                    A("CONS"), K(A("system:ftpop_absorbed")),
-                    S3(
-                        A("CONS"), S4(A("COMP"), N(1), N(1), N(6)),
-                        S4(A("COMP"), N(2), N(1), N(6))))),
-            K(N(2))))),
+                    A("CONS"), S4(A("COMP"), N(1), N(1), N(6)),
+                    S4(A("COMP"), N(2), N(1), N(6))))),
+        K(N(2)))),
 
 DEF("ast:bs_snew",
     S4(A("CONS"), K(A("COMP")), S3(A("COMP"), N(2), N(6)),
@@ -172,15 +168,9 @@ DEF("ast:bs_commit_m",
     S4(
         A("COND"), S3(A("COMP"), A("null"), N(6)), A("ast:bs_commit_base"),
         S4(
-            A("COND"), S3(A("COMP"), A("atom"), S3(A("COMP"), N(1), N(6))),
+            A("CONS"), K(A("COMP")), S4(A("COMP"), A("ast:bs_write_pop2"), N(1), N(6)),
             S4(
-                A("CONS"), K(A("COMP")), S4(A("COMP"), A("ast:Store"), N(1), N(6)),
-                S4(
-                    A("CONS"), K(A("CONS")), A("ast:bs_snew"), A("ast:bs_commit_base"))),
-            S4(
-                A("CONS"), K(A("COMP")), S4(A("COMP"), A("ast:bs_write_pop2"), N(1), N(6)),
-                S4(
-                    A("CONS"), K(A("CONS")), A("ast:bs_snew"), A("ast:bs_commit_base")))))),
+                A("CONS"), K(A("CONS")), A("ast:bs_snew"), A("ast:bs_commit_base"))))),
 
 DEF("ast:bs_write_one",
     S3(

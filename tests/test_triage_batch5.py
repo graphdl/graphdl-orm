@@ -33,14 +33,16 @@ Transition 'ship' is triggered by Fact Type 'Customer ships Order'.
 """
     D, rep = forml.compile_model(MODEL)
     assert rep["unparsed"] == []
+    D = system.layout_cells(system.status_facts(D))          # status(e): RMAP column
     res = system.create(D, "Customer_ships_Order", to_lam(("c1", "o1")))
     o, D2 = from_lam(apply(A(1), res)), apply(A(2), res)
     assert o != "ERROR"                                       # the fact is legal data
     Dpy = from_lam(D2)
     assert _cell(Dpy, "Customer_ships_Order") == {("c1", "o1")}
     # no s_0 declared: the fold has no seed, so NOTHING advances — no topology
-    # inference, no insertion-order guess, no status row
-    assert _cell(Dpy, "Order_status") == set()
+    # inference, no insertion-order guess, no status row in the column
+    assert system.ft_view(D2, "Order_is_currently_in_Status",
+                          system.rmap_partition(D2)) == set()
 
 
 def test_noun_without_a_machine_takes_plain_facts():

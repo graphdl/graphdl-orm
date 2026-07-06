@@ -52,12 +52,15 @@ def test_the_view_cache_equals_the_reassembly():
 
 def test_a_guard_on_an_absorbed_unary_reads_the_routed_write():
     D, _ = forml.compile_model(MODEL)
-    D = apply(ast.Store("Task_status"), S(to_lam((("t1", "Todo"),)), D))
+    D = system.layout_cells(system.status_facts(D))          # status(e): RMAP column
+    sft = "Task_is_currently_in_Status"
+    D = apply(A(2), system.create(D, sft, to_lam(("t1", "Todo"))))
     blocked = apply(A(2), system.create(D, "Worker_starts_Task", to_lam(("w1", "t1"))))
-    assert _cell(from_lam(blocked), "Task_status") == {("t1", "Todo")}   # not ready yet
+    part = system.rmap_partition(D)
+    assert system.ft_view(blocked, sft, part) == {("t1", "Todo")}        # not ready yet
     D = apply(A(2), system.create(D, "Task_is_ready", to_lam(("t1",))))  # ROUTED write
     D = apply(A(2), system.create(D, "Worker_starts_Task", to_lam(("w1", "t1"))))
-    assert _cell(from_lam(D), "Task_status") == {("t1", "Doing")}        # guard sees it
+    assert system.ft_view(D, sft, part) == {("t1", "Doing")}             # guard sees it
 
 
 def test_a_rule_atom_over_an_absorbed_unary_derives():

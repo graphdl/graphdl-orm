@@ -1790,14 +1790,14 @@ class Registry:
         if smd is None:
             return {"app": name, "noun": noun, "id": id, "machine": None,
                     "actions": []}
+        # the machine's OBJECT TYPE (the smDef noun) carries the status column;
+        # _status_rows is the one reader seam
+        gov_noun = next((r[1] for r in _sys._pop_rows(D, "smDef")
+                         if len(r) >= 2 and r[0] == smd), smd)
         status = None
-        for r in _sys._pop_rows(D, f"{noun}_status"):
+        for r in _sys._status_rows(D, gov_noun):
             if len(r) >= 2 and r[0] == id:
                 status = r[1]
-        if status is None:
-            for r in _sys._pop_rows(D, "Resource_is_currently_in_Status"):
-                if len(r) >= 2 and r[0] == id:
-                    status = r[1]
         triples = _sys.sm_triples(D)
         acts = [{"event": t[1], "to": t[2]} for t in triples
                 if status is not None and t[0] == status]

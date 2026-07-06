@@ -152,7 +152,9 @@ Transition 'close' is triggered by Fact Type 'close'.
     from pyarest import apps as _apps
     reg = _apps.Registry(str(base), cache_dir=str(tmp_path / "fz"))
     reg.compile("flow")
-    reg.apply("flow", "Ticket_status", ("t1", "open"))
+    # status(e) is the ORM fact type on its RMAP column (status_facts ran in
+    # the pipeline); the machine's name ('Flow') differs from its noun
+    reg.apply("flow", "Ticket_is_currently_in_Status", ("t1", "open"))
     out = reg.actions("flow", "Ticket", "t1")
     assert out["machine"] == "Flow"
     assert out["status"] == "open"

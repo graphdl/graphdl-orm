@@ -68,8 +68,8 @@ def test_machine_advances_status_in_the_rmap_column():
     status = system.ft_view(D, "Order_is_currently_in_Status", part)
     assert ("o1", "Placed") in status
     assert ("o1", "In Cart") not in status
-    # the noun_status wart is not the store of record
-    assert {tuple(r) for r in system._pop_rows(D, "Order_status")} in (set(), {("o1", "Placed")})
+    # the noun_status wart does not exist: the column IS the store of record
+    assert {tuple(r) for r in system._pop_rows(D, "Order_status")} == set()
 
 
 def test_machine_app_advances_status_in_the_column_through_the_registry(tmp_path):

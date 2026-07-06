@@ -113,16 +113,29 @@ Transition 'ship' is triggered by Fact Type 'Customer ships Order'.
 """
 
 
+SFT = "Order_is_currently_in_Status"
+
+
+def _order_setup():
+    """The whitepaper store with status(e) on its RMAP column: o1 In Cart, plus
+    the machine slot ⟨table, col, width⟩ computed off the partition."""
+    from pyarest.reduce import apply
+    D, _ = forml.compile_model(ORDER)
+    D = system.layout_cells(system.status_facts(D))
+    D = apply(A(2), system.create(D, SFT, to_lam(("o1", "In Cart"))))
+    part = system.rmap_partition(D)
+    scols = system.table_columns(part, "Order")
+    return D, ("Order", 2 + scols.index(SFT), 1 + len(scols))
+
+
 def test_the_machine_advances_identically_on_rust_closures():
     # the killer case: the whitepaper create handler — commit, machine advance, links —
     # is ONE exported FFP object; Rust runs it with zero machine code of its own
-    from pyarest.reduce import apply
-    D, _ = forml.compile_model(ORDER)
-    D = apply(ast.Store("Order_status"), S(to_lam((("o1", "In Cart"),)), D))
+    D, slot = _order_setup()
     trans_of = system.transitions_of(to_lam(system.sm_triples(D)), 2)
     handler = ast.build_system(
         cell_name="Customer_places_Order",
-        machine=("Order_status", system.machine_step("Customer_places_Order"), 2),
+        machine=(slot, system.machine_step("Customer_places_Order"), 2),
         mealy_obj=system.mealy_step("Customer_places_Order"),
         links_obj=trans_of)
     x = S(to_lam(("c1", "o1")), D)
@@ -164,12 +177,11 @@ def test_overrides_and_canonical_terms_agree():
 def test_benchmark_the_flex(capsys):
     # correctness-asserted timing: the whitepaper machine step, N times, three ways
     import time
-    from pyarest.reduce import apply, apply as fast_apply
-    D, _ = forml.compile_model(ORDER)
-    D = apply(ast.Store("Order_status"), S(to_lam((("o1", "In Cart"),)), D))
+    from pyarest.reduce import apply as fast_apply
+    D, slot = _order_setup()
     handler = ast.build_system(
         cell_name="Customer_places_Order",
-        machine=("Order_status", system.machine_step("Customer_places_Order"), 2))
+        machine=(slot, system.machine_step("Customer_places_Order"), 2))
     x = S(to_lam(("c1", "o1")), D)
     N = 10
     N_TRUTH = 2                                               # ground truth is deliberately the
@@ -226,12 +238,10 @@ def test_benchmark_the_flex(capsys):
 def test_the_native_carrier_agrees_three_ways():
     # the deepest override: the native-carrier machine (delta.py's analog) must equal
     # the Scott closures must equal Python — same scenarios, engine selected per request
-    from pyarest.reduce import apply
-    D, _ = forml.compile_model(ORDER)
-    D = apply(ast.Store("Order_status"), S(to_lam((("o1", "In Cart"),)), D))
+    D, slot = _order_setup()
     handler = ast.build_system(
         cell_name="Customer_places_Order",
-        machine=("Order_status", system.machine_step("Customer_places_Order"), 2),
+        machine=(slot, system.machine_step("Customer_places_Order"), 2),
         mealy_obj=system.mealy_step("Customer_places_Order"))
     spin = S(A("WHILE"), S(A("CONST"), A("T")), A("id"))
     cases = [

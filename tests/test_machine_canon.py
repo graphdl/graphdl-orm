@@ -37,8 +37,10 @@ Transition 'ship' is triggered by Fact Type 'Customer ships Order'.
 
 
 def _fixture():
+    # machine_step takes the status POPULATION as its operand (⟨statusPop, P″, D⟩);
+    # D carries M (transitions, guards, roles) — where the population LIVES (the
+    # RMAP status column) is the commit chain's business, not this step object's
     D, _ = forml.compile_model(ORDER)
-    D = apply(ast.Store("Order_status"), S(to_lam((("o1", "In Cart"),)), D))
     spop = to_lam((("o1", "In Cart"),))
     P2 = to_lam((("c1", "o1"),))                              # the trigger fact entered P''
     return D, S(spop, P2, D)

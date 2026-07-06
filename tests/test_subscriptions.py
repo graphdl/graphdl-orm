@@ -57,7 +57,9 @@ Transition 'place' is triggered by Fact Type 'Customer places Order'.
 
 def test_a_refused_step_wakes_nothing():
     D, _ = forml.compile_model(ORDER)
-    D = apply(ast.Store("Order_status"), S(to_lam((("o1", "In Cart"),)), D))
+    D = system.layout_cells(system.status_facts(D))          # status(e): RMAP column
+    D = apply(A(2), system.create(D, "Order_is_currently_in_Status",
+                                  to_lam(("o1", "In Cart"))))
     D = apply(ast.DefineIn("v", ast.FetchPop("Customer_places_Order")), D)
     D = system.subscribe(D, "s", ["Customer_places_Order"], "v")
     # an atom fact bottoms the machine's dynamic role selection: §14.3.1 answers ERROR

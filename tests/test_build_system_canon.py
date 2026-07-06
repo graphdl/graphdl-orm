@@ -27,7 +27,7 @@ def _D(*cells):
 
 
 _REJECT_ALL = S(A("CONS"), A(1), A(1), S(A("CONST"), A("T")))      # V=P'', flag=T
-_SM_LAST = S(A("COMP"), A(1), A(2))                                # status' = first of P''
+_SM_P2 = A(2)                                                      # status' = P'' (a pop)
 
 
 def _slot(v=None):
@@ -71,14 +71,17 @@ def test_an_alethic_flag_refuses_and_reports():
 
 
 def test_the_machine_leg_advances_in_the_same_step():
-    D = _D(("F", ()), ("F_status", ()))
+    # the machine slot is the status COLUMN ⟨table, col, width⟩: status' lands
+    # as a routed row_overwrite on each governed entity's 3NF row
+    D = _D(("F", ()), ("T", (("e1",),)), ("T:e1", ("e1", "s0")))
+    slot = ("T", 2, 2)
     o, d = _run_both(
-        _record("F", machine=(A("F_status"), _SM_LAST)),
-        {"cell_name": "F", "machine": ("F_status", _SM_LAST)},
+        _record("F", machine=(to_lam(slot), _SM_P2)),
+        {"cell_name": "F", "machine": (slot, _SM_P2)},
         to_lam(("e1", "go")), D)
     cells = dict((c[1], c[2]) for c in d)
     assert cells["F"] == (("e1", "go"),)
-    assert cells["F_status"] == ("e1", "go")                  # status' committed with the fact
+    assert cells["T:e1"] == ("e1", "go")                      # status' committed with the fact
 
 
 def test_index_and_append_legs_ride_the_same_commit_chain():
@@ -105,15 +108,16 @@ def test_the_links_leg_with_the_entity_role():
     # status row gets φ, never bottom
     links_obj = S(A("ALPHA"), A(2))                           # each status row -> its status
     sm = S(A("CONST"), to_lam((("e1", "Placed"),)))           # status' population
+    slot = ("St", 2, 2)
     D = _D(("F", ()), ("St", ()))
     o, _d = _run_both(
-        _record("F", links=links_obj, machine=(A("St"), sm, A(1))),
-        {"cell_name": "F", "links_obj": links_obj, "machine": ("St", sm, 1)},
+        _record("F", links=links_obj, machine=(to_lam(slot), sm, A(1))),
+        {"cell_name": "F", "links_obj": links_obj, "machine": (slot, sm, 1)},
         to_lam(("e1", "place")), D)
     assert o[2] == ("Placed",)
     o2, _d2 = _run_both(
-        _record("F", links=links_obj, machine=(A("St"), sm, A(1))),
-        {"cell_name": "F", "links_obj": links_obj, "machine": ("St", sm, 1)},
+        _record("F", links=links_obj, machine=(to_lam(slot), sm, A(1))),
+        {"cell_name": "F", "links_obj": links_obj, "machine": (slot, sm, 1)},
         to_lam(("e9", "place")), D)
     assert o2[2] == ()                                        # no status row: φ
 
@@ -121,9 +125,10 @@ def test_the_links_leg_with_the_entity_role():
 def test_the_mealy_leg_appends_emissions_as_the_last_part():
     mealy = S(A("CONST"), A("receipt"))
     sm = S(A("CONST"), to_lam(()))
+    slot = ("St", 2, 2)
     D = _D(("F", ()), ("St", ()))
     o, _d = _run_both(
-        _record("F", machine=(A("St"), sm), mealy=mealy),
-        {"cell_name": "F", "machine": ("St", sm), "mealy_obj": mealy},
+        _record("F", machine=(to_lam(slot), sm), mealy=mealy),
+        {"cell_name": "F", "machine": (slot, sm), "mealy_obj": mealy},
         to_lam(("e1",)), D)
     assert o[-1] == "receipt"

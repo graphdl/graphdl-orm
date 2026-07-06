@@ -63,9 +63,21 @@ def test_the_sm_triples_read_off_M():
     assert ("ship", "Placed", "Customer_ships_Order", "Shipped") in triples
 
 
+SFT = "Order_is_currently_in_Status"
+
+
+def _setup(model):
+    D, _ = forml.compile_model(model)
+    return system.layout_cells(system.status_facts(D))       # status(e): RMAP column
+
+
+def _status(D):
+    return system.ft_view(D, SFT, system.rmap_partition(D))
+
+
 def test_place_then_ship_advances_the_machine_with_correct_links():
-    D, _ = forml.compile_model(MODEL)
-    D = _with_pop(D, "Order_status", (("o1", "In Cart"),))    # POST /orders created o1
+    D = _setup(MODEL)
+    D = apply(A(2), system.create(D, SFT, to_lam(("o1", "In Cart"))))   # POST /orders
 
     triples = system.sm_triples(D)
     trans_of = system.transitions_of(to_lam(triples), 2)      # links: transitions from status(e)
@@ -77,9 +89,8 @@ def test_place_then_ship_advances_the_machine_with_correct_links():
     # the 'place' trigger fact enters P — ONE AST step advances the machine (Prop. onestep);
     # the ORM layer attaches the machine from M, the caller names only the fact
     D = apply(A(2), system.create(D, "Customer_places_Order", to_lam(("c1", "o1"))))
-    Dpy = from_lam(D)
-    assert _cell(Dpy, "Order_status") == {("o1", "Placed")}   # advanced
-    assert ("c1", "o1") in _cell(Dpy, "Customer_places_Order")
+    assert _status(D) == {("o1", "Placed")}                   # advanced, IN the column
+    assert ("c1", "o1") in _cell(from_lam(D), "Customer_places_Order")
 
     # links from 'Placed': ship offered, place gone (Thm. hateoas: valid controls only)
     avail1 = from_lam(apply(trans_of, to_lam((("o1", "Placed"),))))
@@ -87,19 +98,23 @@ def test_place_then_ship_advances_the_machine_with_correct_links():
 
     # ship advances to Shipped
     D = apply(A(2), system.create(D, "Customer_ships_Order", to_lam(("c1", "o1"))))
-    assert _cell(from_lam(D), "Order_status") == {("o1", "Shipped")}
+    assert _status(D) == {("o1", "Shipped")}
 
 
 def test_the_representation_itself_carries_the_changed_links():
     # §1: "following the place action advances the machine to Placed, after which THE
     # REPRESENTATION offers ship and no longer place" — o = ⟨P″, V, links(e)⟩ where the
     # links are computed from the entity's POST-step status, in the same reduction.
-    D, _ = forml.compile_model(MODEL)
-    D = _with_pop(D, "Order_status", (("o1", "In Cart"),))
+    # Low-level wiring: the machine slot is the status COLUMN ⟨table, col, width⟩.
+    D = _setup(MODEL)
+    D = apply(A(2), system.create(D, SFT, to_lam(("o1", "In Cart"))))
+    part = system.rmap_partition(D)
+    scols = system.table_columns(part, "Order")
+    slot = ("Order", 2 + scols.index(SFT), 1 + len(scols))
     trans_of = system.transitions_of(to_lam(system.sm_triples(D)), 2)
 
     (o, Dp) = from_lam(ast.run(to_lam(("c1", "o1")), D, cell_name="Customer_places_Order",
-                               machine=("Order_status", system.machine_step("Customer_places_Order"), 2),
+                               machine=(slot, system.machine_step("Customer_places_Order"), 2),
                                links_obj=trans_of))
     _p2, _v, links = o
     assert {t[1] for t in links} == {"Customer_ships_Order"}  # ship offered, place gone
@@ -108,7 +123,7 @@ def test_the_representation_itself_carries_the_changed_links():
     # logical deletion ("an entity that reaches a status with no outgoing transitions")
     D2 = _rebuild(Dp)
     (o2, _D3) = from_lam(ast.run(to_lam(("c1", "o1")), D2, cell_name="Customer_ships_Order",
-                                 machine=("Order_status", system.machine_step("Customer_ships_Order"), 2),
+                                 machine=(slot, system.machine_step("Customer_ships_Order"), 2),
                                  links_obj=trans_of))
     assert o2[2] == ()                                        # links(e) = φ — nothing left to do
 

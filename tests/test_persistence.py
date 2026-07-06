@@ -43,13 +43,21 @@ def _fact_cells(D):
     return out
 
 
+SFT = "Order_is_currently_in_Status"
+
+
+def _setup(model):
+    D, _ = forml.compile_model(model)
+    return system.layout_cells(system.status_facts(D))       # status(e): RMAP column
+
+
 def _flow(D):
-    D = apply(ast.Store("Order_status"), S(to_lam((("o1", "In Cart"),)), D))
+    D = apply(A(2), system.create(D, SFT, to_lam(("o1", "In Cart"))))
     return apply(A(2), system.create(D, "Customer_places_Order", to_lam(("c1", "o1"))))
 
 
 def test_sqlite_roundtrips_the_fact_cells(tmp_path):
-    D, _ = forml.compile_model(MODEL)
+    D = _setup(MODEL)
     D = _flow(D)
     path = os.path.join(str(tmp_path), "store.db")
     persist.save_sqlite(D, path)
@@ -61,21 +69,22 @@ def test_the_jsonl_log_replays_to_the_same_state(tmp_path):
     # the event log is the primary form: appending each committed step and replaying
     # through the SAME create rebuilds the state (facts are the source of truth)
     path = os.path.join(str(tmp_path), "steps.jsonl")
-    D, _ = forml.compile_model(MODEL)
-    D = apply(ast.Store("Order_status"), S(to_lam((("o1", "In Cart"),)), D))
+    D = _setup(MODEL)
     log = persist.JsonlLog(path)
-    D = log.create(D, "Customer_places_Order", ("c1", "o1"))
+    D = log.create(D, SFT, ("o1", "In Cart"))                 # the initial status is a
+    D = log.create(D, "Customer_places_Order", ("c1", "o1"))  # LOGGED fact: replay carries it
     D = log.create(D, "Customer_places_Order", ("c2", "o1"))  # re-fire: idempotent facts
-    fresh, _ = forml.compile_model(MODEL)
-    fresh = apply(ast.Store("Order_status"), S(to_lam((("o1", "In Cart"),)), fresh))
+    fresh = _setup(MODEL)
     replayed = persist.replay(fresh, path)
     assert _fact_cells(replayed) == _fact_cells(D)
-    assert _fact_cells(replayed)["Order_status"] == {("o1", "Placed")}
+    assert system.ft_view(replayed, SFT, system.rmap_partition(replayed)) \
+        == {("o1", "Placed")}
 
 
 def test_the_durable_log_carries_transaction_time(tmp_path):
     path = os.path.join(str(tmp_path), "steps.jsonl")
-    D, _ = forml.compile_model(MODEL)
+    D = _setup(MODEL)
+    D = apply(A(2), system.create(D, SFT, to_lam(("o1", "In Cart"))))
     log = persist.JsonlLog(path)
     D = log.create(D, "Customer_places_Order", ("c1", "o1"))
     entries = persist.read_log(path)

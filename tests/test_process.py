@@ -78,8 +78,9 @@ Transition 'ship' is triggered by Fact Type 'Customer ships Order'.
 
 def test_the_run_queue_is_a_view():
     D, _ = forml.compile_model(ORDER)
-    D = apply(ast.Store("Order_status"),
-              S(to_lam((("o1", "In Cart"), ("o2", "Placed"), ("o3", "Shipped"))), D))
+    D = system.layout_cells(system.status_facts(D))          # status(e): RMAP column
+    for row in (("o1", "In Cart"), ("o2", "Placed"), ("o3", "Shipped")):
+        D = apply(A(2), system.create(D, "Order_is_currently_in_Status", to_lam(row)))
     table = system.process_table(D, "Order")
     assert table[("o1", "In Cart")] == ("Customer_places_Order",)   # awaiting place
     assert table[("o2", "Placed")] == ("Customer_ships_Order",)     # awaiting ship
