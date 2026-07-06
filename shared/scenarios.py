@@ -56,5 +56,9 @@ DEF("case:lex-hyphen", S2(A("lex"), A("Layer has valence-Coord and adj- Type")))
 DEF("case:implode-tpl", S2(A("implode"), S2(A(" "), S3(A("{0}"), A("was"), A("{1}"))))),
 DEF("case:implode-us", S2(A("implode"), S2(A("_"), S2(A("a"), A("b"))))),
 DEF("case:slug-reading", S2(A("slug"), A("Order was placed by Customer"))),
-DEF("case:slug-hyphen", S2(A("slug"), A("place-receipt")))
+DEF("case:slug-hyphen", S2(A("slug"), A("place-receipt"))),
+
+DEF("case:reading-parse", S2(A("system:reading_parse"), S3(A("Order was placed by Customer"), S2(A("Order"), A("Customer")), S2(A("The"), A("Each"))))),
+DEF("case:reading-parse-munch", S2(A("system:reading_parse"), S3(A("Event Type has Name"), S3(A("Event"), A("Event Type"), A("Name")), S2(A("The"), A("Each"))))),
+DEF("case:reading-ftid", S2(A("system:ftid"), S2(A("{0} was placed by {1}"), S2(A("Order"), A("Customer")))))
 )

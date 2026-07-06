@@ -3495,6 +3495,396 @@ DEF("system:sm_rows",
                                         K(PHI()))),
                                 K(PHI()))))))))),
 
+DEF("system:rp_take",
+    S3(
+        A("COMP"), S2(A("ALPHA"), S3(A("COMP"), A("apply"), S3(A("CONS"), N(1), N(2)))),
+        S3(
+            A("COMP"), A("distr"),
+            S3(
+                A("CONS"),
+                S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("theta:iota")), N(1))), N(2))))),
+
+DEF("system:rp_drop",
+    S3(
+        A("COMP"), N(2),
+        S3(
+            A("WHILE"), S3(A("COMP"), A("gt"), S3(A("CONS"), N(1), K(N(0)))),
+            S3(
+                A("CONS"), S3(A("COMP"), A("-"), S3(A("CONS"), N(1), K(N(1)))),
+                S3(A("COMP"), A("tl"), N(2)))))),
+
+DEF("system:rp_marker",
+    S3(
+        A("COMP"), A("apply"),
+        S3(
+            A("CONS"), K(A("implode")),
+            S3(
+                A("CONS"), K(A("")), S4(A("CONS"), K(A("{")), A("id"), K(A("}"))))))),
+
+DEF("system:rp_kw",
+    S2(
+        A("ALPHA"),
+        S3(
+            A("CONS"), A("id"),
+            S3(
+                A("COMP"), S2(A("ALPHA"), N(1)),
+                S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("lex")), A("id"))))))),
+
+DEF("system:rp_match",
+    S3(
+        A("COMP"),
+        S4(
+            A("COND"), A("null"), K(PHI()),
+            S2(
+                A("INSERT"),
+                S4(
+                    A("COND"),
+                    S3(
+                        A("COMP"), A("ge"),
+                        S3(
+                            A("CONS"),
+                            S3(A("COMP"), A("length"), S3(A("COMP"), N(2), N(1))),
+                            S3(A("COMP"), A("length"), S3(A("COMP"), N(2), N(2))))),
+                    N(1), N(2)))),
+        S3(
+            A("COMP"), S2(A("ALPHA"), N(2)),
+            S3(
+                A("COMP"), A("apply"),
+                S3(
+                    A("CONS"),
+                    S3(
+                        A("COMP"), A("apply"),
+                        S3(
+                            A("CONS"), K(A("theta:Filter")),
+                            K(
+                                S4(
+                                    A("COND"),
+                                    S4(
+                                        A("COND"),
+                                        S3(
+                                            A("COMP"), A("le"),
+                                            S3(
+                                                A("CONS"),
+                                                S3(A("COMP"), A("length"), S3(A("COMP"), N(2), N(2))),
+                                                S3(A("COMP"), A("length"), S3(A("COMP"), N(1), N(1))))),
+                                        S3(
+                                            A("COMP"), A("eq"),
+                                            S3(
+                                                A("CONS"), S3(A("COMP"), N(2), N(2)),
+                                                S3(
+                                                    A("COMP"), S2(A("ALPHA"), N(1)),
+                                                    S3(
+                                                        A("COMP"), A("apply"),
+                                                        S3(
+                                                            A("CONS"),
+                                                            K(A("system:rp_take")),
+                                                            S3(
+                                                                A("CONS"),
+                                                                S3(A("COMP"), A("length"), S3(A("COMP"), N(2), N(2))),
+                                                                S3(A("COMP"), N(1), N(1)))))))),
+                                        K(A("F"))),
+                                    S4(
+                                        A("COND"),
+                                        S3(
+                                            A("COMP"), A("lt"),
+                                            S3(
+                                                A("CONS"),
+                                                S3(A("COMP"), A("length"), S3(A("COMP"), N(1), N(1))),
+                                                S3(
+                                                    A("COMP"), A("+"),
+                                                    S3(
+                                                        A("CONS"),
+                                                        S3(A("COMP"), A("length"), S3(A("COMP"), N(2), N(2))),
+                                                        K(N(1)))))),
+                                        K(A("T")),
+                                        S4(
+                                            A("COND"),
+                                            S3(
+                                                A("COMP"), A("eq"),
+                                                S3(
+                                                    A("CONS"),
+                                                    S3(
+                                                        A("COMP"), N(7),
+                                                        S3(
+                                                            A("COMP"), A("apply"),
+                                                            S3(
+                                                                A("CONS"),
+                                                                S3(
+                                                                    A("COMP"), A("+"),
+                                                                    S3(
+                                                                        A("CONS"),
+                                                                        S3(A("COMP"), A("length"), S3(A("COMP"), N(2), N(2))),
+                                                                        K(N(1)))),
+                                                                S3(A("COMP"), N(1), N(1))))),
+                                                    K(A("F")))),
+                                            K(A("T")),
+                                            S4(
+                                                A("COND"),
+                                                S3(
+                                                    A("COMP"), A("theta:member"),
+                                                    S3(
+                                                        A("CONS"),
+                                                        S3(
+                                                            A("COMP"), N(3),
+                                                            S3(
+                                                                A("COMP"), A("apply"),
+                                                                S3(
+                                                                    A("CONS"),
+                                                                    S3(
+                                                                        A("COMP"), A("+"),
+                                                                        S3(
+                                                                            A("CONS"),
+                                                                            S3(A("COMP"), A("length"), S3(A("COMP"), N(2), N(2))),
+                                                                            K(N(1)))),
+                                                                    S3(A("COMP"), N(1), N(1))))),
+                                                        S3(A("COMP"), N(3), N(1)))),
+                                                K(A("T")),
+                                                S3(
+                                                    A("COMP"), A("not"),
+                                                    S3(
+                                                        A("COMP"), A("null"),
+                                                        S3(
+                                                            A("COMP"), A("apply"),
+                                                            S3(
+                                                                A("CONS"),
+                                                                S3(
+                                                                    A("COMP"), A("apply"),
+                                                                    S3(
+                                                                        A("CONS"),
+                                                                        K(A("theta:Filter")),
+                                                                        K(
+                                                                            S4(
+                                                                                A("COND"),
+                                                                                S3(
+                                                                                    A("COMP"),
+                                                                                    A("le"),
+                                                                                    S3(
+                                                                                        A("CONS"),
+                                                                                        S3(A("COMP"), A("length"), N(1)),
+                                                                                        S3(A("COMP"), A("length"), S3(A("COMP"), N(2), N(2))))),
+                                                                                S3(
+                                                                                    A("COMP"),
+                                                                                    A("eq"),
+                                                                                    S3(
+                                                                                        A("CONS"),
+                                                                                        N(1),
+                                                                                        S3(
+                                                                                            A("COMP"),
+                                                                                            A("apply"),
+                                                                                            S3(
+                                                                                                A("CONS"),
+                                                                                                K(A("system:rp_take")),
+                                                                                                S3(
+                                                                                                    A("CONS"),
+                                                                                                    S3(A("COMP"), A("length"), N(1)),
+                                                                                                    S3(A("COMP"), N(2), N(2))))))),
+                                                                                K(A("F")))))),
+                                                                S3(
+                                                                    A("COMP"), A("distl"),
+                                                                    S3(
+                                                                        A("CONS"),
+                                                                        S3(
+                                                                            A("COMP"),
+                                                                            A("apndr"),
+                                                                            S3(
+                                                                                A("CONS"),
+                                                                                S3(A("COMP"), N(2), N(2)),
+                                                                                S3(
+                                                                                    A("COMP"),
+                                                                                    N(3),
+                                                                                    S3(
+                                                                                        A("COMP"),
+                                                                                        A("apply"),
+                                                                                        S3(
+                                                                                            A("CONS"),
+                                                                                            S3(
+                                                                                                A("COMP"),
+                                                                                                A("+"),
+                                                                                                S3(
+                                                                                                    A("CONS"),
+                                                                                                    S3(A("COMP"), A("length"), S3(A("COMP"), N(2), N(2))),
+                                                                                                    K(N(1)))),
+                                                                                            S3(A("COMP"), N(1), N(1))))))),
+                                                                        S3(A("COMP"), N(2), N(1))))))))))),
+                                    K(A("F")))))),
+                    S3(A("COMP"), A("distl"), S3(A("CONS"), A("id"), N(2)))))))),
+
+DEF("system:rp_step",
+    S4(
+        A("COND"),
+        S4(
+            A("COND"),
+            S3(
+                A("COMP"), A("eq"),
+                S3(
+                    A("CONS"), S3(A("COMP"), N(8), S3(A("COMP"), N(1), N(1))), K(A("")))),
+            K(A("F")),
+            S3(
+                A("COMP"), A("theta:member"),
+                S3(
+                    A("CONS"), S3(A("COMP"), N(8), S3(A("COMP"), N(1), N(1))),
+                    S3(A("COMP"), S2(A("ALPHA"), N(1)), N(4))))),
+        S6(
+            A("CONS"), S3(A("COMP"), A("tl"), N(1)),
+            S3(
+                A("COMP"), A("apndr"),
+                S3(
+                    A("CONS"), N(2),
+                    S3(
+                        A("COMP"), A("apply"),
+                        S3(
+                            A("CONS"), K(A("system:rp_marker")),
+                            S3(A("COMP"), A("length"), N(3)))))),
+            S3(
+                A("COMP"), A("apndr"),
+                S3(A("CONS"), N(3), S3(A("COMP"), N(8), S3(A("COMP"), N(1), N(1))))),
+            N(4), N(5)),
+        S3(
+            A("COMP"),
+            S4(
+                A("COND"), S3(A("COMP"), A("null"), N(2)),
+                S6(
+                    A("CONS"), S3(A("COMP"), A("tl"), S3(A("COMP"), N(1), N(1))),
+                    S3(
+                        A("COMP"), A("apndr"),
+                        S3(
+                            A("CONS"), S3(A("COMP"), N(2), N(1)),
+                            S3(A("COMP"), N(1), S3(A("COMP"), N(1), S3(A("COMP"), N(1), N(1)))))),
+                    S3(A("COMP"), N(3), N(1)), S3(A("COMP"), N(4), N(1)),
+                    S3(A("COMP"), N(5), N(1))),
+                S6(
+                    A("CONS"),
+                    S3(
+                        A("COMP"), A("apply"),
+                        S3(
+                            A("CONS"), K(A("system:rp_drop")),
+                            S3(
+                                A("CONS"),
+                                S3(A("COMP"), A("length"), S3(A("COMP"), N(2), N(2))),
+                                S3(A("COMP"), N(1), N(1))))),
+                    S3(
+                        A("COMP"), A("apndr"),
+                        S3(
+                            A("CONS"), S3(A("COMP"), N(2), N(1)),
+                            S3(
+                                A("COMP"), A("apply"),
+                                S3(
+                                    A("CONS"), K(A("system:rp_marker")),
+                                    S3(A("COMP"), A("length"), S3(A("COMP"), N(3), N(1))))))),
+                    S3(
+                        A("COMP"), A("apndr"),
+                        S3(A("CONS"), S3(A("COMP"), N(3), N(1)), S3(A("COMP"), N(1), N(2)))),
+                    S3(A("COMP"), N(4), N(1)), S3(A("COMP"), N(5), N(1)))),
+            S3(
+                A("CONS"), A("id"),
+                S3(
+                    A("COMP"), A("apply"),
+                    S3(
+                        A("CONS"), K(A("system:rp_match")), S4(A("CONS"), N(1), N(4), N(5)))))))),
+
+DEF("system:reading_parse",
+    S3(
+        A("COMP"),
+        S3(
+            A("CONS"),
+            S3(
+                A("COMP"), A("apply"),
+                S3(A("CONS"), K(A("implode")), S3(A("CONS"), K(A(" ")), N(2)))),
+            N(3)),
+        S3(
+            A("COMP"),
+            S3(
+                A("WHILE"), S3(A("COMP"), A("not"), S3(A("COMP"), A("null"), N(1))),
+                A("system:rp_step")),
+            S6(
+                A("CONS"), S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("lex")), N(1))),
+                K(PHI()), K(PHI()),
+                S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("system:rp_kw")), N(2))), N(3))))),
+
+DEF("system:ftid",
+    S3(
+        A("COMP"), A("apply"),
+        S3(
+            A("CONS"), K(A("slug")),
+            S3(
+                A("COMP"), A("apply"),
+                S3(
+                    A("CONS"), K(A("implode")),
+                    S3(
+                        A("CONS"), K(A(" ")),
+                        S3(
+                            A("COMP"),
+                            S2(
+                                A("ALPHA"),
+                                S4(
+                                    A("COND"),
+                                    S3(
+                                        A("COMP"), A("null"),
+                                        S3(
+                                            A("COMP"), A("apply"),
+                                            S3(
+                                                A("CONS"),
+                                                S3(
+                                                    A("COMP"), A("apply"),
+                                                    S3(
+                                                        A("CONS"), K(A("theta:Filter")),
+                                                        S4(
+                                                            A("CONS"), K(A("COMP")),
+                                                            K(A("eq")),
+                                                            S4(
+                                                                A("CONS"), K(A("CONS")),
+                                                                K(N(1)),
+                                                                S3(A("CONS"), K(A("CONST")), N(1)))))),
+                                                N(2)))),
+                                    N(1),
+                                    S3(
+                                        A("COMP"), N(2),
+                                        S3(
+                                            A("COMP"), N(1),
+                                            S3(
+                                                A("COMP"), A("apply"),
+                                                S3(
+                                                    A("CONS"),
+                                                    S3(
+                                                        A("COMP"), A("apply"),
+                                                        S3(
+                                                            A("CONS"), K(A("theta:Filter")),
+                                                            S4(
+                                                                A("CONS"), K(A("COMP")),
+                                                                K(A("eq")),
+                                                                S4(
+                                                                    A("CONS"), K(A("CONS")),
+                                                                    K(N(1)),
+                                                                    S3(A("CONS"), K(A("CONST")), N(1)))))),
+                                                    N(2))))))),
+                            S3(
+                                A("COMP"), A("distr"),
+                                S3(
+                                    A("CONS"),
+                                    S3(
+                                        A("COMP"), S2(A("ALPHA"), N(1)),
+                                        S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("lex")), N(1)))),
+                                    S3(
+                                        A("COMP"),
+                                        S2(
+                                            A("ALPHA"),
+                                            S3(
+                                                A("CONS"),
+                                                S3(
+                                                    A("COMP"), A("apply"),
+                                                    S3(
+                                                        A("CONS"), K(A("system:rp_marker")),
+                                                        S3(A("COMP"), A("-"), S3(A("CONS"), N(1), K(N(1)))))),
+                                                N(2))),
+                                        S3(
+                                            A("COMP"), A("trans"),
+                                            S3(
+                                                A("CONS"),
+                                                S3(
+                                                    A("COMP"), A("apply"),
+                                                    S3(A("CONS"), K(A("theta:iota")), S3(A("COMP"), A("length"), N(2)))),
+                                                N(2))))))))))))),
+
 DEF("system:ca_sig",
     S4(A("CONS"), K(A("COMP")),
        K(S3(A("COMP"), A("apply"),

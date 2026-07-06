@@ -559,7 +559,12 @@ def _reading(text, known):
     plus the ordered role object types (the paper's field-replacement model). Scans left to right,
     replacing each known type (longest, word-bounded) with a placeholder; front text, inter-object
     text, and trailing text remain in the template, so unary, binary and n-ary readings, front
-    text ('the birth of {0} occurred in {1}'), and hyphen binding ('adj-Type') all parse."""
+    text ('the birth of {0} occurred in {1}'), and hyphen binding ('adj-Type') all parse.
+
+    THE MEANING IS CANONICAL: system:reading_parse (shared/system.py, over the
+    lex boundary) answers the same (template, roles); this host scan is its
+    certified-equal performant override, the equality enforced over the whole
+    shared/base corpus by test_reading_canon."""
     kset = sorted(known, key=lambda k: -len(k.split()))
     toks, roles, out, i = text.split(), [], [], 0
     while i < len(toks):
@@ -578,7 +583,8 @@ def _reading(text, known):
 
 
 def _ftid_from(template, roles):
-    """A stable fact-type id: the template with its role types substituted back in, slugified."""
+    """A stable fact-type id: the template with its role types substituted back in, slugified.
+    Certified-equal override of system:ftid (test_reading_canon twins them)."""
     s = template
     for i, r in enumerate(roles):
         s = s.replace("{%d}" % i, r)
