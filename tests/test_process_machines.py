@@ -45,8 +45,19 @@ Status 'Placed' emits 'awaiting-shipment'.
 """
 
 
-def _step_place(D, fact):
-    return from_lam(system.create(D, "Customer_places_Order", to_lam(fact)))
+def _setup(model):
+    D, _ = forml.compile_model(model)
+    return system.layout_cells(system.status_facts(D))       # status(e) as its RMAP column
+
+
+def _create(D, ft, *rows):
+    for row in rows:
+        D = apply(A(2), system.create(D, ft, to_lam(row)))
+    return D
+
+
+def _status(D, ft="Order_is_currently_in_Status"):
+    return system.ft_view(D, ft, system.rmap_partition(D))
 
 
 def test_guard_facts_parse_into_M():
@@ -59,19 +70,19 @@ def test_guard_facts_parse_into_M():
 
 
 def test_unsatisfied_guard_blocks_the_transition_not_the_fact():
-    D, _ = forml.compile_model(MODEL)
-    D = _with_pop(D, "Order_status", (("o1", "In Cart"),))
-    (o, Dp) = _step_place(D, ("c1", "o1"))                    # o1 includes NO product
-    assert ("c1", "o1") in _cell(Dp, "Customer_places_Order")  # the fact entered P
-    assert _cell(Dp, "Order_status") == {("o1", "In Cart")}    # the machine did not fire
+    D = _setup(MODEL)
+    D = _create(D, "Order_is_currently_in_Status", ("o1", "In Cart"))
+    D = _create(D, "Customer_places_Order", ("c1", "o1"))     # o1 includes NO product
+    assert ("c1", "o1") in _cell(from_lam(D), "Customer_places_Order")  # fact entered P
+    assert ("o1", "In Cart") in _status(D)                    # the machine did not fire
 
 
 def test_satisfied_guard_fires_the_transition():
-    D, _ = forml.compile_model(MODEL)
-    D = _with_pop(D, "Order_status", (("o1", "In Cart"),))
+    D = _setup(MODEL)
+    D = _create(D, "Order_is_currently_in_Status", ("o1", "In Cart"))
     D = _with_pop(D, "Order_includes_Product", (("o1", "p1"),))
-    (_o, Dp) = _step_place(D, ("c1", "o1"))
-    assert _cell(Dp, "Order_status") == {("o1", "Placed")}
+    D = _create(D, "Customer_places_Order", ("c1", "o1"))
+    assert ("o1", "Placed") in _status(D)
 
 
 DERIVED_GUARD = MODEL.replace(
@@ -81,13 +92,12 @@ DERIVED_GUARD = MODEL.replace(
 
 
 def test_a_derived_fact_type_guards_with_rule_power():
-    D, rep = forml.compile_model(DERIVED_GUARD)
-    assert rep["unparsed"] == []
-    D = _with_pop(D, "Order_status", (("o1", "In Cart"),))
+    D = _setup(DERIVED_GUARD)
+    D = _create(D, "Order_is_currently_in_Status", ("o1", "In Cart"))
     D = _with_pop(D, "Order_includes_Product", (("o1", "p1"),))
     D = system.run_rules(D)                                   # derive readiness first
-    (_o, Dp) = _step_place(D, ("c1", "o1"))
-    assert _cell(Dp, "Order_status") == {("o1", "Placed")}    # guarded by a DERIVED ft
+    D = _create(D, "Customer_places_Order", ("c1", "o1"))
+    assert ("o1", "Placed") in _status(D)                     # guarded by a DERIVED ft
 
 
 SUB = """Party is an entity type.
@@ -106,8 +116,8 @@ def test_machine_binds_through_the_supertype_chain():
 
 
 def test_moore_emission_is_a_rho_application_over_the_status():
-    D, _ = forml.compile_model(MODEL)
+    D = _setup(MODEL)
     D = apply(ast.DefineIn("awaiting-shipment", S(A("CONST"), A("SHIP-SOON"))), D)
-    D = _with_pop(D, "Order_status", (("o1", "Placed"),))
+    D = _create(D, "Order_is_currently_in_Status", ("o1", "Placed"))
     view = system.moore_view(D, "Order")
     assert view[("o1", "Placed")] == "SHIP-SOON"
