@@ -1561,6 +1561,20 @@ def install_entity_cells(D, noun, rows):
     return D
 
 
+def _status_rows(D, noun):
+    """The noun's live status population: the "is currently in Status" fact type
+    read off its RMAP column when present (status_facts wired), else the legacy
+    noun_status cell. The one seam every status reader goes through, dual with
+    create_spec's write side."""
+    status_ft = next((r[1] for r in _pop_rows(D, "smStatusFt")
+                      if len(r) >= 2 and r[0] == noun), None)
+    if status_ft is not None:
+        part = rmap_partition(D)
+        if status_ft in part:
+            return sorted(ft_view(D, status_ft, part))
+    return [tuple(r) for r in _pop_rows(D, f"{noun}_status")]
+
+
 def moore_view(D, noun):
     """The Moore output function as a view: for each live instance whose status carries an
     emission, the ρ-application of the named definition to ⟨entity, status⟩ (outputs are
@@ -1570,7 +1584,7 @@ def moore_view(D, noun):
     from .lam import to_lam, from_lam, atom as _A
     moore = {r[0]: r[1] for r in _pop_rows(D, "smMoore")}
     out = {}
-    for row in _pop_rows(D, f"{noun}_status"):
+    for row in _status_rows(D, noun):
         e, s = row[0], row[1]
         if s in moore:
             with _d.step(D):
@@ -1586,7 +1600,7 @@ def process_table(D, noun):
     (links = φ, the paper's logical deletion)."""
     triples = sm_triples(D)
     out = {}
-    for row in _pop_rows(D, f"{noun}_status"):
+    for row in _status_rows(D, noun):
         e, s = row[0], row[1]
         awaits = tuple(tr for (f, tr, _t) in triples if f == s)
         if awaits:
