@@ -70,3 +70,22 @@ def test_machine_advances_status_in_the_rmap_column():
     assert ("o1", "In Cart") not in status
     # the noun_status wart is not the store of record
     assert {tuple(r) for r in system._pop_rows(D, "Order_status")} in (set(), {("o1", "Placed")})
+
+
+def test_machine_app_advances_status_in_the_column_through_the_registry(tmp_path):
+    """The production path: a machine app compiled through the Registry pipeline
+    (status_facts wired before replay) advances status(e) into the RMAP column,
+    queryable as the "is currently in Status" fact type -- no noun_status cell."""
+    import os
+    from pyarest import apps
+    root = str(tmp_path)
+    d = os.path.join(root, "orders", "readings")
+    os.makedirs(d)
+    with open(os.path.join(d, "m.md"), "w", encoding="utf-8") as f:
+        f.write(MACHINE)
+    reg = apps.Registry(root)
+    reg.compile("orders")
+    # status_facts ran in the pipeline, so the status fact type exists to apply into
+    reg.apply("orders", "Order_is_currently_in_Status", ("o1", "In Cart"))
+    reg.apply("orders", "Customer_places_Order", ("c1", "o1"))
+    assert set(reg.query("orders", "Order_is_currently_in_Status")) == {("o1", "Placed")}

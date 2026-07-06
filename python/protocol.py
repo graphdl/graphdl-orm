@@ -1416,6 +1416,10 @@ class Registry:
         D, rep = forml.compile_model("\n\n".join(texts), D=base,
                                      context_from=base)
         D = system.run_rules(D)
+        # status(e) is an ORM fact type ("<Noun> is currently in Status"), so RMAP
+        # absorbs it as a column and the machine reads/overwrites it there; wired
+        # before replay so the machine fires into the column, not the noun_status wart
+        D = system.status_facts(D)
         # the event stream replays through the SAME create (facts are the source
         # of truth; the .db is disposable, set semantics make replay idempotent),
         # read from whatever sink the registry holds, never a file path
@@ -1545,6 +1549,12 @@ class Registry:
 
     def query(self, name, fact_type):
         D = self._load(name)
+        # a machine-managed status fact type is advanced in place on its RMAP column
+        # (row_overwrite), leaving the append log with the create events; its live
+        # population is therefore the column (ft_view). User-managed fact types read
+        # the log, which create AND retract keep current.
+        if fact_type in {r[1] for r in system._pop_rows(D, "smStatusFt") if len(r) >= 2}:
+            return sorted(system.ft_view(D, fact_type, system.rmap_partition(D)))
         return [tuple(r) for r in system._pop_rows(D, fact_type)]
 
     def sql(self, name, statement):
