@@ -1958,6 +1958,167 @@ class Registry:
                 "fact_types": sorted(fts, key=lambda f: f["id"]),
                 "constraints": cons}
 
+    def induce(self, name, ft_id, to_explain=None, bound=None, cap=5000):
+        """The abduction primitive (whitepaper §3 + Thm. 4; ported from the
+        old engine's induce.rs, its semantics the oracle): enumerate candidate
+        bindings for the hidden fact type — the cartesian product of each
+        role's domain (declared enum values + the noun's observed population;
+        an empty domain collapses the product; an unknown fact type answers
+        []) — gate each through the fact type's alethic constraints as a
+        BASELINE DELTA (pre-existing violations never reject), gate through
+        forward-chain COVERAGE of to_explain when given, score by the app's
+        Scoring Rules (each candidate's synthetic hidden rows land in the
+        DECLARED Hypothesis_Candidate_has_hidden_<Noun> hook so rules bind
+        them; the emitted Confidence Score rows sum — numeric, or 1 per
+        categorical row, 0 when none fire), rank descending (enumeration
+        order stable on ties), and post-filter by `bound` role pins. Answers
+        candidates as data; nothing persists (materialize the convincing one
+        via apply)."""
+        from . import forml
+        from .lam import to_lam, from_lam
+        from .reduce import apply as _apx
+        from .lam import atom as _A
+        D = self._load(name)
+        fts = {f[0] for f in system._pop_rows(D, "factType") if f}
+        roles = sorted((r[2], r[3]) for r in system._pop_rows(D, "role")
+                       if len(r) >= 4 and r[1] == ft_id)
+        if ft_id not in fts or not roles:
+            return []
+        nouns = [n for (_p, n) in roles]
+
+        def domain(noun):
+            vals = []
+            for vc in system._pop_rows(D, "valueConstraint"):
+                if len(vc) >= 2 and vc[0] == noun:
+                    vals += re.findall(r"'([^']*)'", str(vc[1]))
+            for row in system._pop_rows(D, noun):
+                if row and row[0] not in vals:
+                    vals.append(row[0])
+            for r in system._pop_rows(D, "role"):
+                if len(r) >= 4 and r[3] == noun:
+                    pos = r[2]
+                    for frow in system._pop_rows(D, r[1]):
+                        if len(frow) >= pos and frow[pos - 1] != "#" \
+                                and frow[pos - 1] not in vals:
+                            vals.append(frow[pos - 1])
+            return vals
+
+        domains = [domain(n) for n in nouns]
+        if any(not d for d in domains):
+            return []
+        import itertools
+        part = system.rmap_partition(D)
+        val = forml.validate_for(ft_id, D, part)
+        existing = tuple(tuple(r) for r in system.ft_view(D, ft_id, part))
+
+        def violations(rows):
+            import pyarest.lam as L
+            from . import defs as _dm
+            pair = L.SEQ(L.CONS(to_lam(tuple(rows)))(L.CONS(D)(L.NIL)))
+            with _dm.step(D):
+                out = from_lam(_apx(val, pair))
+            return {tuple(v) if isinstance(v, tuple) else (v,)
+                    for v in (out[1] if len(out) >= 2 else ())}
+
+        baseline = violations(existing)
+        hook = f"Hypothesis_Candidate_has_hidden_{nouns[-1].replace(' ', '_')}"
+        hook_declared = hook in fts
+        out = []
+        idx = -1
+        for combo in itertools.islice(itertools.product(*domains), cap):
+            idx += 1
+            if bound:
+                pos_of = {n: p for (p, n) in reversed(roles)}
+                if any(pos_of.get(k) and combo[pos_of[k] - 1] != str(v)
+                       for k, v in bound.items()):
+                    continue
+            cand = tuple(combo)
+            if violations(existing + (cand,)) - baseline:
+                continue                                       # candidate-INTRODUCED only
+            hyp_id = f"hyp-{ft_id}-{idx}"
+            D2 = _bulk_absorbed_install(D, part, part[ft_id], ft_id, [list(cand)]) \
+                if part.get(ft_id, ft_id) != ft_id else \
+                _apx(ast.Store(ft_id),
+                     _S(to_lam(system._rowsort(set(existing) | {cand})), D))
+            if to_explain:
+                D3 = system.run_rules(D2, changed=[ft_id])
+                # derived rows live in the head's ** cell (the derive cache);
+                # a derived ABSORBED head does not land on the column, so the
+                # cell — how rules and guards consume derived facts — is the
+                # membership read here too
+                ok = all(tuple(str(x) for x in e["fact"]) in
+                         {tuple(str(x) for x in r)
+                          for r in system._pop_rows(D3, e["ft"])}
+                         for e in to_explain)
+                if not ok:
+                    continue
+            score = 0
+            if hook_declared:
+                D4 = _apx(ast.Store("Hypothesis_Candidate"),
+                          _S(to_lam(tuple(tuple(r) for r in system._pop_rows(
+                              D2, "Hypothesis_Candidate")) + ((hyp_id,),)), D2))
+                hrows = tuple(tuple(r) for r in system._pop_rows(D4, hook)) \
+                    + ((hyp_id,) + cand[1:],)
+                D4 = _apx(ast.Store(hook), _S(to_lam(hrows), D4))
+                D4 = system.run_rules(D4, changed=[hook, "Hypothesis_Candidate"])
+                for r in system._pop_rows(
+                        D4, "Hypothesis_Candidate_has_Confidence_Score"):
+                    if len(r) >= 2 and r[0] == hyp_id:
+                        try:
+                            score += int(str(r[1]))
+                        except ValueError:
+                            score += 1
+            out.append({"id": hyp_id, "confidence_score": score,
+                        "hidden": {"ft": ft_id, "fact": list(cand)},
+                        "explains": to_explain or []})
+        out.sort(key=lambda h: -h["confidence_score"])
+        return out
+
+    def ask(self, name, question, plan=None):
+        """Read-only Q&A, no LLM in the engine: with a PLAN
+        ({fact_type, filter}) the projection query executes, filter values
+        compared as strings against the named roles' positions; without one
+        the verb answers needs_plan plus the model surface, so ANY caller
+        (an MCP sampler, a CLI human) completes the plan and calls again."""
+        if plan and plan.get("fact_type"):
+            ft = plan["fact_type"]
+            rows = self.query(name, ft)
+            filt = plan.get("filter") or {}
+            if filt:
+                D = self._load(name)
+                pos_of = {r[3]: r[2] for r in system._pop_rows(D, "role")
+                          if len(r) >= 4 and r[1] == ft}
+                rows = [r for r in rows
+                        if all(k in pos_of and len(r) >= pos_of[k]
+                               and str(r[pos_of[k] - 1]) == str(v)
+                               for k, v in filt.items())]
+            return {"app": name, "question": question, "fact_type": ft,
+                    "filter": filt, "rows": rows}
+        return {"app": name, "question": question, "needs_plan": True,
+                "prompt": ("Translate the question into a plan "
+                           "{\"fact_type\": <id>, \"filter\": {<Role Noun>: "
+                           "<value>}} against this model, then call ask "
+                           "again with it."),
+                "model": self.schema(name)}
+
+    def check(self, include_ready=True):
+        """Sweep EVERY app: per-app health (ready / stale / library /
+        not_found) plus the rolled-up summary. Directory-derived, like the
+        registry itself."""
+        out = []
+        for a in self.list():
+            st = self.status(a["name"])
+            st["health"] = ("not_found" if not st["exists"] else
+                            "library" if st["readings"] == 0 else
+                            "stale" if st["stale"] else "ready")
+            out.append(st)
+        summary = {}
+        for st in out:
+            summary[st["health"]] = summary.get(st["health"], 0) + 1
+        return {"summary": summary,
+                "apps": [s for s in out
+                         if include_ready or s["health"] != "ready"]}
+
     def status(self, name):
         """One app's posture without activating it: exists, readings count,
         compiled, and stale (any reading newer than the .db)."""
@@ -2150,6 +2311,36 @@ TOOLS = [
     {"name": "engine_version",
      "description": "The engine and its version.",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "apps_check",
+     "description": "Sweep EVERY app: per-app health (ready / stale / "
+                    "library / not_found) plus the rolled-up summary.",
+     "inputSchema": {"type": "object", "properties": {
+         "include_ready": {"type": "boolean"}}}},
+    {"name": "apps_register",
+     "description": "Registration is directory-derived: re-scan the apps "
+                    "directory and answer the roster; nothing is written.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "induce",
+     "description": "Hypothesis-Candidate search over a fact type — the "
+                    "abduction primitive (whitepaper §3, Thm. 4). Enumerate "
+                    "bindings for the hidden fact, gate through alethic "
+                    "constraints (baseline delta) and forward-chain coverage "
+                    "of to_explain, score by the app's Scoring Rules, answer "
+                    "ranked candidates. Nothing persists: materialize the "
+                    "convincing one via apply.",
+     "inputSchema": {"type": "object", "properties": {
+         "app": {"type": "string"}, "ft_id": {"type": "string"},
+         "to_explain": {"type": "array", "items": {"type": "object"}},
+         "bound": {"type": "object"}}, "required": ["ft_id"]}},
+    {"name": "ask",
+     "description": "Read-only Q&A, no LLM in the engine: pass a plan "
+                    "{fact_type, filter} to execute the projection query "
+                    "(filter values compared as strings); without one the "
+                    "verb answers needs_plan + the model surface for the "
+                    "CALLER's sampler to complete.",
+     "inputSchema": {"type": "object", "properties": {
+         "app": {"type": "string"}, "question": {"type": "string"},
+         "plan": {"type": "object"}}, "required": ["question"]}},
 ]
 
 
@@ -2169,6 +2360,11 @@ SESSION_VERBS = {
     "apps_compile": lambda reg, a: reg.compile(a["name"]),
     "apps_status": lambda reg, a: reg.status(a["name"]),
     "apps_create": lambda reg, a: reg.create(a["name"], a.get("text")),
+    "apps_check": lambda reg, a: reg.check(
+        include_ready=a.get("include_ready", True)),
+    "apps_register": lambda reg, a: {
+        "registered": [x["name"] for x in reg.list()],
+        "note": "directory-derived; nothing written"},
     "engine_version": lambda reg, a: {"engine": "pyarest",
                                       "version": VERSION},
     "context": lambda reg, a: reg.last_receipt
@@ -2198,6 +2394,11 @@ APP_VERBS = {
                                                fact=a.get("fact")),
     "compile": lambda reg, app, a: reg.compile_text(app, a["text"]),
     "propose": lambda reg, app, a: reg.propose(app, a["text"]),
+    "induce": lambda reg, app, a: {"app": app, "candidates": reg.induce(
+        app, a["ft_id"], to_explain=a.get("to_explain"),
+        bound=a.get("bound"))},
+    "ask": lambda reg, app, a: reg.ask(app, a["question"],
+                                       plan=a.get("plan")),
 }
 
 

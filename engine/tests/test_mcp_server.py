@@ -110,3 +110,14 @@ def test_every_engine_verb_is_first_class(tmp_path):
         "name": "fresh", "text": "Note is an entity type.\n"})
     assert made["created"] == "fresh"
     assert os.path.exists(os.path.join(root, "fresh", "readings", "core.md"))
+    # ask: with a plan the projection executes; without one, the caller gets
+    # the model surface to complete the plan (no LLM in the engine)
+    got = mcp_server._dispatch(reg, "ask", {
+        "question": "which tasks are open?",
+        "plan": {"fact_type": "Task_has_Status", "filter": {"Status": "open"}}})
+    assert {tuple(r) for r in got["rows"]} == {("t1", "open"), ("t2", "open")}
+    nop = mcp_server._dispatch(reg, "ask", {"question": "which tasks are open?"})
+    assert nop["needs_plan"] and "model" in nop
+    # apps_check: the registry-wide sweep
+    chk = mcp_server._dispatch(reg, "apps_check", {})
+    assert chk["summary"].get("ready", 0) >= 1

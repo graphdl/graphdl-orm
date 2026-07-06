@@ -646,11 +646,21 @@ _VALUE_SPECS = [
 ]
 
 
+def _enum_member(v):
+    """One declared enumeration member: the surrounding quotes are the
+    READING's, not the value's — 'kitchen' declares kitchen (keeping the
+    quotes made every string enumeration unsatisfiable at apply time)."""
+    v = v.strip()
+    if len(v) >= 2 and v[0] == "'" and v[-1] == "'":
+        v = v[1:-1]
+    return _num(v)
+
+
 def _value_constraint(spec):
     spec = spec.strip()
     hit = next(((pat.match(spec), build) for pat, build in _VALUE_SPECS if pat.match(spec)), None)
     return hit[1](hit[0].groups()) if hit else \
-        C.value_enumeration(1, tuple(_num(v) for v in re.split(r",| and ", spec) if v.strip()))
+        C.value_enumeration(1, tuple(_enum_member(v) for v in re.split(r",| and ", spec) if v.strip()))
 
 
 # ---- planning: (kind, groups, modality) + known → (assertions, constraints) ----
