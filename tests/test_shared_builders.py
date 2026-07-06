@@ -423,6 +423,22 @@ def test_row_resolve_canonical_matches_the_python_builder():
         assert from_lam(_ap(canon, case)) == from_lam(_ap(py, case))
 
 
+def test_row_overwrite_canonical_overwrites_where_row_resolve_collapses():
+    # the guarded machine transition's status write (Def. derive: transition
+    # rules are outside the monotone F_S): like row_resolve, but the addressed
+    # column is SET unconditionally — status(e) is overwritten where an ordinary
+    # functional assert would collapse the row (§11.2.1). Fresh rows still
+    # hole-pad identically, through the same theta:iota quasiquote.
+    canon = _ap(A("system:row_overwrite"), _S(A(3), A(4), A("F")))
+    fresh = _S(_S(A("k1"), A("v1")), to_lam(()))
+    hole = _S(_S(A("k1"), A("v1")), to_lam(("k1", "a", "#", "b")))
+    occupied = _S(_S(A("k1"), A("v1")), to_lam(("k1", "a", "OTHER", "b")))
+    assert from_lam(_ap(canon, fresh)) == ("k1", "#", "v1", "#")
+    assert from_lam(_ap(canon, hole)) == ("k1", "a", "v1", "b")
+    # where a functional row_resolve would collapse the row, this overwrites
+    assert from_lam(_ap(canon, occupied)) == ("k1", "a", "v1", "b")
+
+
 def test_checked_apply_canonical_matches_the_python_builder():
     # the typed boundary (Def. reg dom/cod), the last pipeline mover: apply
     # iff every declared dom position holds an instance of its type, else the
