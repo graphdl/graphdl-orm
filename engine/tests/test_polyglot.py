@@ -259,3 +259,72 @@ def test_the_native_carrier_agrees_three_ways():
     native = polyglot.run_rust(sc)
     assert scott == want
     assert native == want
+
+
+def test_the_resident_serves_an_absorbed_apply_natively(tmp_path):
+    """The write-path flip's first landing, rust-side: with delegation
+    DISABLED (a bogus --python interpreter), the resident commits an ABSORBED
+    fact — the stored create:<ft> handler computes its fact-dependent cell
+    (cellkey) at reduce time, the machine leg advances the status column, the
+    native derive runs, and the sidecar persists — all without the compiler
+    host. A committed receipt here PROVES the native path."""
+    import json
+    import os
+    import subprocess
+    import pytest as _pytest
+    from pyarest import apps as _apps, canon as _canon
+    exe = _canon.rust_bin("arestlam")
+    if not os.path.exists(exe):
+        _pytest.skip("rust kernel not built")
+    root = str(tmp_path / "apps")
+    d = os.path.join(root, "flow", "readings")
+    os.makedirs(d)
+    with open(os.path.join(d, "app.md"), "w", encoding="utf-8") as f:
+        f.write("""Order(.OrderId) is an entity type.
+Customer(.Name) is an entity type.
+Order is paid by Customer.
+Each Order is paid by exactly one Customer.
+State Machine Definition 'Order' is for Noun 'Order'.
+Status 'In Cart' is initial in State Machine Definition 'Order'.
+Transition 'pay' is from Status 'In Cart'.
+Transition 'pay' is to Status 'Paid'.
+Transition 'pay' is triggered by Fact Type 'Order is paid by Customer'.
+""")
+    reg = _apps.Registry(root, cache_dir=str(tmp_path / "fz"))
+    reg.compile("flow")                                       # sidecar for the resident
+    reg.apply("flow", "Order_is_currently_in_Status", ("o1", "In Cart"))
+    proc = subprocess.Popen(
+        [exe, "--mcp", "--apps-dir", root, "--python", "no-such-interpreter"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        encoding="utf-8")
+
+    def rpc(mid, method, params=None):
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": mid,
+                                     "method": method,
+                                     "params": params or {}}) + "\n")
+        proc.stdin.flush()
+        return json.loads(proc.stdout.readline())
+
+    try:
+        rpc(1, "initialize", {"protocolVersion": "2024-11-05"})
+        rpc(2, "tools/call", {"name": "apps_use",
+                              "arguments": {"name": "flow"}})
+        ap = rpc(3, "tools/call", {"name": "apply", "arguments": {
+            "app": "flow", "fact_type": "Order_is_paid_by_Customer",
+            "fact": ["o1", "c1"]}})
+        receipt = json.loads(ap["result"]["content"][0]["text"])
+        assert receipt["committed"] is True                   # native, or it failed
+        q = rpc(4, "tools/call", {"name": "query", "arguments": {
+            "app": "flow", "fact_type": "Order_is_paid_by_Customer"}})
+        rows = json.loads(q["result"]["content"][0]["text"])["rows"]
+        assert ["o1", "c1"] in [list(r) for r in rows]
+    finally:
+        proc.kill()
+    # the resident persisted to the SOURCE OF TRUTH (the event log + the
+    # sidecar; the .db is disposable): a python recompile replays the
+    # resident-written event through the same create, machine advance included
+    reg.compile("flow")
+    D = reg._load("flow")
+    from pyarest import system as _sys
+    assert ("o1", "Paid") in _sys.ft_view(
+        D, "Order_is_currently_in_Status", _sys.rmap_partition(D))

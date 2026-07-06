@@ -1825,14 +1825,48 @@ def _create_from_spec(D, fact_type, fact, spec, fuel=None):
                    append_cell=fact_type, fuel=fuel)
 
 
+def _absorbed_handler(spec, ft):
+    """PHASE TWO, done: the fact-DEPENDENT create handler stored WHOLE. The
+    nine-slot options record computes its cell name from the fact at reduce
+    time — apply(cellkey, ⟨table, key⟩), key = N1(fact) of the operand
+    P = ⟨fact, D⟩ — and every other slot is the spec's constant, so
+    apply(ast:build_system(record(P)), P) reduces exactly the transition
+    _create_from_spec wires host-side (routing, row_resolve, validate, the
+    machine's status-column advance, index and append legs)."""
+    from .lam import to_lam
+
+    def K_(x):
+        return _S(A("CONST"), x)
+
+    def slot(v):
+        return to_lam(()) if v is None else _S(v)
+
+    resolve = row_resolve(spec["col"], spec["width"], spec["unary"])
+    machine = spec["machine"]
+    m = to_lam(()) if machine is None else _S(
+        to_lam(machine[0]), machine[1], *(A(r) for r in machine[2:]))
+    key = _S(A("COMP"), A(1), A(1))
+    cellfn = _S(A("COMP"), A("apply"),
+                _S(A("CONS"), K_(A("cellkey")),
+                   _S(A("CONS"), K_(A(spec["table"])), key)))
+    rec = _S(A("CONS"), cellfn,
+             K_(slot(spec["validate"])), K_(slot(resolve)), K_(to_lam(())),
+             K_(to_lam(())), K_(m), K_(slot(spec["mealy"])),
+             K_(slot(A(spec["table"]))), K_(slot(A(ft))))
+    build = _S(A("COMP"), A("apply"),
+               _S(A("CONS"), K_(A("ast:build_system")), rec))
+    return _S(A("COMP"), A("apply"), _S(A("CONS"), build, A("id")))
+
+
 def create_handlers(D):
     """Store create:<ft> handler cells, the goal being full native for every part
     but lambda and defs: a create handler is a DEF the resident reduces over the
     fact, no host orchestration at write time. An own-table handler is
-    fact-INDEPENDENT (fixed cell name) so its handler is stored whole; an absorbed
-    handler needs the fact's key (table:key) and rides as its spec for the resident
-    to complete, phase two. Called at compile beside the layout and generator
-    cells; recompile replaces the family."""
+    fact-INDEPENDENT (fixed cell name) and stores build_system whole; an absorbed
+    handler computes its cell name from the fact at reduce time
+    (_absorbed_handler), so the resident serves BOTH natively off the cell's
+    presence. Called at compile beside the layout and generator cells; recompile
+    replaces the family."""
     from .lam import to_lam, from_lam
     from . import ast
     part = rmap_partition(D)
@@ -1846,9 +1880,11 @@ def create_handlers(D):
         ft = f[0]
         spec = create_spec(D, ft, part)
         if spec["absorbed"]:
-            continue                                          # phase two: needs the key
-        handler = ast.build_system(cell_name=ft, machine=spec["machine"],
-                                   mealy_obj=spec["mealy"], links_obj=spec["links"])
+            handler = _absorbed_handler(spec, ft)
+        else:
+            handler = ast.build_system(cell_name=ft, machine=spec["machine"],
+                                       mealy_obj=spec["mealy"],
+                                       links_obj=spec["links"])
         fresh.append(("CELL", "create:" + ft, from_lam(handler)))
     return to_lam(cells + tuple(fresh))
 

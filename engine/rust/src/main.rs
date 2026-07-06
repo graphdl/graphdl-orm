@@ -3113,7 +3113,7 @@ const MCP_TOOLS: &str = concat!(
     r#""description":"Runs the derivation rules over the retained store to the least fixed point and answers the rounds and the changed head cells; changed optionally bounds round one to the rules reading those cells.","#,
     r#""inputSchema":{"type":"object","properties":{"changed":{"type":"array","items":{"type":"string"}}}}},"#,
     r#"{"name":"apply","#,
-    r#""description":"Commits one fact row (eq. create) and answers its receipt: an own-table fact type computes and persists natively in the resident, an absorbed fact type delegates to the Python compiler host; a refused write answers committed false with the violations.","#,
+    r#""description":"Commits one fact row (eq. create) and answers its receipt, NATIVELY in the resident for own-table and absorbed fact types alike (the stored create:<ft> handler computes its cell from the fact; the machine leg advances the status column; the bounded derive and the sidecar ride the same step); a refused write answers committed false with the violations.","#,
     r#""inputSchema":{"type":"object","properties":{"app":{"type":"string"},"fact_type":{"type":"string"},"fact":{"type":"array","items":{"type":"string"}}},"required":["app","fact_type","fact"]}},"#,
     r#"{"name":"retract","#,
     r#""description":"Delegates one fact-row retraction to the Python compiler host and answers its receipt; a refused retraction answers committed false with the violations.","#,
@@ -3470,9 +3470,10 @@ fn native_apply(args: &J, apps: &Apps, srv: &mut Srv) -> Option<Result<String, (
         Some(J::A(xs)) => xs.clone(),
         _ => return None,
     };
-    // OWN-TABLE iff a create:<ft> handler cell is present (create_handlers
-    // stores it for own-table fact types only); its absence is the absorbed
-    // case, which delegates
+    // a create:<ft> handler cell serves BOTH shapes now (phase two done):
+    // an own-table handler carries its fixed cell name; an absorbed handler
+    // computes cellkey(table, key) from the fact at reduce time. Absence
+    // (a stale pre-0.9.0 sidecar) delegates
     let cell_name = Leaf::S(format!("create:{}", ft));
     let handler = match srv.cells.iter().find(|(k, _)| k.nateq(&cell_name)) {
         Some((_, c)) => c.clone(),

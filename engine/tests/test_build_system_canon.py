@@ -132,3 +132,44 @@ def test_the_mealy_leg_appends_emissions_as_the_last_part():
         {"cell_name": "F", "machine": (slot, sm), "mealy_obj": mealy},
         to_lam(("e1",)), D)
     assert o[-1] == "receipt"
+
+
+def test_the_stored_absorbed_handler_equals_the_python_create():
+    """The write-path flip's first leaf: an ABSORBED fact type's create:<ft>
+    handler is stored whole — its nine-slot record computes the fact-dependent
+    cell name (cellkey(table, key)) at reduce time; every other slot is the
+    spec's constant. Reducing the stored handler over ⟨fact, D⟩ answers the
+    same ⟨o, D'⟩ as the python create — including the machine leg advancing
+    the status column — so the resident serves absorbed writes natively off
+    the cell's presence alone."""
+    from pyarest import forml, system
+    from pyarest.reduce import apply as _ap
+    MODEL = """Order(.OrderId) is an entity type.
+Customer(.Name) is an entity type.
+Order is paid by Customer.
+Each Order is paid by exactly one Customer.
+State Machine Definition 'Order' is for Noun 'Order'.
+Status 'In Cart' is initial in State Machine Definition 'Order'.
+Transition 'pay' is from Status 'In Cart'.
+Transition 'pay' is to Status 'Paid'.
+Transition 'pay' is triggered by Fact Type 'Order is paid by Customer'.
+"""
+    D, _ = forml.compile_model(MODEL)
+    D = system.layout_cells(system.status_facts(D))
+    D = system.create_handlers(D)
+    D = apply(A(2), system.create(D, "Order_is_currently_in_Status",
+                                  to_lam(("o1", "In Cart"))))
+    # the handler cell exists for the ABSORBED trigger now (phase two done)
+    handler_rows = [c for c in from_lam(D)
+                    if isinstance(c, tuple) and len(c) >= 3
+                    and c[1] == "create:Order_is_paid_by_Customer"]
+    assert handler_rows, "absorbed create handler not stored"
+    handler = to_lam(handler_rows[0][2])
+    fact = to_lam(("o1", "c1"))
+    with defs.step(D):
+        got = from_lam(_ap(handler, S(fact, D)))
+    want = from_lam(system.create(D, "Order_is_paid_by_Customer", fact))
+    assert got == want                                        # ⟨o, D'⟩ byte-equal
+    part = system.rmap_partition(to_lam(got[1]))
+    assert ("o1", "Paid") in system.ft_view(
+        to_lam(got[1]), "Order_is_currently_in_Status", part)  # machine advanced
