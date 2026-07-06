@@ -1,0 +1,57 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Arestlam</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <!-- The include! equivalent: each shared intersection file becomes the body
+       of a varargs method call by BYTE CONCATENATION (prefix + file + suffix),
+       never parsing. The same bytes CPython execs and rustc tokenizes. -->
+  <Target Name="WrapCanon" BeforeTargets="CoreCompile"
+          Inputs="../shared/theta.py;../shared/constraints.py;../shared/ast.py;../shared/system.py;../shared/scenarios.py"
+          Outputs="$(IntermediateOutputPath)Canon.g.cs">
+    <PropertyGroup>
+      <CanonTheta>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/theta.py'))</CanonTheta>
+      <CanonConstraints>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/constraints.py'))</CanonConstraints>
+      <CanonAst>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/ast.py'))</CanonAst>
+      <CanonSystem>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/system.py'))</CanonSystem>
+      <CanonScenarios>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/scenarios.py'))</CanonScenarios>
+      <CanonWrapped>namespace Arestlam%3B
+
+static partial class Canon
+{
+    static object LoadTheta() =&gt; T
+$(CanonTheta)
+%3B
+
+    static object LoadConstraints() =&gt; T
+$(CanonConstraints)
+%3B
+
+    static object LoadAst() =&gt; T
+$(CanonAst)
+%3B
+
+    static object LoadSystem() =&gt; T
+$(CanonSystem)
+%3B
+
+    internal static object LoadScenarios() =&gt; T
+$(CanonScenarios)
+%3B
+}
+</CanonWrapped>
+    </PropertyGroup>
+    <WriteLinesToFile File="$(IntermediateOutputPath)Canon.g.cs"
+                      Lines="$(CanonWrapped)" Overwrite="true" />
+    <ItemGroup>
+      <Compile Include="$(IntermediateOutputPath)Canon.g.cs" />
+    </ItemGroup>
+  </Target>
+
+</Project>

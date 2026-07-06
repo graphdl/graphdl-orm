@@ -1,0 +1,5 @@
+# app databases and event logs are build artifacts of their readings; the
+# readings are the source of truth (an events log with real history would be
+# data, not artifact — none exists here yet)
+*/*.db
+*/*.events.jsonl

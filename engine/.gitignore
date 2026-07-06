@@ -1,0 +1,10 @@
+docs/
+.claude/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.egg-info/
+dist/
+build/
+rust/target/

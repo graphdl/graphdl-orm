@@ -1,0 +1,311 @@
+(
+"The AST layer's cell accessors (Backus 13.3.4/13.3.5) as canonical definitions in INTERSECTION SOURCE (one tuple literal, normal Python and normal Rust verbatim; discipline in shared/theta.py). A cell is CELL,name,contents; fetch answers the top of the name's stack or the unaddressable mark; pop removes the top preserving deeper cells; store is push after pop, verbatim from 13.3.4; a definition is an ORDINARY cell, so DefineIn is store of the object (13.3.5) and definitions travel with the store. Every accessor is a builder applied to the cell NAME (DefineIn to the pair of name and object).",
+
+DEF("ast:named",
+    S4(A("CONS"), K(A("COMP")), K(A("eq")),
+       S4(A("CONS"), K(A("CONS")), K(N(2)),
+          S3(A("CONS"), K(A("CONST")), A("id"))))),
+
+DEF("ast:Fetch",
+    S5(A("CONS"), K(A("COND")),
+       S4(A("CONS"), K(A("COMP")), K(A("null")),
+          S3(A("COMP"), A("theta:Filter"), A("ast:named"))),
+       K(S2(A("CONST"), A("#"))),
+       S5(A("CONS"), K(A("COMP")), K(N(3)), K(N(1)),
+          S3(A("COMP"), A("theta:Filter"), A("ast:named"))))),
+
+DEF("ast:FetchPop",
+    S5(A("CONS"), K(A("COND")),
+       S4(A("CONS"), K(A("COMP")), K(A("eq")),
+          S4(A("CONS"), K(A("CONS")), A("ast:Fetch"),
+             K(S2(A("CONST"), A("#"))))),
+       K(S2(A("CONST"), PHI())),
+       A("ast:Fetch"))),
+
+DEF("ast:Pop",
+    S5(A("CONS"), K(A("COMP")), K(N(2)),
+       S4(A("CONS"), K(A("WHILE")),
+          K(S4(A("COMP"), A("not"), A("null"), N(3))),
+          S5(A("CONS"), K(A("COND")),
+             S4(A("CONS"), K(A("COMP")), K(A("and")),
+                S4(A("CONS"), K(A("CONS")),
+                   K(S3(A("COMP"), A("eq"),
+                        S3(A("CONS"), N(1), S2(A("CONST"), A("F"))))),
+                   S4(A("CONS"), K(A("COMP")), A("ast:named"),
+                      K(S3(A("COMP"), N(1), N(3)))))),
+             K(S4(A("CONS"), S2(A("CONST"), A("T")), N(2),
+                  S3(A("COMP"), A("tl"), N(3)))),
+             K(S4(A("CONS"), N(1),
+                  S3(A("COMP"), A("apndr"),
+                     S3(A("CONS"), N(2), S3(A("COMP"), N(1), N(3)))),
+                  S3(A("COMP"), A("tl"), N(3)))))),
+       K(S4(A("CONS"), S2(A("CONST"), A("F")), S2(A("CONST"), PHI()),
+            A("id"))))),
+
+DEF("ast:Purge",
+    S3(A("COMP"), A("theta:Filter"),
+       S4(A("CONS"), K(A("COMP")), K(A("not")), A("ast:named")))),
+
+DEF("ast:Store",
+    S4(A("CONS"), K(A("COMP")), K(A("apndl")),
+       S4(A("CONS"), K(A("CONS")),
+          S5(A("CONS"), K(A("CONS")), K(S2(A("CONST"), A("CELL"))),
+             S3(A("CONS"), K(A("CONST")), A("id")), K(N(1))),
+          S4(A("CONS"), K(A("COMP")), A("ast:Pop"), K(N(2)))))),
+
+DEF("ast:DefineIn",
+    S4(A("CONS"), K(A("COMP")),
+       S3(A("COMP"), A("ast:Store"), N(1)),
+       S4(A("CONS"), K(A("CONS")),
+          S3(A("CONS"), K(A("CONST")), N(2)),
+          K(A("id"))))),
+
+DEF("ast:stub_validate",
+    S4(A("CONS"), N(1), S2(A("CONST"), PHI()), S2(A("CONST"), A("F")))),
+
+DEF("ast:resolve_default",
+    S4(A("COND"), A("theta:member"), N(2), A("apndl"))),
+
+DEF("ast:bs_P",
+    S4(A("CONS"), K(A("COMP")), S3(A("COMP"), A("ast:FetchPop"), N(1)), K(N(2)))),
+
+DEF("ast:bs_derived",
+    S5(A("CONS"), K(A("COMP")),
+       S4(A("COND"), S3(A("COMP"), A("null"), N(4)),
+          K(A("id")), S3(A("COMP"), N(1), N(4))),
+       S4(A("COND"), S3(A("COMP"), A("null"), N(3)),
+          K(A("ast:resolve_default")), S3(A("COMP"), N(1), N(3))),
+       S4(A("CONS"), K(A("CONS")), K(N(1)), A("ast:bs_P")))),
+
+DEF("ast:bs_valDI",
+    S5(A("CONS"), K(A("CONS")),
+       S4(A("CONS"), K(A("COMP")),
+          S4(A("COND"), S3(A("COMP"), A("null"), N(2)),
+             K(A("ast:stub_validate")), S3(A("COMP"), N(1), N(2))),
+          S4(A("CONS"), K(A("CONS")), A("ast:bs_derived"), K(N(2)))),
+       K(N(2)), K(N(1)))),
+
+DEF("ast:bs_spop",
+    S4(
+        A("CONS"), K(A("COMP")),
+        S3(
+            A("COMP"), A("apply"),
+            S3(
+                A("CONS"), K(A("system:ftpop_absorbed")),
+                S3(
+                    A("CONS"), S4(A("COMP"), N(1), N(1), N(6)),
+                    S4(A("COMP"), N(2), N(1), N(6))))),
+        K(N(2)))),
+
+DEF("ast:bs_snew",
+    S4(A("CONS"), K(A("COMP")), S3(A("COMP"), N(2), N(6)),
+       S5(A("CONS"), K(A("CONS")), A("ast:bs_spop"),
+          K(S3(A("COMP"), N(1), N(1))), K(N(2))))),
+
+DEF("ast:links_keep",
+    S4(A("COND"),
+       S3(A("COMP"),
+          S3(A("COMP"), A("eq"),
+             S3(A("CONS"), S3(A("COMP"), N(1), N(1)), N(2))),
+          N(1)),
+       A("apndl"), N(2))),
+
+DEF("ast:links_filter",
+    S3(A("COMP"), S2(A("INSERT"), A("ast:links_keep")), A("theta:append_phi"))),
+
+DEF("ast:bs_links_in",
+    S4(A("COND"), S3(A("COMP"), A("null"), N(6)),
+       K(S3(A("COMP"), N(1), N(1))),
+       S4(A("COND"), S5(A("COMP"), A("null"), A("tl"), A("tl"), N(6)),
+          K(S3(A("COMP"), N(1), N(1))),
+          S6(A("CONS"), K(A("COMP")),
+             K(S2(A("ALPHA"), N(1))),
+             K(A("ast:links_filter")),
+             K(A("distr")),
+             S4(A("CONS"), K(A("CONS")), A("ast:bs_snew"),
+                S4(A("CONS"), K(A("COMP")),
+                   S3(A("COMP"), N(3), N(6)), K(N(3)))))))),
+
+DEF("ast:bs_mm",
+    S4(A("COND"), S3(A("COMP"), A("null"), N(7)),
+       S2(A("CONST"), A("F")),
+       S4(A("COND"), S3(A("COMP"), A("null"), N(6)),
+          S2(A("CONST"), A("F")), S2(A("CONST"), A("T"))))),
+
+DEF("ast:bs_mealy_part",
+    S4(A("CONS"), K(A("COMP")), S3(A("COMP"), N(1), N(7)),
+       S5(A("CONS"), K(A("CONS")), A("ast:bs_spop"),
+          K(S3(A("COMP"), N(1), N(1))), K(N(2))))),
+
+DEF("ast:bs_links_part",
+    S5(A("CONS"), K(A("COND")),
+       S4(A("CONS"), K(A("COMP")), K(A("null")), A("ast:bs_links_in")),
+       K(S2(A("CONST"), PHI())),
+       S4(A("CONS"), K(A("COMP")), S3(A("COMP"), N(1), N(5)),
+          A("ast:bs_links_in")))),
+
+DEF("ast:bs_o",
+    S4(A("COND"), S3(A("COMP"), A("null"), N(5)),
+       S4(A("COND"), A("ast:bs_mm"),
+          S5(A("CONS"), K(A("CONS")),
+             K(S3(A("COMP"), N(1), N(1))), K(S3(A("COMP"), N(2), N(1))),
+             A("ast:bs_mealy_part")),
+          S4(A("CONS"), K(A("CONS")),
+             K(S3(A("COMP"), N(1), N(1))), K(S3(A("COMP"), N(2), N(1))))),
+       S4(A("COND"), A("ast:bs_mm"),
+          S6(A("CONS"), K(A("CONS")),
+             K(S3(A("COMP"), N(1), N(1))), K(S3(A("COMP"), N(2), N(1))),
+             A("ast:bs_links_part"), A("ast:bs_mealy_part")),
+          S5(A("CONS"), K(A("CONS")),
+             K(S3(A("COMP"), N(1), N(1))), K(S3(A("COMP"), N(2), N(1))),
+             A("ast:bs_links_part"))))),
+
+DEF("ast:bs_commit_base",
+    S4(A("CONS"), K(A("COMP")), S3(A("COMP"), A("ast:Store"), N(1)),
+       S4(A("CONS"), K(A("CONS")), K(S3(A("COMP"), N(1), N(1))), K(N(2))))),
+
+DEF("ast:bs_commit_m",
+    S4(
+        A("COND"), S3(A("COMP"), A("null"), N(6)), A("ast:bs_commit_base"),
+        S4(
+            A("CONS"), K(A("COMP")), S4(A("COMP"), A("ast:bs_write_pop2"), N(1), N(6)),
+            S4(
+                A("CONS"), K(A("CONS")), A("ast:bs_snew"), A("ast:bs_commit_base"))))),
+
+DEF("ast:bs_write_one",
+    S3(
+        A("COMP"), A("apply"),
+        S3(
+            A("CONS"),
+            S3(
+                A("COMP"), A("apply"),
+                S3(
+                    A("CONS"), K(A("ast:Store")),
+                    S3(
+                        A("COMP"), A("apply"),
+                        S3(
+                            A("CONS"), K(A("cellkey")),
+                            S3(A("CONS"), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(1), N(2))))))),
+            S3(
+                A("CONS"),
+                S3(
+                    A("COMP"), A("apply"),
+                    S3(
+                        A("CONS"),
+                        S3(
+                            A("COMP"), A("apply"),
+                            S3(
+                                A("CONS"), K(A("system:row_overwrite")),
+                                S4(
+                                    A("CONS"), S3(A("COMP"), N(2), N(1)),
+                                    S3(A("COMP"), N(3), N(1)), K(A("F"))))),
+                        S3(
+                            A("CONS"), N(2),
+                            S3(
+                                A("COMP"), A("apply"),
+                                S3(
+                                    A("CONS"),
+                                    S3(
+                                        A("COMP"), A("apply"),
+                                        S3(
+                                            A("CONS"), K(A("ast:FetchPop")),
+                                            S3(
+                                                A("COMP"), A("apply"),
+                                                S3(
+                                                    A("CONS"), K(A("cellkey")),
+                                                    S3(A("CONS"), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(1), N(2))))))),
+                                    N(3)))))),
+                N(3))))),
+
+DEF("ast:bs_write_pop",
+    S3(
+        A("COMP"), N(3),
+        S3(
+            A("WHILE"), S3(A("COMP"), A("not"), S3(A("COMP"), A("null"), N(2))),
+            S4(
+                A("CONS"), N(1), S3(A("COMP"), A("tl"), N(2)),
+                S3(
+                    A("COMP"), A("ast:bs_write_one"),
+                    S4(A("CONS"), N(1), S3(A("COMP"), N(1), N(2)), N(3))))))),
+
+DEF("ast:bs_write_pop2",
+    S4(
+        A("CONS"), K(A("COMP")), K(A("ast:bs_write_pop")),
+        S5(
+            A("CONS"), K(A("CONS")), S3(A("CONS"), K(A("CONST")), A("id")), K(N(1)), K(N(2))))),
+
+DEF("ast:bs_ipop",
+    S4(A("CONS"), K(A("COMP")),
+       S4(A("COMP"), A("ast:FetchPop"), N(1), N(8)), K(N(2)))),
+
+DEF("ast:bs_inew",
+    S5(A("CONS"), K(A("COND")),
+       S4(A("CONS"), K(A("COMP")), K(A("theta:member")),
+          S4(A("CONS"), K(A("CONS")),
+             K(S2(A("CONS"), S3(A("COMP"), N(1), N(3)))), A("ast:bs_ipop"))),
+       A("ast:bs_ipop"),
+       S4(A("CONS"), K(A("COMP")), K(A("apndl")),
+          S4(A("CONS"), K(A("CONS")),
+             K(S2(A("CONS"), S3(A("COMP"), N(1), N(3)))), A("ast:bs_ipop"))))),
+
+DEF("ast:bs_commit_i",
+    S4(A("COND"), S3(A("COMP"), A("null"), N(8)),
+       A("ast:bs_commit_m"),
+       S4(A("CONS"), K(A("COMP")),
+          S4(A("COMP"), A("ast:Store"), N(1), N(8)),
+          S4(A("CONS"), K(A("CONS")), A("ast:bs_inew"),
+             A("ast:bs_commit_m"))))),
+
+DEF("ast:bs_apop",
+    S4(A("CONS"), K(A("COMP")),
+       S4(A("COMP"), A("ast:FetchPop"), N(1), N(9)), K(N(2)))),
+
+DEF("ast:bs_anew",
+    S5(A("CONS"), K(A("COND")),
+       S4(A("CONS"), K(A("COMP")), K(A("theta:member")),
+          S4(A("CONS"), K(A("CONS")), K(N(3)), A("ast:bs_apop"))),
+       A("ast:bs_apop"),
+       S4(A("CONS"), K(A("COMP")), K(A("apndl")),
+          S4(A("CONS"), K(A("CONS")), K(N(3)), A("ast:bs_apop"))))),
+
+DEF("ast:bs_commit",
+    S4(A("COND"), S3(A("COMP"), A("null"), N(9)),
+       A("ast:bs_commit_i"),
+       S4(A("CONS"), K(A("COMP")),
+          S4(A("COMP"), A("ast:Store"), N(1), N(9)),
+          S4(A("CONS"), K(A("CONS")), A("ast:bs_anew"),
+             A("ast:bs_commit_i"))))),
+
+DEF("ast:build_system",
+    S4(A("CONS"), K(A("COMP")),
+       S4(A("CONS"), K(A("CONS")), A("ast:bs_o"),
+          S5(A("CONS"), K(A("COND")),
+             K(S3(A("COMP"), N(3), N(1))), K(N(2)), A("ast:bs_commit"))),
+       A("ast:bs_valDI"))),
+
+DEF("ast:dyn_keep",
+    S4(A("COND"),
+       S3(A("COMP"),
+          S3(A("COMP"), A("eq"),
+             S3(A("CONS"), S3(A("COMP"), N(2), N(1)), N(2))),
+          N(1)),
+       A("apndl"), N(2))),
+
+DEF("ast:dyn_hits",
+    S4(A("COMP"),
+       S3(A("COMP"), S2(A("INSERT"), A("ast:dyn_keep")), A("theta:append_phi")),
+       A("distr"),
+       S3(A("CONS"), N(2), N(1)))),
+
+DEF("ast:DynFetch",
+    S4(A("COND"), S3(A("COMP"), A("null"), A("ast:dyn_hits")),
+       S2(A("CONST"), A("#")),
+       S5(A("COMP"), N(3), N(1), N(1), A("ast:dyn_hits")))),
+
+DEF("ast:SYSTEM",
+    S3(A("COMP"), A("apply"),
+       S3(A("CONS"),
+          S3(A("COMP"), A("ast:DynFetch"),
+             S3(A("CONS"), S3(A("COMP"), N(1), N(1)), N(2))),
+          S3(A("CONS"), S3(A("COMP"), N(2), N(1)), N(2)))))
+)

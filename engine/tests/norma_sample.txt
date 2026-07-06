@@ -1,0 +1,60 @@
+Student is an entity type.
+Reference Scheme: Student has Student_id.
+Reference Mode: .id.
+Data Type: Other: Object ID.
+
+Fact Types:
+Student has Student_id.
+Student has Name.
+Student has Email.
+Each Student has at most one Email.
+It is possible that more than one Student has the same Email.
+Each Student has some Name.
+Name is a value type.
+Data Type: Text: Variable Length (0).
+
+Fact Types:
+Student has Name.
+Instructor has Name.
+Email is a value type.
+Data Type: Text: Variable Length (0).
+
+Fact Types:
+Student has Email.
+Instructor has Email.
+Course is an entity type.
+Reference Scheme: Course has Course_id.
+Reference Mode: .id.
+Data Type: Other: Object ID.
+
+Fact Types:
+Course has Course_id.
+Student enrolls in Course.
+It is possible that some Student enrolls in more than one Course
+and that for some Course, more than one Student enrolls in that Course.
+In each population of Student enrolls in Course, each Student, Course combination occurs at most once.
+This association with Student, Course provides the preferred identification scheme for Enrollment.
+Instructor is an entity type.
+Reference Scheme: Instructor has Instructor_id.
+Reference Mode: .id.
+Data Type: Other: Object ID.
+
+Fact Types:
+Instructor has Instructor_id.
+Instructor teaches Course.
+Each Course is taught by at most one Instructor.
+It is possible that some Instructor teaches more than one Course.
+Grade is a value type.
+Data Type: Text: Variable Length (0).
+
+Fact Types:
+Enrollment has Grade.
+Each Enrollment has at most one Grade.
+Enrollment is by online.
+Enrollment is by in-person.
+For each Enrollment, exactly one of the following holds:
+that Enrollment is by online;
+that Enrollment is by in-person.
+Instructor ~is retired.
+If some Student enrolls in some Course that is taught by some Instructor then that Student is advised by that Instructor
+where that Instructor teaches that Course.
