@@ -66,6 +66,32 @@ def test_an_entity_with_no_facts_answers_an_empty_detail():
     assert got == ("detail", ())
 
 
+def test_the_reference_html_render_is_a_registered_def():
+    # "Binding a user interface is then registering a render function, so
+    # a fact renders itself" (AREST.tex §Platform binding, verbatim). The
+    # engine ships ONE reference renderer as a D5 boundary op — semantic
+    # html per tree kind; toolkit renderers register beside it the same
+    # way (the iFactr pattern).
+    menu = to_lam(("menu", (("button", "finish", "completed"),
+                            ("button", "block", "blocked"))))
+    html = from_lam(apply(A("render:html"), menu))
+    assert html == ('<nav class="menu">'
+                    '<button name="finish" value="completed">finish</button>'
+                    '<button name="block" value="blocked">block</button>'
+                    '</nav>')
+    detail = to_lam(("detail", (("field", "{0} has {1}", ("t1", "open")),)))
+    html = from_lam(apply(A("render:html"), detail))
+    assert html == ('<dl class="detail">'
+                    '<dt>{0} has {1}</dt><dd>t1 open</dd>'
+                    '</dl>')
+    lst = to_lam(("list", (("item", "t1", "fix the door"),)))
+    html = from_lam(apply(A("render:html"), lst))
+    assert html == ('<ul class="list">'
+                    '<li data-id="t1">fix the door</li>'
+                    '</ul>')
+    assert from_lam(apply(A("render:html"), A("nonsense"))) == "⊥"
+
+
 def test_the_list_view_projects_id_caption_rows():
     # view_list over ⟨id, caption⟩ rows (the host feeds the ref scheme's
     # identifier + the summarising fact per §3.1): one item per instance.

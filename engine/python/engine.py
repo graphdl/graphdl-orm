@@ -1711,6 +1711,70 @@ def _register_skolem():
 _register_skolem()
 
 
+# The reference RENDER function (AREST.tex §Platform binding, verbatim:
+# "Binding a user interface is then registering a render function, so a
+# fact renders itself"). One D5 boundary op turning the canonical view
+# trees (system:view_menu / view_detail / view_list) into semantic html;
+# toolkit renderers (slint, gtk, web-components…) register beside it the
+# same way — the iFactr pattern, each target its own registered function
+# over the SAME trees. String generation is outside the algebra, hence
+# the boundary slot (the cellkey/skolem family).
+def _render_html_impl(mu):
+    from . import defs as _d
+    import pyarest.lam as L
+
+    def esc(s):
+        return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace('"', "&quot;"))
+
+    def g(o):
+        it = _d._items(L._list(o))
+        if len(it) != 2:
+            return L.BOT
+        kind = _d._aval(it[0])
+        rows = _d._items(L._list(it[1]))
+        if kind == "menu":
+            parts = []
+            for r in rows:
+                rr = _d._items(L._list(r))
+                if len(rr) != 3:
+                    return L.BOT
+                ev, to = _d._aval(rr[1]), _d._aval(rr[2])
+                parts.append(f'<button name="{esc(ev)}" value="{esc(to)}">'
+                             f'{esc(ev)}</button>')
+            return L.atom('<nav class="menu">' + "".join(parts) + "</nav>")
+        if kind == "detail":
+            parts = []
+            for r in rows:
+                rr = _d._items(L._list(r))
+                if len(rr) != 3:
+                    return L.BOT
+                reading = _d._aval(rr[1])
+                vals = [_d._aval(x) for x in _d._items(L._list(rr[2]))]
+                parts.append(f"<dt>{esc(reading)}</dt>"
+                             f"<dd>{esc(' '.join(str(v) for v in vals))}</dd>")
+            return L.atom('<dl class="detail">' + "".join(parts) + "</dl>")
+        if kind == "list":
+            parts = []
+            for r in rows:
+                rr = _d._items(L._list(r))
+                if len(rr) != 3:
+                    return L.BOT
+                rid, cap = _d._aval(rr[1]), _d._aval(rr[2])
+                parts.append(f'<li data-id="{esc(rid)}">{esc(cap)}</li>')
+            return L.atom('<ul class="list">' + "".join(parts) + "</ul>")
+        return L.BOT
+    return g
+
+
+def _register_render_html():
+    from .defs import register
+    register("render:html", _render_html_impl)
+
+
+_register_render_html()
+
+
 # The tokenizer boundary (the keystone's transducer set, same D5 slot): three
 # value ops carry text into the object world — lex (text → per-word records),
 # implode (⟨sep, words⟩ → one atom; templates are strings in factType rows),
