@@ -1951,6 +1951,25 @@ fn reduce_over(srv: &Srv, f: V, x: V, fuel: Option<i64>) -> V {
     reduce_in(&srv.mu, &srv.cells, &srv.d, f, x, fuel)
 }
 
+// (system:verbalize : id) : D over the NATIVE carrier — the ~40x plumb
+// (2026-07-08). The native view builds FRESH from d (srv.nd may be stale:
+// op_run_rules' own idiom; trusting the mirror was the "priced lever"
+// mystery in full). Serves both the synthesize_pairs op (raw pairs) and
+// the MCP synthesize tool (rendered to the Registry's shape).
+fn native_verbalize(srv: &Srv, id: &V) -> V {
+    let nd = v_to_n(&srv.d);
+    let ev = NEval {
+        cells: n_cells_of(&nd),
+        process: srv.nprocess.clone(),
+        defs_n: nd.clone(),
+        fuel: std::cell::Cell::new(-1),
+    };
+    n_to_v(&ev.mu(napp(
+        napp(N::A(Rc::new(Leaf::S("system:verbalize".into()))), v_to_n(id)),
+        nd,
+    )))
+}
+
 fn scalar_atom(j: &J) -> Option<V> {
     // a scalar request parameter as the atom the canon addresses cells by
     match j {
@@ -3311,38 +3330,23 @@ fn op_answer(op: &str, j: &J, srv: &mut Srv) -> Result<String, String> {
             // synthesize's engine half over the resident store: the canonical
             // (system:verbalize : id) : D — the entity's facts paired with
             // their fact types' reading templates; wording stays the caller's.
-            // STILL SCOTT-PATH (the ~40x plumb, priced 2026-07-08): the
-            // one-arm carrier swap was tried and the serve-op pins caught
-            // it answering EMPTY — NEval's op coverage is complete for
-            // compiled RULE objects, not yet for the verbalize def-family
-            // (something in its chain bottoms natively). The plumb's real
-            // scope is NEval completeness: instrument the Bot fallthrough,
-            // enumerate the missing ops, port them with case rows — the
-            // ledger's plan of record.
+            // NATIVE BY DEFAULT (the ~40x plumb closed 2026-07-08):
+            // verbalize rides the carrier exactly like the rules do — the
+            // native view built FRESH from d (srv.nd may be stale,
+            // op_run_rules' own idiom; trusting the mirror was the whole
+            // "priced lever" mystery). Byte-parity pinned by the serve-op
+            // suite; AREST_SYNTH_SCOTT=1 is the escape hatch to the old
+            // Scott reduction.
             let id = match jget(j, "id").and_then(scalar_atom) {
                 Some(a) => a,
                 None => return Err("synthesize_pairs needs a scalar id".to_string()),
             };
-            // AREST_SYNTH_NATIVE=1 routes through the carrier — today the
-            // DIAGNOSIS toggle (pair with AREST_NEVAL_TRACE to enumerate
-            // the coverage gap), tomorrow the cutover flag once the
-            // missing ops port with case rows.
-            let res = if std::env::var_os("AREST_SYNTH_NATIVE").is_some() {
-                let ev = NEval {
-                    cells: srv.ncells.clone(),
-                    process: srv.nprocess.clone(),
-                    defs_n: srv.nd.clone(),
-                    fuel: std::cell::Cell::new(-1),
-                };
-                n_to_v(&ev.mu(napp(
-                    napp(N::A(Rc::new(Leaf::S("system:verbalize".into()))),
-                         v_to_n(&id)),
-                    srv.nd.clone(),
-                )))
-            } else {
+            let res = if std::env::var_os("AREST_SYNTH_SCOTT").is_some() {
                 let f = mkapp(atom(Leaf::S("system:verbalize".into())),
                               id.clone());
                 reduce_over(srv, f, srv.d.clone(), fuel)
+            } else {
+                native_verbalize(srv, &id)
             };
             let mut r = String::from("{\"id\":");
             write_v(&id, &mut r);
@@ -3358,6 +3362,39 @@ fn op_answer(op: &str, j: &J, srv: &mut Srv) -> Result<String, String> {
             // the head cells that gained rows, and the retained store is
             // REPLACED by the derived result
             op_run_rules(j, srv)
+        }
+        "neval" => {
+            // DEBUG-ONLY (gated on AREST_NEVAL_TRACE): evaluate f : x over
+            // the retained NATIVE carrier — the bisection probe the
+            // silent-semantic gap requires (ledger 2026-07-08). Not in the
+            // MCP tool table; the cases mechanism rides Scott, so this is
+            // its native counterpart for A/B sub-term probes.
+            if std::env::var_os("AREST_NEVAL_TRACE").is_none() {
+                return Err("neval is a debug op: set AREST_NEVAL_TRACE".to_string());
+            }
+            let f = match jget(j, "f") {
+                Some(v) => j_to_n(v),
+                None => return Err("neval needs f".to_string()),
+            };
+            let x = match jget(j, "x") {
+                Some(v) => j_to_n(v),
+                None => return Err("neval needs x".to_string()),
+            };
+            // the native view BUILT FRESH from d — srv.nd may be stale
+            // (op_run_rules' own idiom; trusting srv.nd was the probe's
+            // first false lead: length(D) natively answered 0)
+            let nd = v_to_n(&srv.d);
+            let ev = NEval {
+                cells: n_cells_of(&nd),
+                process: srv.nprocess.clone(),
+                defs_n: nd,
+                fuel: std::cell::Cell::new(-1),
+            };
+            let res = n_to_v(&ev.mu(napp(f, x)));
+            let mut r = String::from("{\"result\":");
+            write_v(&res, &mut r);
+            r.push('}');
+            Ok(r)
         }
         _ => {
             if SESSION_VERBS.contains(&op) || APP_VERBS.contains(&op) {
@@ -4085,9 +4122,73 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
         // on the claude scratch: 264 s canonical Rust against 10.9 s
         // delegated). Plumbing the native carrier into op_answer is the
         // priced lever that brings it home.
-        "get" | "schema" | "sql" | "explain" | "validate" | "verify" | "actions"
-        | "synthesize" => {
+        "get" | "schema" | "sql" | "explain" | "validate" | "verify" | "actions" => {
             delegate_read(tool, args, apps)
+        }
+        "synthesize" => {
+            // NATIVE BY DEFAULT (the ~40x plumb closed 2026-07-08): the MCP
+            // synthesize evaluates verbalize on the carrier and RENDERS the
+            // Registry's exact shape ({app, id, facts:[{reading, row,
+            // text}]}) — the delegated python answered this and the pins
+            // hold it; the python spawn it replaces measured 35+ MINUTES
+            // at tasks scale. AREST_SYNTH_SCOTT=1 restores the delegate.
+            if std::env::var_os("AREST_SYNTH_SCOTT").is_some() {
+                return delegate_read(tool, args, apps);
+            }
+            let app = match &apps.current {
+                Some(n) => n.clone(),
+                None => return Err((-32602,
+                    "no app loaded; call apps_use before synthesize".to_string())),
+            };
+            let id = match jget(args, "id") {
+                Some(J::S(s)) => atom(Leaf::S(s.clone())),
+                Some(J::I(i)) => atom(Leaf::I(*i)),
+                _ => return Err((-32602,
+                    "synthesize needs a scalar id".to_string())),
+            };
+            let pairs = native_verbalize(srv, &id);
+            let mut r = String::from("{\"app\":");
+            esc(&app, &mut r);
+            r.push_str(",\"id\":");
+            write_v(&id, &mut r);
+            r.push_str(",\"facts\":[");
+            let mut first = true;
+            for p in items(&list_of(&pairs)) {
+                let it = items(&list_of(&p));
+                if it.len() != 2 {
+                    continue;
+                }
+                let reading = match aval(&it[0]).as_deref() {
+                    Some(Leaf::S(s)) => s.clone(),
+                    _ => continue,
+                };
+                let row: Vec<String> = items(&list_of(&it[1]))
+                    .iter()
+                    .filter_map(|x| aval(x).map(|l| match &*l {
+                        Leaf::S(s) => s.clone(),
+                        Leaf::I(i) => i.to_string(),
+                        Leaf::F(fl) => fl.to_string(),
+                        _ => String::new(),
+                    }))
+                    .collect();
+                let mut text = reading.clone();
+                for (i, v) in row.iter().enumerate() {
+                    text = text.replace(&format!("{{{}}}", i), v);
+                }
+                if !first {
+                    r.push(',');
+                }
+                first = false;
+                r.push_str("{\"reading\":");
+                esc(&reading, &mut r);
+                r.push_str(",\"row\":");
+                write_v(&it[1], &mut r);
+                r.push_str(",\"text\":");
+                esc(&text, &mut r);
+                r.push('}');
+            }
+            r.push_str("]}");
+            Ok(r)
         }
         "query" | "cells" => {
             if apps.current.is_none() {
