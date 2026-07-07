@@ -1711,14 +1711,40 @@ def _register_skolem():
 _register_skolem()
 
 
+# The html ESCAPE transducer — the render's ONE legitimate boundary piece
+# (the doctrine correction, 2026-07-08: meaning in canon, boundary for
+# TRANSDUCTION only). Byte-level entity substitution, the lex family:
+# & < > " to their entities; ints stringify; sequences bottom.
+def _escape_html_impl(mu):
+    from . import defs as _d
+    import pyarest.lam as L
+
+    def g(o):
+        v = _d._aval(o)
+        if v is None or isinstance(v, tuple) or isinstance(v, bool):
+            return L.BOT
+        s = (str(v).replace("&", "&amp;").replace("<", "&lt;")
+             .replace(">", "&gt;").replace('"', "&quot;"))
+        return L.atom(s)
+    return g
+
+
+def _register_escape_html():
+    from .defs import register
+    register("escape_html", _escape_html_impl)
+
+
+_register_escape_html()
+
+
 # The reference RENDER function (AREST.tex §Platform binding, verbatim:
 # "Binding a user interface is then registering a render function, so a
-# fact renders itself"). One D5 boundary op turning the canonical view
-# trees (system:view_menu / view_detail / view_list) into semantic html;
-# toolkit renderers (slint, gtk, web-components…) register beside it the
-# same way — the iFactr pattern, each target its own registered function
-# over the SAME trees. String generation is outside the algebra, hence
-# the boundary slot (the cellkey/skolem family).
+# fact renders itself"). MEANING IN CANON: system:render_html is the
+# definition of record (tree structure + implode joins over escape_html);
+# this host function is the certified-equal PERFORMANCE OVERRIDE, held
+# equal by the twin test — the _classify_heads discipline. Toolkit
+# renderers (slint, gtk, web-components…) register beside it the same
+# way over the SAME trees: the iFactr pattern.
 def _render_html_impl(mu):
     from . import defs as _d
     import pyarest.lam as L

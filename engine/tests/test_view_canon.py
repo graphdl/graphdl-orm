@@ -66,6 +66,17 @@ def test_an_entity_with_no_facts_answers_an_empty_detail():
     assert got == ("detail", ())
 
 
+def test_the_escape_transducer_is_the_only_boundary_piece():
+    # the doctrine correction (Samuel, 2026-07-08): meaning in canon,
+    # boundary for TRANSDUCTION only. escape_html is the one byte-level
+    # piece the render needs — & < > " to their entities; ints stringify;
+    # sequences bottom (a value op, the lex family).
+    assert from_lam(apply(A("escape_html"), A('a<b>&"c'))) == \
+        "a&lt;b&gt;&amp;&quot;c"
+    assert from_lam(apply(A("escape_html"), A(7))) == "7"
+    assert from_lam(apply(A("escape_html"), _S(A("x")))) == "⊥"
+
+
 def test_the_reference_html_render_is_a_registered_def():
     # "Binding a user interface is then registering a render function, so
     # a fact renders itself" (AREST.tex §Platform binding, verbatim). The
@@ -90,6 +101,28 @@ def test_the_reference_html_render_is_a_registered_def():
                     '<li data-id="t1">fix the door</li>'
                     '</ul>')
     assert from_lam(apply(A("render:html"), A("nonsense"))) == "⊥"
+
+
+def test_the_canon_render_twins_the_host_override():
+    # the doctrine conformance (Samuel's correction, 2026-07-08):
+    # system:render_html is the DEFINITION OF RECORD; the host render
+    # (render:html) is its certified-equal performance override. The
+    # twin holds byte-equal on all three tree kinds + escaping.
+    trees = [
+        ("menu", (("button", "finish", "completed"),
+                  ("button", "block", "blocked"))),
+        ("menu", ()),
+        ("detail", (("field", "{0} has {1}", ("t1", "open")),
+                    ("field", "{0} <keeps> {1}", ("t1", 'r"x')))),
+        ("list", (("item", "t1", "fix the door"),
+                  ("item", "t2", "a<b"))),
+        ("list", ()),
+    ]
+    for t in trees:
+        canon = from_lam(apply(A("system:render_html"), to_lam(t)))
+        host = from_lam(apply(A("render:html"), to_lam(t)))
+        assert canon == host, (t, canon, host)
+        assert isinstance(canon, str) and canon.startswith("<")
 
 
 def test_the_list_view_projects_id_caption_rows():
