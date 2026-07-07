@@ -1201,7 +1201,6 @@ def run_rules(D, changed=None, stats=None):
     #           heads (reachable from themselves through derived-head reads)
     #           stay out: their overestimate can rederive itself through the
     #           cycle, and cleaning them needs the delta form of the paper.
-    kindmap = {r[0]: r[1] for r in _pop_rows(D, "derivation") if len(r) >= 2}
     spans_of = {}
     for r in _pop_rows(D, "spans"):
         if len(r) >= 2:
@@ -1239,6 +1238,7 @@ def run_rules(D, changed=None, stats=None):
     classes = _classify_heads(D)
     sweep = classes["sweep"]
     sweep_cyclic = classes["dred"]
+    aggwhole = set(classes["aggwhole"])
 
     def _eval_rules(rids, Dx):
         outs = set()
@@ -1280,7 +1280,7 @@ def run_rules(D, changed=None, stats=None):
             if isinstance(out, tuple):
                 agg_rows = {tuple(r) for r in out if isinstance(r, tuple)}
                 before = {tuple(r) for r in _pop_rows(D, head)}
-                if kindmap.get(head) in _OWNED and dirty is None:
+                if head in aggwhole and dirty is None:
                     # a derivation-OWNED agg head on a FULL derive replaces
                     # whole: the cell is materialization, and per-group
                     # supersession cannot retire a group whose supply
@@ -1451,11 +1451,19 @@ def _classify_heads(D):
     heads (the task-955 upsert; kind-blind, like the pass); among the
     remaining derivation-owned plain heads (_OWNED), 'dred' for the
     self-supporting (empty-first refill, GMS93's recursive form) and 'sweep'
-    for the acyclic rest (delete-and-rederive). run_rules builds its strata
+    for the acyclic rest (delete-and-rederive); 'aggwhole' the derivation-
+    owned agg heads (the whole-replace license). run_rules builds its strata
     FROM this and scheduler_cells materializes it as the passHeads cell —
     one classification, so the scheduler and the schedule-as-data cannot
     drift. A head may be both 'agg' and 'keyed' (agg rules fold it while
-    plain keyed rules upsert it); 'sweep'/'dred' exclude both."""
+    plain keyed rules upsert it); 'sweep'/'dred' exclude both.
+
+    THE MEANING LIVES IN CANON: system:classify_heads (shared/system.canon,
+    the cls_* def family) over the six fetched pops answers the same rows —
+    this host function is the certified-equal PERFORMANT OVERRIDE, held
+    equal by tests/test_classify_canon.py on every run (the doctrine:
+    functionality with a performant override must be defined in the shared
+    lambda base)."""
     aggids = {r[0] for r in _pop_rows(D, "ruleAgg") if r}
     all_rules = [(r[0], r[1]) for r in _pop_rows(D, "ruleDerives")
                  if len(r) >= 2]
@@ -1500,7 +1508,14 @@ def _classify_heads(D):
     return {"agg": sorted(agg_heads),
             "keyed": sorted(h for h in plain_of if h in keyspanned),
             "sweep": sorted(h for h in owned if not _self_supporting(h)),
-            "dred": sorted(h for h in owned if _self_supporting(h))}
+            "dred": sorted(h for h in owned if _self_supporting(h)),
+            # the agg pass's whole-replace-vs-per-group decision is a KIND
+            # question pass membership alone cannot carry: a derivation-
+            # owned agg head on a FULL derive replaces whole (a vanished
+            # group dies); any other agg head supersedes per group. The
+            # fifth label rides the cell so readers never need kindmap.
+            "aggwhole": sorted(h for h in agg_heads
+                               if kindmap.get(h) in _OWNED)}
 
 
 def scheduler_cells(D):
@@ -1513,7 +1528,7 @@ def scheduler_cells(D):
     classifies at run time, which is what run_rules does anyway."""
     from .lam import to_lam, from_lam
     classes = _classify_heads(D)
-    rows = [(p, h) for p in ("agg", "keyed", "sweep", "dred")
+    rows = [(p, h) for p in ("agg", "keyed", "sweep", "dred", "aggwhole")
             for h in classes[p]]
     cells = tuple(c for c in from_lam(D)
                   if not (isinstance(c, tuple) and len(c) >= 2

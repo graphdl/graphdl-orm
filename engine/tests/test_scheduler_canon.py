@@ -26,6 +26,8 @@ MODEL = """Task(.id) is an entity type.
 Peer(.id) is an entity type.
 Cost is a value type.
 Rank is a value type.
+Cost Total is a value type.
+Cost Tally is a value type.
 Peer serves Task.
 Peer has Cost.
 Peer has Rank.
@@ -35,12 +37,16 @@ Task has Rank. **
 Each Task has at most one Rank.
 Task is reachable. **
 Task is urgent.
+Task has Cost Total. **
+Task has Cost Tally.
 
 * Task has Cost iff some Peer serves that Task and that Peer has Cost.
 * Task has Rank iff some Peer serves that Task and that Peer has Rank.
 * Task is reachable iff the Task blocks some Task1 and Task1 has Cost.
 * Task is reachable iff the Task blocks some Task1 and Task1 is reachable.
 * Task is urgent iff the Task blocks some Task1 and Task1 has Cost.
+* Task1 has Cost Total iff Cost Total is the sum of Cost1 where Task1 has Cost1.
+* Task1 has Cost Tally iff Cost Tally is the count of Cost1 where Task1 has Cost1.
 """
 
 INSTANCES = """
@@ -83,6 +89,21 @@ def test_unmarked_ruled_heads_stay_out_of_the_destructive_passes():
     # sweep). It joins no destructive pass — exactly run_rules' behavior.
     got = _passheads()
     assert "Task_is_urgent" not in {h for (_p, h) in got}
+
+
+def test_aggwhole_marks_the_derivation_owned_agg_heads():
+    # the agg pass's whole-replace-vs-per-group decision is a KIND question
+    # (owned on a full derive -> whole-replace; a group whose supply
+    # vanished dies), and pass membership alone cannot carry it — so the
+    # cell's fifth label. Task_has_Cost_Total (**) is derivation-owned:
+    # agg AND aggwhole. Task_has_Cost_Tally (unmarked) folds in the agg
+    # pass like any aggregate rule, but supersedes per group — never
+    # whole-replaces — so it stays out of aggwhole.
+    got = _passheads()
+    assert ("agg", "Task_has_Cost_Total") in got
+    assert ("aggwhole", "Task_has_Cost_Total") in got
+    assert ("agg", "Task_has_Cost_Tally") in got
+    assert ("aggwhole", "Task_has_Cost_Tally") not in got
 
 
 def test_derived_and_stored_heads_rederive_at_run_rules():
