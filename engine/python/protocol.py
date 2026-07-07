@@ -227,6 +227,25 @@ def replay_entries(D, entries):
     return D
 
 
+def _watermark(D):
+    """The snapshot's event-stream watermark: how many stream entries the
+    stored D already incorporates. None on a pre-watermark snapshot, written
+    when every write passed through this Registry — complete by construction
+    at its save time (recompile stamps it)."""
+    rows = system._pop_rows(D, "eventWatermark")
+    return rows[0][0] if rows and rows[0] else None
+
+
+def _with_watermark(D, n):
+    """Stamp the watermark cell — facts all the way down: how much of the
+    stream a snapshot holds is knowledge about the store, so it rides IN the
+    store and replaces wholesale like the other meta cells."""
+    cells = tuple(c for c in from_lam(D)
+                  if not (isinstance(c, tuple) and len(c) >= 2
+                          and c[1] == "eventWatermark"))
+    return to_lam(cells + (("CELL", "eventWatermark", ((n,),)),))
+
+
 def _bulk_absorbed_install(D, part, table, ft, facts):
     """The batch install of an absorbed fact type's rows: each ⟨key, value⟩
     lands on the entity's 3NF row (fresh rows hole-padded, the row_resolve
@@ -1558,6 +1577,9 @@ class Registry:
         if entries:
             D = persist.replay_entries(D, entries)
             D = system.run_rules(D)
+        # the snapshot records how much of the stream it holds, so a load can
+        # replay exactly the tail another host appended after this save
+        D = persist._with_watermark(D, len(entries))
         D = system.layout_cells(D)
         D = system.generator_cells(D)
         D = system.create_handlers(D)                         # create:<ft> defs, native apply
@@ -1587,7 +1609,9 @@ class Registry:
         payload = {"d": _conv(from_lam(D)), "process": process,
                    "overrides": 1, "cases": []}
         path = os.path.join(self._app_dir(name), f"{name}.store.json")
-        tmp = path + ".tmp"
+        # the tmp name carries the pid: the Rust resident writes this sidecar
+        # too, and two writers sharing one tmp path tear the file mid-stream
+        tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
         os.replace(tmp, path)
@@ -1624,6 +1648,11 @@ class Registry:
         if not refused:
             D2 = system.run_rules(D2, changed=[fact_type])
             self._sink(name).append({"ft": fact_type, "fact": list(row)})
+            wm = persist._watermark(D2)
+            if wm is not None:
+                # our append joins the count, so the saved snapshot holds
+                # exactly the stream it claims to
+                D2 = persist._with_watermark(D2, wm + 1)
             self._storage(name).save(D2)
             self._sidecar(name, D2)
         receipt = {"app": name, "fact_type": fact_type, "fact": list(row),
@@ -1676,6 +1705,22 @@ class Registry:
         D = drv.load()
         if D is None:
             raise FileNotFoundError(f"app {name!r} is not compiled (no store)")
+        # the STREAM is the store of record and the snapshot is disposable, so
+        # a snapshot TRAILING the stream heals here: the Rust resident commits
+        # natively by appending to the stream (it never writes the .db), and
+        # the tail beyond the snapshot's watermark replays through the same
+        # create. The healed watermark rides the returned store, so a
+        # committing caller persists it. A pre-watermark snapshot has no count
+        # to trail from and loads as-is; recompile stamps it.
+        wm = persist._watermark(D)
+        if wm is not None:
+            entries = self._sink(name).read()
+            if len(entries) > wm:
+                tail = entries[wm:]
+                D = persist.replay_entries(D, tail)
+                D = system.run_rules(D, changed=sorted(
+                    {e["ft"] for e in tail if e.get("ft")}))
+                D = persist._with_watermark(D, len(entries))
         return D
 
     def query(self, name, fact_type):

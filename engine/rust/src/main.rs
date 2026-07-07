@@ -2887,6 +2887,154 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
         }
         dirty = Some(round_changed);
     }
+    // ---- VIEW == REASSEMBLY FOR DERIVED HEADS (engine.py's
+    // _reconcile_absorbed_heads): an ABSORBED head's ** cell is the derive
+    // cache and its RMAP column is the storage, so after the fixpoint the
+    // columns become exactly the cell — a present row writes its value onto
+    // the key's table row (a fresh key joins the index, hole-padded) and a
+    // key whose derived row VANISHED holes the column, so the sweep's
+    // supersession reaches the storage. The layout rides in the store as the
+    // rmapColumns cell (rows ⟨table, col, ft⟩); a changed head without a
+    // layout row is own-table and needs nothing. Row cells address by
+    // cellkey's text (S and I leaves only), exactly as native_apply writes
+    // them.
+    {
+        let mut layout: HashMap<String, (String, usize)> = HashMap::new();
+        let mut widths: HashMap<String, usize> = HashMap::new();
+        for r in pop_rows(&cells, &leaf("rmapColumns")) {
+            let it = items(&list_of(&r));
+            if it.len() >= 3 {
+                if let (Some(t), Some(Leaf::I(c)), Some(f)) =
+                    (aval(&it[0]), aval(&it[1]).as_deref(), aval(&it[2]))
+                {
+                    if *c < 2 {
+                        // a malformed layout row must not fault the resident
+                        continue;
+                    }
+                    let (tn, fname) = (leaf_text(&t), leaf_text(&f));
+                    let w = widths.entry(tn.clone()).or_insert(1);
+                    *w = (*w).max(*c as usize);
+                    layout.insert(fname, (tn, *c as usize));
+                }
+            }
+        }
+        if !layout.is_empty() {
+            // unary heads write "T"; the role rows carry each head's arity
+            let mut maxpos: HashMap<String, i64> = HashMap::new();
+            for r in pop_rows(&cells, &leaf("role")) {
+                let it = items(&list_of(&r));
+                if it.len() >= 4 {
+                    if let (Some(f), Some(Leaf::I(p))) =
+                        (aval(&it[1]), aval(&it[2]).as_deref())
+                    {
+                        let e = maxpos.entry(leaf_text(&f)).or_insert(0);
+                        *e = (*e).max(*p);
+                    }
+                }
+            }
+            let keytext = |l: &Leaf| match l {
+                Leaf::S(s) => Some(s.clone()),
+                Leaf::I(i) => Some(i.to_string()),
+                _ => None,
+            };
+            let hole = || atom(Leaf::S("#".to_string()));
+            for ftname in changed.iter() {
+                let (table, col) = match layout.get(ftname) {
+                    Some((t, c)) => (t.clone(), *c),
+                    None => continue,
+                };
+                let width = *widths.get(&table).unwrap_or(&1);
+                let unary = maxpos.get(ftname).copied() == Some(1);
+                // want: key text → ⟨key atom, the value the column must carry⟩
+                let mut want: HashMap<String, (V, V)> = HashMap::new();
+                for r in pop_rows(&cells, &leaf(ftname)) {
+                    let it = items(&list_of(&r));
+                    if it.is_empty() {
+                        continue;
+                    }
+                    let kt = match aval(&it[0]).and_then(|l| keytext(&l)) {
+                        Some(t) => t,
+                        None => continue,
+                    };
+                    let v = if unary {
+                        atom(Leaf::S("T".to_string()))
+                    } else if it.len() >= 2 {
+                        it[1].clone()
+                    } else {
+                        hole()
+                    };
+                    want.insert(kt, (it[0].clone(), v));
+                }
+                let tleaf = leaf(&table);
+                let mut tbl = pop_rows(&cells, &tleaf);
+                // every indexed key gets its column written or holed; a
+                // duplicate index entry visits once, as Python's key set does
+                let mut seen: HashSet<String> = HashSet::new();
+                let mut visits: Vec<String> = Vec::new();
+                for r in &tbl {
+                    let it = items(&list_of(r));
+                    if it.is_empty() {
+                        continue;
+                    }
+                    if let Some(kt) = aval(&it[0]).and_then(|l| keytext(&l)) {
+                        if seen.insert(kt.clone()) {
+                            visits.push(kt);
+                        }
+                    }
+                }
+                for kt in visits {
+                    let v = want.remove(&kt).map(|(_, v)| v).unwrap_or_else(hole);
+                    let rc = Leaf::S(format!("{}:{}", table, kt));
+                    let mut row = pop_rows(&cells, &rc);
+                    if row.is_empty() {
+                        row = vec![atom(Leaf::S(kt.clone()))];
+                    }
+                    while row.len() < width {
+                        row.push(hole());
+                    }
+                    if !eqobj(&row[col - 1], &v) {
+                        row[col - 1] = v;
+                        store_into(&mut d, &mut cells, &mut nd, &mut ncells, &rc,
+                                   seq(from_vec(row)));
+                    }
+                }
+                // the leftover keys are FRESH: hole-padded rows join the
+                // index in Python's sorted(...) order (numeric ints, lexical
+                // strings; Python faults on a mix, so the split is free)
+                let mut fresh: Vec<(u8, i64, String)> = Vec::new();
+                for (kt, (ka, _)) in &want {
+                    match aval(ka).as_deref() {
+                        Some(Leaf::I(i)) => fresh.push((0, *i, kt.clone())),
+                        _ => fresh.push((1, 0, kt.clone())),
+                    }
+                }
+                fresh.sort();
+                let grew = !fresh.is_empty();
+                for (_, _, kt) in fresh {
+                    let (ka, v) = match want.remove(&kt) {
+                        Some(kv) => kv,
+                        None => continue,
+                    };
+                    let rc = Leaf::S(format!("{}:{}", table, kt));
+                    let mut row = pop_rows(&cells, &rc);
+                    if row.is_empty() {
+                        row = vec![ka.clone()];
+                    }
+                    while row.len() < width {
+                        row.push(hole());
+                    }
+                    row[col - 1] = v;
+                    store_into(&mut d, &mut cells, &mut nd, &mut ncells, &rc,
+                               seq(from_vec(row)));
+                    tbl.push(seq(from_vec(vec![ka])));
+                }
+                if grew {
+                    store_into(&mut d, &mut cells, &mut nd, &mut ncells, &tleaf,
+                               seq(from_vec(tbl)));
+                }
+            }
+        }
+    }
     // REPLACE the retained store with the fixpoint, the retain protocol's
     // commit: d and its cell index move together, and the native-carrier mirror
     // moves with them (nd was maintained in lockstep through the passes, so it
@@ -3533,7 +3681,9 @@ fn write_sidecar(apps: &Apps, app: &str, srv: &Srv) -> std::io::Result<()> {
     payload.push_str("],\"overrides\":1,\"cases\":[]}");
     let path = apps.sidecar(app);
     let mut tmp = path.clone().into_os_string();
-    tmp.push(".tmp"); // <app>.store.json.tmp, matching _sidecar's path + ".tmp"
+    // the tmp name carries the pid, matching _sidecar: the Python CLI writes
+    // this sidecar too, and two writers sharing one tmp path tear the file
+    tmp.push(format!(".{}.tmp", std::process::id()));
     let tmp = std::path::PathBuf::from(tmp);
     std::fs::write(&tmp, payload.as_bytes())?;
     std::fs::rename(&tmp, &path)

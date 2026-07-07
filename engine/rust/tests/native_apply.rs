@@ -1,22 +1,26 @@
-//! The resident's NATIVE write path for OWN-TABLE fact types, end to end. A
-//! fact type whose RMAP mapping keeps it its own table carries a create:<ft>
-//! handler cell (engine.py create_handlers stores one per own-table fact type;
-//! an absorbed fact type has none, phase two), so the resident computes and
-//! persists the create in process — fetch the handler, reduce it over the pair
-//! of the fact and the retained store, extract the receipt exactly as
-//! protocol.py Registry.apply does, retain D', run the native derive, and
-//! persist natively (the event line to <app>.events.jsonl, the store sidecar
-//! refreshed). An absorbed fact type has no handler cell and FALLS BACK to the
-//! Python CLI delegation.
+//! The resident's NATIVE write path, end to end, BOTH RMAP shapes. Every
+//! compiled fact type carries a create:<ft> handler cell (engine.py
+//! create_handlers: an own-table handler names its fixed cell; an absorbed
+//! handler computes cellkey(table, key) from the fact at reduce time), so the
+//! resident computes and persists the create in process — fetch the handler,
+//! reduce it over the pair of the fact and the retained store, extract the
+//! receipt exactly as protocol.py Registry.apply does, retain D', run the
+//! native derive, and persist natively (the event line to <app>.events.jsonl,
+//! the store sidecar refreshed). Delegation remains for the REFUSAL receipt
+//! (the bare-ERROR case owes the offenders, and Python's validate names
+//! them) and for the compiler-host verbs.
 //!
-//! The discriminator that keeps the test honest: the own-table flow runs
-//! against a resident spawned with a BOGUS --python, so any delegation fails to
-//! spawn. An own-table apply that commits there committed WITHOUT the host — it
-//! went native. The absorbed apply against the same broken-delegate resident
-//! errors, proving it took the delegate path. A second resident with a real
-//! python then proves the absorbed fallback commits end to end, and supplies
-//! the Python parity reference for the differential (the native store's queried
-//! rows against a Python-written app's, over the same own-table fact).
+//! The discriminator that keeps the test honest: the write flow runs against
+//! a resident spawned with a BOGUS --python, so any delegation fails to
+//! spawn. An apply that commits there committed WITHOUT the host — it went
+//! native, own-table and absorbed alike. A second resident with a real
+//! python then proves durability across a reboot, supplies the Python parity
+//! reference for the differential (the native store's queried rows against a
+//! Python-written app's, over the same own-table fact), and exercises the
+//! REFUSAL path: a conflicting functional value reduces to the bare ERROR
+//! natively and rides the delegate for its violation set — over the healed
+//! stream (the watermark tail replay), so the delegate sees the native
+//! commit it conflicts with instead of a stale snapshot.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
@@ -155,9 +159,10 @@ fn write_readings(apps_dir: &std::path::Path, name: &str) {
     let dir = apps_dir.join(name).join("readings");
     std::fs::create_dir_all(&dir).unwrap();
     // Task blocks Task is an m:n binary fact type: no uniqueness, so RMAP keeps
-    // it its OWN table and create_handlers stores create:Task_blocks_Task.
-    // Task has Status is functional (at most one), so RMAP ABSORBS it into the
-    // Task table and it carries no create cell — the phase-two, delegate case.
+    // it its OWN table. Task has Status is functional (at most one), so RMAP
+    // ABSORBS it into the Task table as a column. BOTH carry create:<ft>
+    // handler cells (phase two): the absorbed handler computes its cell name
+    // from the fact at reduce time.
     std::fs::write(
         dir.join("app.md"),
         concat!(
@@ -181,7 +186,7 @@ fn rows_tail(resp: &str) -> String {
 }
 
 #[test]
-fn native_apply_commits_own_table_in_process_and_delegates_absorbed() {
+fn native_apply_commits_both_rmap_shapes_in_process() {
     // Gate exactly as the delegated write-flow test does: the flow needs a
     // python on PATH and cli.py above the crate. Absent either, skip clean.
     let python_ok = Command::new("python")
@@ -223,17 +228,17 @@ fn native_apply_commits_own_table_in_process_and_delegates_absorbed() {
         let r = c.call(1, "apps_use", r#"{"name":"ring"}"#);
         assert!(r.contains(r#"\"ok\":true"#), "apps_use ring: {r}");
 
-        // the structural proof of which path each fact type takes: the
-        // own-table fact type carries a create:<ft> handler cell, the absorbed
-        // one does not.
+        // the structural proof that BOTH shapes serve natively: each fact
+        // type carries its create:<ft> handler cell (the absorbed one
+        // computes cellkey(table, key) at reduce time).
         let r = c.call(2, "cells", r#"{"pattern":"create:"}"#);
         assert!(
             r.contains(r#"\"name\":\"create:Task_blocks_Task\""#),
             "own-table must carry a create cell: {r}"
         );
         assert!(
-            !r.contains("create:Task_has_Status"),
-            "absorbed must carry NO create cell: {r}"
+            r.contains(r#"\"name\":\"create:Task_has_Status\""#),
+            "absorbed must carry a create cell too (phase two): {r}"
         );
 
         // the own-table apply: committed in process, the receipt protocol.py's
@@ -271,17 +276,21 @@ fn native_apply_commits_own_table_in_process_and_delegates_absorbed() {
             "the event line must match FileEventSink: {ev:?}"
         );
 
-        // the absorbed apply has no create cell, so it FALLS BACK to
-        // delegation — which fails against the bogus python, proving the
-        // fallback routes to the CLI (never silently native).
+        // the absorbed apply commits natively too — same broken delegate, so
+        // a commit here proves the absorbed handler computed in process.
         let r = c.call(
             5,
             "apply",
             r#"{"app":"ring","fact_type":"Task_has_Status","fact":["t1","open"]}"#,
         );
         assert!(
-            r.contains(r#""error""#) && !r.contains(r#"\"committed\":true"#),
-            "absorbed must delegate (and fail against the bogus python): {r}"
+            r.contains(r#"\"committed\":true"#),
+            "absorbed apply must commit natively (no host): {r}"
+        );
+        let r = c.call(6, "query", r#"{"fact_type":"Task_has_Status"}"#);
+        assert!(
+            r.contains(r#"[\"t1\",\"open\"]"#),
+            "the absorbed row must be queryable natively: {r}"
         );
     }
 
@@ -317,7 +326,10 @@ fn native_apply_commits_own_table_in_process_and_delegates_absorbed() {
             "native apply's rows must match Python Registry.apply's rows"
         );
 
-        // the absorbed fallback commits end to end through the real delegate.
+        // the absorbed apply commits natively here too; its CONFLICT then
+        // reduces to the bare ERROR and rides the real delegate for the
+        // violation set — against the healed stream (the watermark tail
+        // replay), so the refusal sees the native commit it conflicts with.
         let r = c.call(
             5,
             "apply",
@@ -325,7 +337,20 @@ fn native_apply_commits_own_table_in_process_and_delegates_absorbed() {
         );
         assert!(
             r.contains(r#"\"committed\":true"#),
-            "absorbed apply must commit through delegation: {r}"
+            "absorbed apply must commit natively: {r}"
+        );
+        let r = c.call(
+            6,
+            "apply",
+            r#"{"app":"ringpy","fact_type":"Task_has_Status","fact":["t9","closed"]}"#,
+        );
+        assert!(
+            r.contains(r#"\"committed\":false"#),
+            "a second Status must refuse through the delegate: {r}"
+        );
+        assert!(
+            r.contains(r#"\"violations\""#),
+            "the refusal owes the offenders: {r}"
         );
     }
 

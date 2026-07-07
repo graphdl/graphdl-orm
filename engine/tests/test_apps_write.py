@@ -93,6 +93,32 @@ def test_retract_refuses_when_the_shrunk_population_violates(tmp_path):
     assert ("p1", "Ada") in {tuple(r) for r in reg.query("w5", "Person_has_Name")}
 
 
+def test_a_load_replays_the_streams_tail_beyond_the_snapshot(tmp_path):
+    """The store of record is the EVENT STREAM; the .db is a disposable
+    snapshot. The Rust resident commits natively by APPENDING to the stream
+    (it never touches the .db), so a snapshot can trail the stream — every
+    load replays the tail through the same create. Without the tail, a
+    delegated write validates against the stale snapshot (it commits a second
+    Status the population refuses) and its own snapshot write clobbers the
+    resident's commits: the 2026-07-06 mcp regression."""
+    reg = _mkapp(tmp_path, "w7", READINGS)
+    reg.compile("w7")
+    # a FOREIGN commit: the resident's append_event, bypassing this Registry
+    log = os.path.join(str(tmp_path), "w7", "w7.events.jsonl")
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"ft": "Person_has_Name",
+                            "fact": ["p1", "Ada"]}) + "\n")
+    rows = [list(r) for r in reg.query("w7", "Person_has_Name")]
+    assert ["p1", "Ada"] in rows                     # reads see the stream
+    receipt = reg.apply("w7", "Person_has_Name", ["p1", "Grace"])
+    assert receipt["committed"] is False             # the at-most-one holds
+    assert receipt["violations"]
+    # and the foreign commit SURVIVES a later python write's snapshot
+    reg.apply("w7", "Person_has_Name", ["p2", "Grace"])
+    rows = {tuple(r) for r in reg.query("w7", "Person_has_Name")}
+    assert rows == {("p1", "Ada"), ("p2", "Grace")}
+
+
 def test_the_db_carries_the_projected_tables(tmp_path):
     reg = _mkapp(tmp_path, "w6", READINGS)
     rep = reg.compile("w6")

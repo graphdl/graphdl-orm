@@ -74,15 +74,22 @@ fn verb_ops_answer_over_a_store_built_via_serve_ops() {
     let r = s.rpc(&store_case("Person_keeps_Pet", r#"[["p1","rex"]]"#));
     assert!(r.starts_with(r#"[["ok","#), "Person_keeps_Pet store step: {r}");
 
-    // ---- verbs: the surface-agnostic table + the resident subset ----
+    // ---- verbs: the surface-agnostic table + the resident subset — the
+    //      FULL first-class table (rust-primary serving: one verb surface,
+    //      every binding advertises exactly what it dispatches) ----
     assert_eq!(
         s.rpc(r#"{"op":"verbs"}"#),
         concat!(
             r#"{"op":"verbs","result":{"verbs":["#,
-            r#""apps_compile","apps_current","apps_list","apps_use","context","orient","#,
-            r#""apply","cells","explain","get","query","retract","schema","sql","synthesize"],"#,
-            r#""session":["apps_compile","apps_current","apps_list","apps_use","context","orient"],"#,
-            r#""app":["apply","cells","explain","get","query","retract","schema","sql","synthesize"],"#,
+            r#""apps_check","apps_compile","apps_create","apps_current","apps_list","#,
+            r#""apps_register","apps_status","apps_use","context","engine_version","orient","#,
+            r#""apply","ask","cells","compile","explain","get","induce","propose","#,
+            r#""query","retract","schema","sql","synthesize"],"#,
+            r#""session":["apps_check","apps_compile","apps_create","apps_current","#,
+            r#""apps_list","apps_register","apps_status","apps_use","context","#,
+            r#""engine_version","orient"],"#,
+            r#""app":["apply","ask","cells","compile","explain","get","induce","#,
+            r#""propose","query","retract","schema","sql","synthesize"],"#,
             r#""resident":["cells","query","run_rules","synthesize_pairs","verbs"]}}"#
         )
     );

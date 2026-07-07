@@ -68,3 +68,33 @@ def test_a_rule_atom_over_an_absorbed_unary_derives():
     D = apply(A(2), system.create(D, "Task_is_ready", to_lam(("t7",))))
     D = system.run_rules(D)
     assert ("t7",) in _cell(from_lam(D), "Task_is_startable")
+
+
+def test_a_rule_derived_absorbed_head_lands_on_the_column():
+    """view == reassembly for DERIVED heads too: a rule whose head is an
+    absorbed fact type writes the ** cell (the derive cache) AND the RMAP
+    columns — run_rules reconciles the columns to exactly the settled cell,
+    holing keys whose derived row vanished (the sweep's supersession reaches
+    the storage, not just the cache)."""
+    MODEL2 = """Person(.Name) is an entity type.
+Room is a value type.
+Person was in Room.
+Each Person was in at most one Room.
+Person1 is placed if Person1 was in some Room1.
+"""
+    D, rep = forml.compile_model(MODEL2)
+    assert rep["unparsed"] == []
+    part = system.rmap_partition(D)
+    assert part["Person_is_placed"] == "Person"               # absorbed unary head
+    D = apply(A(2), system.create(D, "Person_was_in_Room", to_lam(("Adler", "library"))))
+    D = system.run_rules(D)
+    # the cache derived...
+    assert ("Adler",) in {tuple(r) for r in system._pop_rows(D, "Person_is_placed")}
+    # ...and the COLUMN carries it: view == reassembly
+    assert system.ft_view(D, "Person_is_placed", part) == {("Adler",)}
+    # supersession reaches the column: the antecedent vanishes, the sweep
+    # clears the head, and the row's column holes
+    D = apply(ast.Store("Person_was_in_Room"), S(to_lam(()), D))
+    D = system.run_rules(D)
+    assert {tuple(r) for r in system._pop_rows(D, "Person_is_placed")} == set()
+    assert system.ft_view(D, "Person_is_placed", part) == set()

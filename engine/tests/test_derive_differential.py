@@ -139,3 +139,73 @@ def test_rust_self_supporting_cyclic_fixpoint_matches_python():
     finally:
         s.close()
     assert got == want                                        # the closure, both hosts
+
+
+def test_rust_derive_reconciles_absorbed_heads_to_the_columns(tmp_path):
+    """view == reassembly for DERIVED heads, cross-host: after an apply whose
+    ripple derives an ABSORBED head, the entity's table row carries the
+    derived column in BOTH engines — python's run_rules reconciles, and the
+    resident's bounded native derive must reconcile identically or the
+    stores diverge row-for-row."""
+    import json
+    import os
+    import shutil
+    import subprocess
+    import pytest
+    from pyarest import apps as _apps, canon as _canon, system
+    exe = _canon.rust_bin("arestlam")
+    if not os.path.exists(exe):
+        pytest.skip("rust kernel not built")
+    MODEL = """Person(.Name) is an entity type.
+Room is a value type.
+Person was in Room.
+Each Person was in at most one Room.
+Person1 is placed if Person1 was in some Room1.
+"""
+    root = str(tmp_path / "apps")
+    d = os.path.join(root, "flow", "readings")
+    os.makedirs(d)
+    with open(os.path.join(d, "app.md"), "w", encoding="utf-8") as f:
+        f.write(MODEL)
+    reg = _apps.Registry(root, cache_dir=str(tmp_path / "fz"))
+    reg.compile("flow")
+    # snapshot the compiled app for the resident BEFORE the python apply
+    root2 = str(tmp_path / "apps2")
+    shutil.copytree(root, root2)
+    # PYTHON: apply + ripple
+    reg.apply("flow", "Person_was_in_Room", ("Adler", "library"))
+    D = reg._load("flow")
+    py_row = next(tuple(c[2]) for c in
+                  __import__("pyarest").lam.from_lam(D)
+                  if isinstance(c, tuple) and len(c) >= 3
+                  and c[1] == "Person:Adler")
+    assert "T" in py_row                                      # the derived column landed
+    # RUST: the same apply natively (delegation disabled), then read the row
+    proc = subprocess.Popen(
+        [exe, "--mcp", "--apps-dir", root2, "--python", "no-such-interpreter"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        encoding="utf-8")
+
+    def rpc(mid, method, params=None):
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": mid,
+                                     "method": method,
+                                     "params": params or {}}) + "\n")
+        proc.stdin.flush()
+        return json.loads(proc.stdout.readline())
+
+    try:
+        rpc(1, "initialize", {"protocolVersion": "2024-11-05"})
+        rpc(2, "tools/call", {"name": "apps_use", "arguments": {"name": "flow"}})
+        ap = rpc(3, "tools/call", {"name": "apply", "arguments": {
+            "app": "flow", "fact_type": "Person_was_in_Room",
+            "fact": ["Adler", "library"]}})
+        assert json.loads(ap["result"]["content"][0]["text"])["committed"] is True
+    finally:
+        proc.kill()
+    # the resident persisted its store to the sidecar: read the row there
+    side = json.load(open(os.path.join(root2, "flow", "flow.store.json"),
+                          encoding="utf-8"))
+    rust_row = next((tuple(c[2]) for c in side["d"]
+                     if isinstance(c, list) and len(c) >= 3
+                     and c[0] == "CELL" and c[1] == "Person:Adler"), None)
+    assert rust_row == py_row

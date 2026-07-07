@@ -991,6 +991,71 @@ def rebuild_class_twins(D):
     return len(specs)
 
 
+def _reconcile_absorbed_heads(D, heads):
+    """view == reassembly for DERIVED heads: an ABSORBED head's ** cell is the
+    derive cache and its RMAP column is the storage, so after the fixpoint the
+    columns become exactly the cell — present rows write their value onto the
+    key's table row (fresh keys join the index, hole-padded) and keys whose
+    derived row VANISHED hole the column (the sweep's supersession reaches the
+    storage). One from_lam/to_lam pass for all heads."""
+    from .lam import to_lam, from_lam
+    part = rmap_partition(D)
+    plan = []
+    for ft in heads:
+        table = part.get(ft, ft)
+        if table == ft:
+            continue
+        cols = table_columns(part, table)
+        col = 2 + cols.index(ft)
+        width = 1 + len(cols)
+        unary = max((r[2] for r in _pop_rows(D, "role")
+                     if len(r) >= 3 and r[1] == ft), default=2) == 1
+        plan.append((ft, table, col, width, unary,
+                     [tuple(r) for r in _pop_rows(D, ft)]))
+    if not plan:
+        return D
+    from .lam import from_lam as _fl
+    cells_l = list(_fl(D))
+    idx = {c[1]: i for i, c in enumerate(cells_l)
+           if isinstance(c, tuple) and len(c) >= 3 and c[0] == "CELL"}
+
+    def setcell(name, val):
+        if name in idx:
+            cells_l[idx[name]] = ("CELL", name, val)
+        else:
+            idx[name] = len(cells_l)
+            cells_l.append(("CELL", name, val))
+
+    for (ft, table, col, width, unary, rows) in plan:
+        tbl = list(cells_l[idx[table]][2]) if table in idx else []
+        keys = {r[0] for r in tbl if r}
+        want = {}
+        for r in rows:
+            if r:
+                want[r[0]] = "T" if unary else (r[1] if len(r) >= 2 else "#")
+        for k in sorted(keys):
+            rc = f"{table}:{k}"
+            row = list(cells_l[idx[rc]][2]) if rc in idx                 else [k] + ["#"] * (width - 1)
+            while len(row) < width:
+                row.append("#")
+            v = want.pop(k, "#")
+            if row[col - 1] != v:
+                row[col - 1] = v
+                setcell(rc, tuple(row))
+        for k in sorted(want):
+            rc = f"{table}:{k}"
+            row = list(cells_l[idx[rc]][2]) if rc in idx                 else [k] + ["#"] * (width - 1)
+            while len(row) < width:
+                row.append("#")
+            row[col - 1] = want[k]
+            setcell(rc, tuple(row))
+            if k not in keys:
+                keys.add(k)
+                tbl.append((k,))
+        setcell(table, tuple(tbl))
+    return to_lam(tuple(cells_l))
+
+
 def run_rules(D, changed=None, stats=None):
     """Cross-cell derivation to the least fixed point, semi-naive (Bancilhon–
     Ramakrishnan 1986): round one evaluates full bodies, BOUNDED by the frontier
@@ -1210,6 +1275,7 @@ def run_rules(D, changed=None, stats=None):
     # all three passes the same way, so iteration runs exactly as deep as the
     # dependency chain that moved.
     dirty = None if changed is None else (set(changed) | closure_changed)
+    strata_changed = set()
     for _outer in range(12):
         settled = True
         round_changed = set()
@@ -1287,6 +1353,14 @@ def run_rules(D, changed=None, stats=None):
         if settled:
             break
         dirty = round_changed
+        strata_changed.update(round_changed)
+    touched = closure_changed | strata_changed
+    if touched:
+        part_r = rmap_partition(D)
+        absorbed = [h for h in sorted(touched)
+                    if h in derived_heads and part_r.get(h, h) != h]
+        if absorbed:
+            D = _reconcile_absorbed_heads(D, absorbed)
     return D
 
 
