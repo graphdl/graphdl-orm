@@ -296,6 +296,29 @@ static class Reducer
                 var b = o[1] is string sb ? sb : o[1] is long ib ? ib.ToString() : null;
                 return a is null || b is null ? Bot.Value : a + ":" + b;
             }
+            case "skolem":
+            {
+                // The skolem boundary op (task-970, spec D5 beside cellkey):
+                // "ve_" + fnv1a64 hex of the frontier values joined by '|'.
+                // str/int atoms only; empty or non-sequence input bottoms.
+                // Mirrors the Python/Rust/Java twins.
+                if (x is not object[] xs || xs.Length == 0) return Bot.Value;
+                var parts = new string[xs.Length];
+                for (var i = 0; i < xs.Length; i++)
+                {
+                    parts[i] = xs[i] is string sv ? sv
+                             : xs[i] is long iv ? iv.ToString() : null;
+                    if (parts[i] is null) return Bot.Value;
+                }
+                var h = 14695981039346656037UL;
+                foreach (var b in System.Text.Encoding.UTF8.GetBytes(
+                             string.Join("|", parts)))
+                {
+                    h ^= b;
+                    h *= 1099511628211UL;
+                }
+                return "ve_" + h.ToString("x16");
+            }
             case "lex":
             {
                 // The tokenizer boundary (spec D5, beside cellkey): text to

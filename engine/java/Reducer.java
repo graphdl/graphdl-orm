@@ -223,6 +223,28 @@ public class Reducer {
                      : o[1] instanceof Long ? o[1].toString() : null;
             return val(a == null || b == null ? BOT : a + ":" + b);
         }
+        if (name.equals("skolem")) {
+            // The skolem boundary op (task-970, spec D5 beside cellkey): an
+            // existential head's fresh id as a PURE function of its frontier —
+            // "ve_" + fnv1a64 hex of the values joined by '|'. str/int atoms
+            // only; empty or non-sequence input bottoms. Mirrors the
+            // Python/Rust/C# twins; determinism is the idempotence crux.
+            if (o == null || o.length == 0) return val(BOT);
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < o.length; i++) {
+                String v = o[i] instanceof String ? (String) o[i]
+                         : o[i] instanceof Long ? o[i].toString() : null;
+                if (v == null) return val(BOT);
+                if (i > 0) sb.append('|');
+                sb.append(v);
+            }
+            long h = -3750763034362895579L;              // fnv1a64 offset basis
+            for (byte b : sb.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8)) {
+                h ^= (b & 0xffL);
+                h *= 1099511628211L;                     // fnv1a64 prime, wrapping
+            }
+            return val("ve_" + String.format("%016x", h));
+        }
         if (name.equals("lex")) {
             // The tokenizer boundary (spec D5, beside cellkey): text to per-word
             // lexical records; the vocabulary matching above it is canonical

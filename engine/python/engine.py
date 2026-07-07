@@ -1671,6 +1671,46 @@ def _register_cellkey():
 _register_cellkey()
 
 
+# The skolem boundary op (task-970's value-invention leaf, mapped to 0.9.0):
+# the semi-oblivious chase's labelled null — an existential head's fresh id
+# as a PURE function of its frontier. apply(skolem, ⟨v1..vn⟩) answers
+# 've_' + fnv1a64_hex(v1 '|' .. '|' vn). ID MINTING is a boundary act (the
+# slug precedent, same D5 slot); determinism is the idempotence crux: the
+# same frontier answers the same id, so the owned sweep DEDUPS a
+# re-derivation instead of duplicating it — eager delete-and-rederive IS
+# the chase step. An empty or non-sequence input answers ⊥ (a skolem with
+# no distinguishing frontier is a modeling error, not a global singleton).
+def _skolem_impl(mu):
+    from . import defs as _d
+    import pyarest.lam as L
+
+    def g(o):
+        it = _d._items(L._list(o))
+        if not it:
+            return L.BOT
+        vals = []
+        for x in it:
+            v = _d._aval(x)
+            # str and int atoms only (the cross-host pin's domain): a float
+            # frontier would format differently per host — refuse it
+            if not isinstance(v, (str, int)) or isinstance(v, bool):
+                return L.BOT
+            vals.append(str(v))
+        h = 14695981039346656037
+        for byte in "|".join(vals).encode("utf-8"):
+            h = ((h ^ byte) * 1099511628211) % (1 << 64)
+        return L.atom("ve_" + format(h, "016x"))
+    return g
+
+
+def _register_skolem():
+    from .defs import register
+    register("skolem", _skolem_impl)
+
+
+_register_skolem()
+
+
 # The tokenizer boundary (the keystone's transducer set, same D5 slot): three
 # value ops carry text into the object world — lex (text → per-word records),
 # implode (⟨sep, words⟩ → one atom; templates are strings in factType rows),

@@ -761,6 +761,34 @@ fn register_base() {
             _ => bot(),
         }
     }));
+    // the skolem boundary op (task-970 mapped to 0.9.0): an existential
+    // head's fresh id as a PURE function of its frontier — 've_' +
+    // fnv1a64_hex(values joined '|'). Determinism is the idempotence crux
+    // (same frontier, same id: the owned sweep dedups re-derivations).
+    // str/int atoms only; empty or non-sequence input answers ⊥.
+    register("skolem", Rc::new(|_mu, o| {
+        let it = items(&list_of(&o));
+        if it.is_empty() {
+            return bot();
+        }
+        let mut vals: Vec<String> = Vec::new();
+        for x in &it {
+            match aval(x) {
+                Some(l) => match &*l {
+                    Leaf::S(s) => vals.push(s.clone()),
+                    Leaf::I(i) => vals.push(i.to_string()),
+                    _ => return bot(),
+                },
+                None => return bot(),
+            }
+        }
+        let mut h: u64 = 14695981039346656037;
+        for b in vals.join("|").as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(1099511628211);
+        }
+        atom(Leaf::S(format!("ve_{:016x}", h)))
+    }));
     register("lex", Rc::new(|_mu, o| {
         let t = match aval(&o).and_then(|l| leaf_str(&l)) {
             Some(t) => t,
@@ -1264,6 +1292,39 @@ impl NEval {
                     match (sv(&a), sv(&b)) {
                         (Some(p), Some(q)) => N::A(Rc::new(Leaf::S(format!("{}:{}", p, q)))),
                         _ => N::Bot,
+                    }
+                }
+                _ => N::Bot,
+            },
+            "skolem" => match x {
+                N::S(xs) if !xs.is_empty() => {
+                    let mut vals: Vec<String> = Vec::new();
+                    let mut ok = true;
+                    for v in xs.iter() {
+                        match v {
+                            N::A(l) => match &**l {
+                                Leaf::S(s) => vals.push(s.clone()),
+                                Leaf::I(i) => vals.push(i.to_string()),
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
+                            },
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok {
+                        N::Bot
+                    } else {
+                        let mut h: u64 = 14695981039346656037;
+                        for b in vals.join("|").as_bytes() {
+                            h ^= *b as u64;
+                            h = h.wrapping_mul(1099511628211);
+                        }
+                        N::A(Rc::new(Leaf::S(format!("ve_{:016x}", h))))
                     }
                 }
                 _ => N::Bot,
