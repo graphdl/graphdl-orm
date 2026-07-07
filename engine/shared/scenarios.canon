@@ -64,5 +64,11 @@ DEF("case:reading-ftid", S2(A("system:ftid"), S2(A("{0} was placed by {1}"), S2(
 
 DEF("case:skolem-mints-frontier-id", S2(A("skolem"), S2(A("menu"), A("t1")))),
 
-DEF("case:skolem-empty-frontier-bottoms", S2(A("skolem"), PHI()))
+DEF("case:skolem-empty-frontier-bottoms", S2(A("skolem"), PHI())),
+
+DEF("case:escape-html-entities", S2(A("escape_html"), A("a<b>&\"c"))),
+
+DEF("case:escape-html-int-stringifies", S2(A("escape_html"), N(7))),
+
+DEF("case:render-menu-canonical", S2(A("system:render_html"), S2(A("menu"), S1(S3(A("button"), A("go"), A("done"))))))
 )

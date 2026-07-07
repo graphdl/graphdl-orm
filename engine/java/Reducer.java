@@ -223,6 +223,16 @@ public class Reducer {
                      : o[1] instanceof Long ? o[1].toString() : null;
             return val(a == null || b == null ? BOT : a + ":" + b);
         }
+        if (name.equals("escape_html")) {
+            // The html escape transducer (the render's ONE boundary piece):
+            // & < > " to entities, ints stringify, sequences bottom.
+            // Mirrors the Python/Rust/C# twins.
+            String v = x instanceof String ? (String) x
+                     : x instanceof Long ? x.toString() : null;
+            if (v == null) return val(BOT);
+            return val(v.replace("&", "&amp;").replace("<", "&lt;")
+                        .replace(">", "&gt;").replace("\"", "&quot;"));
+        }
         if (name.equals("skolem")) {
             // The skolem boundary op (task-970, spec D5 beside cellkey): an
             // existential head's fresh id as a PURE function of its frontier —

@@ -296,6 +296,16 @@ static class Reducer
                 var b = o[1] is string sb ? sb : o[1] is long ib ? ib.ToString() : null;
                 return a is null || b is null ? Bot.Value : a + ":" + b;
             }
+            case "escape_html":
+            {
+                // The html escape transducer (the render's ONE boundary
+                // piece): & < > " to entities, ints stringify, sequences
+                // bottom. Mirrors the Python/Rust/Java twins.
+                var ev = x is string es ? es : x is long ei ? ei.ToString() : null;
+                if (ev is null) return Bot.Value;
+                return ev.Replace("&", "&amp;").Replace("<", "&lt;")
+                         .Replace(">", "&gt;").Replace("\"", "&quot;");
+            }
             case "skolem":
             {
                 // The skolem boundary op (task-970, spec D5 beside cellkey):

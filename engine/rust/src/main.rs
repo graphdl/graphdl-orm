@@ -789,6 +789,24 @@ fn register_base() {
         }
         atom(Leaf::S(format!("ve_{:016x}", h)))
     }));
+    // the html escape transducer (the render's ONE boundary piece; the
+    // doctrine correction 2026-07-08): & < > " to entities, ints
+    // stringify, sequences bottom. Mirrors the Python/Java/C# twins.
+    register("escape_html", Rc::new(|_mu, o| {
+        match aval(&o) {
+            Some(l) => {
+                let s = match &*l {
+                    Leaf::S(s) => s.clone(),
+                    Leaf::I(i) => i.to_string(),
+                    _ => return bot(),
+                };
+                let e = s.replace('&', "&amp;").replace('<', "&lt;")
+                    .replace('>', "&gt;").replace('"', "&quot;");
+                atom(Leaf::S(e))
+            }
+            None => bot(),
+        }
+    }));
     register("lex", Rc::new(|_mu, o| {
         let t = match aval(&o).and_then(|l| leaf_str(&l)) {
             Some(t) => t,
@@ -1335,6 +1353,19 @@ impl NEval {
                         (Some(p), Some(q)) => N::A(Rc::new(Leaf::S(format!("{}:{}", p, q)))),
                         _ => N::Bot,
                     }
+                }
+                _ => N::Bot,
+            },
+            "escape_html" => match x {
+                N::A(l) => {
+                    let s = match &**l {
+                        Leaf::S(s) => s.clone(),
+                        Leaf::I(i) => i.to_string(),
+                        _ => return Some(N::Bot),
+                    };
+                    let e = s.replace('&', "&amp;").replace('<', "&lt;")
+                        .replace('>', "&gt;").replace('"', "&quot;");
+                    N::A(Rc::new(Leaf::S(e)))
                 }
                 _ => N::Bot,
             },
