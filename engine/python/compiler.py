@@ -1491,6 +1491,31 @@ def _h_rule_if(g, k, m, kind="fully-derived"):
             A_.append(("ruleCopies", (rule_cid, atoms[0][0], hft)))
         obj = _sys.compile_rule([a[0] for a in atoms], proj, widths, filters,
                                 joins)
+    elif ok and atoms and not negs and agg is None:
+        # EXISTENTIAL (TGD) heads, task-970's surface under 0.9.0: a head
+        # variable never bound in the body is a SKOLEM role. Its projection
+        # entry is the combinator ⟨COMP, skolem, ⟨CONS, CONST(varname),
+        # frontier selectors…⟩⟩ over the joined row — the variable IS the
+        # skolem function symbol (two fresh variables in one head mint
+        # distinct ids; the same variable over the same body SHARES its id
+        # across rules, the multi-consequent E), and the frontier is every
+        # body-bound column in appearance order. theta:selrow consumes the
+        # entry as a function directly, so no new machinery evaluates it;
+        # deterministic ids make the OWNED sweep idempotent — eager
+        # delete-and-rederive IS the semi-oblivious chase step.
+        fixed_idx = {vi for vi, _l in _hlits}
+        litmap = {vi: lit for vi, lit in _hlits}
+        frontier = tuple(sorted(cols.values()))
+
+        def _sk(v):
+            return ("COMP", "skolem", ("CONS", ("CONST", v)) + frontier)
+        A_.append(("derivationRule", (hft, atoms[0][0], len(atoms))))
+        A_.append(("ruleSkolem", (rule_cid, hft)))
+        proj = [("CONST", _num(litmap[i])) if i in fixed_idx
+                else (cols[v] if v in cols else _sk(v))
+                for i, v in enumerate(hvars)]
+        obj = _sys.compile_rule([a[0] for a in atoms], proj, widths, filters,
+                                joins)
     elif ok:
         fixed = {hvars[vi] for vi, _l in _hlits if vi < len(hvars)}
         unbound = sorted(set(hvars) - set(cols) - fixed) if atoms else []
