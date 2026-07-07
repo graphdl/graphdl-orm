@@ -871,39 +871,78 @@ def _clause_ft(text, known):
     return ft_full
 
 
+# WHICH constraint fact a statement asserts and WHERE each scoped object
+# attaches is the canonical object system:cs_rows (⟨kind, subject, clause ids,
+# raw texts, modality⟩ → the constraint A-row + ⟨cell, builder⟩ attachment
+# rows); these handlers are thin callers, sm_rows-style. Subjects and clause
+# ids arrive RESOLVED (the boundary's step), the [:40] cid mint is boundary
+# policy (no take prim joins the kernel for cosmetics), and the attachment
+# rows fold through the named builders — already canon themselves
+# (constraints:scoped_*), so each object needs only its arguments read back
+# off the A-row.
+_CS_PREFIX = {"disjunctive_mandatory": "ior_", "subset": "subset_",
+              "equality": "eq_"}
+
+
+def _cs_call(kind, subj, clause_fts, raws, m):
+    from .reduce import apply as _apply
+    from .lam import atom as _A, from_lam as _fl
+    rows = _fl(_apply(_A("system:cs_rows"),
+                      to_lam((kind, subj, tuple(clause_fts), tuple(raws), m))))
+    arow, attaches = rows[0], rows[1:]
+    cid = arow[1]
+    pre = _CS_PREFIX.get(kind, "")
+    minted = pre + cid[len(pre):][:40] if pre else cid
+    clauses = tuple(arow[4]) if isinstance(arow[4], tuple) else arow[4]
+    A_ = [("constraint", (minted, arow[2], arow[3], clauses, arow[5]))]
+    build = {
+        "exclusion": lambda ft: C.exclusion(),
+        "exclusive_or": lambda ft: C.exclusive_or(),
+        "inclusive_or": lambda ft: C.inclusive_or(),
+        "scoped_exclusion": lambda ft: C.scoped_exclusion(clauses, ft),
+        "scoped_exclusive_or":
+            lambda ft: C.scoped_exclusive_or(arow[3], clauses, ft),
+        "scoped_inclusive_or":
+            lambda ft: C.scoped_inclusive_or(arow[3], clauses, ft),
+        "scoped_subset": lambda ft: C.scoped_subset(arow[4]),
+        "scoped_equality_side": lambda ft: C.scoped_equality_side(ft),
+    }
+    objs = []
+    for (_tag, cell, builder) in attaches:
+        ft = cell.split("@", 1)[1] if "@" in cell else None
+        if builder == "scoped_equality_side":
+            # the _a side checks against B, the _b side against A
+            ft = arow[4] if cell.endswith("_a") else arow[3]
+        objs.append((cell.replace(cid, minted, 1), build[builder](ft)))
+    return A_, objs
+
+
 def _h_set_comparison(g, k, m):
     subj, mode, body = g
-    clauses = tuple(_clause_ft(c, k) for c in body.split(";") if c.strip())
-    kind = {"exactly": "exclusive_or", "at most": "exclusion"}[mode]
-    cid = _slug(subj) + {"exactly": "_xor", "at most": "_excl"}[mode]
-    scoped = {"exactly": lambda ft: C.scoped_exclusive_or(subj, clauses, ft),
-              "at most": lambda ft: C.scoped_exclusion(clauses, ft)}[mode]
-    objs = [(cid, {"exactly": C.exclusive_or, "at most": C.exclusion}[mode]())] + \
-           [(cid + "@" + ft, scoped(ft)) for ft in clauses]    # one attachment per clause cell
-    return [("constraint", (cid, kind, subj, clauses, m))], objs
+    pairs = [(c.strip(), _clause_ft(c, k))
+             for c in body.split(";") if c.strip()]
+    return _cs_call(mode, subj, [ft for _, ft in pairs],
+                    [t for t, _ in pairs], m)
 
 def _h_disjunctive(g, k, m):
     body = g[-1]
     subj, rest = _subject(body, k) if len(g) == 1 else (_subject(g[0], k)[0], body)
-    clauses = tuple(_clause_ft(subj + " " + c, k) for c in rest.split(" or ") if c.strip())
-    cid = "ior_" + _slug(subj)[:40]
-    objs = [(cid, C.inclusive_or())] + \
-           [(cid + "@" + ft, C.scoped_inclusive_or(subj, clauses, ft)) for ft in clauses]
-    return [("constraint", (cid, "disjunctive_mandatory", subj, clauses, m))], objs
+    pairs = [(subj + " " + c.strip(), _clause_ft(subj + " " + c, k))
+             for c in rest.split(" or ") if c.strip()]
+    return _cs_call("disjunctive_mandatory", subj, [ft for _, ft in pairs],
+                    [t for t, _ in pairs], m)
 
 def _h_subset(g, k, m):
     ante, cons_txt = g
     conseq, _, _where = cons_txt.partition(" where ")         # a 'where' join condition, if present
-    ft_a, ft_b = _clause_ft(ante, k), _clause_ft(conseq, k)
-    cid = "subset_" + _slug(ante)[:40]
-    return [("constraint", (cid, "subset", ft_a, ft_b, m))], \
-        [(cid, C.scoped_subset(ft_b))]                         # attached to the antecedent cell
+    return _cs_call("subset", "",
+                    [_clause_ft(ante, k), _clause_ft(conseq, k)],
+                    [ante, conseq], m)
 
 def _h_equality(g, k, m):
-    ft_a, ft_b = _clause_ft(g[0], k), _clause_ft(g[1], k)
-    cid = "eq_" + _slug(g[0])[:40]
-    return [("constraint", (cid, "equality", ft_a, ft_b, m))], \
-        [(cid + "_a", C.scoped_equality_side(ft_b)), (cid + "_b", C.scoped_equality_side(ft_a))]
+    return _cs_call("equality", "",
+                    [_clause_ft(g[0], k), _clause_ft(g[1], k)],
+                    [g[0], g[1]], m)
 
 def _h_negation(g, k, m):
     a, pred = _subject(g[0], k)
