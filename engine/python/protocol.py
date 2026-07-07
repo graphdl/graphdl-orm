@@ -2450,6 +2450,19 @@ TOOLS = [
                     "status filter.",
      "inputSchema": {"type": "object", "properties": {
          "status": {"type": "string"}}}},
+    {"name": "select_component",
+     "description": "Select a UI Component by intent and constraints from "
+                    "the Component registry app (binding doctrine: the "
+                    "registry is facts; toolkit implementations register in "
+                    "DEFS). Answers ranked {component, role, toolkit, "
+                    "symbol, score} records; intent matches the Component "
+                    "Role as a case-insensitive substring.",
+     "inputSchema": {"type": "object", "properties": {
+         "intent": {"type": "string"},
+         "traits": {"type": "array", "items": {"type": "string"}},
+         "toolkit": {"type": "string"},
+         "limit": {"type": "number"},
+         "app": {"type": "string"}}, "required": ["intent"]}},
 ]
 
 
@@ -2608,6 +2621,62 @@ def tutor_check(reg, ref):
             "detail": detail}
 
 
+def select_component(reg, intent, traits=None, toolkit=None, limit=5,
+                     app=None):
+    """Select a UI Component by intent and constraints (the UI redirect,
+    2026-07-08: binding doctrine — the registry is ORDINARY FACTS in a
+    registry app, toolkit implementations register in DEFS per the iFactr
+    pattern, and selection is this verb). Intent matches case-insensitively
+    as a substring against the Component Role (either containment
+    direction); wanted traits score +2 present / -1 absent; ranked
+    {component, role, toolkit, symbol, score} records answer, highest
+    first, ties by component id."""
+    name = app or "_components"
+
+    def rows(ft, arity=2):
+        try:
+            return [tuple(str(x) for x in r) for r in reg.query(name, ft)
+                    if isinstance(r, (list, tuple)) and len(r) >= arity]
+        except Exception:
+            return []
+    impls = {}
+    # both registry spellings: the corpus's objectified ternary ⟨component,
+    # toolkit, symbol⟩ and the flat ⟨component, symbol, toolkit⟩
+    for c, tk, sym in rows("Component_is_implemented_by_Toolkit_at_Toolkit_Symbol",
+                           arity=3):
+        impls.setdefault(c, []).append((sym, tk))
+    for c, sym, tk in rows("Component_is_implemented_by_Symbol_in_Toolkit",
+                           arity=3):
+        impls.setdefault(c, []).append((sym, tk))
+    haves = {}
+    for c, t in rows("Component_has_Trait"):
+        haves.setdefault(c, set()).add(t)
+    # binding-level traits key by '<component>.<toolkit>' (the corpus's
+    # ImplementationBinding objectification): per-implementation bonuses
+    bind_traits = {}
+    for b, t in rows("ImplementationBinding_has_Trait"):
+        bind_traits.setdefault(b, set()).add(t)
+    want = (intent or "").strip().lower()
+    wanted = set(traits or [])
+    out = []
+    for comp, role in rows("Component_has_Component_Role"):
+        rl = role.lower()
+        if want and want not in rl and rl not in want:
+            continue
+        got = haves.get(comp, set())
+        base = 10 + 2 * len(wanted & got) - len(wanted - got)
+        for sym, tk in impls.get(comp, [("", "")]):
+            if toolkit and tk != toolkit:
+                continue
+            bgot = bind_traits.get(f"{comp}.{tk}", set())
+            score = base + 2 * len(wanted & bgot)
+            out.append({"component": comp, "role": role, "toolkit": tk,
+                        "symbol": sym, "score": score})
+    out.sort(key=lambda p: (-p["score"], p["component"]))
+    return {"app": name, "intent": intent,
+            "components": out[:int(limit or 5)]}
+
+
 def tutor_authoring(reg, status=None):
     """The authoring workflow, joined from the sandbox's Authoring Step
     facts (the legacy readTutorAuthoringWorkflow, positionally: the new
@@ -2685,6 +2754,10 @@ SESSION_VERBS = {
     "tutor_actions": lambda reg, a: APP_VERBS["actions"](reg, TUTOR_APP, a),
     "tutor_authoring": lambda reg, a: tutor_authoring(
         reg, status=a.get("status")),
+    "select_component": lambda reg, a: select_component(
+        reg, a.get("intent", ""), traits=a.get("traits") or a.get("a11y"),
+        toolkit=a.get("toolkit"), limit=a.get("limit", 5),
+        app=a.get("app")),
 }
 
 APP_VERBS = {
