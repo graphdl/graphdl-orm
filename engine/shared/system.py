@@ -3885,6 +3885,112 @@ DEF("system:ftid",
                                                     S3(A("CONS"), K(A("theta:iota")), S3(A("COMP"), A("length"), N(2)))),
                                                 N(2))))))))))))),
 
+DEF("system:cf_dropw",
+    S3(
+        A("COMP"), A("apply"),
+        S3(
+            A("CONS"),
+            S3(
+                A("COMP"), A("apply"),
+                S3(
+                    A("CONS"), K(A("theta:Filter")),
+                    S4(
+                        A("CONS"), K(A("COMP")), K(A("not")),
+                        S4(
+                            A("CONS"), K(A("COMP")), K(A("eq")),
+                            S4(
+                                A("CONS"), K(A("CONS")), K(N(1)),
+                                S3(A("CONS"), K(A("CONST")), N(2))))))),
+            N(1)))),
+
+DEF("system:cf_dropq",
+    S3(
+        A("COMP"), A("system:cf_dropw"),
+        S3(
+            A("CONS"),
+            S3(
+                A("COMP"), A("system:cf_dropw"),
+                S3(
+                    A("CONS"),
+                    S3(
+                        A("COMP"), A("system:cf_dropw"),
+                        S3(
+                            A("CONS"),
+                            S3(
+                                A("COMP"), A("system:cf_dropw"),
+                                S3(A("CONS"), A("id"), K(A("some")))),
+                            K(A("that")))),
+                    K(A("each")))),
+            K(A("no"))))),
+
+DEF("system:cf_text",
+    S3(
+        A("COMP"), A("apply"),
+        S3(
+            A("CONS"), K(A("implode")),
+            S3(A("CONS"), K(A(" ")), S2(A("ALPHA"), N(1)))))),
+
+DEF("system:cf_drop_min",
+    S3(
+        A("COMP"), A("system:cf_text"),
+        S3(A("COMP"), A("system:cf_dropq"), A("lex")))),
+
+DEF("system:cf_drop_full",
+    S3(
+        A("COMP"), A("system:cf_text"),
+        S3(
+            A("COMP"), A("system:cf_dropw"),
+            S3(
+                A("CONS"),
+                S3(
+                    A("COMP"), A("system:cf_dropw"),
+                    S3(
+                        A("CONS"),
+                        S3(A("COMP"), A("system:cf_dropq"), A("lex")),
+                        K(A("an")))),
+                K(A("a")))))),
+
+DEF("system:cf_scan",
+    S3(A("COMP"), A("system:ftid"), A("system:reading_parse"))),
+
+DEF("system:clause_ft",
+    S3(
+        A("COMP"),
+        S4(
+            A("COND"),
+            S4(
+                A("COMP"), A("not"), A("null"),
+                S3(
+                    A("COMP"), A("apply"),
+                    S3(
+                        A("CONS"),
+                        S3(
+                            A("COMP"), A("apply"),
+                            S3(
+                                A("CONS"), K(A("theta:Filter")),
+                                S4(
+                                    A("CONS"), K(A("COMP")), K(A("eq")),
+                                    S4(
+                                        A("CONS"), K(A("CONS")), K(A("id")),
+                                        S3(A("CONS"), K(A("CONST")), N(1)))))),
+                        N(3)))),
+            N(1), N(2)),
+        S4(
+            A("CONS"),
+            S3(
+                A("COMP"), A("system:cf_scan"),
+                S4(
+                    A("CONS"),
+                    S3(A("COMP"), A("system:cf_drop_min"), N(1)),
+                    N(2), N(3))),
+            S3(
+                A("COMP"), A("system:cf_scan"),
+                S4(
+                    A("CONS"),
+                    S3(A("COMP"), A("system:cf_drop_full"), N(1)),
+                    N(2), N(3))),
+            N(4)))),
+
 DEF("system:ca_sig",
     S4(A("CONS"), K(A("COMP")),
        K(S3(A("COMP"), A("apply"),
