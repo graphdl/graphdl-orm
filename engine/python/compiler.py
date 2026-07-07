@@ -998,42 +998,19 @@ def stage1_vocabulary(D):
     return {(r[0], r[1]) for r in _sys._pop_rows(D, "classLit") if len(r) >= 2}
 
 
-def tokenize_statement(D, stmt, nouns=(), sid="s1"):
-    """Stage-1, the bootstrap kernel: extract field FACTS from one statement. The
-    vocabulary is stage1_vocabulary (from D, never hardcoded); a Trailing Marker must
-    trail; Role References are known-noun occurrences; a quoted token is a Literal
-    Role. Returns [(field_ft, (sid, value)), …]."""
-    text = stmt.strip().rstrip(".")
-    # LITERAL-AWARE (the old engine's #845 scanner, and the same blindness the
-    # rule recognizers had): recognizer tokens and Role References must never
-    # fire INSIDE a quoted literal — task 916's description contained a
-    # negation token, classified the instance fact Negation Reading, and the
-    # specific-beats-generic dispatch dropped the fact silently
-    bare = _QUOTED_SPAN.sub(lambda m: " " * len(m.group(0)), text)
-    out = []
-    for (ftb, lit) in sorted(stage1_vocabulary(D), key=lambda p: -len(p[1])):
-        # case-insensitive: Stage-1 recognises phrases at any position, 'The possible
-        # values of …' included (the file's own Verb-override comment)
-        if not re.search(r"(?<![A-Za-z])" + re.escape(lit) + r"(?![A-Za-z])", bare, re.IGNORECASE):
-            continue
-        if ftb == "Statement_has_Trailing_Marker" and not bare.rstrip().lower().endswith(lit.lower()):
-            continue
-        out.append((ftb, (sid, lit)))
-    for n in nouns:
-        if re.search(r"(?<![A-Za-z])" + re.escape(n) + r"(?![A-Za-z])", bare):
-            out.append(("Statement_has_Role_Reference", (sid, n)))
-    quoted = _QUOTED.findall(text)
-    if quoted:
-        out.append(("Statement_has_Literal_Role", (sid, quoted[0])))
-    # the prose posture as a FIELD FACT (the flip's last item): structural
-    # punctuation OUTSIDE literals is the paragraph tell; the grammar rule
-    # 'Statement has Classification Prose iff Statement has Prose Punctuation.'
-    # classifies it, and Prose is specific so it beats Fact Type Reading
-    for mark in (",", "(", ")", ": "):
-        if mark in bare:
-            out.append(("Statement_has_Prose_Punctuation", (sid, mark)))
-            break
-    return out
+def tokenize_statement(D, stmt, nouns=(), sid="s1", vocab=None):
+    """Stage-1, the bootstrap kernel: extract field FACTS from one statement.
+    The vocabulary is stage1_vocabulary (from D, never hardcoded) — HOISTED
+    by batch callers and passed in, because the per-statement reducer fetch
+    of classLit was the fleet's 10-25-minute compile pocket (the sweep's D
+    never changes mid-loop). The extraction itself is system.stage1_fields,
+    the lex-boundary prim (literal-blind recognizers, trailing markers, role
+    references, literal roles, the prose tell — the #845 scanner's rules,
+    docstring there). Returns [(field_ft, (sid, value)), …]."""
+    from . import system as _sys
+    if vocab is None:
+        vocab = stage1_vocabulary(D)
+    return _sys.stage1_fields(stmt, vocab, nouns, sid)
 
 
 def classify_via_M(D, stmt, nouns=(), sid="s1"):
@@ -1067,8 +1044,10 @@ def classify_all_via_M(D, stmts, nouns=()):
     # per cell — the phase split measured the one-per-row applies at 2.9s of a
     # 3.7s classification while the derive (twinned) took 0.27s
     by_cell = {}
+    vocab = stage1_vocabulary(D)          # ONE reducer fetch for the sweep
     for i, stmt in enumerate(stmts):
-        for (ftb, row) in tokenize_statement(D, stmt, nouns, "s%d" % (i + 1)):
+        for (ftb, row) in tokenize_statement(D, stmt, nouns, "s%d" % (i + 1),
+                                             vocab=vocab):
             by_cell.setdefault(ftb, []).append(tuple(row))
     if not by_cell:
         return [set() for _ in stmts]

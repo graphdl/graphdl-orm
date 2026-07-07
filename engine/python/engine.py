@@ -1623,11 +1623,85 @@ def _slug_impl(mu):
     return g
 
 
+_S1_QUOTED_SPAN = None
+_S1_QUOTED = None
+
+
+def stage1_fields(text, vocab, nouns=(), sid="s1"):
+    """Stage-1, the bootstrap kernel's field extraction (moved whole from
+    compiler.tokenize_statement — the behavioral spec): the statement's field
+    FACTS from its text against the supplied VOCABULARY (the classLit
+    population, hoisted ONCE per sweep by the caller — the per-statement
+    reducer fetch was the fleet's 10-25-minute compile pocket). A Trailing
+    Marker must trail; Role References are known-noun occurrences; a quoted
+    token is a Literal Role; recognizer tokens and Role References never fire
+    INSIDE a quoted literal; structural punctuation outside literals is the
+    prose tell. Returns [(field_ft, (sid, value)), …]."""
+    import re
+    global _S1_QUOTED_SPAN, _S1_QUOTED
+    if _S1_QUOTED_SPAN is None:
+        _S1_QUOTED_SPAN = re.compile(r"'[^']*'")
+        _S1_QUOTED = re.compile(r"'([^']*)'")
+    text = text.strip().rstrip(".")
+    bare = _S1_QUOTED_SPAN.sub(lambda m: " " * len(m.group(0)), text)
+    out = []
+    for (ftb, lit) in sorted(vocab, key=lambda p: -len(p[1])):
+        if not re.search(r"(?<![A-Za-z])" + re.escape(lit) + r"(?![A-Za-z])",
+                         bare, re.IGNORECASE):
+            continue
+        if ftb == "Statement_has_Trailing_Marker" \
+                and not bare.rstrip().lower().endswith(lit.lower()):
+            continue
+        out.append((ftb, (sid, lit)))
+    for n in nouns:
+        if re.search(r"(?<![A-Za-z])" + re.escape(n) + r"(?![A-Za-z])", bare):
+            out.append(("Statement_has_Role_Reference", (sid, n)))
+    quoted = _S1_QUOTED.findall(text)
+    if quoted:
+        out.append(("Statement_has_Literal_Role", (sid, quoted[0])))
+    for mark in (",", "(", ")", ": "):
+        if mark in bare:
+            out.append(("Statement_has_Prose_Punctuation", (sid, mark)))
+            break
+    return out
+
+
+def _stage1_fields_impl(mu):
+    """Stage-1 at the lex boundary (beside lex/implode/slug — the tokenizer
+    stratum): ⟨text, vocab, nouns, sid⟩ → the field-fact rows. The
+    implementation is host regex registered against the prim name — the
+    operating rule (Samuel, 2026-07-07): a performant implementation proven
+    to the interface by the contract tests (test_stage1_canon); a canonical
+    composition is not owed at the boundary, exactly as lex itself."""
+    from . import defs as _d
+    import pyarest.lam as L
+
+    def g(o):
+        it = _d._items(L._list(o))
+        if len(it) != 4:
+            return L.BOT
+        text, sid = _d._aval(it[0]), _d._aval(it[3])
+        if not isinstance(text, str) or not isinstance(sid, str):
+            return L.BOT
+        vocab = []
+        for p in _d._items(L._list(it[1])):
+            pi = _d._items(L._list(p))
+            if len(pi) >= 2:
+                vocab.append((_d._aval(pi[0]), _d._aval(pi[1])))
+        nouns = tuple(_d._aval(n) for n in _d._items(L._list(it[2])))
+        from .lam import to_lam
+        return to_lam(tuple((ft, tuple(r))
+                            for (ft, r) in stage1_fields(text, vocab,
+                                                         nouns, sid)))
+    return g
+
+
 def _register_lex_boundary():
     from .defs import register
     register("lex", _lex_impl)
     register("implode", _implode_impl)
     register("slug", _slug_impl)
+    register("stage1_fields", _stage1_fields_impl)
 
 
 _register_lex_boundary()
