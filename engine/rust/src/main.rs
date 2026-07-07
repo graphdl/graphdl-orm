@@ -4153,8 +4153,157 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
         // on the claude scratch: 264 s canonical Rust against 10.9 s
         // delegated). Plumbing the native carrier into op_answer is the
         // priced lever that brings it home.
-        "get" | "sql" | "explain" | "validate" | "verify" | "actions" => {
+        "get" | "sql" | "explain" | "validate" | "verify" => {
             delegate_read(tool, args, apps)
+        }
+        "actions" => {
+            // NATIVE (the store-only family): Theorem 4 off the retained
+            // store — the machine walk (smDef + subtype chain), the status
+            // via the CANON's vb_fetch (the RMAP-aware ft_view, evaluated
+            // on the carrier — no rust reimplementation of the column
+            // dispatch), the triples via the CANON's sm_join, filtered
+            // from == status. Registry.actions' exact shape and key order.
+            if std::env::var_os("AREST_DELEGATE_READS").is_some() {
+                return delegate_read(tool, args, apps);
+            }
+            let app = match &apps.current {
+                Some(n) => n.clone(),
+                None => return Err((-32602,
+                    "no app loaded; call apps_use before actions".to_string())),
+            };
+            let noun = match jget(args, "noun") {
+                Some(J::S(s)) => s.clone(),
+                _ => return Err((-32602, "actions needs a string noun".to_string())),
+            };
+            let id = match jget(args, "id") {
+                Some(J::S(s)) => s.clone(),
+                Some(J::I(i)) => i.to_string(),
+                _ => return Err((-32602, "actions needs a scalar id".to_string())),
+            };
+            let leaf = |s: &str| Leaf::S(s.to_string());
+            let sv = |l: &Leaf| match l {
+                Leaf::S(s) => Some(s.clone()),
+                Leaf::I(i) => Some(i.to_string()),
+                _ => None,
+            };
+            let two = |r: &V| {
+                let it = items(&list_of(r));
+                if it.len() >= 2 {
+                    match (aval(&it[0]).and_then(|l| sv(&l)),
+                           aval(&it[1]).and_then(|l| sv(&l))) {
+                        (Some(a), Some(b)) => Some((a, b)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            };
+            let bound: Vec<(String, String)> = pop_rows(&srv.cells, &leaf("smDef"))
+                .iter().filter_map(two).map(|(sm, n)| (n, sm)).collect();
+            let subs: Vec<(String, String)> = pop_rows(&srv.cells, &leaf("subtype"))
+                .iter().filter_map(two).collect();
+            let mut n = noun.clone();
+            let mut seen: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let smd = loop {
+                if let Some((_n, sm)) = bound.iter().find(|(bn, _)| *bn == n) {
+                    break Some(sm.clone());
+                }
+                if !seen.insert(n.clone()) {
+                    break None;
+                }
+                match subs.iter().find(|(s, _)| *s == n) {
+                    Some((_s, sup)) => n = sup.clone(),
+                    None => break None,
+                }
+            };
+            let mut out = String::from("{\"app\":");
+            esc(&app, &mut out);
+            out.push_str(",\"noun\":");
+            esc(&noun, &mut out);
+            out.push_str(",\"id\":");
+            esc(&id, &mut out);
+            let smd = match smd {
+                None => {
+                    out.push_str(",\"machine\":null,\"actions\":[]}");
+                    return Ok(out);
+                }
+                Some(s) => s,
+            };
+            let gov = bound.iter().find(|(_n, sm)| *sm == smd)
+                .map(|(n, _)| n.clone()).unwrap_or_else(|| noun.clone());
+            let status_ft = pop_rows(&srv.cells, &leaf("smStatusFt")).iter()
+                .filter_map(two).find(|(bn, _)| *bn == gov)
+                .map(|(_, ft)| ft);
+            let nd = v_to_n(&srv.d);
+            let ev = NEval {
+                cells: n_cells_of(&nd),
+                process: srv.nprocess.clone(),
+                defs_n: nd.clone(),
+                fuel: std::cell::Cell::new(-1),
+            };
+            let mut status: Option<String> = None;
+            if let Some(ft) = status_ft {
+                let rows = ev.mu(napp(
+                    N::A(Rc::new(Leaf::S("system:vb_fetch".into()))),
+                    nseq(vec![N::A(Rc::new(Leaf::S(ft))), nd.clone()]),
+                ));
+                if let N::S(rs) = &rows {
+                    for r in rs.iter() {
+                        if let N::S(cols) = r {
+                            if cols.len() >= 2 {
+                                if let (N::A(a), N::A(b)) = (&cols[0], &cols[1]) {
+                                    if sv(a).as_deref() == Some(id.as_str()) {
+                                        status = sv(b);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let pops: Vec<N> = ["smFrom", "smTrigger", "smTo"].iter()
+                .map(|c| {
+                    let rows = pop_rows(&srv.cells, &leaf(c));
+                    v_to_n(&seq(from_vec(rows)))
+                })
+                .collect();
+            let triples = ev.mu(napp(
+                N::A(Rc::new(Leaf::S("system:sm_join".into()))),
+                nseq(pops),
+            ));
+            out.push_str(",\"machine\":");
+            esc(&smd, &mut out);
+            out.push_str(",\"status\":");
+            match &status {
+                Some(s) => esc(s, &mut out),
+                None => out.push_str("null"),
+            }
+            out.push_str(",\"actions\":[");
+            let mut first = true;
+            if let (Some(st), N::S(ts)) = (&status, &triples) {
+                for t in ts.iter() {
+                    if let N::S(cols) = t {
+                        if cols.len() >= 3 {
+                            if let (N::A(f), N::A(e), N::A(to)) =
+                                (&cols[0], &cols[1], &cols[2])
+                            {
+                                if sv(f).as_deref() == Some(st.as_str()) {
+                                    if !first { out.push(','); }
+                                    first = false;
+                                    out.push_str("{\"event\":");
+                                    esc(&sv(e).unwrap_or_default(), &mut out);
+                                    out.push_str(",\"to\":");
+                                    esc(&sv(to).unwrap_or_default(), &mut out);
+                                    out.push('}');
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            out.push_str("]}");
+            Ok(out)
         }
         "schema" => {
             // NATIVE (the store-only read family, 2026-07-08): the model
