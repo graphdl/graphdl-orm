@@ -1,9 +1,9 @@
-"""INTERSECTION SOURCE: shared/theta.py is one file, consumed verbatim by both
+"""INTERSECTION SOURCE: shared/theta.canon is one file, consumed verbatim by both
 hosts. Python execs it under the vocabulary binding (canon.load); the Rust kernel
 include!s the identical bytes into a function defining the same vocabulary over its
 V, and resolves the names at reduction like any compiled definition. The tests hold
 the file to its meaning: every canonical definition loaded from the shared file
-reduces exactly like python/theta.py's constructed object (the authoring toolchain),
+reduces exactly like python/theta.canon's constructed object (the authoring toolchain),
 on both kernels. No JSON shim, no parser, no tree format: the source is the source."""
 import pytest
 import pyarest.prims  # noqa: F401

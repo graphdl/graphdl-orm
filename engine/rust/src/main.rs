@@ -4241,15 +4241,15 @@ fn canon_defs() -> Vec<(String, V)> {
         let S7 = |a: V, b: V, c: V, d: V, e: V, f: V, g: V| seqv(vec![a, b, c, d, e, f, g]);
         let S8 = |a: V, b: V, c: V, d: V, e: V, f: V, g: V, h: V| seqv(vec![a, b, c, d, e, f, g, h]);
         let S9 = |a: V, b: V, c: V, d: V, e: V, f: V, g: V, h: V, i: V| seqv(vec![a, b, c, d, e, f, g, h, i]);
-        include!("../../shared/theta.py");
-        include!("../../shared/constraints.py");
-        include!("../../shared/ast.py");
-        include!("../../shared/system.py");
+        include!("../../shared/theta.canon");
+        include!("../../shared/constraints.canon");
+        include!("../../shared/ast.canon");
+        include!("../../shared/system.canon");
     }
     out.into_inner()
 }
 
-// The cross-host case table (shared/scenarios.py), the same bytes the Python,
+// The cross-host case table (shared/scenarios.canon), the same bytes the Python,
 // C#, and Java hosts consume: each DEF is ⟨expr, operand⟩, reduced by --cases.
 #[allow(non_snake_case, unused, path_statements)]
 fn scenario_defs() -> Vec<(String, V)> {
@@ -4269,7 +4269,7 @@ fn scenario_defs() -> Vec<(String, V)> {
         let S7 = |a: V, b: V, c: V, d: V, e: V, f: V, g: V| seqv(vec![a, b, c, d, e, f, g]);
         let S8 = |a: V, b: V, c: V, d: V, e: V, f: V, g: V, h: V| seqv(vec![a, b, c, d, e, f, g, h]);
         let S9 = |a: V, b: V, c: V, d: V, e: V, f: V, g: V, h: V, i: V| seqv(vec![a, b, c, d, e, f, g, h, i]);
-        include!("../../shared/scenarios.py");
+        include!("../../shared/scenarios.canon");
     }
     out.into_inner()
 }

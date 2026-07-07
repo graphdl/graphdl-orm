@@ -561,7 +561,7 @@ def _reading(text, known):
     text, and trailing text remain in the template, so unary, binary and n-ary readings, front
     text ('the birth of {0} occurred in {1}'), and hyphen binding ('adj-Type') all parse.
 
-    THE MEANING IS CANONICAL: system:reading_parse (shared/system.py, over the
+    THE MEANING IS CANONICAL: system:reading_parse (shared/system.canon, over the
     lex boundary) answers the same (template, roles); this host scan is its
     certified-equal performant override, the equality enforced over the whole
     shared/base corpus by test_reading_canon."""

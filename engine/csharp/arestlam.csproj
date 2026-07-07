@@ -13,14 +13,14 @@
        of a varargs method call by BYTE CONCATENATION (prefix + file + suffix),
        never parsing. The same bytes CPython execs and rustc tokenizes. -->
   <Target Name="WrapCanon" BeforeTargets="CoreCompile"
-          Inputs="../shared/theta.py;../shared/constraints.py;../shared/ast.py;../shared/system.py;../shared/scenarios.py"
+          Inputs="../shared/theta.canon;../shared/constraints.canon;../shared/ast.canon;../shared/system.canon;../shared/scenarios.canon"
           Outputs="$(IntermediateOutputPath)Canon.g.cs">
     <PropertyGroup>
-      <CanonTheta>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/theta.py'))</CanonTheta>
-      <CanonConstraints>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/constraints.py'))</CanonConstraints>
-      <CanonAst>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/ast.py'))</CanonAst>
-      <CanonSystem>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/system.py'))</CanonSystem>
-      <CanonScenarios>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/scenarios.py'))</CanonScenarios>
+      <CanonTheta>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/theta.canon'))</CanonTheta>
+      <CanonConstraints>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/constraints.canon'))</CanonConstraints>
+      <CanonAst>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/ast.canon'))</CanonAst>
+      <CanonSystem>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/system.canon'))</CanonSystem>
+      <CanonScenarios>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/scenarios.canon'))</CanonScenarios>
       <CanonWrapped>namespace Arestlam%3B
 
 static partial class Canon

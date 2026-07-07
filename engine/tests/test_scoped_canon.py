@@ -4,7 +4,7 @@ frozen D through ast:FetchPop — which is why these waited for the ast wave. Th
 strict gates hand-build stores with sibling cells and assert absolute violations per
 family; the wrapper must agree with the canonical name. The EXPRESSION-parameterized
 branch (the RMAP view seam, where the sibling is an absorbed fact type reassembled
-through the index) stays host-side until system.py migrates, and the wrappers keep
+through the index) stays host-side until system.canon migrates, and the wrappers keep
 that branch."""
 import pyarest.prims  # noqa: F401
 import pyarest.lam as L

@@ -1,5 +1,5 @@
 """The builders migration (the thin-runner endgame, per the Operating Rule
-defs-override-glue-framework): each Python tree-builder in system.py moves to
+defs-override-glue-framework): each Python tree-builder in system.canon moves to
 a shared canonical DEF, proven by the twin oracle. The Python builder is the
 behavioral specification; the canonical def applied to the same operands must
 answer the same rows. Hosts then need only the reducer and the shared file,

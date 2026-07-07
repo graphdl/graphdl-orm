@@ -38,7 +38,7 @@ def cell(name, contents):
 
 def Fetch(name):
     """↑name — contents (role 3) of the first cell named `name`, else # (Backus
-    §13.3.4). The canonical builder applied to the name (shared/ast.py)."""
+    §13.3.4). The canonical builder applied to the name (shared/ast.canon)."""
     return apply(A("ast:Fetch"), A(name))
 
 
@@ -231,9 +231,9 @@ def run(input_fact, D, validate_obj=None, cell_name="FILE", resolve_obj=None, de
 
 # DynFetch : ⟨name, D⟩ → contents of the first cell of D named `name` (a runtime
 # value), else #. SYSTEM : ⟨⟨entity, op⟩, D⟩ → apply:⟨↑entity:D, ⟨op, D⟩⟩. Both are
-# the CANON's (shared/ast.py, eq. sys verbatim); this module binds them.
+# the CANON's (shared/ast.canon, eq. sys verbatim); this module binds them.
 from . import canon as _canon
-_C = dict(_canon.read("ast.py"))
+_C = dict(_canon.read("ast.canon"))
 
 
 def DynFetch():
@@ -294,7 +294,7 @@ _1, _2 = A(1), A(2)
 
 def uniqueness(roles):
     """Uniqueness constraint over `roles` (ORM's fundamental constraint): the
-    canonical builder (shared/constraints.py) applied to the key roles.
+    canonical builder (shared/constraints.canon) applied to the key roles.
         hasDup:⟨t,P⟩ = not null ( Filter(key(1)=key(2) ∧ 1≠2) : (distl:⟨t,P⟩) )
         V_uc         = α(1) ∘ Filter(hasDup) ∘ distr ∘ [id, id]
     """
@@ -426,14 +426,14 @@ def _canon_c(name):
     global _CC
     if _CC is None:
         from . import canon as _canon
-        _CC = dict(_canon.read("constraints.py"))
+        _CC = dict(_canon.read("constraints.canon"))
     return _CC[name]
 
 
 def mandatory():
     """Simple mandatory role: every entity plays the role. Input ⟨entities, players⟩;
     V = entities ∖ players (Codd setminus) — the entities that play no fact. The
-    canon value (shared/constraints.py)."""
+    canon value (shared/constraints.canon)."""
     return _canon_c("constraints:mandatory")
 
 
@@ -498,7 +498,7 @@ _P = _1                                                       # ⟨P,D⟩ → th
 
 def _scoped(name, cell, host):
     """A string cell name applies the canonical builder; a ready population
-    EXPRESSION (the RMAP view seam) keeps the host composition until system.py
+    EXPRESSION (the RMAP view seam) keeps the host composition until system.canon
     migrates."""
     if isinstance(cell, str):
         from .reduce import apply as _apply
@@ -675,7 +675,7 @@ def validate_of(constraints, alethic=None, scoped=(), scoped_alethic=None):
     consume the target population P (cell-local — composed with the selector); `scoped` consume
     ⟨P, D⟩ whole (cross-cell — they fetch sibling cells from the frozen D). `alethic` /
     `scoped_alethic` are the commit-blocking subsets (default: all of each). The canonical
-    builder (shared/system.py) applied to ⟨local, alethic?, scoped, scoped_alethic?⟩; an
+    builder (shared/system.canon) applied to ⟨local, alethic?, scoped, scoped_alethic?⟩; an
     absent subset is the empty slot, a provided one wraps (deliberately-deontic empties
     stay distinct from absence)."""
     from .reduce import apply as _apply
@@ -781,7 +781,7 @@ def resolve_minting(col):
 def nav_of(key_pos):
     """nav(e): the facts of P sharing the affected entity's key (role `key_pos` of the head fact).
         α(1) ∘ Filter(key(f) = headKey) ∘ distr ∘ [id, key∘1]
-    The canonical builder applied to the key selector (shared/system.py)."""
+    The canonical builder applied to the key selector (shared/system.canon)."""
     from .reduce import apply as _apply
     return _apply(A("system:nav_of"), A(key_pos))
 
@@ -790,7 +790,7 @@ def transitions_of(sm, status_pos):
     """transitions(status(e)): the state-machine transitions available from the head fact's
     status. `sm` is a value ⟨⟨from, trigger, to⟩…⟩; a transition fires when from = status(head).
         α(1) ∘ Filter(from(t) = status) ∘ distr ∘ [sm̄, status∘1]
-    The canonical builder applied to ⟨sm, pos⟩ (shared/system.py)."""
+    The canonical builder applied to ⟨sm, pos⟩ (shared/system.canon)."""
     from .reduce import apply as _apply
     return _apply(A("system:transitions_of"), _S(sm, A(status_pos)))
 
@@ -833,7 +833,7 @@ def membership_def():
 def cmp_filter(op, col, lit=None, col2=None):
     """The comparator PREDICATE over a joined row: col `op` lit, or col `op` col2
     (the cross-antecedent form). compile_rule Filter-wraps it after the joins. The
-    canonical builders (shared/system.py)."""
+    canonical builders (shared/system.canon)."""
     from .reduce import apply as _apply
     from .lam import to_lam
     if col2 is not None:
@@ -866,7 +866,7 @@ def compile_rule(atom_fts, head_positions, widths=None, filters=None, joins=None
     """A rule's body as one FFP object over D: the populations of the clause fact types,
     each fetched from its own cell, joined linearly by default and by the general Codd
     join where `joins` says so, with the head's variable positions projected. The
-    canonical WHILE-over-atoms builder (shared/system.py) applied to
+    canonical WHILE-over-atoms builder (shared/system.canon) applied to
     ⟨⟨ft, width, join?⟩…, head, filters⟩. Cross-cell by construction:
     store-on-derive's read side."""
     from .reduce import apply as _apply
@@ -902,7 +902,7 @@ def compile_rule_delta(atom_fts, head_positions, delta_at, widths=None, filters=
                        joins=None):
     """The rule body with atom `delta_at` (0-based) reading the round's DELTA instead of
     its cell: an FFP object over ⟨Δ, D⟩ — semi-naive evaluation's inner join
-    (Bancilhon–Ramakrishnan 1986). The canonical builder (shared/system.py) applied to
+    (Bancilhon–Ramakrishnan 1986). The canonical builder (shared/system.canon) applied to
     ⟨atoms, head, filters, delta_at+1⟩; every non-delta fetch composes with selector 2
     of the pair."""
     from .reduce import apply as _apply
@@ -1414,7 +1414,7 @@ def _pop_rows(D, name):
 
 def rmap_partition(D):
     """M-facts → the cell partition {fact type: table key}, by the RMAP grouping rules. The
-    meaning is the canonical system:partition (shared/system.py), the sub-DEF family
+    meaning is the canonical system:partition (shared/system.canon), the sub-DEF family
     rmap_top/subject/role2/mand/oneone/side folded to ⟨table, fact type⟩ pairs (Halpin
     ch.10): a spanning UC or none at all gives the fact type its own table (rule 1); a
     single-role UC absorbs it into its role-1 player's top supertype, or the mandatory
@@ -1710,7 +1710,7 @@ _register_lex_boundary()
 def table_columns(partition, table):
     """The fact types absorbed into `table`, in declaration order; column j of the 3NF row
     ⟨key, v1, v2, …⟩ holds the (1+j)th entry's value. The meaning is the canonical
-    system:table_columns (shared/system.py), the RMAP partition pairs filtered to the
+    system:table_columns (shared/system.canon), the RMAP partition pairs filtered to the
     target table with its own entity fact type excluded, then projected to the fact type.
     This host binding applies that def through the reducer, so every host reads one
     definition; the twin is pinned in test_shared_builders."""
@@ -1866,7 +1866,7 @@ def mealy_step(trigger_ft, row_col=None):
 def _governed_player(D, ft):
     """The player of `ft` whose noun a machine governs (directly via smDef, or through
     the derived governedBy closure), and so whose status cell the trigger advances. The
-    meaning is the canonical system:governed_player (shared/system.py), a D-reader over
+    meaning is the canonical system:governed_player (shared/system.canon), a D-reader over
     the pair ⟨ft, D⟩: the union of the smDef nouns and the governedBy closure, then the
     first role of the fact type whose player lies in that union. This host binding applies
     that def through the reducer, so every host reads one definition; the twin is pinned

@@ -1,4 +1,4 @@
-"""The cross-host case table (shared/scenarios.py, intersection source): every
+"""The cross-host case table (shared/scenarios.canon, intersection source): every
 host reduces each case's expr applied to its operand. Here the PYTHON half:
 the Scott evaluator (the ground truth) and the delta fast path must answer
 every case identically, which makes the table the intra-Python differential
@@ -10,7 +10,7 @@ from pyarest.lam import from_lam
 
 
 def _cases():
-    return canon.read("scenarios.py")
+    return canon.read("scenarios.canon")
 
 
 def test_the_case_table_reads_and_covers_the_semantics():
@@ -67,7 +67,7 @@ def test_the_rust_kernel_answers_the_same_table():
         if isinstance(o, str):
             return "'" + o + "'"
         return str(o)
-    for name, pair in _canon.read("scenarios.py"):
+    for name, pair in _canon.read("scenarios.canon"):
         expr = _r.apply(A(1), pair)
         operand = _r.apply(A(2), pair)
         got = from_lam(_r.apply(expr, operand))

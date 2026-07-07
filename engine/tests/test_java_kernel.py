@@ -70,7 +70,7 @@ def _python_cases():
     from pyarest import reduce as _r
     from pyarest.lam import atom as A
     out = {}
-    for name, pair in canon.read("scenarios.py"):
+    for name, pair in canon.read("scenarios.canon"):
         expr = _r.apply(A(1), pair)
         operand = _r.apply(A(2), pair)
         got = from_lam(_r.apply(expr, operand))

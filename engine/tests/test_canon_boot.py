@@ -1,7 +1,7 @@
 """Canon at boot, toolchain on the canon. Importing pyarest loads the intersection
 files into DEFS (like the translator and federation registrations), so canonical
 names resolve in any step frame without an explicit load. The toolchain modules then
-STOP owning the definitions: python/theta.py's closed objects ARE the canon values
+STOP owning the definitions: python/theta.canon's closed objects ARE the canon values
 (name-reference-bearing trees), and its constructors apply the canonical builders
 through the reducer, so there is exactly one source of truth, the shared files, and
 the host module is a binding of it. The migrated objects carry theta: references by

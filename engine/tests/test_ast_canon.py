@@ -1,6 +1,6 @@
 """The ast cell accessors from the shared source, gated strictly: the canonical NAME
 applied to the cell name (DefineIn to the pair) must produce the exact accessor
-semantics of Backus 13.3.4/13.3.5 on hand-built stores, and the python/ast.py
+semantics of Backus 13.3.4/13.3.5 on hand-built stores, and the python/ast.canon
 wrapper must agree. The stack discipline is the load-bearing detail: cells of one
 name form a LIFO stack, fetch reads the top, pop removes ONLY the top, purge removes
 all, store is push-after-pop so deeper same-named cells survive."""
