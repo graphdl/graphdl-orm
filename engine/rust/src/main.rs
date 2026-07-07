@@ -2728,8 +2728,14 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     for r in pop_rows(&cells, &leaf("passOrder")) {
         let it = items(&list_of(&r));
         if it.len() >= 2 {
-            if let Some(Leaf::I(i)) = aval(&it[0]).as_deref() {
-                pass_order.push((*i, key_of(&it[1])));
+            // the pass NAME must extract as the bare string (key_of would
+            // quote it and no dispatch arm would ever match — the store's
+            // whole schedule silently skipping was the 2026-07-08 bug the
+            // minted-cell differential caught)
+            if let (Some(li), Some(ln)) = (aval(&it[0]), aval(&it[1])) {
+                if let (Leaf::I(i), Leaf::S(s)) = (&*li, &*ln) {
+                    pass_order.push((*i, s.clone()));
+                }
             }
         }
     }
