@@ -116,7 +116,14 @@ If some Customer places some Order then that Order has Shipping Address equal to
 
 ## Derivation Rules
 
-* Order has Amount iff Amount is the sum of LineItem Amount where some LineItem belongs to that Order.
+### The 0.9.0 aggregate grammar takes ONE source atom after `where`, so the
+### two-hop sum (belongs-to joined with the line's Amount) reads through a
+### fully-derived carrier — the same shape the tasks app's priority tiers use.
+Order carries line Amount. *
+
+* Order1 carries line Amount iff LineItem1 belongs to Order1 and LineItem1 has Amount.
+
+* Order1 has Amount iff Amount is the sum of Amount1 where Order1 carries line Amount1.
 
 ### A derivation rule couples a conclusion to its premises. Keep each premise an
 ### elementary fact so the rule reads as a composition, not a prose sentence.

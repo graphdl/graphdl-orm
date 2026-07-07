@@ -2395,7 +2395,256 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "app": {"type": "string"}, "question": {"type": "string"},
          "plan": {"type": "object"}}, "required": ["question"]}},
+    {"name": "tutor_list",
+     "description": "List the tutor lessons (tracks easy/medium/hard) with "
+                    "titles and goals. The tutor rides a sandbox app "
+                    "(_tutor) so lessons never disturb the active app.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "tutor_get",
+     "description": "One lesson, parsed: narrative title/goal, the runnable "
+                    "fences (each is ONE first-class verb call), and the "
+                    "expect predicate the check evaluates.",
+     "inputSchema": {"type": "object", "properties": {
+         "lesson": {"type": "string",
+                    "description": "track/NN, e.g. easy/01"}},
+      "required": ["lesson"]}},
+    {"name": "tutor_check",
+     "description": "Evaluate the lesson's expect predicate against the "
+                    "sandbox app; flips passed when the learner's work "
+                    "satisfies it.",
+     "inputSchema": {"type": "object", "properties": {
+         "lesson": {"type": "string"}}, "required": ["lesson"]}},
+    {"name": "tutor_reset",
+     "description": "Rebootstrap the sandbox: wipe the learner's state, "
+                    "copy tutor/domains readings into the _tutor app, "
+                    "recompile.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "tutor_apply",
+     "description": "apply, scoped to the tutor sandbox app.",
+     "inputSchema": {"type": "object", "properties": {
+         "fact_type": {"type": "string"},
+         "fact": {"type": "array", "items": {}}},
+      "required": ["fact_type", "fact"]}},
+    {"name": "tutor_query",
+     "description": "query, scoped to the tutor sandbox app.",
+     "inputSchema": {"type": "object", "properties": {
+         "fact_type": {"type": "string"}}, "required": ["fact_type"]}},
+    {"name": "tutor_compile",
+     "description": "compile readings text into the tutor sandbox app.",
+     "inputSchema": {"type": "object", "properties": {
+         "text": {"type": "string"}}, "required": ["text"]}},
+    {"name": "tutor_propose",
+     "description": "propose, scoped to the tutor sandbox app.",
+     "inputSchema": {"type": "object", "properties": {
+         "text": {"type": "string"}}, "required": ["text"]}},
+    {"name": "tutor_actions",
+     "description": "actions (HATEOAS transitions), scoped to the tutor "
+                    "sandbox app.",
+     "inputSchema": {"type": "object", "properties": {
+         "noun": {"type": "string"}, "id": {"type": "string"}},
+      "required": ["noun", "id"]}},
+    {"name": "tutor_authoring",
+     "description": "The authoring workflow joined from the sandbox's "
+                    "Authoring Step facts: ordered steps with situation, "
+                    "guidance, status, and recommended tools; optional "
+                    "status filter.",
+     "inputSchema": {"type": "object", "properties": {
+         "status": {"type": "string"}}}},
 ]
+
+
+# ---- the tutor: lessons over a sandbox app (2026-07-08, ports the legacy
+# WASM entry's tutor surface). The sandbox IS an app: _tutor's readings are
+# COPIES of tutor/domains (reset == wipe learner state + copy + recompile,
+# so the stream/db machinery comes free), and the tutor_* verbs are the
+# first-class verbs scoped to it plus the lesson reader and the expect
+# checker. The lesson grammar is tutor/lessons/_format.md: runnable fences
+# are ONE verb call each; ONE expect predicate per lesson. contains/equals
+# objects match by VALUES (the engine's query rows are positional). ----
+TUTOR_APP = "_tutor"
+
+
+def _tutor_root():
+    env = os.environ.get("AREST_TUTOR_DIR")
+    if env:
+        return env
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "tutor")
+
+
+def _tutor_lessons():
+    return os.path.join(_tutor_root(), "lessons")
+
+
+def tutor_reset(reg):
+    """Rebootstrap the sandbox: wipe the learner's state (stream + db +
+    sidecar), copy tutor/domains into the _tutor app, recompile."""
+    import shutil
+    src = os.path.join(_tutor_root(), "domains")
+    app_dir = os.path.join(reg.root, TUTOR_APP)
+    dst = os.path.join(app_dir, "readings")
+    os.makedirs(dst, exist_ok=True)
+    for fn in os.listdir(dst):
+        if fn.endswith(".md"):
+            os.remove(os.path.join(dst, fn))
+    for fn in sorted(os.listdir(src)):
+        if fn.endswith(".md"):
+            shutil.copy2(os.path.join(src, fn), os.path.join(dst, fn))
+    for fn in list(os.listdir(app_dir)):
+        if fn.endswith((".events.jsonl", ".db", ".db.loadcache",
+                        ".store.json")):
+            try:
+                os.remove(os.path.join(app_dir, fn))
+            except OSError:
+                pass
+    rep = reg.compile(TUTOR_APP)
+    return {"app": TUTOR_APP, "reset": True, "compiled": rep.get("total")}
+
+
+# the corpus heads lessons '# Lesson E1: TITLE' (track letter + number);
+# _format.md spells '<track>.<num>' — accept both, the corpus wins
+_LESSON_HEAD = re.compile(r"^# Lesson\s+([A-Za-z]+)\.?(\d+):\s*(.+)$", re.M)
+_LESSON_FENCE = re.compile(r"^~~~\s*(\w+)\s*\n(.*?)^~~~\s*$", re.M | re.S)
+
+
+def _parse_lesson(text):
+    m = _LESSON_HEAD.search(text)
+    track, num, title = (m.group(1), m.group(2), m.group(3).strip()) \
+        if m else ("", "", "")
+    g = re.search(r"^\*\*Goal:\*\*\s*(.+)$", text, re.M)
+    fences, expect = [], ""
+    for tag, body in _LESSON_FENCE.findall(text):
+        if tag == "expect":
+            expect = body.strip()
+        else:
+            fences.append({"tag": tag, "body": body.strip()})
+    return {"track": track, "num": num, "title": title,
+            "goal": g.group(1).strip() if g else "",
+            "fences": fences, "expect": expect}
+
+
+def _lesson_file(ref):
+    track, _, num = ref.partition("/")
+    d = os.path.join(_tutor_lessons(), track)
+    for fn in sorted(os.listdir(d)):
+        if fn.startswith(num + "-") and fn.endswith(".md"):
+            return os.path.join(d, fn)
+    raise FileNotFoundError(f"no lesson {ref!r}")
+
+
+def tutor_list():
+    root = _tutor_lessons()
+    out = []
+    for track in sorted(x for x in os.listdir(root)
+                        if os.path.isdir(os.path.join(root, x))):
+        for fn in sorted(os.listdir(os.path.join(root, track))):
+            if not fn.endswith(".md") or fn.startswith("_"):
+                continue
+            p = _parse_lesson(open(os.path.join(root, track, fn),
+                                   encoding="utf-8").read())
+            out.append({"lesson": f"{track}/{fn.split('-', 1)[0]}",
+                        "track": track, "title": p["title"],
+                        "goal": p["goal"]})
+    return {"lessons": out}
+
+
+def tutor_get(ref):
+    p = _parse_lesson(open(_lesson_file(ref), encoding="utf-8").read())
+    p["lesson"] = ref
+    return p
+
+
+_EXPECT_OPS = {"==": lambda a, b: a == b, ">=": lambda a, b: a >= b,
+               "<=": lambda a, b: a <= b, ">": lambda a, b: a > b,
+               "<": lambda a, b: a < b}
+
+
+def _expect_eval(reg, pred):
+    """One predicate, _format.md's four forms, against the sandbox app."""
+    toks = pred.split()
+    if len(toks) >= 4 and toks[0] == "query" and toks[2] == "contains":
+        want = json.loads(pred.split("contains", 1)[1].strip())
+        rows = reg.query(TUTOR_APP, toks[1])
+        vals = {str(v) for v in want.values()}
+        return (any(vals <= {str(x) for x in r} for r in rows),
+                f"{len(rows)} rows")
+    if len(toks) >= 5 and toks[0] in ("query", "list") and toks[2] == "count":
+        if toks[0] == "query":
+            n = len(reg.query(TUTOR_APP, toks[1]))
+        else:
+            n = len(reg.get(TUTOR_APP, toks[1], None) or [])
+        return (_EXPECT_OPS[toks[3]](n, int(toks[4])), f"count {n}")
+    if len(toks) >= 4 and toks[0] == "list" and toks[2] == "contains":
+        want = json.loads(pred.split("contains", 1)[1].strip())
+        entries = reg.get(TUTOR_APP, toks[1], None) or []
+        vals = {str(v) for v in want.values()}
+        return (any(vals <= {str(x) for x in
+                             (e.values() if isinstance(e, dict) else e)}
+                    for e in entries), f"{len(entries)} entries")
+    if len(toks) >= 5 and toks[0] == "get" and toks[3] == "equals":
+        want = json.loads(pred.split("equals", 1)[1].strip())
+        view = reg.get(TUTOR_APP, toks[1], toks[2]) or {}
+        flat = json.dumps(view)
+        return (all(str(v) in flat for v in want.values()), "view fetched")
+    if len(toks) >= 5 and toks[0] == "status" and toks[3] == "is":
+        view = reg.get(TUTOR_APP, toks[1], toks[2]) or {}
+        return (toks[4] in json.dumps(view), "status read")
+    if pred.startswith("violations for apply") and " include " in pred:
+        head, cid = pred.rsplit(" include ", 1)
+        parts = head.split(None, 5)
+        receipt = reg.apply(TUTOR_APP, parts[4], tuple(
+            json.loads(head.split(parts[4], 1)[1].strip())))
+        hit = any(cid.strip() in str(v) for v in
+                  receipt.get("violations", []))
+        return (hit, f"committed={receipt.get('committed')}")
+    return (False, f"unrecognized expect form: {pred[:60]!r}")
+
+
+def tutor_check(reg, ref):
+    """Evaluate the lesson's ONE expect predicate against the sandbox."""
+    pred = tutor_get(ref)["expect"]
+    ok, detail = _expect_eval(reg, pred)
+    return {"lesson": ref, "expect": pred, "passed": bool(ok),
+            "detail": detail}
+
+
+def tutor_authoring(reg, status=None):
+    """The authoring workflow, joined from the sandbox's Authoring Step
+    facts (the legacy readTutorAuthoringWorkflow, positionally: the new
+    engine's rows are ⟨step, value⟩ pairs). Steps sort by their order;
+    a status filter keeps the steps that use it."""
+    def rows(ft):
+        try:
+            return [tuple(r) for r in reg.query(TUTOR_APP, ft)
+                    if isinstance(r, (list, tuple)) and len(r) >= 2]
+        except Exception:
+            return []
+    steps = {}
+
+    def ensure(s):
+        return steps.setdefault(s, {"step": s, "order": None,
+                                    "situation": None, "guidance": None,
+                                    "status": None, "tools": []})
+    for s, v in rows("Authoring_Step_has_Authoring_Step_Order"):
+        try:
+            ensure(str(s))["order"] = int(str(v))
+        except ValueError:
+            pass
+    for s, v in rows("Authoring_Step_applies_in_Authoring_Situation"):
+        ensure(str(s))["situation"] = str(v)
+    for s, v in rows("Authoring_Step_has_Authoring_Guidance"):
+        ensure(str(s))["guidance"] = str(v)
+    for s, v in rows("Authoring_Step_uses_Status"):
+        ensure(str(s))["status"] = str(v)
+    for s, v in rows("Authoring_Step_recommends_Authoring_Tool"):
+        ensure(str(s))["tools"].append(str(v))
+    for rec in steps.values():
+        rec["tools"].sort()
+    out = sorted(steps.values(),
+                 key=lambda r: (r["order"] is None, r["order"], r["step"]))
+    if status is not None:
+        out = [r for r in out if r["status"] == status]
+    return {"app": TUTOR_APP, "steps": out}
 
 
 # THE VERB TABLE, first-class from the system (Samuel, 2026-07-04: the
@@ -2423,6 +2672,19 @@ SESSION_VERBS = {
                                       "version": VERSION},
     "context": lambda reg, a: reg.last_receipt
         or {"note": "no mutation this session"},
+    # the tutor surface (the legacy WASM entry's port): the lesson reader
+    # and checker plus the first-class verbs scoped to the sandbox app
+    "tutor_list": lambda reg, a: tutor_list(),
+    "tutor_get": lambda reg, a: tutor_get(a["lesson"]),
+    "tutor_check": lambda reg, a: tutor_check(reg, a["lesson"]),
+    "tutor_reset": lambda reg, a: tutor_reset(reg),
+    "tutor_apply": lambda reg, a: APP_VERBS["apply"](reg, TUTOR_APP, a),
+    "tutor_query": lambda reg, a: APP_VERBS["query"](reg, TUTOR_APP, a),
+    "tutor_compile": lambda reg, a: APP_VERBS["compile"](reg, TUTOR_APP, a),
+    "tutor_propose": lambda reg, a: APP_VERBS["propose"](reg, TUTOR_APP, a),
+    "tutor_actions": lambda reg, a: APP_VERBS["actions"](reg, TUTOR_APP, a),
+    "tutor_authoring": lambda reg, a: tutor_authoring(
+        reg, status=a.get("status")),
 }
 
 APP_VERBS = {
