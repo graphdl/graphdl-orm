@@ -1920,11 +1920,16 @@ class Registry:
 
     def verify(self, name):
         """The migration report's derived-population check, IN PLACE (the swap
-        tool's parity evidence turned self-audit): for each fully-derived head
-        with rules, re-evaluate the rules over the settled store (rho within
-        the step's D, as explain does) and compare with the stored cell. A
-        mismatch is a materialization the current rules do not reproduce —
-        a tampered .db, or a store saved before the rules changed."""
+        tool's parity evidence turned self-audit): for each head whose stored
+        cell IS rule materialization — the schedule's destructive passes
+        (sweep, dred, aggwhole) plus the derivation-owned keyed heads — re-
+        evaluate the rules over the settled store (rho within the step's D,
+        as explain does) and compare with the stored cell. A mismatch is a
+        materialization the current rules do not reproduce — a tampered .db,
+        or a store saved before the rules changed. ONE classification: the
+        audit reads system._classify_heads, the same schedule run_rules
+        executes and scheduler_cells materializes (keyed membership is
+        kind-blind there, so the owned-keyed corner consults the kinds)."""
         from .reduce import apply as _apply
         from .kernel import atom as A, from_lam
         from . import defs
@@ -1935,9 +1940,12 @@ class Registry:
         for r in system._pop_rows(D, "ruleDerives"):
             if len(r) >= 2:
                 rules.setdefault(r[1], []).append(r[0])
+        classes = system._classify_heads(D)
+        audit = set(classes["sweep"]) | set(classes["dred"]) \
+            | set(classes["aggwhole"]) \
+            | {h for h in classes["keyed"] if kinds.get(h) in system._OWNED}
         checks = []
-        for head in sorted(h for h, k in kinds.items()
-                           if k == "fully-derived" and h in rules):
+        for head in sorted(h for h in audit if h in rules):
             recomputed = set()
             for rid in sorted(rules[head]):
                 try:
