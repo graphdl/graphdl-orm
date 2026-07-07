@@ -1,13 +1,13 @@
-# CI for AREST. Tracks #671.
-#
-# Mirrors the local developer flow: invokes scripts/test-all.ps1, which
-# runs every test surface (cargo unit/integration/doctest, kernel host
-# tests, vitest, kernel UEFI smoke, worker e2e) and exits 0 only when
-# there are no novel failures. KnownFailures inside the script don't gate.
-#
-# windows-latest (not ubuntu) because the orchestration scripts are
-# PowerShell-first and use Windows-only paths/process semantics. cargo
-# tests target x86_64-pc-windows-msvc, the host triple on this runner.
+# CI for AREST — the 0.9.0 engine (engine/ is the codebase of record;
+# the old crates/ + TS orchestration retired 2026-07-08, ledger entry
+# "the old rust goes"). Two legs mirror the local gates:
+#   - python: the fast suites (the full 3-chunk broad gate stays a
+#     local/nightly concern; this leg pins the load-bearing families)
+#   - rust: cargo test in engine/rust (derive, mcp, serve_ops,
+#     native_apply — the resident's whole certified surface)
+# The frozen worker surface (src/, wrangler) is deliberately NOT built
+# here: its wasm fed from the retired crates; the successor WASM path
+# builds from engine/rust when that rung starts (see the ledger).
 
 name: ci
 
@@ -17,68 +17,49 @@ on:
   pull_request:
     branches: [main]
 
-# Cancel in-flight runs for the same ref when a new commit arrives.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  test:
+  python:
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          submodules: recursive
+          python-version: '3.12'
+      - run: pip install pytest
+      - name: engine fast suites
+        working-directory: engine
+        run: >
+          python -m pytest
+          tests/test_scheduler_canon.py tests/test_classify_canon.py
+          tests/test_derive.py tests/test_rule_if.py
+          tests/test_rule_anaphora.py tests/test_rule_negation.py
+          tests/test_aggregates.py tests/test_derivation.py
+          tests/test_skolem_prim.py tests/test_skolem_head.py
+          tests/test_verb_parity.py tests/test_tutor_port.py
+          tests/test_select_component.py tests/test_shared_scenarios.py
+          -q
 
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt, clippy
-
-      # Cache cargo registry + git index + per-crate target dirs. Keeps
-      # cold runs from rebuilding every dependency from scratch.
+  rust:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            crates/arest/target
-            crates/arest-kernel/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+            engine/rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('engine/rust/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
-
-      - name: Setup Node + yarn
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: yarn
-
-      - name: Install wasm-pack
-        # Required by yarn build:wasm; not bundled with the runner.
-        run: cargo install wasm-pack --locked
-
-      - run: yarn install --frozen-lockfile
-
-      # WASM artifacts are a prerequisite for the vitest stage in test-all.ps1.
-      - run: yarn build:wasm
-
-      # pwsh (not bash) because the script is PowerShell-first and uses
-      # System.Diagnostics.Process and CIM cmdlets directly. Exit code is
-      # 0 iff no novel failures; KnownFailures stay non-blocking.
-      - name: Run test-all.ps1
-        shell: pwsh
-        run: ./scripts/test-all.ps1
-
-      # Cross-target compile sweep. Catches the silent-aarch64-break
-      # failure mode that bit #441/#452/#654 — surfaces target-specific
-      # type/feature regressions that test-all.ps1's host-only run
-      # misses. continue-on-error: true while the aarch64 lang-item
-      # break (filed as #677) is being chased; flip back to gating once
-      # that lands.
-      - name: Run check-all-targets.ps1
-        shell: pwsh
-        run: ./scripts/check-all-targets.ps1
-        continue-on-error: true
+      - name: resident test suites
+        working-directory: engine/rust
+        run: cargo test

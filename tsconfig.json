@@ -16,5 +16,5 @@
     }
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "dist", ".do", "crates/arest/pkg/**"]
+  "exclude": ["node_modules", "dist", ".do"]
 }
