@@ -4637,5 +4637,34 @@ DEF("system:pass_order",
          S2(N(3), A("sweep")), S2(N(4), A("dred"))))),
 
 DEF("system:pass_bound",
-    K(S1(S1(N(12)))))
+    K(S1(S1(N(12))))),
+
+"THE VIEW PROJECTIONS (2026-07-08, the ui re-authoring's first slice — the binding doctrine): view(entity) = project(P, entity), Theorem 4 extended from actions to whole views as PURE defs answering abstract element trees as VALUES, never stored facts. system:view_menu over ⟨status, sm-triples⟩ answers ⟨menu, ⟨⟨button, event, to⟩…⟩⟩ — one button per transition available FROM the status; the element vocabulary is the Component registry's Role names, so select_component resolves nodes to toolkit implementations and DEFS-registered render functions draw them.",
+
+DEF("system:view_menu",
+    S3(A("CONS"),
+       K(A("menu")),
+       S3(A("COMP"),
+          S2(A("ALPHA"),
+             S4(A("CONS"), K(A("button")), N(2), N(3))),
+          S3(A("COMP"), A("apply"),
+             S3(A("CONS"),
+                S3(A("COMP"), A("apply"),
+                   S3(A("CONS"), K(A("theta:Filter")),
+                      S4(A("CONS"), K(A("COMP")), K(A("eq")),
+                         S4(A("CONS"), K(A("CONS")), K(N(1)),
+                            S3(A("CONS"), K(A("CONST")), N(1)))))),
+                N(2)))))),
+
+DEF("system:view_detail",
+    S3(A("CONS"),
+       K(A("detail")),
+       S2(A("ALPHA"),
+          S4(A("CONS"), K(A("field")), N(1), N(2))))),
+
+DEF("system:view_list",
+    S3(A("CONS"),
+       K(A("list")),
+       S2(A("ALPHA"),
+          S4(A("CONS"), K(A("item")), N(1), N(2)))))
 )
