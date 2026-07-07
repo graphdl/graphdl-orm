@@ -30,6 +30,9 @@ State Machine 'sm1' is currently in Status 'in_progress'.
 @pytest.mark.skipif(not polyglot.rust_available(), reason="no rust binary")
 def test_rust_fixpoint_matches_python_per_head():
     D, rep = forml.compile_model(MODEL)
+    # the resident READS the schedule (passHeads) — mint the cell exactly
+    # as the compile pipeline does before exporting the store to rust
+    D = system.scheduler_cells(D)
     heads = sorted({r[1] for r in system._pop_rows(D, "ruleDerives")
                     if len(r) >= 2})
     assert heads, "the model must carry a derivation rule"
@@ -73,6 +76,7 @@ def test_rust_aggregate_fixpoint_matches_python():
     # the closure the state-machine model exercises
     D, rep = forml.compile_model(AGG_MODEL)
     assert rep["unparsed"] == []
+    D = system.scheduler_cells(D)
     heads = sorted({r[1] for r in system._pop_rows(D, "ruleDerives")
                     if len(r) >= 2})
     assert heads, "the model must carry an aggregate rule"
@@ -115,6 +119,7 @@ def test_rust_self_supporting_cyclic_fixpoint_matches_python():
     # check must reach it (the fleet proved it on kernel; this pins it portably)
     D, rep = forml.compile_model(CYCLIC_MODEL)
     assert rep["unparsed"] == []
+    D = system.scheduler_cells(D)
     heads = sorted({r[1] for r in system._pop_rows(D, "ruleDerives")
                     if len(r) >= 2})
     kinds = {r[0]: r[1] for r in system._pop_rows(D, "derivation")}

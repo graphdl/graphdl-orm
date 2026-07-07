@@ -2113,44 +2113,10 @@ fn keyed_key(row: &V, key_pos: &[usize]) -> String {
     key_of(&seq(from_vec(sel)))
 }
 
-// self_supporting is engine.py's _self_supporting (line 1160): head h is
-// reachable from itself through derived-head reads over the reach graph. The
-// walk starts at h's own reads restricted to derived heads and expands each
-// derived head it meets; reaching h proves a cycle. Such heads take the DRed
-// recursive form (empty first, then rederive) because a stale cycle would
-// otherwise rederive itself over a store that still contains it.
-fn self_supporting(
-    h: &str,
-    reach: &HashMap<String, std::collections::HashSet<String>>,
-    derived_heads: &std::collections::HashSet<String>,
-) -> bool {
-    use std::collections::HashSet;
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut stack: Vec<String> = Vec::new();
-    if let Some(rs) = reach.get(h) {
-        for x in rs {
-            if derived_heads.contains(x) {
-                stack.push(x.clone());
-            }
-        }
-    }
-    while let Some(x) = stack.pop() {
-        if x.as_str() == h {
-            return true;
-        }
-        if !seen.insert(x.clone()) {
-            continue;
-        }
-        if let Some(rs) = reach.get(&x) {
-            for y in rs {
-                if derived_heads.contains(y) {
-                    stack.push(y.clone());
-                }
-            }
-        }
-    }
-    false
-}
+// The self-support walk RETIRED here 2026-07-08 (scheduler-in-canon slice
+// 2): the sweep/dred split is read from the passHeads cell, and the walk's
+// meaning lives in canon (system:cls_selfsup, the WHILE closure over
+// system:cls_edges in shared/system.canon), twinned to python's override.
 
 // touched_by is engine.py's _touched (line 1215): with no dirty set (a FULL
 // derive's first round) every read set is live; otherwise a read set is live
@@ -2550,25 +2516,41 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     // a full derive evaluates every eligible head once (the idempotence
     // guarantee), while a frontier call touches only heads whose reads meet
     // the frontier, the closure's changes, or this round's own stores.
-    let mut kindmap: HashMap<String, String> = HashMap::new();
-    for r in pop_rows(&cells, &leaf("derivation")) {
+    // THE SCHEDULE IS STORE KNOWLEDGE (scheduler-in-canon slice 2): pass
+    // membership comes from the passHeads cell — system:classify_heads'
+    // materialization, written by every compile beside rmapColumns — read
+    // here exactly as rmapColumns is read below, never reclassified. Rows
+    // are ⟨pass, head⟩ with pass ∈ {agg, keyed, sweep, dred, aggwhole};
+    // a store without the cell runs its positive closure but maintains no
+    // destructive pass (the same posture as a store without rmapColumns
+    // reading as all-own-table). The retired reclassification (kindmap +
+    // kind_owned + the self-support walk) lives on as canon: the cls_*
+    // family in shared/system.canon, twinned to python's override.
+    let mut pass_sweep: Vec<String> = Vec::new();
+    let mut pass_dred: Vec<String> = Vec::new();
+    let mut pass_keyed: HashSet<String> = HashSet::new();
+    let mut pass_aggwhole: HashSet<String> = HashSet::new();
+    for r in pop_rows(&cells, &leaf("passHeads")) {
         let it = items(&list_of(&r));
         if it.len() >= 2 {
-            if let Some(k) = aval(&it[1]) {
-                if let Leaf::S(ks) = &*k {
-                    kindmap.insert(key_of(&it[0]), ks.clone());
+            let p = match aval(&it[0]).as_deref() {
+                Some(Leaf::S(s)) => s.clone(),
+                _ => continue,
+            };
+            let h = key_of(&it[1]);
+            match p.as_str() {
+                "sweep" => pass_sweep.push(h),
+                "dred" => pass_dred.push(h),
+                "keyed" => {
+                    pass_keyed.insert(h);
                 }
+                "aggwhole" => {
+                    pass_aggwhole.insert(h);
+                }
+                _ => {}
             }
         }
     }
-    // the storage kinds whose cell the DERIVATION owns (python _OWNED):
-    // NORMA's * and ** — no user asserts into either population, so
-    // destructive rederivation is sound; + / ++ and unmarked ruled heads
-    // keep asserted rows and stay out of every destructive pass.
-    let kind_owned = |kindmap: &HashMap<String, String>, hk: &str| {
-        matches!(kindmap.get(hk).map(String::as_str),
-                 Some("fully-derived") | Some("derived-and-stored"))
-    };
     let mut plain_of: HashMap<String, Vec<Leaf>> = HashMap::new();
     // head_leaf_of recovers a plain head's cell name (a Leaf) from its key,
     // for the keyed and sweep passes that address cells by name.
@@ -2582,10 +2564,6 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
             .entry(rr.head_key.clone())
             .or_insert_with(|| rr.head.clone());
     }
-    // agg_heads: the aggregate head keys, excluded from the sweeps (they
-    // supersede per group in the agg pass, never re-materialize whole here).
-    let agg_heads: HashSet<String> =
-        agg_rules.iter().map(|rr| rr.head_key.clone()).collect();
     // spans_of: constraint id key to its role-position set (spans rows are
     // ⟨constraint id, position⟩). A BTreeSet keeps positions sorted, so the
     // keyed key reads columns in Python's sorted(keyspans[head]) order.
@@ -2639,32 +2617,20 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
             e.extend(rs.iter().cloned());
         }
     }
-    // derived_heads: the aggregate heads plus every plain head, the vertex
-    // set the self-support walk is restricted to.
-    let mut derived_heads: HashSet<String> = agg_heads.clone();
-    for h in plain_of.keys() {
-        derived_heads.insert(h.clone());
-    }
-    // sweep / sweep_cyclic: derivation-owned plain heads that are neither
-    // aggregate nor keyed, split by whether they support themselves through a
-    // cycle. Both iterate in head-name order, matching Python's sorted(...).
+    // sweep / sweep_cyclic straight from the cell's lists: a listed head
+    // with no rules in THIS store resolves no leaf and is skipped. The
+    // sorts are defensive against hand stores — the compiled cell already
+    // rides in head-name order per pass.
     let mut sweep: Vec<(String, Leaf)> = Vec::new();
     let mut sweep_cyclic: Vec<(String, Leaf)> = Vec::new();
-    for hk in plain_of.keys() {
-        if !kind_owned(&kindmap, hk) {
-            continue;
+    for hk in &pass_sweep {
+        if let Some(hl) = head_leaf_of.get(hk) {
+            sweep.push((hk.clone(), hl.clone()));
         }
-        if agg_heads.contains(hk) || keyed_of.contains_key(hk) {
-            continue;
-        }
-        let hl = match head_leaf_of.get(hk) {
-            Some(l) => l.clone(),
-            None => continue,
-        };
-        if self_supporting(hk, &reach, &derived_heads) {
-            sweep_cyclic.push((hk.clone(), hl));
-        } else {
-            sweep.push((hk.clone(), hl));
+    }
+    for hk in &pass_dred {
+        if let Some(hl) = head_leaf_of.get(hk) {
+            sweep_cyclic.push((hk.clone(), hl.clone()));
         }
     }
     sweep.sort_by(|a, b| leaf_text(&a.1).cmp(&leaf_text(&b.1)));
@@ -2674,6 +2640,9 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     let mut keyed_sorted: Vec<(String, Leaf, Vec<(Leaf, String)>, Vec<usize>)> =
         Vec::new();
     for (hk, rls) in &keyed_of {
+        if !pass_keyed.contains(hk) {
+            continue;
+        }
         let hl = match head_leaf_of.get(hk) {
             Some(l) => l.clone(),
             None => continue,
@@ -2727,7 +2696,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                     before_rows.push(r.clone());
                 }
             }
-            if kind_owned(&kindmap, &rr.head_key) && dirty.is_none() {
+            if pass_aggwhole.contains(&rr.head_key) && dirty.is_none() {
                 // whole-replace: the agg rows plus the head's plain rules'
                 // rows ARE the cell; nothing older survives
                 for rid in plain_of.get(&rr.head_key).map(|v| v.as_slice()).unwrap_or(&[])

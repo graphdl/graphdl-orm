@@ -398,6 +398,8 @@ fn a_fully_derived_agg_head_whole_replaces_so_vanished_groups_die() {
     assert!(r.starts_with(r#"[["ok","#), "Src store step: {r}");
     let r = s.rpc(&store_case("derivation", r#"[["Tot","fully-derived"]]"#));
     assert!(r.starts_with(r#"[["ok","#), "derivation store step: {r}");
+    let r = s.rpc(&store_case("passHeads", r#"[["agg","Tot"],["aggwhole","Tot"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "passHeads store step: {r}");
     let r = s.rpc(&store_case("ruleAgg", r#"[["agg1"]]"#));
     assert!(r.starts_with(r#"[["ok","#), "ruleAgg store step: {r}");
     let r = s.rpc(&store_case("ruleDerives", r#"[["agg1","Tot"]]"#));
@@ -521,6 +523,8 @@ fn a_keyed_head_upserts_per_key_retiring_the_stale_row_and_keeping_the_orphan() 
         r#"[["assign_uc","uniqueness","Assign","alethic"]]"#,
     ));
     assert!(r.starts_with(r#"[["ok","#), "constraint store step: {r}");
+    let r = s.rpc(&store_case("passHeads", r#"[["keyed","Assign"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "passHeads store step: {r}");
     let r = s.rpc(&store_case("spans", r#"[["assign_uc",1]]"#));
     assert!(r.starts_with(r#"[["ok","#), "spans store step: {r}");
     let r = s.rpc(&store_case("assign_rule", &copy_rule("Src")));
@@ -560,6 +564,8 @@ fn a_fully_derived_plain_head_sweeps_whole_dropping_a_stale_row() {
     assert!(r.starts_with(r#"[["ok","#), "Der store step: {r}");
     let r = s.rpc(&store_case("derivation", r#"[["Der","fully-derived"]]"#));
     assert!(r.starts_with(r#"[["ok","#), "derivation store step: {r}");
+    let r = s.rpc(&store_case("passHeads", r#"[["sweep","Der"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "passHeads store step: {r}");
     let r = s.rpc(&store_case("ruleDerives", r#"[["der_rule","Der"]]"#));
     assert!(r.starts_with(r#"[["ok","#), "ruleDerives store step: {r}");
     let r = s.rpc(&store_case("ruleReads", r#"[["der_rule","Src"]]"#));
@@ -599,6 +605,41 @@ fn a_derived_and_stored_head_sweeps_exactly_like_fully_derived() {
     assert!(r.starts_with(r#"[["ok","#), "Der store step: {r}");
     let r = s.rpc(&store_case("derivation", r#"[["Der","derived-and-stored"]]"#));
     assert!(r.starts_with(r#"[["ok","#), "derivation store step: {r}");
+    let r = s.rpc(&store_case("passHeads", r#"[["sweep","Der"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "passHeads store step: {r}");
+    let r = s.rpc(&store_case("ruleDerives", r#"[["der_rule","Der"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "ruleDerives store step: {r}");
+    let r = s.rpc(&store_case("ruleReads", r#"[["der_rule","Src"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "ruleReads store step: {r}");
+    let r = s.rpc(&store_case("der_rule", &copy_rule("Src")));
+    assert!(r.starts_with(r#"[["ok","#), "der_rule store step: {r}");
+
+    assert_eq!(
+        s.rpc(r#"{"op":"run_rules"}"#),
+        r#"{"op":"run_rules","result":{"rounds":1,"changed":["Der"]}}"#
+    );
+    assert_eq!(
+        s.rpc(r#"{"op":"query","fact_type":"Der"}"#),
+        r#"{"op":"query","result":{"fact_type":"Der","rows":[["a","p"],["b","q"]]}}"#
+    );
+}
+
+#[test]
+fn the_schedule_is_read_from_the_passheads_cell_never_reclassified() {
+    // slice 2 of scheduler-in-canon: the resident READS pass membership
+    // from the passHeads cell (python scheduler_cells' materialization of
+    // system:classify_heads) exactly as it reads rmapColumns — it never
+    // recomputes kinds or self-support. The store here carries NO
+    // derivation rows at all: under the retired reclassification Der
+    // would join no pass; the sweep fires ONLY because the cell says so.
+    let mut s = Serve::spawn();
+    assert_eq!(s.rpc(r#"{"d": []}"#), "[]");
+    let r = s.rpc(&store_case("Src", r#"[["a","p"],["b","q"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "Src store step: {r}");
+    let r = s.rpc(&store_case("Der", r#"[["a","p"],["b","q"],["stale","z"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "Der store step: {r}");
+    let r = s.rpc(&store_case("passHeads", r#"[["sweep","Der"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "passHeads store step: {r}");
     let r = s.rpc(&store_case("ruleDerives", r#"[["der_rule","Der"]]"#));
     assert!(r.starts_with(r#"[["ok","#), "ruleDerives store step: {r}");
     let r = s.rpc(&store_case("ruleReads", r#"[["der_rule","Src"]]"#));
@@ -634,6 +675,8 @@ fn a_self_supporting_head_empties_first_so_a_cyclic_only_row_is_retired() {
     assert!(r.starts_with(r#"[["ok","#), "Reach store step: {r}");
     let r = s.rpc(&store_case("derivation", r#"[["Reach","fully-derived"]]"#));
     assert!(r.starts_with(r#"[["ok","#), "derivation store step: {r}");
+    let r = s.rpc(&store_case("passHeads", r#"[["dred","Reach"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "passHeads store step: {r}");
     let r = s.rpc(&store_case(
         "ruleDerives",
         r#"[["reach_base","Reach"],["reach_self","Reach"]]"#,
