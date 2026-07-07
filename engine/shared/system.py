@@ -3953,6 +3953,192 @@ DEF("system:cf_drop_full",
 DEF("system:cf_scan",
     S3(A("COMP"), A("system:ftid"), A("system:reading_parse"))),
 
+DEF("system:cs_cid",
+    S3(
+        A("COMP"), A("apply"),
+        S3(
+            A("CONS"), K(A("implode")),
+            S3(
+                A("CONS"), K(A("")),
+                S3(A("CONS"), S3(A("COMP"), A("slug"), N(1)), N(2)))))),
+
+DEF("system:cs_at",
+    S4(
+        A("CONS"), K(A("attach")),
+        S3(
+            A("COMP"), A("apply"),
+            S3(
+                A("CONS"), K(A("implode")),
+                S3(
+                    A("CONS"), K(A("")),
+                    S4(A("CONS"), N(1), K(A("@")), N(2))))),
+        N(3))),
+
+DEF("system:cs_scoped",
+    S3(
+        A("COMP"),
+        S2(
+            A("ALPHA"),
+            S3(
+                A("COMP"), A("system:cs_at"),
+                S4(
+                    A("CONS"), S3(A("COMP"), N(1), N(1)), N(2),
+                    S3(A("COMP"), N(2), N(1))))),
+        S3(
+            A("COMP"), A("distl"),
+            S3(A("CONS"), S3(A("CONS"), N(1), N(3)), N(2))))),
+
+DEF("system:cs_fam",
+    S3(
+        A("COMP"), A("apndl"),
+        S3(
+            A("CONS"),
+            S3(
+                A("COMP"), A("apndl"),
+                S3(
+                    A("CONS"), K(A("constraint")),
+                    S6(
+                        A("CONS"), N(1), N(5),
+                        S3(A("COMP"), N(2), N(2)),
+                        S3(A("COMP"), N(3), N(2)),
+                        S3(A("COMP"), N(5), N(2))))),
+            S3(
+                A("COMP"), A("apndl"),
+                S3(
+                    A("CONS"),
+                    S4(A("CONS"), K(A("attach")), N(1), N(4)),
+                    S3(
+                        A("COMP"), A("system:cs_scoped"),
+                        S4(
+                            A("CONS"), N(1),
+                            S3(A("COMP"), N(3), N(2)), N(3)))))))),
+
+DEF("system:cs_rows",
+    S4(
+        A("COND"),
+        S3(A("COMP"), A("eq"), S3(A("CONS"), N(1), K(A("at most")))),
+        S3(
+            A("COMP"), A("system:cs_fam"),
+            S6(
+                A("CONS"),
+                S3(
+                    A("COMP"), A("system:cs_cid"),
+                    S3(A("CONS"), N(2), K(A("_excl")))),
+                A("id"), K(A("scoped_exclusion")), K(A("exclusion")),
+                K(A("exclusion")))),
+        S4(
+            A("COND"),
+            S3(A("COMP"), A("eq"), S3(A("CONS"), N(1), K(A("exactly")))),
+            S3(
+                A("COMP"), A("system:cs_fam"),
+                S6(
+                    A("CONS"),
+                    S3(
+                        A("COMP"), A("system:cs_cid"),
+                        S3(A("CONS"), N(2), K(A("_xor")))),
+                    A("id"), K(A("scoped_exclusive_or")),
+                    K(A("exclusive_or")), K(A("exclusive_or")))),
+            S4(
+                A("COND"),
+                S3(
+                    A("COMP"), A("eq"),
+                    S3(A("CONS"), N(1), K(A("disjunctive_mandatory")))),
+                S3(
+                    A("COMP"), A("system:cs_fam"),
+                    S6(
+                        A("CONS"),
+                        S3(
+                            A("COMP"), A("apply"),
+                            S3(
+                                A("CONS"), K(A("implode")),
+                                S3(
+                                    A("CONS"), K(A("")),
+                                    S3(
+                                        A("CONS"), K(A("ior_")),
+                                        S3(A("COMP"), A("slug"), N(2)))))),
+                        A("id"), K(A("scoped_inclusive_or")),
+                        K(A("inclusive_or")), K(A("disjunctive_mandatory")))),
+                S4(
+                    A("COND"),
+                    S3(
+                        A("COMP"), A("eq"),
+                        S3(A("CONS"), N(1), K(A("subset")))),
+                    S3(
+                        A("COMP"),
+                        S3(
+                            A("CONS"),
+                            S3(
+                                A("COMP"), A("apndl"),
+                                S3(
+                                    A("CONS"), K(A("constraint")),
+                                    S6(
+                                        A("CONS"), N(1), K(A("subset")),
+                                        S3(A("COMP"), N(1), S3(A("COMP"), N(3), N(2))),
+                                        S3(A("COMP"), N(2), S3(A("COMP"), N(3), N(2))),
+                                        S3(A("COMP"), N(5), N(2))))),
+                            S4(A("CONS"), K(A("attach")), N(1), K(A("scoped_subset")))),
+                        S3(
+                            A("CONS"),
+                            S3(
+                                A("COMP"), A("apply"),
+                                S3(
+                                    A("CONS"), K(A("implode")),
+                                    S3(
+                                        A("CONS"), K(A("")),
+                                        S3(
+                                            A("CONS"), K(A("subset_")),
+                                            S3(
+                                                A("COMP"), A("slug"),
+                                                S3(A("COMP"), N(1), N(4))))))),
+                            A("id"))),
+                    S3(
+                        A("COMP"),
+                        S4(
+                            A("CONS"),
+                            S3(
+                                A("COMP"), A("apndl"),
+                                S3(
+                                    A("CONS"), K(A("constraint")),
+                                    S6(
+                                        A("CONS"), N(1), K(A("equality")),
+                                        S3(A("COMP"), N(1), S3(A("COMP"), N(3), N(2))),
+                                        S3(A("COMP"), N(2), S3(A("COMP"), N(3), N(2))),
+                                        S3(A("COMP"), N(5), N(2))))),
+                            S4(
+                                A("CONS"), K(A("attach")),
+                                S3(
+                                    A("COMP"), A("apply"),
+                                    S3(
+                                        A("CONS"), K(A("implode")),
+                                        S3(
+                                            A("CONS"), K(A("")),
+                                            S3(A("CONS"), N(1), K(A("_a")))))),
+                                K(A("scoped_equality_side"))),
+                            S4(
+                                A("CONS"), K(A("attach")),
+                                S3(
+                                    A("COMP"), A("apply"),
+                                    S3(
+                                        A("CONS"), K(A("implode")),
+                                        S3(
+                                            A("CONS"), K(A("")),
+                                            S3(A("CONS"), N(1), K(A("_b")))))),
+                                K(A("scoped_equality_side")))),
+                        S3(
+                            A("CONS"),
+                            S3(
+                                A("COMP"), A("apply"),
+                                S3(
+                                    A("CONS"), K(A("implode")),
+                                    S3(
+                                        A("CONS"), K(A("")),
+                                        S3(
+                                            A("CONS"), K(A("eq_")),
+                                            S3(
+                                                A("COMP"), A("slug"),
+                                                S3(A("COMP"), N(1), N(4))))))),
+                            A("id")))))))),
+
 DEF("system:clause_ft",
     S3(
         A("COMP"),

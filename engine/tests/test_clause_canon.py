@@ -40,3 +40,44 @@ def test_the_full_strip_answers_when_the_minimal_id_is_undeclared():
     # regardless of declaration (article-free models keep their ids)
     assert _clause("Employee is a manager", ("Employee",),
                    ()) == "Employee_is_manager"
+
+
+def test_the_canonical_clause_resolution_twins_the_python_over_the_corpus():
+    """The strongest oracle: every constraint clause the four handler
+    families extract from shared/base answers the SAME fact-type id
+    through system:clause_ft as through compiler._clause_ft. The clause
+    texts replicate each handler's own extraction (compiler.py 874-906)."""
+    import os
+    from pyarest import forml
+    from pyarest.compiler import _clause_ft, _Known
+    root = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "shared", "base")
+    text = "\n\n".join(open(os.path.join(root, f), encoding="utf-8").read()
+                       for f in sorted(os.listdir(root)) if f.endswith(".md"))
+    stmts = forml.statements(text)
+    known = forml._known(stmts)
+    names = sorted(set(known))
+    fts = getattr(known, "fts", None) or set()
+    clauses = []
+    for s in stmts:
+        kind, g, _m = forml.analyze(s)
+        if kind == "set_comparison":
+            clauses += [c.strip() for c in g[2].split(";") if c.strip()]
+        elif kind == "disjunctive_mandatory":
+            body = g[-1]
+            subj, rest = (forml._subject(body, known) if len(g) == 1
+                          else (forml._subject(g[0], known)[0], body))
+            clauses += [subj + " " + c.strip()
+                        for c in rest.split(" or ") if c.strip()]
+        elif kind == "subset":
+            conseq, _, _w = g[1].partition(" where ")
+            clauses += [g[0].strip(), conseq.strip()]
+        elif kind == "equality":
+            clauses += [g[0].strip(), g[1].strip()]
+    checked = 0
+    for c in clauses:
+        want = _clause_ft(c, known)
+        got = _clause(c, names, sorted(fts))
+        assert got == want, (c, got, want)
+        checked += 1
+    assert checked >= 8                                # the corpus is real
