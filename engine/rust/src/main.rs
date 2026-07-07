@@ -1101,6 +1101,27 @@ impl NEval {
                     if let Some((_, obj)) = self.process.iter().rev().find(|(n, _)| *n == k) {
                         return self.mu(napp(obj.clone(), x));
                     }
+                    // the bisection tracer (third stage): under
+                    // AREST_NEVAL_TRACE every CANON-def evaluation prints
+                    // name -> answer shape, so one traced run walks the
+                    // whole tree and the first unexpectedly-empty answer
+                    // names the collapse point (the silent-semantic gap the
+                    // miss/bot tracers cannot see).
+                    if std::env::var_os("AREST_NEVAL_TRACE").is_some() {
+                        if let Some(obj) = NCANON.with(|c| {
+                            c.borrow().iter().rev().find(|(n, _)| *n == k)
+                                .map(|(_, o)| o.clone())
+                        }) {
+                            let r = self.mu(napp(obj, x));
+                            let shape = match &r {
+                                N::A(_) => "atom".to_string(),
+                                N::S(v) => format!("seq({})", v.len()),
+                                N::Bot => "BOT".to_string(),
+                            };
+                            eprintln!("neval-def: {} -> {}", k, shape);
+                            return r;
+                        }
+                    }
                     // the intersection-source fallback: the native mirror of the
                     // Scott mu's CANON step (make_mu resolves cells, then the
                     // base, then process, then canon). A rule body that reaches a
