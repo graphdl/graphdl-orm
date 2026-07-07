@@ -239,7 +239,7 @@ from .lam import from_lam
 
 from .canon import rust_bin
 
-_BIN = rust_bin("arestlam")
+_BIN = rust_bin("arest")
 
 
 def _conv(v):

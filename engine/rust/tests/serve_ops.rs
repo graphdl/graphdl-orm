@@ -14,12 +14,12 @@ struct Serve {
 
 impl Serve {
     fn spawn() -> Serve {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_arestlam"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_arest"))
             .arg("--serve")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .expect("spawn arestlam --serve");
+            .expect("spawn arest --serve");
         let out = BufReader::new(child.stdout.take().unwrap());
         Serve { child, out }
     }

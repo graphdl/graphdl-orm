@@ -3385,7 +3385,7 @@ fn parse_json(text: &str) -> Option<J> {
 
 // find_cli walks up from the running executable toward the filesystem root
 // and answers the first ancestor directory's cli.py; the exe lives at
-// <root>/rust/target/<profile>/arestlam.exe, so the repository root is the
+// <root>/rust/target/<profile>/arest.exe, so the repository root is the
 // first hit. The --py-cli flag overrides the walk entirely.
 fn find_cli() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
@@ -3923,7 +3923,7 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
             // keep rewriting it through the Python host).
             op_answer("run_rules", args, srv).map_err(|m| (-32602, m))
         }
-        "engine_version" => Ok("{\"engine\":\"arestlam\",\"version\":\"0.9.0\"}".to_string()),
+        "engine_version" => Ok("{\"engine\":\"arest\",\"version\":\"0.9.0\"}".to_string()),
         "apps_status" => {
             let name = match jget(args, "name") {
                 Some(J::S(n)) => n.clone(),
@@ -4065,7 +4065,7 @@ fn run_mcp() {
                     _ => r.push_str("\"2024-11-05\""),
                 }
                 r.push_str(",\"capabilities\":{\"tools\":{}},\
-                            \"serverInfo\":{\"name\":\"arestlam\",\"version\":\"0.1.0\"}}");
+                            \"serverInfo\":{\"name\":\"arest\",\"version\":\"0.1.0\"}}");
                 Some(Ok(r))
             }
             "tools/list" => Some(Ok(format!("{{\"tools\":{}}}", MCP_TOOLS))),

@@ -2,8 +2,8 @@
   "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/sdk/main/schemas/mcp.json",
   "mcpServers": {
     "arest": {
-      "description": "AREST engine 0.9.0, served by the RUST RESIDENT (arestlam --mcp): reads, applies (own-table AND absorbed, the stored create:<ft> handlers), orient/cells/query/derive compute natively over the retained sidecar store; the compiler-host verbs (compile/propose/induce/ask, sql and the read long tail) delegate to the same engine's python through cli.py's generic call form \u2014 one first-class verb table, two bindings. 28 tools.",
-      "command": "engine/rust/target/release/arestlam.exe",
+      "description": "AREST engine 0.9.0, served by the RUST RESIDENT (arest --mcp): reads, applies (own-table AND absorbed, the stored create:<ft> handlers), orient/cells/query/derive compute natively over the retained sidecar store; the compiler-host verbs (compile/propose/induce/ask, sql and the read long tail) delegate to the same engine's python through cli.py's generic call form \u2014 one first-class verb table, two bindings. 28 tools.",
+      "command": "engine/rust/target/release/arest.exe",
       "args": [
         "--mcp",
         "--apps-dir",

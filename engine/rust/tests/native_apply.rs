@@ -37,7 +37,7 @@ impl Mcp {
     // the interpreter the delegate spawns (a bogus name breaks delegation so a
     // committed own-table apply proves it went native).
     fn spawn_over(apps_dir: &str, python: &str) -> Mcp {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_arestlam"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_arest"))
             .arg("--mcp")
             .arg("--apps-dir")
             .arg(apps_dir)
@@ -46,7 +46,7 @@ impl Mcp {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .expect("spawn arestlam --mcp");
+            .expect("spawn arest --mcp");
         let out = BufReader::new(child.stdout.take().unwrap());
         let (tx, rx) = channel();
         std::thread::spawn(move || {
@@ -204,7 +204,7 @@ fn native_apply_commits_both_rmap_shapes_in_process() {
     }
 
     let tmp = std::env::temp_dir().join(format!(
-        "arestlam-native-apply-{}-{}",
+        "arest-native-apply-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -219,7 +219,7 @@ fn native_apply_commits_both_rmap_shapes_in_process() {
 
     // A bogus interpreter: any delegation this resident attempts fails to
     // spawn, so a committed own-table apply committed WITHOUT the host.
-    let bogus = "arestlam_no_such_python_interpreter";
+    let bogus = "arest_no_such_python_interpreter";
 
     // ---- Phase 1: the own-table apply computes natively, no host ----
     let ring_rows;

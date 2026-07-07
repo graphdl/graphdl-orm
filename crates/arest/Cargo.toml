@@ -15,12 +15,11 @@ autotests = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-[[bin]]
-# Named arest-cli (not arest) to avoid a .pdb collision with the
-# lib target on Windows. The CLI behavior is unchanged; invoke via
-#   cargo run --bin arest-cli -- <readings_dir>
-name = "arest-cli"
-path = "src/main.rs"
+# The arest-cli bin target was REMOVED 2026-07-08 (Samuel's directive:
+# the 0.9.0 rust resident engine/rust/target/release/arest.exe is THE
+# binary; the old CLI served nothing since the 07-06 swap). The lib
+# stays for the WASM pkg the arest-legacy MCP entry loads (tutor +
+# select_component) until those verbs port.
 
 # Merged integration test binary — bundles tests/integration.rs,
 # tests/properties.rs, tests/e3_integration.rs as submodules. Avoids

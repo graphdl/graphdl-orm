@@ -1,10 +1,10 @@
 [package]
-name = "arestlam"
+name = "arest"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "arestlam"
+name = "arest"
 path = "src/main.rs"
 
 [profile.release]

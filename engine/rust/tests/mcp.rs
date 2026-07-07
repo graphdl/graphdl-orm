@@ -31,14 +31,14 @@ impl Mcp {
     // spawn_over boots the server against any apps directory; the write-flow
     // test points it at a temp registry it materializes itself.
     fn spawn_over(apps_dir: &str) -> Mcp {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_arestlam"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_arest"))
             .arg("--mcp")
             .arg("--apps-dir")
             .arg(apps_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .expect("spawn arestlam --mcp");
+            .expect("spawn arest --mcp");
         // A reader thread feeds a channel so a missing reply fails the test
         // by timeout instead of hanging it.
         let out = BufReader::new(child.stdout.take().unwrap());
@@ -100,7 +100,7 @@ fn mcp_mode_serves_the_apps_registry_over_stdio() {
         concat!(
             r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","#,
             r#""capabilities":{"tools":{}},"#,
-            r#""serverInfo":{"name":"arestlam","version":"0.1.0"}}}"#
+            r#""serverInfo":{"name":"arest","version":"0.1.0"}}}"#
         )
     );
 
@@ -246,7 +246,7 @@ fn mcp_write_verbs_delegate_to_the_cli_and_reload_the_sidecar() {
         println!("skipping the write flow: python --version failed to run");
         return;
     }
-    let cli_found = std::path::Path::new(env!("CARGO_BIN_EXE_arestlam"))
+    let cli_found = std::path::Path::new(env!("CARGO_BIN_EXE_arest"))
         .ancestors()
         .skip(1)
         .any(|d| d.join("cli.py").is_file());
@@ -261,7 +261,7 @@ fn mcp_write_verbs_delegate_to_the_cli_and_reload_the_sidecar() {
     // readings carry the fixture README's seven-line model, and apps_compile
     // builds the .db and the sidecar through the CLI.
     let tmp = std::env::temp_dir().join(format!(
-        "arestlam-mcp-write-{}-{}",
+        "arest-mcp-write-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

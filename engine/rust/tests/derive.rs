@@ -25,12 +25,12 @@ struct Serve {
 
 impl Serve {
     fn spawn() -> Serve {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_arestlam"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_arest"))
             .arg("--serve")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .expect("spawn arestlam --serve");
+            .expect("spawn arest --serve");
         let out = BufReader::new(child.stdout.take().unwrap());
         Serve { child, out }
     }
@@ -683,7 +683,7 @@ fn the_rust_fixpoint_rederives_an_emptied_head_from_python_compiled_rules() {
         println!("skipping the rederive flow: python --version failed to run");
         return;
     }
-    let cli = std::path::Path::new(env!("CARGO_BIN_EXE_arestlam"))
+    let cli = std::path::Path::new(env!("CARGO_BIN_EXE_arest"))
         .ancestors()
         .skip(1)
         .map(|d| d.join("cli.py"))
@@ -699,7 +699,7 @@ fn the_rust_fixpoint_rederives_an_emptied_head_from_python_compiled_rules() {
     // the SAME model as the MCP flow below (tests/test_rule_anaphora.py's
     // SM_MODEL), compiled directly through the one-shot CLI
     let tmp = std::env::temp_dir().join(format!(
-        "arestlam-serve-rederive-{}-{}",
+        "arest-serve-rederive-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -786,14 +786,14 @@ struct Mcp {
 
 impl Mcp {
     fn spawn_over(apps_dir: &str) -> Mcp {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_arestlam"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_arest"))
             .arg("--mcp")
             .arg("--apps-dir")
             .arg(apps_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .expect("spawn arestlam --mcp");
+            .expect("spawn arest --mcp");
         let out = BufReader::new(child.stdout.take().unwrap());
         let (tx, rx) = channel();
         std::thread::spawn(move || {
@@ -841,7 +841,7 @@ fn the_derive_tool_is_idempotent_over_a_python_derived_app() {
         println!("skipping the derive flow: python --version failed to run");
         return;
     }
-    let cli_found = std::path::Path::new(env!("CARGO_BIN_EXE_arestlam"))
+    let cli_found = std::path::Path::new(env!("CARGO_BIN_EXE_arest"))
         .ancestors()
         .skip(1)
         .any(|d| d.join("cli.py").is_file());
@@ -854,7 +854,7 @@ fn the_derive_tool_is_idempotent_over_a_python_derived_app() {
     // anaphoric derivation rules the Python compiler compiles, with instance
     // facts that derive one row into each head.
     let tmp = std::env::temp_dir().join(format!(
-        "arestlam-mcp-derive-{}-{}",
+        "arest-mcp-derive-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
