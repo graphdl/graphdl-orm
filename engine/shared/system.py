@@ -3953,6 +3953,86 @@ DEF("system:cf_drop_full",
 DEF("system:cf_scan",
     S3(A("COMP"), A("system:ftid"), A("system:reading_parse"))),
 
+DEF("system:ft_rows",
+    S3(
+        A("COMP"),
+        S3(
+            A("COMP"),
+            S4(
+                A("COND"),
+                S3(
+                    A("COMP"), A("eq"),
+                    S3(
+                        A("CONS"),
+                        S3(A("COMP"), N(3), S3(A("COMP"), N(2), N(2))),
+                        K(A("")))),
+                N(1),
+                S3(
+                    A("COMP"), A("apndr"),
+                    S3(
+                        A("CONS"), N(1),
+                        S3(
+                            A("CONS"), K(A("derivation")),
+                            S3(
+                                A("CONS"),
+                                S3(A("COMP"), N(1), N(2)),
+                                S3(A("COMP"), N(3), S3(A("COMP"), N(2), N(2)))))))),
+            S3(
+                A("CONS"),
+                S3(
+                    A("COMP"), A("apndl"),
+                    S3(
+                        A("CONS"),
+                        S3(
+                            A("CONS"), K(A("factType")),
+                            S3(
+                                A("CONS"), N(1),
+                                S3(A("COMP"), N(1), N(2)))),
+                        S3(
+                            A("COMP"),
+                            S2(
+                                A("ALPHA"),
+                                S3(
+                                    A("CONS"), K(A("role")),
+                                    S5(
+                                        A("CONS"),
+                                        S3(
+                                            A("COMP"), A("apply"),
+                                            S3(
+                                                A("CONS"), K(A("implode")),
+                                                S3(
+                                                    A("CONS"), K(A("")),
+                                                    S4(
+                                                        A("CONS"), N(1),
+                                                        K(A(".")),
+                                                        S3(A("COMP"), N(1), N(2)))))),
+                                        N(1),
+                                        S3(A("COMP"), N(1), N(2)),
+                                        S3(A("COMP"), N(2), N(2))))),
+                            S3(
+                                A("COMP"), A("distl"),
+                                S3(
+                                    A("CONS"), N(1),
+                                    S3(
+                                        A("COMP"), A("trans"),
+                                        S3(
+                                            A("CONS"),
+                                            S3(
+                                                A("COMP"), A("apply"),
+                                                S3(
+                                                    A("CONS"), K(A("theta:iota")),
+                                                    S3(
+                                                        A("COMP"), A("length"),
+                                                        S3(A("COMP"), N(2), N(2))))),
+                                            S3(A("COMP"), N(2), N(2))))))))),
+                A("id"))),
+        S3(
+            A("CONS"),
+            S3(
+                A("COMP"), A("system:ftid"),
+                S3(A("CONS"), N(1), N(2))),
+            A("id")))),
+
 DEF("system:cs_cid",
     S3(
         A("COMP"), A("apply"),
