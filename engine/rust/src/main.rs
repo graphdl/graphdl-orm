@@ -1082,6 +1082,19 @@ impl NEval {
                     return self.mu(napp(sd.clone(), x));     // the step's DEFS cell first
                 }
                 if let Some(r) = self.prim(lc, &x) {
+                    // the coverage tracer's second stage: a KNOWN prim
+                    // answering ⊥ names the semantic gap (shape mismatch
+                    // inside the op), which a name-miss trace cannot see
+                    if matches!(r, N::Bot)
+                        && std::env::var_os("AREST_NEVAL_TRACE").is_some()
+                    {
+                        let shape = match &x {
+                            N::A(_) => "atom".to_string(),
+                            N::S(v) => format!("seq({})", v.len()),
+                            N::Bot => "bot".to_string(),
+                        };
+                        eprintln!("neval-bot: prim {:?} over {}", lc, shape);
+                    }
                     return self.mu(r);                       // the native base
                 }
                 if let Some(k) = leaf_key(lc) {
@@ -1102,6 +1115,14 @@ impl NEval {
                         c.borrow().iter().rev().find(|(n, _)| *n == k).map(|(_, o)| o.clone())
                     }) {
                         return self.mu(napp(obj, x));
+                    }
+                    // the coverage tracer (the synthesize-plumb diagnosis,
+                    // ledger 2026-07-08): a name neither prim nor process
+                    // nor canon is the carrier's gap — name it on stderr
+                    // when tracing, so the missing-op list enumerates
+                    // itself instead of collapsing silently to ⊥.
+                    if std::env::var_os("AREST_NEVAL_TRACE").is_some() {
+                        eprintln!("neval-miss: {}", k);
                     }
                 }
                 N::Bot
@@ -3268,13 +3289,40 @@ fn op_answer(op: &str, j: &J, srv: &mut Srv) -> Result<String, String> {
         "synthesize_pairs" => {
             // synthesize's engine half over the resident store: the canonical
             // (system:verbalize : id) : D — the entity's facts paired with
-            // their fact types' reading templates; wording stays the caller's
+            // their fact types' reading templates; wording stays the caller's.
+            // STILL SCOTT-PATH (the ~40x plumb, priced 2026-07-08): the
+            // one-arm carrier swap was tried and the serve-op pins caught
+            // it answering EMPTY — NEval's op coverage is complete for
+            // compiled RULE objects, not yet for the verbalize def-family
+            // (something in its chain bottoms natively). The plumb's real
+            // scope is NEval completeness: instrument the Bot fallthrough,
+            // enumerate the missing ops, port them with case rows — the
+            // ledger's plan of record.
             let id = match jget(j, "id").and_then(scalar_atom) {
                 Some(a) => a,
                 None => return Err("synthesize_pairs needs a scalar id".to_string()),
             };
-            let f = mkapp(atom(Leaf::S("system:verbalize".into())), id.clone());
-            let res = reduce_over(srv, f, srv.d.clone(), fuel);
+            // AREST_SYNTH_NATIVE=1 routes through the carrier — today the
+            // DIAGNOSIS toggle (pair with AREST_NEVAL_TRACE to enumerate
+            // the coverage gap), tomorrow the cutover flag once the
+            // missing ops port with case rows.
+            let res = if std::env::var_os("AREST_SYNTH_NATIVE").is_some() {
+                let ev = NEval {
+                    cells: srv.ncells.clone(),
+                    process: srv.nprocess.clone(),
+                    defs_n: srv.nd.clone(),
+                    fuel: std::cell::Cell::new(-1),
+                };
+                n_to_v(&ev.mu(napp(
+                    napp(N::A(Rc::new(Leaf::S("system:verbalize".into()))),
+                         v_to_n(&id)),
+                    srv.nd.clone(),
+                )))
+            } else {
+                let f = mkapp(atom(Leaf::S("system:verbalize".into())),
+                              id.clone());
+                reduce_over(srv, f, srv.d.clone(), fuel)
+            };
             let mut r = String::from("{\"id\":");
             write_v(&id, &mut r);
             r.push_str(",\"pairs\":");
