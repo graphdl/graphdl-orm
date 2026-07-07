@@ -106,6 +106,20 @@ def test_aggwhole_marks_the_derivation_owned_agg_heads():
     assert ("aggwhole", "Task_has_Cost_Tally") not in got
 
 
+def test_the_pass_order_and_bound_ride_the_store():
+    # the scheduler-as-data endgame's second face: WHICH passes run, in
+    # WHAT order, under WHAT round bound — store knowledge (canonical
+    # CONSTANT defs system:pass_order / system:pass_bound, materialized
+    # beside passHeads; the hosts' joint loops dispatch by the cell and
+    # fall back to the same literals when a store lacks it).
+    D, _rep = forml.compile_model(MODEL)
+    D = system.scheduler_cells(D)
+    order = [tuple(r) for r in _pop_rows(D, "passOrder")]
+    assert order == [(1, "agg"), (2, "keyed"), (3, "sweep"), (4, "dred")]
+    bound = [tuple(r) for r in _pop_rows(D, "passBound")]
+    assert bound == [(12,)]
+
+
 def test_derived_and_stored_heads_rederive_at_run_rules():
     # the regression this slice fixes: before the OWNED gate, a non-keyed **
     # head sat in NO pass, so its rules never fired after the 0.9.0 swap

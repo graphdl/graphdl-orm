@@ -4628,5 +4628,14 @@ DEF("system:classify_heads",
              A("system:cls_dred")),
           S3(A("COMP"),
              S2(A("ALPHA"), S3(A("CONS"), K(A("aggwhole")), A("id"))),
-             A("system:cls_aggwhole")))))
+             A("system:cls_aggwhole"))))),
+
+"THE PASS ORDER AND ROUND BOUND AS DATA (2026-07-08, scheduler-as-data second face): constants of doctrine, materialized as the passOrder and passBound cells beside passHeads; hosts dispatch their native pass bodies by the cell and fall back to the same literals when a store lacks it. The positive closure stays OUTSIDE the ordered passes: it is the floor the strata stand on.",
+
+DEF("system:pass_order",
+    K(S4(S2(N(1), A("agg")), S2(N(2), A("keyed")),
+         S2(N(3), A("sweep")), S2(N(4), A("dred"))))),
+
+DEF("system:pass_bound",
+    K(S1(S1(N(12)))))
 )

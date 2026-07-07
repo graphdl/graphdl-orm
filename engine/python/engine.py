@@ -1264,7 +1264,18 @@ def run_rules(D, changed=None, stats=None):
     # dependency chain that moved.
     dirty = None if changed is None else (set(changed) | closure_changed)
     strata_changed = set()
-    for _outer in range(12):
+    # the ORDER and the round BOUND come from the canonical constants
+    # (system:pass_order / system:pass_bound — the same values
+    # scheduler_cells materializes as passOrder/passBound): the joint
+    # loop DISPATCHES its native pass bodies by that schedule; an
+    # unknown pass name skips (forward compatibility).
+    _order = [p for (_i, p) in sorted(
+        tuple(r) for r in from_lam(_ap(_A("system:pass_order"), to_lam(())))
+        if isinstance(r, tuple) and len(r) >= 2)]
+    _brows = from_lam(_ap(_A("system:pass_bound"), to_lam(())))
+    _bound = int(_brows[0][0]) if isinstance(_brows, tuple) and _brows \
+        and isinstance(_brows[0], tuple) and _brows[0] else 12
+    for _outer in range(_bound):
         settled = True
         round_changed = set()
 
@@ -1272,72 +1283,78 @@ def run_rules(D, changed=None, stats=None):
             if dirty is None:
                 return True
             return bool(read_set & dirty) or bool(read_set & round_changed)
-        for (rid, head) in agg_rules:
-            if (_outer or dirty is not None) and not _touched(reads.get(rid, set())):
-                continue
-            with defs.step(D):
-                out = from_lam(_ap(_A(rid), D))
-            if isinstance(out, tuple):
-                agg_rows = {tuple(r) for r in out if isinstance(r, tuple)}
-                before = {tuple(r) for r in _pop_rows(D, head)}
-                if head in aggwhole and dirty is None:
-                    # a derivation-OWNED agg head on a FULL derive replaces
-                    # whole: the cell is materialization, and per-group
-                    # supersession cannot retire a group whose supply
-                    # VANISHED (nothing produces its key). The paired plain
-                    # rows (the zero-supply idiom) rejoin fresh.
-                    plain = _eval_rules(plain_of.get(head, []), D)
-                    merged = agg_rows | plain
-                else:
-                    keys = {r[:-1] for r in agg_rows}
-                    merged = agg_rows | {r for r in before
-                                         if r[:-1] not in keys}
-                if merged != before:
-                    settled = False
-                    round_changed.add(head)
-                    D = _ap(ast.Store(head), _S(to_lam(_rowsort(merged)), D))
-        for head in classes["keyed"]:
-            if (_outer or dirty is not None) and not _touched(
-                    {ft for rid in keyed_of[head] for ft in reads.get(rid, set())}):
-                continue
-            key_pos = sorted(keyspans[head])
-            outs = _eval_rules(keyed_of[head], D)
+        for _pass in _order:
+            if _pass == "agg":
+                for (rid, head) in agg_rules:
+                    if (_outer or dirty is not None) and not _touched(reads.get(rid, set())):
+                        continue
+                    with defs.step(D):
+                        out = from_lam(_ap(_A(rid), D))
+                    if isinstance(out, tuple):
+                        agg_rows = {tuple(r) for r in out if isinstance(r, tuple)}
+                        before = {tuple(r) for r in _pop_rows(D, head)}
+                        if head in aggwhole and dirty is None:
+                            # a derivation-OWNED agg head on a FULL derive
+                            # replaces whole: the cell is materialization, and
+                            # per-group supersession cannot retire a group
+                            # whose supply VANISHED (nothing produces its
+                            # key). The paired plain rows (the zero-supply
+                            # idiom) rejoin fresh.
+                            plain = _eval_rules(plain_of.get(head, []), D)
+                            merged = agg_rows | plain
+                        else:
+                            keys = {r[:-1] for r in agg_rows}
+                            merged = agg_rows | {r for r in before
+                                                 if r[:-1] not in keys}
+                        if merged != before:
+                            settled = False
+                            round_changed.add(head)
+                            D = _ap(ast.Store(head), _S(to_lam(_rowsort(merged)), D))
+            elif _pass == "keyed":
+                for head in classes["keyed"]:
+                    if (_outer or dirty is not None) and not _touched(
+                            {ft for rid in keyed_of[head] for ft in reads.get(rid, set())}):
+                        continue
+                    key_pos = sorted(keyspans[head])
+                    outs = _eval_rules(keyed_of[head], D)
 
-            def key(r, _kp=key_pos):
-                return tuple(r[p - 1] for p in _kp if p <= len(r))
-            keys = {key(r) for r in outs}
-            kept = {tuple(r) for r in _pop_rows(D, head)
-                    if key(tuple(r)) not in keys}
-            merged = _rowsort(outs | kept)
-            current = _rowsort({tuple(r) for r in _pop_rows(D, head)})
-            if merged != current:
-                settled = False
-                round_changed.add(head)
-                D = _ap(ast.Store(head), _S(to_lam(merged), D))
-        for head in sweep:
-            if not _touched(reach.get(head, set())):
-                continue
-            outs = _eval_rules(plain_of[head], D)
-            current = {tuple(r) for r in _pop_rows(D, head)}
-            if outs != current:
-                settled = False
-                round_changed.add(head)
-                D = _ap(ast.Store(head), _S(to_lam(_rowsort(outs)), D))
-        for head in sweep_cyclic:
-            if not _touched(reach.get(head, set())):
-                continue
-            current = {tuple(r) for r in _pop_rows(D, head)}
-            Dx = _ap(ast.Store(head), _S(to_lam(()), D))
-            prev = None
-            outs = set()
-            while outs != prev:
-                prev = outs
-                outs = _eval_rules(plain_of[head], Dx)
-                Dx = _ap(ast.Store(head), _S(to_lam(_rowsort(outs)), Dx))
-            if outs != current:
-                settled = False
-                round_changed.add(head)
-            D = Dx
+                    def key(r, _kp=key_pos):
+                        return tuple(r[p - 1] for p in _kp if p <= len(r))
+                    keys = {key(r) for r in outs}
+                    kept = {tuple(r) for r in _pop_rows(D, head)
+                            if key(tuple(r)) not in keys}
+                    merged = _rowsort(outs | kept)
+                    current = _rowsort({tuple(r) for r in _pop_rows(D, head)})
+                    if merged != current:
+                        settled = False
+                        round_changed.add(head)
+                        D = _ap(ast.Store(head), _S(to_lam(merged), D))
+            elif _pass == "sweep":
+                for head in sweep:
+                    if not _touched(reach.get(head, set())):
+                        continue
+                    outs = _eval_rules(plain_of[head], D)
+                    current = {tuple(r) for r in _pop_rows(D, head)}
+                    if outs != current:
+                        settled = False
+                        round_changed.add(head)
+                        D = _ap(ast.Store(head), _S(to_lam(_rowsort(outs)), D))
+            elif _pass == "dred":
+                for head in sweep_cyclic:
+                    if not _touched(reach.get(head, set())):
+                        continue
+                    current = {tuple(r) for r in _pop_rows(D, head)}
+                    Dx = _ap(ast.Store(head), _S(to_lam(()), D))
+                    prev = None
+                    outs = set()
+                    while outs != prev:
+                        prev = outs
+                        outs = _eval_rules(plain_of[head], Dx)
+                        Dx = _ap(ast.Store(head), _S(to_lam(_rowsort(outs)), Dx))
+                    if outs != current:
+                        settled = False
+                        round_changed.add(head)
+                    D = Dx
         if settled:
             break
         dirty = round_changed
@@ -1526,14 +1543,24 @@ def scheduler_cells(D):
     fast lane); the MEMBERSHIP becomes store knowledge any host reads instead
     of recomputing. Recompile replaces the cell wholesale; a store without it
     classifies at run time, which is what run_rules does anyway."""
-    from .lam import to_lam, from_lam
+    from .lam import to_lam, from_lam, atom as _A
+    from .reduce import apply as _ap
     classes = _classify_heads(D)
     rows = [(p, h) for p in ("agg", "keyed", "sweep", "dred", "aggwhole")
             for h in classes[p]]
+    # the ORDER and the round BOUND are constants of doctrine (canonical
+    # defs system:pass_order / system:pass_bound) — evaluated here and
+    # materialized beside the membership, so a reader holds the whole
+    # schedule: which passes, whose heads, in what order, bounded how.
+    order = from_lam(_ap(_A("system:pass_order"), to_lam(())))
+    bound = from_lam(_ap(_A("system:pass_bound"), to_lam(())))
     cells = tuple(c for c in from_lam(D)
                   if not (isinstance(c, tuple) and len(c) >= 2
-                          and c[1] == "passHeads"))
-    return to_lam(cells + (("CELL", "passHeads", tuple(rows)),))
+                          and c[1] in ("passHeads", "passOrder",
+                                       "passBound")))
+    return to_lam(cells + (("CELL", "passHeads", tuple(rows)),
+                           ("CELL", "passOrder", tuple(order)),
+                           ("CELL", "passBound", tuple(bound))))
 
 
 def generator_cells(D):

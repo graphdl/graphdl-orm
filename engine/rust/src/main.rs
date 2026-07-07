@@ -2657,9 +2657,45 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     let mut dirty: Option<HashSet<String>> = frontier
         .as_ref()
         .map(|fr| fr.union(&closure_keys).cloned().collect());
-    for outer in 0..12 {
+    // THE ORDER AND THE ROUND BOUND ARE STORE KNOWLEDGE (the passOrder /
+    // passBound cells, system:pass_order / system:pass_bound materialized
+    // — the same posture as passHeads): the joint loop DISPATCHES its
+    // native pass bodies by the cell's sequence and falls back to the
+    // doctrine literals when a store lacks the cells. Unknown pass names
+    // skip (forward compatibility).
+    let mut pass_order: Vec<(i64, String)> = Vec::new();
+    for r in pop_rows(&cells, &leaf("passOrder")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            if let Some(Leaf::I(i)) = aval(&it[0]).as_deref() {
+                pass_order.push((*i, key_of(&it[1])));
+            }
+        }
+    }
+    pass_order.sort();
+    let order: Vec<String> = if pass_order.is_empty() {
+        ["agg", "keyed", "sweep", "dred"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        pass_order.into_iter().map(|(_i, p)| p).collect()
+    };
+    let mut bound: i64 = 12;
+    for r in pop_rows(&cells, &leaf("passBound")) {
+        let it = items(&list_of(&r));
+        if !it.is_empty() {
+            if let Some(Leaf::I(n)) = aval(&it[0]).as_deref() {
+                bound = *n;
+            }
+        }
+    }
+    for outer in 0..bound {
         let mut settled = true;
         let mut round_changed: HashSet<String> = HashSet::new();
+        for p in &order {
+            match p.as_str() {
+                "agg" => {
         for rr in &agg_rules {
             // the gate: round zero of a full derive evaluates everything;
             // otherwise only rules whose reads touch the dirty set or this
@@ -2732,6 +2768,8 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 store_into(&mut d, &mut cells, &mut nd, &mut ncells, &rr.head, seq(from_vec(merged)));
             }
         }
+                }
+                "keyed" => {
         // ---- THE KEYED-UPSERT PASS (engine.py lines 1243 through 1260):
         // each keyed head, in head-name order, re-evaluates over the settled
         // store and supersedes PER KEY. Gated like the agg pass on the union
@@ -2785,6 +2823,8 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 store_into(&mut d, &mut cells, &mut nd, &mut ncells, hl, seq(from_vec(merged)));
             }
         }
+                }
+                "sweep" => {
         // ---- THE SWEEP PASS (engine.py lines 1261 through 1269): a
         // derivation-owned, non-self-supporting plain head re-evaluates whole
         // and REPLACES, so this call's supersessions propagate and staleness
@@ -2817,6 +2857,8 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 store_into(&mut d, &mut cells, &mut nd, &mut ncells, hl, seq(from_vec(m)));
             }
         }
+                }
+                "dred" => {
         // ---- THE DRED SWEEP FOR CYCLES (engine.py lines 1270 through 1284):
         // a self-supporting head EMPTIES first, then rederives to a LOCAL
         // least fixpoint over the store with the emptied head, repeatedly
@@ -2856,6 +2898,10 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 settled = false;
                 round_changed.insert(hk.clone());
                 changed.insert(leaf_text(hl));
+            }
+        }
+                }
+                _ => {}
             }
         }
         if settled {
