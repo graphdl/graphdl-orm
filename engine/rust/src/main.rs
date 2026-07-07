@@ -3410,7 +3410,40 @@ const MCP_TOOLS: &str = concat!(
     r#""inputSchema":{"type":"object","properties":{}}},"#,
     r#"{"name":"ask","#,
     r#""description":"Read-only Q&A, no LLM in the engine: pass a plan {fact_type, filter} to execute the projection query; without one the verb answers needs_plan + the model surface for the CALLER's sampler to complete.","#,
-    r#""inputSchema":{"type":"object","properties":{"app":{"type":"string"},"question":{"type":"string"},"plan":{"type":"object"}},"required":["question"]}}]"#
+    r#""inputSchema":{"type":"object","properties":{"app":{"type":"string"},"question":{"type":"string"},"plan":{"type":"object"}},"required":["question"]}},"#,
+    r#"{"name":"select_component","#,
+    r#""description":"Select a UI Component by intent and constraints from the Component registry app (binding doctrine: the registry is facts; toolkit implementations register in DEFS). Answers ranked {component, role, toolkit, symbol, score} records.","#,
+    r#""inputSchema":{"type":"object","properties":{"intent":{"type":"string"},"traits":{"type":"array","items":{"type":"string"}},"toolkit":{"type":"string"},"limit":{"type":"number"},"app":{"type":"string"}},"required":["intent"]}},"#,
+    r#"{"name":"tutor_list","#,
+    r#""description":"List the tutor lessons (tracks easy/medium/hard) with titles and goals; the tutor rides the _tutor sandbox app.","#,
+    r#""inputSchema":{"type":"object","properties":{}}},"#,
+    r#"{"name":"tutor_get","#,
+    r#""description":"One lesson, parsed: title, goal, the runnable fences (each is one first-class verb call), and the expect predicate.","#,
+    r#""inputSchema":{"type":"object","properties":{"lesson":{"type":"string"}},"required":["lesson"]}},"#,
+    r#"{"name":"tutor_check","#,
+    r#""description":"Evaluate the lesson's expect predicate against the sandbox app; passed flips when the learner's work satisfies it.","#,
+    r#""inputSchema":{"type":"object","properties":{"lesson":{"type":"string"}},"required":["lesson"]}},"#,
+    r#"{"name":"tutor_reset","#,
+    r#""description":"Rebootstrap the sandbox: wipe learner state, copy tutor/domains readings into the _tutor app, recompile.","#,
+    r#""inputSchema":{"type":"object","properties":{}}},"#,
+    r#"{"name":"tutor_apply","#,
+    r#""description":"apply, scoped to the tutor sandbox app.","#,
+    r#""inputSchema":{"type":"object","properties":{"fact_type":{"type":"string"},"fact":{"type":"array","items":{}}},"required":["fact_type","fact"]}},"#,
+    r#"{"name":"tutor_query","#,
+    r#""description":"query, scoped to the tutor sandbox app.","#,
+    r#""inputSchema":{"type":"object","properties":{"fact_type":{"type":"string"}},"required":["fact_type"]}},"#,
+    r#"{"name":"tutor_compile","#,
+    r#""description":"compile readings text into the tutor sandbox app.","#,
+    r#""inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}},"#,
+    r#"{"name":"tutor_propose","#,
+    r#""description":"propose, scoped to the tutor sandbox app.","#,
+    r#""inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}},"#,
+    r#"{"name":"tutor_actions","#,
+    r#""description":"actions (HATEOAS transitions), scoped to the tutor sandbox app.","#,
+    r#""inputSchema":{"type":"object","properties":{"noun":{"type":"string"},"id":{"type":"string"}},"required":["noun","id"]}},"#,
+    r#"{"name":"tutor_authoring","#,
+    r#""description":"The authoring workflow joined from the sandbox's Authoring Step facts: ordered steps with situation, guidance, status, and recommended tools.","#,
+    r#""inputSchema":{"type":"object","properties":{"status":{"type":"string"}}}}]"#
 );
 
 struct Apps {
@@ -4079,6 +4112,17 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
         // one Python dispatch table, never a second registry here. The live
         // additive compile mutates the app, so the retained sidecar reloads.
         "compile" => delegate_call("compile", args, apps, srv, true),
+        // the tutor surface + select_component (the 2026-07-08 ports): the
+        // generic call form, one Python dispatch table — never a second
+        // registry here. The tutor write verbs reload like compile; the
+        // reads reload nothing.
+        "select_component" | "tutor_list" | "tutor_get" | "tutor_check"
+        | "tutor_query" | "tutor_actions" | "tutor_authoring" => {
+            delegate_call(tool, args, apps, srv, false)
+        }
+        "tutor_apply" | "tutor_compile" | "tutor_propose" | "tutor_reset" => {
+            delegate_call(tool, args, apps, srv, true)
+        }
         "propose" | "induce" | "ask" => delegate_call(tool, args, apps, srv, false),
         _ => Err((-32601, format!("unknown tool {:?}", tool))),
     }

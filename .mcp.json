@@ -13,15 +13,6 @@
         "--py-cli",
         "engine/cli.py"
       ]
-    },
-    "arest-legacy": {
-      "description": "The old shell, retained during 0.9.0 interop for the verbs not yet ported: tutor + tutor.* and select_component. WASM mode against its bundled metamodel \u2014 the old engine CLI is OUT of the serving path. Everything else: use 'arest' (the new engine).",
-      "command": "npx",
-      "args": [
-        "-y",
-        "tsx",
-        "src/mcp/server.ts"
-      ]
     }
   }
 }
