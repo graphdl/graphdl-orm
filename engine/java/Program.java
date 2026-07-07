@@ -1,7 +1,7 @@
 // The Java host's first breath: load the canon through the byte-wrapped
 // vocabulary and report what landed. The reducer follows; the acceptance is
 // the cross-host differential over the same probes the other kernels agree on.
-package arestlam;
+package arest;
 
 import java.util.List;
 

@@ -4,7 +4,7 @@
 // each shared file's bytes become one varargs method call (return T <file>;).
 // Trees build in the delta evaluator's native form: an atom is a scalar
 // (String/Long), a sequence is an Object[], K(x) is the pair ("CONST", x).
-package arestlam;
+package arest;
 
 import java.util.ArrayList;
 import java.util.List;

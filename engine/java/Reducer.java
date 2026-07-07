@@ -4,7 +4,7 @@
 // application node. Metacomposition is the only mechanism; comparators and
 // arithmetic coerce int-first then float; equality stays NATEQ (same type and
 // equal, so 1 never equals 1.0). Java 8 idiom throughout.
-package arestlam;
+package arest;
 
 import java.util.HashMap;
 import java.util.Map;

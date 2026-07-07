@@ -36,7 +36,7 @@ def test_the_java_kernel_agrees_with_the_python_evaluator():
                    check=True, capture_output=True, cwd=_JAVA, timeout=300)
     out = subprocess.run([os.path.join(_JDK, "java.exe"),
                           "-Dfile.encoding=UTF-8", "-cp", "out",
-                          "arestlam.Program"],
+                          "arest.Program"],
                          capture_output=True, text=True, timeout=300,
                          encoding="utf-8", cwd=_JAVA)
     assert out.returncode == 0, out.stderr[-800:]
