@@ -584,6 +584,39 @@ fn a_fully_derived_plain_head_sweeps_whole_dropping_a_stale_row() {
 }
 
 #[test]
+fn a_derived_and_stored_head_sweeps_exactly_like_fully_derived() {
+    // the 2026-07-08 _OWNED gate (python engine.py _OWNED; kind_owned here):
+    // NORMA's ** is "derive materializes into the cell, kept in sync" — the
+    // same no-user-assertions license * carries, so the sweep owns it too.
+    // Before the gate a non-keyed ** head joined NO pass and sat silently
+    // stale (the tasks board's frozen recommendation columns). Same shape as
+    // the fully-derived sweep above; only the derivation kind differs.
+    let mut s = Serve::spawn();
+    assert_eq!(s.rpc(r#"{"d": []}"#), "[]");
+    let r = s.rpc(&store_case("Src", r#"[["a","p"],["b","q"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "Src store step: {r}");
+    let r = s.rpc(&store_case("Der", r#"[["a","p"],["b","q"],["stale","z"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "Der store step: {r}");
+    let r = s.rpc(&store_case("derivation", r#"[["Der","derived-and-stored"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "derivation store step: {r}");
+    let r = s.rpc(&store_case("ruleDerives", r#"[["der_rule","Der"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "ruleDerives store step: {r}");
+    let r = s.rpc(&store_case("ruleReads", r#"[["der_rule","Src"]]"#));
+    assert!(r.starts_with(r#"[["ok","#), "ruleReads store step: {r}");
+    let r = s.rpc(&store_case("der_rule", &copy_rule("Src")));
+    assert!(r.starts_with(r#"[["ok","#), "der_rule store step: {r}");
+
+    assert_eq!(
+        s.rpc(r#"{"op":"run_rules"}"#),
+        r#"{"op":"run_rules","result":{"rounds":1,"changed":["Der"]}}"#
+    );
+    assert_eq!(
+        s.rpc(r#"{"op":"query","fact_type":"Der"}"#),
+        r#"{"op":"query","result":{"fact_type":"Der","rows":[["a","p"],["b","q"]]}}"#
+    );
+}
+
+#[test]
 fn a_self_supporting_head_empties_first_so_a_cyclic_only_row_is_retired() {
     // CHECKPOINT FIVE (b) (the DRed sweep for cycles, engine.py lines 1270
     // through 1284): a self-supporting head (reach_self reads Reach) carrying

@@ -2526,7 +2526,8 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     //
     //   agg   — each aggregate rule evaluates its FULL body over the current
     //           D; its head then SUPERSEDES rather than unions. A
-    //           fully-derived head on a FULL derive is REPLACED whole by the
+    //           derivation-OWNED head (kind_owned: NORMA's * and ** — kinds
+    //           no user asserts into) on a FULL derive is REPLACED whole by the
     //           agg rows unioned with its plain rules' rows, so a group whose
     //           supply vanished dies (per-group supersession could never
     //           retire it) and the paired plain rows of the zero-supply idiom
@@ -2537,7 +2538,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     //           the settled store and supersedes PER KEY: a produced key
     //           replaces its stored row, an asserted row whose key no rule
     //           produced survives (task-955 upsert);
-    //   sweep — a fully-derived plain head is materialization, never ground
+    //   sweep — a derivation-OWNED plain head is materialization, never ground
     //           truth (Gupta-Mumick-Subrahmanian 1993, delete-and-rederive).
     //           A non-self-supporting head re-evaluates whole and REPLACES,
     //           retiring staleness the monotone closure's union can never
@@ -2560,6 +2561,14 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
             }
         }
     }
+    // the storage kinds whose cell the DERIVATION owns (python _OWNED):
+    // NORMA's * and ** — no user asserts into either population, so
+    // destructive rederivation is sound; + / ++ and unmarked ruled heads
+    // keep asserted rows and stay out of every destructive pass.
+    let kind_owned = |kindmap: &HashMap<String, String>, hk: &str| {
+        matches!(kindmap.get(hk).map(String::as_str),
+                 Some("fully-derived") | Some("derived-and-stored"))
+    };
     let mut plain_of: HashMap<String, Vec<Leaf>> = HashMap::new();
     // head_leaf_of recovers a plain head's cell name (a Leaf) from its key,
     // for the keyed and sweep passes that address cells by name.
@@ -2636,13 +2645,13 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     for h in plain_of.keys() {
         derived_heads.insert(h.clone());
     }
-    // sweep / sweep_cyclic: fully-derived plain heads that are neither
+    // sweep / sweep_cyclic: derivation-owned plain heads that are neither
     // aggregate nor keyed, split by whether they support themselves through a
     // cycle. Both iterate in head-name order, matching Python's sorted(...).
     let mut sweep: Vec<(String, Leaf)> = Vec::new();
     let mut sweep_cyclic: Vec<(String, Leaf)> = Vec::new();
     for hk in plain_of.keys() {
-        if kindmap.get(hk).map(String::as_str) != Some("fully-derived") {
+        if !kind_owned(&kindmap, hk) {
             continue;
         }
         if agg_heads.contains(hk) || keyed_of.contains_key(hk) {
@@ -2718,9 +2727,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                     before_rows.push(r.clone());
                 }
             }
-            if kindmap.get(&rr.head_key).map(String::as_str) == Some("fully-derived")
-                && dirty.is_none()
-            {
+            if kind_owned(&kindmap, &rr.head_key) && dirty.is_none() {
                 // whole-replace: the agg rows plus the head's plain rules'
                 // rows ARE the cell; nothing older survives
                 for rid in plain_of.get(&rr.head_key).map(|v| v.as_slice()).unwrap_or(&[])
@@ -2810,7 +2817,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
             }
         }
         // ---- THE SWEEP PASS (engine.py lines 1261 through 1269): a
-        // fully-derived, non-self-supporting plain head re-evaluates whole
+        // derivation-owned, non-self-supporting plain head re-evaluates whole
         // and REPLACES, so this call's supersessions propagate and staleness
         // the closure's union could never remove converges. Always gated on
         // _touched(reach), which a full derive makes true for every head.

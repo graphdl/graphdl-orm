@@ -1188,7 +1188,9 @@ def run_rules(D, changed=None, stats=None):
     #           settled store and supersede PER KEY; asserted rows whose key
     #           the rules did not produce survive;
     #   sweep — DELETE-AND-REDERIVE (Gupta-Mumick-Subrahmanian 1993, in the
-    #           library): for a FULLY-derived plain head the stored cell is
+    #           library): for a derivation-OWNED plain head (_OWNED: NORMA's
+    #           * and **; + / ++ and unmarked ruled heads keep asserted rows
+    #           and stay out of every destructive pass) the stored cell is
     #           materialization of the expressible set (Codd 1970 §1.5), never
     #           ground truth, so it re-evaluates whole and REPLACES — which
     #           both propagates this invocation's supersessions and converges
@@ -1223,34 +1225,20 @@ def run_rules(D, changed=None, stats=None):
     reach = {h: {ft for rid in rids for ft in reads.get(rid, set())}
              for h, rids in plain_of.items()}
     derived_heads = set(agg_heads) | set(plain_of)
-
-    def _self_supporting(h):
-        seen, stack = set(), [x for x in reach.get(h, ()) if x in derived_heads]
-        while stack:
-            x = stack.pop()
-            if x == h:
-                return True
-            if x in seen:
-                continue
-            seen.add(x)
-            stack.extend(y for y in reach.get(x, ()) if y in derived_heads)
-        return False
-
-    sweep = sorted(h for h in plain_of
-                   if kindmap.get(h) == "fully-derived"
-                   and h not in agg_heads and h not in keyed_of
-                   and not _self_supporting(h))
-    # Self-supporting heads (closures) get the paper's RECURSIVE form: a
-    # stale cycle rederives itself over a store that still contains it, so
-    # whole-cell re-evaluation cannot clean it. Delete the overestimate
-    # FIRST (empty the cell), then rederive to the LOCAL least fixpoint from
-    # remaining support (GMS93; termination by the same finiteness as the
-    # main closure). Rows with only cyclic support die; base-supported rows
-    # rebuild.
-    sweep_cyclic = sorted(h for h in plain_of
-                          if kindmap.get(h) == "fully-derived"
-                          and h not in agg_heads and h not in keyed_of
-                          and _self_supporting(h))
+    # MEMBERSHIP comes from THE classification — the same _classify_heads
+    # the compile materializes as the passHeads cell — so the running
+    # scheduler and the schedule-as-data cannot drift. The rule lists and
+    # key positions above stay local: they are the pass bodies' inputs, not
+    # the schedule. Self-supporting heads (closures, the 'dred' class) get
+    # the paper's RECURSIVE form: a stale cycle rederives itself over a
+    # store that still contains it, so whole-cell re-evaluation cannot
+    # clean it. Delete the overestimate FIRST (empty the cell), then
+    # rederive to the LOCAL least fixpoint from remaining support (GMS93;
+    # termination by the same finiteness as the main closure). Rows with
+    # only cyclic support die; base-supported rows rebuild.
+    classes = _classify_heads(D)
+    sweep = classes["sweep"]
+    sweep_cyclic = classes["dred"]
 
     def _eval_rules(rids, Dx):
         outs = set()
@@ -1292,8 +1280,8 @@ def run_rules(D, changed=None, stats=None):
             if isinstance(out, tuple):
                 agg_rows = {tuple(r) for r in out if isinstance(r, tuple)}
                 before = {tuple(r) for r in _pop_rows(D, head)}
-                if kindmap.get(head) == "fully-derived" and dirty is None:
-                    # a FULLY-derived agg head on a FULL derive replaces
+                if kindmap.get(head) in _OWNED and dirty is None:
+                    # a derivation-OWNED agg head on a FULL derive replaces
                     # whole: the cell is materialization, and per-group
                     # supersession cannot retire a group whose supply
                     # VANISHED (nothing produces its key). The paired plain
@@ -1308,7 +1296,7 @@ def run_rules(D, changed=None, stats=None):
                     settled = False
                     round_changed.add(head)
                     D = _ap(ast.Store(head), _S(to_lam(_rowsort(merged)), D))
-        for head in sorted(keyed_of):
+        for head in classes["keyed"]:
             if (_outer or dirty is not None) and not _touched(
                     {ft for rid in keyed_of[head] for ft in reads.get(rid, set())}):
                 continue
@@ -1443,6 +1431,94 @@ def layout_cells(D):
                   if not (isinstance(c, tuple) and len(c) >= 2
                           and c[1] == "rmapColumns"))
     return to_lam(cells + (("CELL", "rmapColumns", tuple(rows)),))
+
+
+# the storage kinds whose cell the DERIVATION owns: no user asserts into a
+# * or ** population (NORMA: * recomputes on demand, ** is "kept in sync" —
+# both are materialization of the rule's output), so delete-and-rederive is
+# sound. Semi-derived (+ / ++) and unmarked ruled heads keep asserted rows
+# and never join a destructive pass. Until 2026-07-08 the gates read * only,
+# which left every non-keyed ** head silently unmaintained after the 0.9.0
+# swap (the tasks board's recommendation columns, the claude app's deontic
+# trigger) — resolved engine-side: NORMA's ** is exactly "derive
+# materializes into the cell", the same license * carries.
+_OWNED = ("fully-derived", "derived-and-stored")
+
+
+def _classify_heads(D):
+    """The joint fixpoint's head classification, ONE computation: pass name →
+    sorted heads. 'agg' aggregate-rule heads; 'keyed' key-spanned plain-ruled
+    heads (the task-955 upsert; kind-blind, like the pass); among the
+    remaining derivation-owned plain heads (_OWNED), 'dred' for the
+    self-supporting (empty-first refill, GMS93's recursive form) and 'sweep'
+    for the acyclic rest (delete-and-rederive). run_rules builds its strata
+    FROM this and scheduler_cells materializes it as the passHeads cell —
+    one classification, so the scheduler and the schedule-as-data cannot
+    drift. A head may be both 'agg' and 'keyed' (agg rules fold it while
+    plain keyed rules upsert it); 'sweep'/'dred' exclude both."""
+    aggids = {r[0] for r in _pop_rows(D, "ruleAgg") if r}
+    all_rules = [(r[0], r[1]) for r in _pop_rows(D, "ruleDerives")
+                 if len(r) >= 2]
+    agg_heads = {h for (rid, h) in all_rules if rid in aggids}
+    plain_of = {}
+    for (rid, h) in all_rules:
+        if rid not in aggids:
+            plain_of.setdefault(h, []).append(rid)
+    kindmap = {r[0]: r[1] for r in _pop_rows(D, "derivation") if len(r) >= 2}
+    spans_of = {}
+    for r in _pop_rows(D, "spans"):
+        if len(r) >= 2:
+            spans_of.setdefault(r[0], set()).add(r[1])
+    keyspanned = set()
+    for c in _pop_rows(D, "constraint"):
+        if len(c) >= 3 and c[1] in ("uniqueness", "spanning_uniqueness") \
+                and spans_of.get(c[0]):
+            keyspanned.add(c[2])
+    reads = {}
+    for r in _pop_rows(D, "ruleReads"):
+        if len(r) >= 2:
+            reads.setdefault(r[0], set()).add(r[1])
+    reach = {h: {ft for rid in rids for ft in reads.get(rid, set())}
+             for h, rids in plain_of.items()}
+    derived_heads = set(agg_heads) | set(plain_of)
+
+    def _self_supporting(h):
+        seen, stack = set(), [x for x in reach.get(h, ()) if x in derived_heads]
+        while stack:
+            x = stack.pop()
+            if x == h:
+                return True
+            if x in seen:
+                continue
+            seen.add(x)
+            stack.extend(y for y in reach.get(x, ()) if y in derived_heads)
+        return False
+
+    owned = [h for h in plain_of
+             if kindmap.get(h) in _OWNED
+             and h not in agg_heads and h not in keyspanned]
+    return {"agg": sorted(agg_heads),
+            "keyed": sorted(h for h in plain_of if h in keyspanned),
+            "sweep": sorted(h for h in owned if not _self_supporting(h)),
+            "dred": sorted(h for h in owned if _self_supporting(h))}
+
+
+def scheduler_cells(D):
+    """Materialize the SCHEDULE as data (the pipeline-as-data endgame's first
+    face): the passHeads cell, rows ⟨pass, head⟩ from _classify_heads — the
+    same classification run_rules builds its strata from, computed once at
+    compile beside rmapColumns. The pass BODIES stay native (the certified
+    fast lane); the MEMBERSHIP becomes store knowledge any host reads instead
+    of recomputing. Recompile replaces the cell wholesale; a store without it
+    classifies at run time, which is what run_rules does anyway."""
+    from .lam import to_lam, from_lam
+    classes = _classify_heads(D)
+    rows = [(p, h) for p in ("agg", "keyed", "sweep", "dred")
+            for h in classes[p]]
+    cells = tuple(c for c in from_lam(D)
+                  if not (isinstance(c, tuple) and len(c) >= 2
+                          and c[1] == "passHeads"))
+    return to_lam(cells + (("CELL", "passHeads", tuple(rows)),))
 
 
 def generator_cells(D):

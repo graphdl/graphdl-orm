@@ -1581,6 +1581,7 @@ class Registry:
         # replay exactly the tail another host appended after this save
         D = persist._with_watermark(D, len(entries))
         D = system.layout_cells(D)
+        D = system.scheduler_cells(D)
         D = system.generator_cells(D)
         D = system.create_handlers(D)                         # create:<ft> defs, native apply
         drv = self._storage(name)
