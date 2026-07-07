@@ -4153,8 +4153,123 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
         // on the claude scratch: 264 s canonical Rust against 10.9 s
         // delegated). Plumbing the native carrier into op_answer is the
         // priced lever that brings it home.
-        "get" | "schema" | "sql" | "explain" | "validate" | "verify" | "actions" => {
+        "get" | "sql" | "explain" | "validate" | "verify" | "actions" => {
             delegate_read(tool, args, apps)
+        }
+        "schema" => {
+            // NATIVE (the store-only read family, 2026-07-08): the model
+            // surface straight off the retained cells, mirroring
+            // Registry.schema's shape and ordering. AREST_DELEGATE_READS=1
+            // is the family's escape hatch back to the python delegate.
+            if std::env::var_os("AREST_DELEGATE_READS").is_some() {
+                return delegate_read(tool, args, apps);
+            }
+            let app = match &apps.current {
+                Some(n) => n.clone(),
+                None => return Err((-32602,
+                    "no app loaded; call apps_use before schema".to_string())),
+            };
+            let leaf = |s: &str| Leaf::S(s.to_string());
+            let sv = |l: &Leaf| match l {
+                Leaf::S(s) => Some(s.clone()),
+                Leaf::I(i) => Some(i.to_string()),
+                _ => None,
+            };
+            let mut nouns: Vec<(String, String)> = Vec::new();
+            for r in pop_rows(&srv.cells, &leaf("instanceOf")) {
+                let it = items(&list_of(&r));
+                if it.len() >= 2 {
+                    if let (Some(n), Some(k)) =
+                        (aval(&it[0]).and_then(|l| sv(&l)),
+                         aval(&it[1]).and_then(|l| sv(&l)))
+                    {
+                        if k == "ObjectType" || k == "ValueType" {
+                            nouns.push((n, k));
+                        }
+                    }
+                }
+            }
+            nouns.sort();
+            let mut roles: std::collections::HashMap<String, Vec<(i64, String)>> =
+                std::collections::HashMap::new();
+            for r in pop_rows(&srv.cells, &leaf("role")) {
+                let it = items(&list_of(&r));
+                if it.len() >= 4 {
+                    if let (Some(ft), Some(Leaf::I(i)), Some(p)) = (
+                        aval(&it[1]).and_then(|l| sv(&l)),
+                        aval(&it[2]).as_deref().cloned().into(),
+                        aval(&it[3]).and_then(|l| sv(&l)),
+                    ) {
+                        roles.entry(ft).or_default().push((i, p));
+                    }
+                }
+            }
+            let mut fts: Vec<(String, String)> = Vec::new();
+            for f in pop_rows(&srv.cells, &leaf("factType")) {
+                let it = items(&list_of(&f));
+                if it.len() >= 2 {
+                    if let (Some(id), Some(rd)) =
+                        (aval(&it[0]).and_then(|l| sv(&l)),
+                         aval(&it[1]).and_then(|l| sv(&l)))
+                    {
+                        fts.push((id, rd));
+                    }
+                }
+            }
+            fts.sort();
+            let mut out = String::from("{\"app\":");
+            esc(&app, &mut out);
+            out.push_str(",\"object_types\":[");
+            for (i, (n, k)) in nouns.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                out.push_str("{\"name\":");
+                esc(n, &mut out);
+                out.push_str(",\"kind\":");
+                esc(k, &mut out);
+                out.push('}');
+            }
+            out.push_str("],\"fact_types\":[");
+            for (i, (id, rd)) in fts.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                out.push_str("{\"id\":");
+                esc(id, &mut out);
+                out.push_str(",\"reading\":");
+                esc(rd, &mut out);
+                out.push_str(",\"roles\":[");
+                let mut rs = roles.get(id).cloned().unwrap_or_default();
+                rs.sort();
+                for (j, (_i, p)) in rs.iter().enumerate() {
+                    if j > 0 { out.push(','); }
+                    esc(p, &mut out);
+                }
+                out.push_str("]}");
+            }
+            out.push_str("],\"constraints\":[");
+            let mut first = true;
+            for c in pop_rows(&srv.cells, &leaf("constraint")) {
+                let it = items(&list_of(&c));
+                if it.len() >= 2 {
+                    if let (Some(id), Some(k)) =
+                        (aval(&it[0]).and_then(|l| sv(&l)),
+                         aval(&it[1]).and_then(|l| sv(&l)))
+                    {
+                        if !first { out.push(','); }
+                        first = false;
+                        out.push_str("{\"id\":");
+                        esc(&id, &mut out);
+                        out.push_str(",\"kind\":");
+                        esc(&k, &mut out);
+                        out.push_str(",\"fact_type\":");
+                        match it.get(2).and_then(|x| aval(x)).and_then(|l| sv(&l)) {
+                            Some(ft) => esc(&ft, &mut out),
+                            None => out.push_str("null"),
+                        }
+                        out.push('}');
+                    }
+                }
+            }
+            out.push_str("]}");
+            Ok(out)
         }
         "synthesize" => {
             // NATIVE BY DEFAULT (the ~40x plumb closed 2026-07-08): the MCP
