@@ -1839,6 +1839,20 @@ class Registry:
             return sorted(system.ft_view(D, fact_type, system.rmap_partition(D)))
         return [tuple(r) for r in system._pop_rows(D, fact_type)]
 
+    def entities(self, name, noun):
+        """The noun's population for the UI containers: its own table's
+        keys unioned with the role-1 keys of every fact type it heads —
+        a fresh compile carries pops before any table cell
+        materializes, and an entity is an entity by playing a fact."""
+        D = self._load(name)
+        keys = {str(r[0]) for r in system._pop_rows(D, noun) if r}
+        for r in system._pop_rows(D, "role"):
+            if len(r) >= 4 and r[2] == 1 and r[3] == noun:
+                keys |= {str(x[0])
+                         for x in system._pop_rows(D, r[1]) if x}
+        keys -= {"", "φ"}
+        return sorted(keys)
+
     def sql(self, name, statement):
         return self._storage(name).query(statement)          # the 3NF surface (SQL backends)
 

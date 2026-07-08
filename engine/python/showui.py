@@ -121,18 +121,9 @@ class Container:
                 if n["kind"] == "ObjectType"]
 
     def entities(self, noun):
-        """The noun's population: its own table's keys unioned with the
-        role-1 keys of every fact type it heads (a fresh compile carries
-        pops before any table cell materializes)."""
-        from . import system
-        D = self.reg._load(self.app)
-        keys = {str(r[0]) for r in system._pop_rows(D, noun) if r}
-        for r in system._pop_rows(D, "role"):
-            if len(r) >= 4 and r[2] == 1 and r[3] == noun:
-                keys |= {str(x[0])
-                         for x in system._pop_rows(D, r[1]) if x}
-        keys -= {"", "φ"}
-        return sorted(keys)
+        """The noun's population — Registry.entities is the one home
+        (the WPF adapter reads the same verb through the cli)."""
+        return self.reg.entities(self.app, noun)
 
     def entity(self, noun, id):
         return self.reg.get(self.app, noun, id)

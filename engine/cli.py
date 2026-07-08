@@ -36,7 +36,7 @@ _USAGE = ("usage: cli.py <verb> --apps-dir <dir> <app> [args...]\n"
 # arguments; the CLI is a thin delegate, so outputs pass through as the
 # method answers them.
 _READS = {"get": 3, "schema": 1, "sql": 2, "explain": 2, "validate": 1,
-          "verify": 1, "actions": 3, "synthesize": 2}
+          "verify": 1, "actions": 3, "synthesize": 2, "entities": 2}
 
 
 def main(argv):
