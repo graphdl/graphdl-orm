@@ -1554,6 +1554,54 @@ impl NEval {
             // with the canon encodings (unary T/F, absent "#"); kinds
             // ride system:ev_cols for the render. Twinned by the
             // entity-view parity pin (tests/derive.rs).
+            // CERTIFIED-EQUAL OVERRIDE of DEF("system:ev_cols") — the
+            // classified column layout, one spine pass (the WHILE-fold is
+            // interpretive-minutes at fleet scale). Twinned beside
+            // entity_view's pin.
+            "system:ev_cols" => match pairv(x) {
+                Some((N::A(nl), d)) => {
+                    let noun = match leaf_str(&nl) {
+                        Some(s) => s,
+                        None => return Some(N::Bot),
+                    };
+                    let spine: Vec<(String, N)> = match &d {
+                        N::S(cells) => cells
+                            .iter()
+                            .filter_map(|c| {
+                                if let N::S(it) = c {
+                                    if it.len() == 3 {
+                                        if let (N::A(l0), N::A(k)) = (&it[0], &it[1]) {
+                                            if matches!(&**l0, Leaf::S(s) if s == "CELL") {
+                                                return leaf_str(k).map(|key| (key, it[2].clone()));
+                                            }
+                                        }
+                                    }
+                                }
+                                None
+                            })
+                            .collect(),
+                        _ => return Some(N::Bot),
+                    };
+                    let hash = N::A(Rc::new(Leaf::S("#".into())));
+                    N::S(Rc::new(
+                        ev_cols_native(&spine, &noun)
+                            .into_iter()
+                            .map(|(ft, kind, other, col)| {
+                                N::S(Rc::new(vec![
+                                    N::A(Rc::new(Leaf::S(ft))),
+                                    N::A(Rc::new(Leaf::S(kind))),
+                                    match other {
+                                        Some(o) => N::A(Rc::new(Leaf::S(o))),
+                                        None => hash.clone(),
+                                    },
+                                    N::A(Rc::new(Leaf::S(col))),
+                                ]))
+                            })
+                            .collect(),
+                    ))
+                }
+                _ => N::Bot,
+            },
             "system:entity_view" => match x {
                 N::S(v3) if v3.len() == 3 => {
                     let noun = match &v3[0] {
@@ -1594,122 +1642,20 @@ impl NEval {
                     let sv2 = |n: &N| -> Option<String> {
                         match n { N::A(l) => leaf_str(l), _ => None }
                     };
-                    // the classification (system:ev_cols' semantics):
-                    // rmapColumns rows for the noun in cell order
-                    let colrows: Vec<(i64, String)> = rows_of("rmapColumns")
-                        .iter()
-                        .filter_map(|r| {
-                            if let N::S(cc) = r {
-                                if cc.len() >= 3 {
-                                    if sv2(&cc[0]).as_deref() == Some(noun.as_str()) {
-                                        if let (N::A(cl), Some(ft)) = (&cc[1], sv2(&cc[2])) {
-                                            if let Leaf::I(ci) = &**cl {
-                                                return Some((*ci, ft));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            None
-                        })
-                        .collect();
-                    let mut roles: Vec<(String, i64, String)> = Vec::new();
-                    for r in rows_of("role") {
-                        if let N::S(cc) = &r {
-                            if cc.len() >= 4 {
-                                if let (Some(ft), N::A(pl), Some(player)) =
-                                    (sv2(&cc[1]), &cc[2], sv2(&cc[3]))
-                                {
-                                    if let Leaf::I(p) = &**pl {
-                                        roles.push((ft, *p, player));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    let mut entities: Vec<String> = Vec::new();
-                    for r in rows_of("instanceOf") {
-                        if let N::S(cc) = &r {
-                            if cc.len() >= 2 && sv2(&cc[1]).as_deref() == Some("ObjectType") {
-                                if let Some(e) = sv2(&cc[0]) {
-                                    entities.push(e);
-                                }
-                            }
-                        }
-                    }
-                    let mut refmode: Vec<(String, String)> = Vec::new();
-                    for cell in ["refScheme", "refMode"] {
-                        for r in rows_of(cell) {
-                            if let N::S(cc) = &r {
-                                if cc.len() >= 2 {
-                                    if let (Some(a), Some(b)) = (sv2(&cc[0]), sv2(&cc[1])) {
-                                        if !refmode.iter().any(|(k, _)| *k == a) {
-                                            refmode.push((a, b));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
                     let hash = N::A(Rc::new(Leaf::S("#".into())));
                     let t_at = N::A(Rc::new(Leaf::S("T".into())));
                     let f_at = N::A(Rc::new(Leaf::S("F".into())));
                     let mut fields: Vec<N> = Vec::new();
-                    let mut counts: Vec<(String, i64)> = Vec::new();
                     let mut any_seen = false;
-                    let mut cr_sorted = colrows.clone();
-                    cr_sorted.sort_by_key(|(c, _)| *c);
-                    for (_c, ft) in &cr_sorted {
-                        let rs: Vec<(i64, String)> = {
-                            let mut v: Vec<(i64, String)> = roles
-                                .iter()
-                                .filter(|(f, _, _)| f == ft)
-                                .map(|(_, p, pl)| (*p, pl.clone()))
-                                .collect();
-                            v.sort();
-                            v
-                        };
-                        let (kind, other): (&str, Option<String>) = if rs.len() == 1 {
-                            ("unary", None)
-                        } else {
-                            let o = rs.iter().find(|(_, pl)| *pl != noun).map(|(_, pl)| pl.clone());
-                            match &o {
-                                Some(pl) if entities.iter().any(|e| e == pl) => ("ref", o.clone()),
-                                Some(_) => ("value", o.clone()),
-                                None => ("value", None),
-                            }
-                        };
-                        let base = match kind {
-                            "unary" => sql_name(ft.strip_prefix(noun.as_str()).unwrap_or(ft)),
-                            "ref" => {
-                                let o = other.clone().unwrap_or_default();
-                                let m = refmode
-                                    .iter()
-                                    .find(|(k, _)| *k == o)
-                                    .map(|(_, v)| v.clone())
-                                    .unwrap_or_else(|| "id".into());
-                                format!("{}_{}", sql_name(&o), sql_name(&m))
-                            }
-                            _ => match &other {
-                                Some(o) => sql_name(o),
-                                None => sql_name(ft),
-                            },
-                        };
-                        let n = {
-                            let e = counts.iter_mut().find(|(b, _)| *b == base);
-                            match e {
-                                Some((_, c)) => { *c += 1; *c }
-                                None => { counts.push((base.clone(), 1)); 1 }
-                            }
-                        };
-                        let col = if n >= 2 { format!("{}_{}", base, n) } else { base };
+                    let classified = ev_cols_native(&spine, &noun);
+                    for (ft, kind, other, col) in &classified {
                         let key = if kind == "unary" {
-                            col
+                            col.clone()
                         } else {
-                            other.clone().unwrap_or(col)
+                            other.clone().unwrap_or_else(|| col.clone())
                         };
                         let pop = rows_of(ft);
-                        let val: N = if kind == "unary" {
+                        let val: N = if kind.as_str() == "unary" {
                             let hit = pop.iter().any(|r| match r {
                                 N::S(cc) if !cc.is_empty() =>
                                     sv2(&cc[0]).as_deref() == Some(id.as_str()),
@@ -1739,8 +1685,6 @@ impl NEval {
                     }
                     // own facts: factType order, minus absorbed, the noun's
                     // role positions, any position matching the id
-                    let absorbed: Vec<String> =
-                        colrows.iter().map(|(_, f)| f.clone()).collect();
                     let all_absorbed: Vec<String> = rows_of("rmapColumns")
                         .iter()
                         .filter_map(|r| {
@@ -1750,7 +1694,6 @@ impl NEval {
                             None
                         })
                         .collect();
-                    let _ = absorbed;
                     let mut facts: Vec<N> = Vec::new();
                     for fr in rows_of("factType") {
                         let ft = match &fr {
@@ -1763,10 +1706,23 @@ impl NEval {
                         if all_absorbed.iter().any(|a| *a == ft) {
                             continue;
                         }
-                        let positions: Vec<i64> = roles
+                        let positions: Vec<i64> = rows_of("role")
                             .iter()
-                            .filter(|(f, _, pl)| *f == ft && *pl == noun)
-                            .map(|(_, p, _)| *p)
+                            .filter_map(|r| {
+                                if let N::S(cc) = r {
+                                    if cc.len() >= 4
+                                        && sv2(&cc[1]).as_deref() == Some(ft.as_str())
+                                        && sv2(&cc[3]).as_deref() == Some(noun.as_str())
+                                    {
+                                        if let N::A(pl) = &cc[2] {
+                                            if let Leaf::I(pp) = &**pl {
+                                                return Some(*pp);
+                                            }
+                                        }
+                                    }
+                                }
+                                None
+                            })
                             .collect();
                         if positions.is_empty() {
                             continue;
@@ -2132,6 +2088,132 @@ fn j_to_n(j: &J) -> N {
         J::A(xs) => N::S(Rc::new(xs.iter().map(j_to_n).collect())),
         J::O(_) | J::Null | J::B(_) => N::Bot,
     }
+}
+
+// system:ev_cols' classification, natively (shared by the ev_cols and
+// entity_view prims): the noun's rmapColumns layout in column order,
+// each ft classified unary/value/ref with its played type and its
+// deduped sql column name. Reads only the store spine the caller
+// already built.
+fn ev_cols_native(
+    spine: &[(String, N)],
+    noun: &str,
+) -> Vec<(String, String, Option<String>, String)> {
+    let fetch = |name: &str| -> Option<&N> {
+        spine.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+    };
+    let rows_of = |name: &str| -> Vec<N> {
+        match fetch(name) {
+            Some(N::S(v)) => v.to_vec(),
+            _ => Vec::new(),
+        }
+    };
+    let sv2 = |n: &N| -> Option<String> {
+        match n { N::A(l) => leaf_str(l), _ => None }
+    };
+    let mut colrows: Vec<(i64, String)> = rows_of("rmapColumns")
+        .iter()
+        .filter_map(|r| {
+            if let N::S(cc) = r {
+                if cc.len() >= 3 && sv2(&cc[0]).as_deref() == Some(noun) {
+                    if let (N::A(cl), Some(ft)) = (&cc[1], sv2(&cc[2])) {
+                        if let Leaf::I(ci) = &**cl {
+                            return Some((*ci, ft));
+                        }
+                    }
+                }
+            }
+            None
+        })
+        .collect();
+    colrows.sort_by_key(|(c, _)| *c);
+    let mut roles: Vec<(String, i64, String)> = Vec::new();
+    for r in rows_of("role") {
+        if let N::S(cc) = &r {
+            if cc.len() >= 4 {
+                if let (Some(ft), N::A(pl), Some(player)) =
+                    (sv2(&cc[1]), &cc[2], sv2(&cc[3]))
+                {
+                    if let Leaf::I(pp) = &**pl {
+                        roles.push((ft, *pp, player));
+                    }
+                }
+            }
+        }
+    }
+    let mut entities: Vec<String> = Vec::new();
+    for r in rows_of("instanceOf") {
+        if let N::S(cc) = &r {
+            if cc.len() >= 2 && sv2(&cc[1]).as_deref() == Some("ObjectType") {
+                if let Some(e) = sv2(&cc[0]) {
+                    entities.push(e);
+                }
+            }
+        }
+    }
+    let mut refmode: Vec<(String, String)> = Vec::new();
+    for cell in ["refScheme", "refMode"] {
+        for r in rows_of(cell) {
+            if let N::S(cc) = &r {
+                if cc.len() >= 2 {
+                    if let (Some(a), Some(b)) = (sv2(&cc[0]), sv2(&cc[1])) {
+                        if !refmode.iter().any(|(k, _)| *k == a) {
+                            refmode.push((a, b));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out: Vec<(String, String, Option<String>, String)> = Vec::new();
+    let mut counts: Vec<(String, i64)> = Vec::new();
+    for (_c, ft) in &colrows {
+        let rs: Vec<(i64, String)> = {
+            let mut v: Vec<(i64, String)> = roles
+                .iter()
+                .filter(|(f, _, _)| f == ft)
+                .map(|(_, p, pl)| (*p, pl.clone()))
+                .collect();
+            v.sort();
+            v
+        };
+        let (kind, other): (&str, Option<String>) = if rs.len() == 1 {
+            ("unary", None)
+        } else {
+            let o = rs.iter().find(|(_, pl)| *pl != noun).map(|(_, pl)| pl.clone());
+            match &o {
+                Some(pl) if entities.iter().any(|e| e == pl) => ("ref", o.clone()),
+                Some(_) => ("value", o.clone()),
+                None => ("value", None),
+            }
+        };
+        let base = match kind {
+            "unary" => sql_name(ft.strip_prefix(noun).unwrap_or(ft)),
+            "ref" => {
+                let o = other.clone().unwrap_or_default();
+                let m = refmode
+                    .iter()
+                    .find(|(k, _)| *k == o)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| "id".into());
+                format!("{}_{}", sql_name(&o), sql_name(&m))
+            }
+            _ => match &other {
+                Some(o) => sql_name(o),
+                None => sql_name(ft),
+            },
+        };
+        let n = {
+            let e = counts.iter_mut().find(|(b, _)| *b == base);
+            match e {
+                Some((_, c)) => { *c += 1; *c }
+                None => { counts.push((base.clone(), 1)); 1 }
+            }
+        };
+        let col = if n >= 2 { format!("{}_{}", base, n) } else { base };
+        out.push((ft.clone(), kind.to_string(), other, col));
+    }
+    out
 }
 
 fn n_cells_of(d: &N) -> Vec<(Leaf, N)> {

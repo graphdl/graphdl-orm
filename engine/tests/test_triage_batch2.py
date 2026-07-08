@@ -56,16 +56,21 @@ Each Person has at most one Name.
 
 
 def test_a_rule_that_cannot_compile_says_why():
+    # The unbound-head diagnostic CLASS retired 2026-07-08 (the skolem
+    # compiler surface: an unbound head variable is its own skolem
+    # function of the body frontier — the old positive form now
+    # COMPILES). The says-why pin keeps its intent on a rule that still
+    # cannot compile: a body with no fact-type clause at all.
     MODEL = """Person is an entity type.
 Glyph is an entity type.
 Person mentors Person.
 Glyph links Glyph.
-Person1 is odd if Glyph2 links Glyph3.
+Person1 is odd if no Glyph2 links Glyph3.
 """
     D, rep = forml.compile_model(MODEL)
     assert rep["unparsed"] == []
     diags = _cell(from_lam(D), "ruleDiag")
-    assert any("Person1" in reason for (_rid, reason) in diags)   # unbound head variable
+    assert any("no fact-type clause" in reason for (_rid, reason) in diags)
     assert rep.get("rule_diagnostics")                            # surfaced in the report
 
 

@@ -1113,6 +1113,23 @@ fn the_native_entity_view_twins_the_canonical_def() {
     ));
     assert!(native.contains(want_t1), "the native prim must answer the canon: {native}");
 
+    // the classified layout itself twins (system:ev_cols is a prim too —
+    // the interpretive WHILE-fold measured minutes at fleet scale)
+    let want_cols = concat!(
+        r##"[["Task_is_started","unary","#","is_started"],"##,
+        r##"["Task_has_Task_Priority","value","Task Priority","task_priority"]]"##
+    );
+    let cols_canon = s.rpc(concat!(
+        r#"{"cases":[{"f":["COMP","system:ev_cols","#,
+        r#"["CONS",["CONST","Task"],2]],"xd":[],"fuel":0}]}"#
+    ));
+    assert!(cols_canon.contains(want_cols), "ev_cols canon: {cols_canon}");
+    let cols_native = s.rpc(concat!(
+        r#"{"op":"neval","f":["COMP","system:ev_cols","#,
+        r#"["CONS",["CONST","Task"],"DEFS"]],"x":"x"}"#
+    ));
+    assert!(cols_native.contains(want_cols), "ev_cols prim: {cols_native}");
+
     // t2: no fields set, but it plays position 2 of the blocks row and
     // rides the spine — exists via the fact
     let want_t2 = concat!(
