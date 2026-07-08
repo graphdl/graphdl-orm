@@ -81,7 +81,7 @@ _PANE_FOR = {"tabs": "tabs", "list": "master",
 
 
 class HistoryStack:
-    """IHistoryStack's core: push/pop/current over one pane."""
+    """IHistoryStack's surface: push/pop/pop-to/replace over one pane."""
 
     def __init__(self):
         self.views = []
@@ -96,6 +96,22 @@ class HistoryStack:
     def pop_to_root(self):
         del self.views[1:]
         return self.views[0] if self.views else None
+
+    def pop_to(self, frame):
+        """PopToView: unwind until `frame` is current (a no-op when it
+        is not on the stack — iFactr throws; the container prefers
+        grace)."""
+        while self.views and self.views[-1] != frame:
+            self.views.pop()
+        return self.current
+
+    def replace(self, old, new):
+        """ReplaceView: swap in place, history above untouched."""
+        for i, f in enumerate(self.views):
+            if f == old:
+                self.views[i] = new
+                return new
+        return None
 
     @property
     def current(self):
@@ -112,7 +128,9 @@ class Container:
         self.reg = registry
         self.app = app
         self.toolkit = toolkit
-        self.stacks = {p: HistoryStack() for p in PANES}
+        self.active_tab = 0                 # AppNavigationContext.ActiveTab
+        self._stacks = {}                   # PaneManager's registry,
+        self.gates = []                     # ShouldNavigateFrom pollees
 
     # -- model reads (facts render) --
     def nouns(self):
@@ -162,39 +180,81 @@ class Container:
     def entry_tree(self, noun):
         return view_entry_tree(self.reg._load(self.app), noun)
 
-    # -- navigation: pane assignment + per-pane history --
-    def pane_for(self, frame):
-        """PaneManager.GetPreferredPane collapsed to the kind map; an
-        unknown kind lands Detail (the survey's default)."""
-        return _PANE_FOR.get(frame[0] if frame else None, "detail")
+    # -- navigation: pane assignment + per-pane-per-tab history --
+    def stack_for(self, pane, tab=None):
+        """PaneManager.FromNavContext: stacks are keyed by ⟨pane, tab⟩
+        (the survey's pane + tab*256) — each tab carries its own
+        master/detail/popover histories; the tabs pane itself is
+        tab-independent."""
+        key = (pane, 0 if pane == "tabs"
+               else (self.active_tab if tab is None else tab))
+        if key not in self._stacks:
+            self._stacks[key] = HistoryStack()
+        return self._stacks[key]
 
-    def navigate(self, frame, clear_history=False):
-        """DisplayView: assign the pane, optionally clear its history
-        (RequestType.ClearPaneHistory), push. A master navigation
-        clears the DETAIL pane's history too — the split-view rule:
-        a new master context invalidates the old detail."""
-        pane = self.pane_for(frame)
-        stack = self.stacks[pane]
+    @property
+    def stacks(self):
+        """The ACTIVE tab's stacks, one per pane (the older surface;
+        tests and renderers address panes of the current context)."""
+        return {p: self.stack_for(p) for p in PANES}
+
+    def pane_for(self, frame, pane=None):
+        """GetPreferredPane's priority collapsed to this container's
+        channels: an explicit override (OutputOnPane / the frame's own
+        pane= request) wins, then the kind map, then Detail — and a
+        Tabs target coerces to Master (iApp.Navigate's forcing: content
+        never lands ON the tab strip)."""
+        chosen = pane or _PANE_FOR.get(frame[0] if frame else None,
+                                       "detail")
+        if chosen == "tabs" and frame and frame[0] != "tabs":
+            chosen = "master"
+        return chosen
+
+    def should_navigate(self, frame):
+        """The ShouldNavigate gate: every registered pollee (a view's
+        ShouldNavigateFrom) may veto by answering False."""
+        return all(g(frame) for g in self.gates)
+
+    def navigate(self, frame, clear_history=False, pane=None):
+        """DisplayView: gate, assign the pane (override channel first),
+        optionally clear its history (RequestType.ClearPaneHistory),
+        push. A master navigation clears the DETAIL and POPOVER
+        histories of ITS TAB — the split-view rule: a new master
+        context invalidates the old detail. Answers the pane, or None
+        when a gate vetoed."""
+        if not self.should_navigate(frame):
+            return None
+        pane = self.pane_for(frame, pane)
+        if frame and frame[0] == "tabs" and len(frame) > 2:
+            self.active_tab = frame[2]
+        stack = self.stack_for(pane)
         if clear_history:
             stack.views.clear()
         stack.push(frame)
         if pane == "master":
-            self.stacks["detail"].views.clear()
-            self.stacks["popover"].views.clear()
+            self.stack_for("detail").views.clear()
+            self.stack_for("popover").views.clear()
         return pane
 
     def back(self, pane="detail"):
         """Pop the pane's stack; answer the frame now current there
         (None when the pane emptied — the popover's close)."""
-        self.stacks[pane].pop()
-        return self.stacks[pane].current
+        self.stack_for(pane).pop()
+        return self.stack_for(pane).current
+
+    def detail_link(self, frame):
+        """iLayer.DetailLink's auto-load: a master frame carrying a
+        5th element ⟨…, detail-frame⟩ names the detail its split view
+        should open with; answers it (the renderer navigates)."""
+        return frame[4] if frame and len(frame) > 4 else None
 
     @property
     def stack(self):
-        """The flattened view state in pane ordinal order (tabs first),
-        the topmost frame per occupied pane — TopmostPane's shape."""
+        """The flattened view state of the ACTIVE tab in pane ordinal
+        order (tabs first), topmost frame per occupied pane —
+        TopmostPane's shape."""
         return [s.current for p, s in
-                ((p, self.stacks[p]) for p in PANES) if s.current]
+                ((p, self.stack_for(p)) for p in PANES) if s.current]
 
     # -- rendering: resolve control constructors through DEFS --
     def render(self, parent, tree, ctx):
@@ -330,6 +390,17 @@ def show(registry, app, noun=None, mainloop=True):
         clear(right)
         noun = state["noun"]
         got = c.entity(noun, id)
+        bar = tk.Frame(right, pady=2)
+        bar.pack(side=tk.TOP, fill=tk.X)
+
+        def go_back():
+            prev = c.back("detail")
+            if prev and prev[0] == "detail":
+                render_detail(prev[2])
+            else:
+                clear(right)
+        tk.Button(bar, text="◀ Back", command=go_back).pack(side=tk.LEFT,
+                                                            padx=3)
         fields = sorted((k, v) for k, v in (got.get("fields") or {}).items()
                         if not isinstance(v, bool))
         c.render(right, view_detail_tree(fields), {})
@@ -385,14 +456,16 @@ def show(registry, app, noun=None, mainloop=True):
     def switch(noun):
         state["noun"] = noun
         status_var.set(f"{app} · {noun}")
-        c.navigate(("tabs", noun), clear_history=True)
+        # the tabs frame carries its tab index: the pane manager keys
+        # each tab's own master/detail/popover histories off it
+        c.navigate(("tabs", noun, nouns.index(noun)), clear_history=True)
         clear(right)
         render_list()
 
     for n in nouns:
         tk.Button(tabs, text=n, command=lambda n=n: switch(n)).pack(
             side=tk.LEFT, padx=2)
-    c.navigate(("tabs", state["noun"]))
+    c.navigate(("tabs", state["noun"], nouns.index(state["noun"])))
     render_list()
     if mainloop:
         root.mainloop()

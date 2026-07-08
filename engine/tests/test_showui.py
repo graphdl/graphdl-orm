@@ -134,6 +134,55 @@ def test_the_pane_stack_assigns_and_clears(tmp_path):
     assert c.stack[0][0] == "tabs" and c.stack[-1][0] == "list"
 
 
+def test_the_stack_is_keyed_per_tab(tmp_path):
+    # PaneManager's registry is ⟨pane, tab⟩ (pane + tab*256): each tab
+    # carries its OWN master/detail histories; switching tabs switches
+    # the whole context and switching back finds it intact
+    reg = _mk(tmp_path)
+    c = showui.Container(reg, "flow")
+    c.navigate(("tabs", "Ticket", 0))
+    c.navigate(("list", "Ticket"))
+    c.navigate(("detail", "Ticket", "t1"))
+    c.navigate(("tabs", "Other", 1))
+    assert c.stacks["detail"].current is None       # tab 1's detail
+    c.navigate(("list", "Other"))
+    c.navigate(("tabs", "Ticket", 0))
+    assert c.stacks["detail"].current == ("detail", "Ticket", "t1")
+
+
+def test_pane_override_coercion_and_gates(tmp_path):
+    reg = _mk(tmp_path)
+    c = showui.Container(reg, "flow")
+    # the override channel (OutputOnPane): a detail frame forced onto
+    # the master pane lands there
+    assert c.navigate(("detail", "Ticket", "t1"), pane="master") == "master"
+    # iApp.Navigate's forcing: content never lands ON the tab strip
+    assert c.navigate(("list", "Ticket"), pane="tabs") == "master"
+    # the ShouldNavigate veto: a registered gate answers False and the
+    # navigation is refused (None), stacks untouched
+    before = c.stacks["detail"].current
+    c.gates.append(lambda f: f[0] != "detail")
+    assert c.navigate(("detail", "Ticket", "t2")) is None
+    assert c.stacks["detail"].current == before
+
+
+def test_pop_to_replace_and_detail_link(tmp_path):
+    reg = _mk(tmp_path)
+    c = showui.Container(reg, "flow")
+    for id in ("a", "b", "c"):
+        c.navigate(("detail", "Ticket", id))
+    st = c.stacks["detail"]
+    assert st.pop_to(("detail", "Ticket", "a")) == ("detail", "Ticket", "a")
+    assert st.replace(("detail", "Ticket", "a"),
+                      ("detail", "Ticket", "z")) == ("detail", "Ticket", "z")
+    assert st.current == ("detail", "Ticket", "z")
+    # iLayer.DetailLink: a master frame's 5th element names the detail
+    # its split view opens with
+    frame = ("list", "Ticket", None, None, ("detail", "Ticket", "t1"))
+    assert c.detail_link(frame) == ("detail", "Ticket", "t1")
+    assert c.detail_link(("list", "Ticket")) is None
+
+
 def test_the_window_renders_headlessly(tmp_path):
     try:
         import tkinter as tk
