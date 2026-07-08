@@ -4866,64 +4866,16 @@ fn mcp_call(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Result<Stri
     out
 }
 
-#[cfg(feature = "host")]
-fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Result<String, (i64, String)> {
-    match tool {
-        "context" => Ok(LAST_RECEIPT.with(|c| c.borrow().clone())
-            .unwrap_or_else(|| "{\"note\":\"no mutation this session\"}".to_string())),
-        "orient" => {
-            let mut r = String::from("{\"apps\":");
-            esc_names(&apps.list(), &mut r);
-            r.push_str(",\"current\":");
-            match &apps.current {
-                Some(n) => esc(n, &mut r),
-                None => r.push_str("null"),
-            }
-            r.push('}');
-            Ok(r)
-        }
-        "apps_list" => {
-            let mut r = String::new();
-            esc_names(&apps.list(), &mut r);
-            Ok(r)
-        }
-        "apps_current" => {
-            let mut r = String::from("{\"current\":");
-            match &apps.current {
-                Some(n) => esc(n, &mut r),
-                None => r.push_str("null"),
-            }
-            r.push('}');
-            Ok(r)
-        }
-        "apps_use" => {
-            let name = match jget(args, "name") {
-                Some(J::S(n)) => n.clone(),
-                _ => return Err((-32602, "apps_use needs a string name".to_string())),
-            };
-            load_sidecar(apps, &name, srv).map_err(|m| (-32602, m))?;
-            apps.current = Some(name.clone());
-            let mut r = String::from("{\"app\":");
-            esc(&name, &mut r);
-            r.push_str(",\"ok\":true}");
-            Ok(r)
-        }
-        // apply flips native for OWN-TABLE: a fact type carrying a create:<ft>
-        // handler cell computes and persists in process (native_apply); an
-        // absorbed fact type, a non-retained target app, or a bare-ERROR
-        // refusal answers None and falls through to the CLI delegate. retract
-        // and apps_compile still delegate whole.
-        "apply" => match native_apply(args, apps, srv) {
-            Some(res) => res,
-            None => delegate_verb(tool, args, apps, srv),
-        },
-        "retract" | "apps_compile" => delegate_verb(tool, args, apps, srv),
-        // synthesize delegates for now: the canonical verbalize over the
-        // daily driver's store reduces in minutes on this path where the
-        // Python host's native twins answer in seconds (measured 2026-07-05
-        // on the claude scratch: 264 s canonical Rust against 10.9 s
-        // delegated). Plumbing the native carrier into op_answer is the
-        // priced lever that brings it home.
+// ONE dispatch, two bindings: the STORE-ONLY verb table — no Apps,
+// no delegates, srv only (the wasm Worker serves exactly this; the
+// MCP host wraps it with the app-loaded guard and the delegate
+// escape). The app name is envelope text, passed in. None = not a
+// store-only verb, the caller's dispatch continues.
+#[allow(clippy::needless_return)]
+fn store_call(tool: &str, args: &J, app: &str, srv: &mut Srv)
+    -> Option<Result<String, (i64, String)>> {
+    let _ = app;
+    Some(match tool {
         "get" => {
             // NATIVE: the 3NF per-entity view — system:entity_view resolves
             // to its canon-named prim (the vb_fetch treatment: one spine
@@ -4931,21 +4883,14 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
             // scale), ev_cols rides along so the render knows a unary T
             // from a binary value "T", rendered to Registry.get's exact
             // JSON shape. AREST_DELEGATE_READS is the escape hatch.
-            if std::env::var_os("AREST_DELEGATE_READS").is_some() {
-                return delegate_read(tool, args, apps);
-            }
-            let app = match &apps.current {
-                Some(n) => n.clone(),
-                None => return Err((-32602,
-                    "no app loaded; call apps_use before get".to_string())),
-            };
+            let app = app.to_string();
             let noun = match jget(args, "noun") {
                 Some(J::S(s)) => s.clone(),
-                _ => return Err((-32602, "get needs a string noun".to_string())),
+                _ => return Some(Err((-32602, "get needs a string noun".to_string()))),
             };
             let id = match jget(args, "id") {
                 Some(J::S(s)) => s.clone(),
-                _ => return Err((-32602, "get needs a string id".to_string())),
+                _ => return Some(Err((-32602, "get needs a string id".to_string()))),
             };
             let ev = NEval {
                 cells: srv.ncells.clone(),
@@ -4964,8 +4909,8 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
             ));
             let (exists, fields, facts) = match &view {
                 N::S(v) if v.len() == 3 => (&v[0], &v[1], &v[2]),
-                _ => return Err((-32603,
-                    "entity_view answered an unexpected shape".to_string())),
+                _ => return Some(Err((-32603,
+                    "entity_view answered an unexpected shape".to_string()))),
             };
             let kinds: Vec<String> = match &cols {
                 N::S(cs) => cs.iter().map(|c| match c {
@@ -5060,9 +5005,6 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
             out.push_str("]}");
             Ok(out)
         }
-        "sql" | "explain" | "validate" | "verify" => {
-            delegate_read(tool, args, apps)
-        }
         "actions" => {
             // NATIVE (the store-only family): Theorem 4 off the retained
             // store — the machine walk (smDef + subtype chain), the status
@@ -5070,22 +5012,15 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
             // on the carrier — no rust reimplementation of the column
             // dispatch), the triples via the CANON's sm_join, filtered
             // from == status. Registry.actions' exact shape and key order.
-            if std::env::var_os("AREST_DELEGATE_READS").is_some() {
-                return delegate_read(tool, args, apps);
-            }
-            let app = match &apps.current {
-                Some(n) => n.clone(),
-                None => return Err((-32602,
-                    "no app loaded; call apps_use before actions".to_string())),
-            };
+            let app = app.to_string();
             let noun = match jget(args, "noun") {
                 Some(J::S(s)) => s.clone(),
-                _ => return Err((-32602, "actions needs a string noun".to_string())),
+                _ => return Some(Err((-32602, "actions needs a string noun".to_string()))),
             };
             let id = match jget(args, "id") {
                 Some(J::S(s)) => s.clone(),
                 Some(J::I(i)) => i.to_string(),
-                _ => return Err((-32602, "actions needs a scalar id".to_string())),
+                _ => return Some(Err((-32602, "actions needs a scalar id".to_string()))),
             };
             let leaf = |s: &str| Leaf::S(s.to_string());
             let sv = |l: &Leaf| match l {
@@ -5133,7 +5068,7 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
             let smd = match smd {
                 None => {
                     out.push_str(",\"machine\":null,\"actions\":[]}");
-                    return Ok(out);
+                    return Some(Ok(out));
                 }
                 Some(s) => s,
             };
@@ -5218,14 +5153,7 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
             // surface straight off the retained cells, mirroring
             // Registry.schema's shape and ordering. AREST_DELEGATE_READS=1
             // is the family's escape hatch back to the python delegate.
-            if std::env::var_os("AREST_DELEGATE_READS").is_some() {
-                return delegate_read(tool, args, apps);
-            }
-            let app = match &apps.current {
-                Some(n) => n.clone(),
-                None => return Err((-32602,
-                    "no app loaded; call apps_use before schema".to_string())),
-            };
+            let app = app.to_string();
             let leaf = |s: &str| Leaf::S(s.to_string());
             let sv = |l: &Leaf| match l {
                 Leaf::S(s) => Some(s.clone()),
@@ -5335,19 +5263,12 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
             // text}]}) — the delegated python answered this and the pins
             // hold it; the python spawn it replaces measured 35+ MINUTES
             // at tasks scale. AREST_SYNTH_SCOTT=1 restores the delegate.
-            if std::env::var_os("AREST_SYNTH_SCOTT").is_some() {
-                return delegate_read(tool, args, apps);
-            }
-            let app = match &apps.current {
-                Some(n) => n.clone(),
-                None => return Err((-32602,
-                    "no app loaded; call apps_use before synthesize".to_string())),
-            };
+            let app = app.to_string();
             let id = match jget(args, "id") {
                 Some(J::S(s)) => atom(Leaf::S(s.clone())),
                 Some(J::I(i)) => atom(Leaf::I(*i)),
-                _ => return Err((-32602,
-                    "synthesize needs a scalar id".to_string())),
+                _ => return Some(Err((-32602,
+                    "synthesize needs a scalar id".to_string()))),
             };
             let pairs = native_verbalize(srv, &id);
             let mut r = String::from("{\"app\":");
@@ -5394,23 +5315,108 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
             Ok(r)
         }
         "query" | "cells" => {
-            if apps.current.is_none() {
-                return Err((-32602, format!("no app loaded; call apps_use before {}", tool)));
-            }
             // The MCP arguments object IS the op request body.
             op_answer(tool, args, srv).map_err(|m| (-32602, m))
         }
         "derive" => {
-            if apps.current.is_none() {
-                return Err((-32602, format!("no app loaded; call apps_use before {}", tool)));
-            }
-            // derive is the run_rules op under the daily driver's tool name:
-            // the naive fixpoint runs natively over the retained store and
-            // replaces it in place. The sidecar stays untouched (a compiled
-            // sidecar is already at the fixpoint, and the delegated writes
-            // keep rewriting it through the Python host).
+            // derive is the run_rules op under the daily driver's tool
+            // name: the naive fixpoint runs natively over the retained
+            // store and replaces it in place.
             op_answer("run_rules", args, srv).map_err(|m| (-32602, m))
         }
+        _ => return None,
+    })
+}
+
+#[cfg(feature = "host")]
+fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Result<String, (i64, String)> {
+    // ONE dispatch, two bindings (the doctrine): the STORE-ONLY verbs
+    // route through the hostless store_call the wasm Worker shares.
+    // The host keeps the app-loaded guard and the delegate escape.
+    if matches!(tool, "get" | "actions" | "schema" | "synthesize"
+                    | "query" | "cells" | "derive") {
+        if apps.current.is_none() {
+            return Err((-32602,
+                format!("no app loaded; call apps_use before {}", tool)));
+        }
+        if (std::env::var_os("AREST_DELEGATE_READS").is_some()
+            && matches!(tool, "get" | "actions" | "schema" | "synthesize"))
+            || (tool == "synthesize"
+                && std::env::var_os("AREST_SYNTH_SCOTT").is_some())
+        {
+            return delegate_read(tool, args, apps);
+        }
+        let app = apps.current.clone().unwrap_or_default();
+        if let Some(r) = store_call(tool, args, &app, srv) {
+            return r;
+        }
+    }
+
+    match tool {
+        "context" => Ok(LAST_RECEIPT.with(|c| c.borrow().clone())
+            .unwrap_or_else(|| "{\"note\":\"no mutation this session\"}".to_string())),
+        "orient" => {
+            let mut r = String::from("{\"apps\":");
+            esc_names(&apps.list(), &mut r);
+            r.push_str(",\"current\":");
+            match &apps.current {
+                Some(n) => esc(n, &mut r),
+                None => r.push_str("null"),
+            }
+            r.push('}');
+            Ok(r)
+        }
+        "apps_list" => {
+            let mut r = String::new();
+            esc_names(&apps.list(), &mut r);
+            Ok(r)
+        }
+        "apps_current" => {
+            let mut r = String::from("{\"current\":");
+            match &apps.current {
+                Some(n) => esc(n, &mut r),
+                None => r.push_str("null"),
+            }
+            r.push('}');
+            Ok(r)
+        }
+        "apps_use" => {
+            let name = match jget(args, "name") {
+                Some(J::S(n)) => n.clone(),
+                _ => return Err((-32602, "apps_use needs a string name".to_string())),
+            };
+            load_sidecar(apps, &name, srv).map_err(|m| (-32602, m))?;
+            apps.current = Some(name.clone());
+            let mut r = String::from("{\"app\":");
+            esc(&name, &mut r);
+            r.push_str(",\"ok\":true}");
+            Ok(r)
+        }
+        // apply flips native for OWN-TABLE: a fact type carrying a create:<ft>
+        // handler cell computes and persists in process (native_apply); an
+        // absorbed fact type, a non-retained target app, or a bare-ERROR
+        // refusal answers None and falls through to the CLI delegate. retract
+        // and apps_compile still delegate whole.
+        "apply" => match native_apply(args, apps, srv) {
+            Some(res) => res,
+            None => delegate_verb(tool, args, apps, srv),
+        },
+        "retract" | "apps_compile" => delegate_verb(tool, args, apps, srv),
+        // synthesize delegates for now: the canonical verbalize over the
+        // daily driver's store reduces in minutes on this path where the
+        // Python host's native twins answer in seconds (measured 2026-07-05
+        // on the claude scratch: 264 s canonical Rust against 10.9 s
+        // delegated). Plumbing the native carrier into op_answer is the
+        // priced lever that brings it home.
+
+        "sql" | "explain" | "validate" | "verify" => {
+            delegate_read(tool, args, apps)
+        }
+
+
+
+
+
         "engine_version" => Ok("{\"engine\":\"arest\",\"version\":\"0.9.0\"}".to_string()),
         "apps_status" => {
             let name = match jget(args, "name") {
@@ -5814,6 +5820,53 @@ mod worker {
     #[wasm_bindgen]
     pub fn arest_version() -> String {
         "arest 0.9.0 core (wasm)".to_string()
+    }
+
+    use std::cell::RefCell;
+    thread_local! {
+        // wasm is single-threaded: ONE retained store per Worker
+        // instance, loaded once and served by the same store_call the
+        // MCP host dispatches through — one verb table, two bindings.
+        static WSRV: RefCell<Srv> = RefCell::new(Srv {
+            d: phi(),
+            cells: Vec::new(),
+            mu: make_mu(),
+            nd: N::Bot,
+            ncells: Vec::new(),
+            nprocess: Vec::new(),
+        });
+    }
+
+    #[wasm_bindgen]
+    pub fn arest_load(store_json: &str) -> String {
+        match parse_json(store_json) {
+            Some(payload) if jget(&payload, "d").is_some() => {
+                WSRV.with(|s| handle(&payload, &mut s.borrow_mut(), true))
+            }
+            _ => "{\"error\":\"the payload needs a d\"}".to_string(),
+        }
+    }
+
+    #[wasm_bindgen]
+    pub fn arest_call(tool: &str, args_json: &str) -> String {
+        let args = match parse_json(args_json) {
+            Some(a) => a,
+            None => return "{\"error\":\"unparseable args\"}".to_string(),
+        };
+        WSRV.with(|s| {
+            match store_call(tool, &args, "worker", &mut s.borrow_mut()) {
+                Some(Ok(r)) => r,
+                Some(Err((code, msg))) => {
+                    let mut out = String::from("{\"error\":");
+                    esc(&msg, &mut out);
+                    out.push_str(",\"code\":");
+                    out.push_str(&code.to_string());
+                    out.push('}');
+                    out
+                }
+                None => "{\"error\":\"not a store-only verb\"}".to_string(),
+            }
+        })
     }
 
     #[wasm_bindgen]
