@@ -1619,9 +1619,237 @@ def generator_cells(D):
         my_trans = tuple(sorted(set(sms.get(noun, ()))))
         cells["dsl:" + noun] = ((noun, kind, my_readings, my_cons,
                                  my_trans),)
+    # the OPT-IN family (docs/07-generators.md restored 2026-07-08; the
+    # runtime-parity list owl xsd edm html dtd wsdl xforms plix nav,
+    # NORMA's XML/OIALto* transforms the on-disk oracle at
+    # Repos/NORMA/XML). App uses Generator '<name>' instance facts
+    # activate targets; a generator not opted in produces nothing.
+    # Per entity noun THE CANON classifies once (system:ev_cols — the
+    # generator never re-derives the layout; system:sqlname names) and
+    # each opted format transduces the same classification. Column
+    # kinds: unary -> boolean, ref -> the target noun, value -> string
+    # until datatype facts land. Identity is the id attribute/key/part
+    # everywhere (eq. (sys)); transitions come from the dsl member's
+    # machine triples (Theorem 4a); plural slugs prefer Noun has
+    # Plural instance facts over sqlname+s (docs/07).
+    opted = {r[1] for r in _pop_rows(D, "App_uses_Generator")
+             if len(r) >= 2}
+    active = opted.intersection(("xsd", "owl", "edm", "html", "dtd",
+                                 "wsdl", "xforms", "plix", "nav"))
+    if active:
+        import json as _json
+        from .reduce import apply as _xap
+        from .lam import atom as _XA
+        import pyarest.lam as _XL
+
+        def _xpair(noun_name):
+            return _XL.SEQ(_XL.CONS(_XA(noun_name))(_XL.CONS(D)(_XL.NIL)))
+
+        def _xesc(s):
+            return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+                    .replace(">", "&gt;").replace('"', "&quot;"))
+
+        def _sqlname(s):
+            return str(from_lam(_xap(_XA("system:sqlname"),
+                                     _XA(str(s)))))
+
+        def _xname(s):
+            return "".join(str(s).split())
+
+        def _pascal(s):
+            return "".join(w.capitalize() for w in str(s).split("_"))
+
+        plurals = {r[0]: r[1] for r in _pop_rows(D, "Noun_has_Plural")
+                   if len(r) >= 2}
+
+        def _plural(noun_name):
+            return plurals.get(noun_name, _sqlname(noun_name) + "s")
+
+        for noun, kind in sorted(kinds.items()):
+            if kind != "entity":
+                continue
+            classified = from_lam(_xap(_XA("system:ev_cols"),
+                                       _xpair(noun)))
+            if not isinstance(classified, tuple):
+                continue
+            cols = [(str(c[0]), str(c[1]), c[2], str(c[3]))
+                    for c in classified
+                    if isinstance(c, tuple) and len(c) >= 4]
+            trans = cells["dsl:" + noun][0][4]
+            events = sorted({t[0] for t in trans if len(t) >= 3})
+            x = _xname(noun)
+            s_noun = _sqlname(noun)
+            p_noun = _plural(noun)
+
+            if "xsd" in active:
+                lines = ['<xs:complexType name="%s">' % _xesc(x)]
+                lines.append("  <xs:sequence>")
+                for _ft, ckind, _other, cname in cols:
+                    ctype = ("xs:boolean" if ckind == "unary"
+                             else "xs:string")
+                    lines.append(
+                        '    <xs:element name="%s" type="%s"'
+                        ' minOccurs="0"/>' % (_xesc(cname), ctype))
+                lines.append("  </xs:sequence>")
+                lines.append('  <xs:attribute name="id" type="xs:string"'
+                             ' use="required"/>')
+                lines.append("</xs:complexType>")
+                cells["xsd:" + noun] = (("\n".join(lines),),)
+
+            if "owl" in active:
+                XSDNS = "http://www.w3.org/2001/XMLSchema#"
+                lines = ['<owl:Class rdf:about="#%s"/>' % _xesc(x)]
+                for _ft, ckind, other, cname in cols:
+                    is_ref = ckind == "ref" and other is not None
+                    tag = ("owl:ObjectProperty" if is_ref
+                           else "owl:DatatypeProperty")
+                    rng = ("#" + _xname(other) if is_ref
+                           else XSDNS + ("boolean" if ckind == "unary"
+                                         else "string"))
+                    lines.append('<%s rdf:about="#%s.%s">'
+                                 % (tag, _xesc(x), _xesc(cname)))
+                    lines.append('  <rdfs:domain rdf:resource="#%s"/>'
+                                 % _xesc(x))
+                    lines.append('  <rdfs:range rdf:resource="%s"/>'
+                                 % _xesc(rng))
+                    lines.append("</%s>" % tag)
+                cells["owl:" + noun] = (("\n".join(lines),),)
+
+            if "edm" in active:
+                lines = ['<EntityType Name="%s">' % _xesc(x)]
+                lines.append("  <Key>")
+                lines.append('    <PropertyRef Name="id"/>')
+                lines.append("  </Key>")
+                lines.append('  <Property Name="id" Type="Edm.String"'
+                             ' Nullable="false"/>')
+                for _ft, ckind, other, cname in cols:
+                    if ckind == "ref" and other is not None:
+                        lines.append(
+                            '  <NavigationProperty Name="%s" Type="%s"/>'
+                            % (_xesc(cname), _xesc(_xname(other))))
+                    else:
+                        etype = ("Edm.Boolean" if ckind == "unary"
+                                 else "Edm.String")
+                        lines.append(
+                            '  <Property Name="%s" Type="%s"'
+                            ' Nullable="true"/>' % (_xesc(cname), etype))
+                lines.append("</EntityType>")
+                cells["edm:" + noun] = (("\n".join(lines),),)
+
+            if "html" in active:
+                lines = ['<form data-noun="%s" method="post"'
+                         ' action="/%s">' % (_xesc(noun), _xesc(p_noun))]
+                lines.append('  <label>id <input name="id" type="text"'
+                             ' required/></label>')
+                for _ft, ckind, other, cname in cols:
+                    itype = "checkbox" if ckind == "unary" else "text"
+                    ref = ('' if not (ckind == "ref" and other is not None)
+                           else ' data-ref="%s"' % _xesc(other))
+                    lines.append(
+                        '  <label>%s <input name="%s" type="%s"%s/>'
+                        '</label>' % (_xesc(cname), _xesc(cname),
+                                      itype, ref))
+                lines.append('  <button type="submit">Create %s</button>'
+                             % _xesc(noun))
+                lines.append("</form>")
+                cells["html:" + noun] = (("\n".join(lines),),)
+
+            if "dtd" in active:
+                model = ("(%s)" % ", ".join(c[3] + "?" for c in cols)
+                         if cols else "EMPTY")
+                lines = ["<!ELEMENT %s %s>" % (s_noun, model),
+                         "<!ATTLIST %s id CDATA #REQUIRED>" % s_noun]
+                for _ft, _ckind, _other, cname in cols:
+                    lines.append("<!ELEMENT %s (#PCDATA)>" % cname)
+                cells["dtd:" + noun] = (("\n".join(lines),),)
+
+            if "wsdl" in active:
+                lines = ['<wsdl:message name="%sGetRequest">' % x,
+                         '  <wsdl:part name="id" type="xsd:string"/>',
+                         "</wsdl:message>",
+                         '<wsdl:message name="%sCreateRequest">' % x,
+                         '  <wsdl:part name="body" element="tns:%s"/>' % x,
+                         "</wsdl:message>",
+                         '<wsdl:message name="%sResponse">' % x,
+                         '  <wsdl:part name="body" element="tns:%s"/>' % x,
+                         "</wsdl:message>"]
+                ops = [("get" + x, "GetRequest"),
+                       ("create" + x, "CreateRequest")]
+                ops += [(_xname(e) + x, "GetRequest") for e in events]
+                lines.append('<wsdl:portType name="%sPort">' % x)
+                for opname, req in ops:
+                    lines.append('  <wsdl:operation name="%s">'
+                                 % _xesc(opname))
+                    lines.append('    <wsdl:input message="tns:%s%s"/>'
+                                 % (x, req))
+                    lines.append('    <wsdl:output'
+                                 ' message="tns:%sResponse"/>' % x)
+                    lines.append("  </wsdl:operation>")
+                lines.append("</wsdl:portType>")
+                cells["wsdl:" + noun] = (("\n".join(lines),),)
+
+            if "xforms" in active:
+                lines = ['<xf:model id="%s">' % x,
+                         "  <xf:instance>",
+                         '    <%s id="">' % s_noun]
+                for _ft, _ckind, _other, cname in cols:
+                    lines.append("      <%s/>" % cname)
+                lines.append("    </%s>" % s_noun)
+                lines.append("  </xf:instance>")
+                lines.append('  <xf:bind nodeset="@id"'
+                             ' required="true()"/>')
+                for _ft, ckind, _other, cname in cols:
+                    btype = ("xf:boolean" if ckind == "unary"
+                             else "xf:string")
+                    lines.append('  <xf:bind nodeset="%s" type="%s"/>'
+                                 % (cname, btype))
+                lines.append("</xf:model>")
+                for _ft, _ckind, _other, cname in cols:
+                    lines.append('<xf:input ref="%s"><xf:label>%s'
+                                 "</xf:label></xf:input>"
+                                 % (cname, _xesc(cname)))
+                lines.append('<xf:submit submission="create-%s">'
+                             "<xf:label>Create %s</xf:label></xf:submit>"
+                             % (s_noun, _xesc(noun)))
+                cells["xforms:" + noun] = (("\n".join(lines),),)
+
+            if "plix" in active:
+                lines = ['<plx:class name="%s" visibility="public">' % x]
+                props = [("Id", ".string")]
+                for _ft, ckind, other, cname in cols:
+                    if ckind == "ref" and other is not None:
+                        props.append((_pascal(cname), _xname(other)))
+                    else:
+                        props.append((_pascal(cname),
+                                      ".boolean" if ckind == "unary"
+                                      else ".string"))
+                for pname, ptype in props:
+                    lines.append('  <plx:property name="%s"'
+                                 ' visibility="public">' % _xesc(pname))
+                    lines.append('    <plx:returns dataTypeName="%s"/>'
+                                 % _xesc(ptype))
+                    lines.append("  </plx:property>")
+                lines.append("</plx:class>")
+                cells["plix:" + noun] = (("\n".join(lines),),)
+
+            if "nav" in active:
+                navs = [{"relation": ft, "target": str(other),
+                         "href": "/%s/{id}/%s"
+                                 % (p_noun, _plural(str(other)))}
+                        for ft, ckind, other, _cname in cols
+                        if ckind == "ref" and other is not None]
+                trs = [{"event": t[0], "from": t[1], "to": t[2],
+                        "href": "/%s/{id}/%s" % (p_noun, t[0])}
+                       for t in trans if len(t) >= 3]
+                doc = {"noun": noun, "self": "/%s/{id}" % p_noun,
+                       "navigation": navs, "transitions": trs}
+                cells["nav:" + noun] = (
+                    (_json.dumps(doc, sort_keys=True),),)
+    _GEN = ("dsl:", "xsd:", "owl:", "edm:", "html:", "dtd:", "wsdl:",
+            "xforms:", "plix:", "nav:")
     keep = tuple(c for c in from_lam(D)
                  if not (isinstance(c, tuple) and len(c) >= 2
-                         and str(c[1]).startswith("dsl:")))
+                         and str(c[1]).startswith(_GEN)))
     fresh = tuple(("CELL", name, rows) for name, rows in sorted(cells.items()))
     return to_lam(keep + fresh)
 

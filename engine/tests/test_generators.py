@@ -37,3 +37,98 @@ def test_dsl_cells_generate_per_noun():
     # the value type gets its own cell with its kind
     vrows = system._pop_rows(D, "dsl:Status")
     assert vrows and vrows[0][1] == "value"
+
+
+def _pipeline(model):
+    # mirror the protocol compile order (protocol.py): layout before
+    # generators, so rmapColumns exists when the canon classifies
+    D, _ = forml.compile_model(model)
+    D = system.layout_cells(D)
+    D = system.generator_cells(D)
+    return D
+
+
+def test_the_xsd_generator_is_opt_in_and_canon_classified():
+    # docs/07-generators.md (restored): a generator not opted in
+    # produces nothing; opted in, xsd:{Noun} carries an xs:complexType
+    # whose elements are system:ev_cols' classified columns
+    import xml.etree.ElementTree as ET
+
+    D = _pipeline(MODEL)
+    assert not system._pop_rows(D, "xsd:Ticket")
+
+    OPTED = MODEL + "App 'flowapp' uses Generator 'xsd'.\n"
+    D2 = _pipeline(OPTED)
+    xsd = system._pop_rows(D2, "xsd:Ticket")[0][0]
+    root = ET.fromstring(xsd.replace("xs:", ""))       # namespace-light parse
+    assert root.tag == "complexType" and root.get("name") == "Ticket"
+    names = [e.get("name") for e in root.iter("element")]
+    assert "status" in names
+    assert root.find("attribute").get("use") == "required"
+
+
+def test_the_generator_family_transduces_one_canon_classification():
+    # the runtime-parity list (owl edm html dtd wsdl xforms plix nav;
+    # NORMA's XML/OIALto* transforms the oracle): every format renders
+    # the SAME system:ev_cols classification — ref columns become
+    # ObjectProperty/NavigationProperty/data-ref/nav links, machine
+    # triples become wsdl operations and nav transitions, identity is
+    # the id key everywhere
+    import json
+    import xml.etree.ElementTree as ET
+
+    OPTED = MODEL + (
+        "Customer is an entity type.\n"
+        "Ticket is assigned to Customer.\n"
+        "Each Ticket is assigned to at most one Customer.\n"
+        "Noun 'Ticket' has Plural 'tickets'.\n"
+        + "".join("App 'flowapp' uses Generator '%s'.\n" % g
+                  for g in ("owl", "edm", "html", "dtd", "wsdl",
+                            "xforms", "plix", "nav")))
+    D = _pipeline(OPTED)
+
+    owl = system._pop_rows(D, "owl:Ticket")[0][0]
+    assert '<owl:Class rdf:about="#Ticket"/>' in owl
+    assert "owl:ObjectProperty" in owl and '"#Customer"' in owl
+    assert "XMLSchema#string" in owl
+
+    edm = ET.fromstring(system._pop_rows(D, "edm:Ticket")[0][0])
+    assert edm.get("Name") == "Ticket"
+    assert edm.find("Key/PropertyRef").get("Name") == "id"
+    assert any(p.get("Name") == "status" for p in edm.iter("Property"))
+    assert any(n.get("Type") == "Customer"
+               for n in edm.iter("NavigationProperty"))
+
+    html = system._pop_rows(D, "html:Ticket")[0][0]
+    assert 'action="/tickets"' in html and 'name="status"' in html
+    assert 'data-ref="Customer"' in html
+
+    dtd = system._pop_rows(D, "dtd:Ticket")[0][0]
+    assert "<!ATTLIST ticket id CDATA #REQUIRED>" in dtd
+    assert "<!ELEMENT status (#PCDATA)>" in dtd
+
+    wsdl = system._pop_rows(D, "wsdl:Ticket")[0][0]
+    assert '<wsdl:operation name="createTicket">' in wsdl
+    assert '<wsdl:operation name="closeTicket">' in wsdl    # Theorem 4a
+
+    xf = system._pop_rows(D, "xforms:Ticket")[0][0]
+    assert '<xf:bind nodeset="@id" required="true()"/>' in xf
+    assert '<xf:input ref="status">' in xf
+
+    plix = system._pop_rows(D, "plix:Ticket")[0][0]
+    assert '<plx:class name="Ticket" visibility="public">' in plix
+    assert 'dataTypeName="Customer"' in plix
+
+    nav = json.loads(system._pop_rows(D, "nav:Ticket")[0][0])
+    assert nav["self"] == "/tickets/{id}"
+    assert any(n["target"] == "Customer"
+               and n["href"] == "/tickets/{id}/customers"
+               for n in nav["navigation"])
+    assert any(t["event"] == "close" and t["to"] == "done"
+               for t in nav["transitions"])
+
+    # a generator that is not opted in produces nothing (docs/07)
+    D0 = _pipeline(MODEL)
+    for fam in ("owl", "edm", "html", "dtd", "wsdl", "xforms",
+                "plix", "nav"):
+        assert not system._pop_rows(D0, fam + ":Ticket")
