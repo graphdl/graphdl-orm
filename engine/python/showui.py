@@ -131,6 +131,8 @@ class Container:
         self.active_tab = 0                 # AppNavigationContext.ActiveTab
         self._stacks = {}                   # PaneManager's registry,
         self.gates = []                     # ShouldNavigateFrom pollees
+        self._shy = set()                   # HistoryShy frames
+        self._sid = {}                      # frame -> StackID
 
     # -- model reads (facts render) --
     def nouns(self):
@@ -219,7 +221,8 @@ class Container:
         ShouldNavigateFrom) may veto by answering False."""
         return all(g(frame) for g in self.gates)
 
-    def navigate(self, frame, clear_history=False, pane=None):
+    def navigate(self, frame, clear_history=False, pane=None,
+                 stack_id=None, history_shy=False):
         """DisplayView: gate, assign the pane (override channel first),
         optionally clear its history (RequestType.ClearPaneHistory),
         push. A master navigation clears the DETAIL and POPOVER
@@ -234,6 +237,24 @@ class Container:
         stack = self.stack_for(pane)
         if clear_history:
             stack.views.clear()
+        # HistoryShy: a shy CURRENT never lingers — the incoming
+        # navigation replaces it (StackBehaviorAttribute.HistoryShy)
+        if stack.current is not None and stack.current in self._shy:
+            self._shy.discard(stack.current)
+            self._sid.pop(stack.current, None)
+            stack.pop()
+        # StackID: the same logical screen REPLACES in place
+        if stack_id is not None:
+            existing = next((f for f in stack.views
+                             if self._sid.get(f) == stack_id), None)
+            if existing is not None and existing != frame:
+                self._sid.pop(existing, None)
+                self._shy.discard(existing)
+                stack.replace(existing, frame)
+                self._sid[frame] = stack_id
+                if history_shy:
+                    self._shy.add(frame)
+                return pane
         # iApp.Navigate's dedup: a view already ON the stack is popped
         # TO, never pushed twice — back-behavior stays truthful; the
         # split-view clearing below still applies (a re-navigated
@@ -242,6 +263,10 @@ class Container:
             stack.pop_to(frame)
         else:
             stack.push(frame)
+        if stack_id is not None:
+            self._sid[frame] = stack_id
+        if history_shy:
+            self._shy.add(frame)
         if pane == "master":
             self.stack_for("detail").views.clear()
             self.stack_for("popover").views.clear()
@@ -262,9 +287,11 @@ class Container:
     def topmost_pane(self):
         """TopmostPane: the highest-ordinal occupied pane of the active
         tab — what a SINGLE-PANE surface shows (detail covers master;
-        the popover covers everything)."""
+        the popover covers everything). HistoryShy views are invisible
+        here: a pane counts only if some non-shy view occupies it."""
         for p in reversed(PANES):
-            if self.stack_for(p).current is not None:
+            if any(f not in self._shy
+                   for f in self.stack_for(p).views):
                 return p
         return None
 

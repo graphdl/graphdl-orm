@@ -232,6 +232,29 @@ def test_topmost_pane_walks_ordinals(tmp_path):
     assert c.topmost_pane() == "detail"
 
 
+def test_stack_id_replaces_and_history_shy_hides(tmp_path):
+    # StackID: the same logical screen replaces in place; HistoryShy:
+    # the next navigation replaces a shy current, and TopmostPane
+    # never sees shy views
+    reg = _mk(tmp_path)
+    c = showui.Container(reg, "flow")
+    c.navigate(("detail", "Ticket", "a"))
+    c.navigate(("detail", "Ticket", "settings-v1"), stack_id="settings")
+    c.navigate(("detail", "Ticket", "settings-v2"), stack_id="settings")
+    assert c.stacks["detail"].views == [
+        ("detail", "Ticket", "a"), ("detail", "Ticket", "settings-v2")]
+    # shy: a transient frame vanishes on the next navigation
+    c.navigate(("detail", "Ticket", "flash"), history_shy=True)
+    assert c.topmost_pane() == "detail"      # non-shy views exist below
+    c.navigate(("detail", "Ticket", "b"))
+    assert ("detail", "Ticket", "flash") not in c.stacks["detail"].views
+    # a pane holding ONLY shy views is invisible to TopmostPane
+    c2 = showui.Container(reg, "flow")
+    c2.navigate(("list", "Ticket"))
+    c2.navigate(("detail", "Ticket", "x"), history_shy=True)
+    assert c2.topmost_pane() == "master"
+
+
 def test_the_window_renders_headlessly(tmp_path):
     try:
         import tkinter as tk
