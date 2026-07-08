@@ -15,7 +15,7 @@
 //                                 fact (WRITE PATH: step 5 — the
 //                                 Worker is read-only until the write
 //                                 story lands; 501 meanwhile)
-import init, { arest_load, arest_call, arest_apply, arest_view } from "./arest_core.js";
+import init, { arest_load, arest_call, arest_apply, arest_view, arest_entry } from "./arest_core.js";
 import wasmModule from "./arest_core_bg.wasm";
 import SIDECAR from "./sidecar.js";
 
@@ -127,6 +127,8 @@ function Tree({ node, onFollow }) {
         h("dt", null, String(f[1])),
         h("dd", null, f[2] === null || f[2] === "" ? h("i", null, "—")
                       : String(f[2]))) : null));
+  if (kind === "entry")
+    return h(EntryForm, { body: body || [], onCreate: onFollow });
   if (kind === "menu")
     return h("p", { className: "actions" }, (body || []).map((b, i) =>
       b && b[0] === "button" ? h("button", {
@@ -134,6 +136,28 @@ function Tree({ node, onFollow }) {
         onClick: () => onFollow({ event: String(b[1]), to: String(b[2]) }),
       }, String(b[1]) + " → " + String(b[2])) : null));
   return null;
+}
+
+function EntryForm({ body, onCreate }) {
+  const [vals, setVals] = React.useState({});
+  const [newId, setNewId] = React.useState("");
+  const inputs = body.filter(n => n && n[0] === "input");
+  return h("form", {
+    onSubmit: e => { e.preventDefault(); onCreate({ id: newId, vals, inputs }); },
+  },
+    h("p", null, h("label", null, "id ",
+      h("input", { value: newId, required: true,
+                   onChange: e => setNewId(e.target.value) }))),
+    inputs.map((n, i) => {
+      const [_k, ft, name, kind] = n.map(String);
+      return h("p", { key: i }, h("label", null, name + " ",
+        kind === "unary"
+          ? h("input", { type: "checkbox", checked: !!vals[ft],
+              onChange: e => setVals({ ...vals, [ft]: e.target.checked }) })
+          : h("input", { value: vals[ft] || "",
+              onChange: e => setVals({ ...vals, [ft]: e.target.value }) })));
+    }),
+    h("button", { type: "submit" }, "Create"));
 }
 
 function App() {
@@ -146,16 +170,41 @@ function App() {
     setViews(v.views || []);
   }, [noun, id]);
   const follow = async (a) => {
+    if (a.inputs) {                // the entry form's submit: one POST
+      for (const n of a.inputs) {  // per filled SubmitKey
+        const ft = String(n[1]), kind = String(n[3]);
+        const v = a.vals[ft];
+        if (kind === "unary" ? !v : !v) continue;
+        const fact = kind === "unary" ? [a.id] : [a.id, v];
+        const r = await fetch("/" + noun, { method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ fact_type: ft, fact }) });
+        const doc = await r.json();
+        if (!doc.committed) {
+          setReceipt(JSON.stringify(doc, null, 1));
+          return;
+        }
+      }
+      setId(a.id);
+      setReceipt("created " + a.id);
+      await refetch();
+      return;
+    }
     const r = await fetch("/" + noun + "/" + id + "/" + a.event, { method: "POST" });
     setReceipt(JSON.stringify(await r.json(), null, 1));
     await refetch();               // the store is the state
+  };
+  const openEntry = async () => {
+    const v = await (await fetch("/" + noun + "/new")).json();
+    setViews(v.views || []);
   };
   return h("div", null,
     h("h1", null, "AREST — a fact renders itself"),
     h("div", { className: "bar" },
       h("input", { value: noun, onChange: e => setNoun(e.target.value) }),
       h("input", { value: id, onChange: e => setId(e.target.value) }),
-      h("button", { onClick: refetch }, "fetch")),
+      h("button", { onClick: refetch }, "fetch"),
+      h("button", { onClick: openEntry }, "new")),
     views.map((v, i) => h(Tree, { key: i, node: v, onFollow: follow })),
     receipt && h("div", { className: "receipt" }, receipt));
 }
@@ -300,6 +349,12 @@ export default {
           method: "POST", body: JSON.stringify(r.event) });
       }
       return json(JSON.stringify(r), r.receipt?.committed ? 201 : 422);
+    }
+    if (seg.length === 2 && seg[1] === "new") {
+      const noun = nounOf(seg[0]);
+      if (!noun) return json('{"error":"unknown noun"}', 404);
+      try { return json(arest_entry(noun)); }
+      catch (e) { return json(JSON.stringify({ error: String(e) }), 500); }
     }
     if (seg.length >= 2) {
       const noun = nounOf(seg[0]);

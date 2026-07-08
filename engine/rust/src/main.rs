@@ -5150,18 +5150,37 @@ fn view_trees_json(noun: &str, id: &str, srv: &Srv) -> Result<String, (i64, Stri
 // per-noun create form; each input's SubmitKey IS its fact type, and
 // the client POSTs one {fact_type, fact} per filled input.
 fn entry_tree_json(noun: &str, srv: &Srv) -> Result<String, (i64, String)> {
-    let ev = NEval {
-        cells: srv.ncells.clone(),
-        process: srv.nprocess.clone(),
-        defs_n: srv.nd.clone(),
-        fuel: std::cell::Cell::new(-1),
+    // native build of system:view_entry's shape (the certified-override
+    // pattern): one input node per classified column, the fact type the
+    // node's SubmitKey — ev_cols_native is the same classifier the get
+    // arm trusts
+    let spine: Vec<(String, N)> = match &srv.nd {
+        N::S(cells) => cells
+            .iter()
+            .filter_map(|c| {
+                if let N::S(it) = c {
+                    if it.len() == 3 {
+                        if let (N::A(l0), N::A(k)) = (&it[0], &it[1]) {
+                            if matches!(&**l0, Leaf::S(s) if s == "CELL") {
+                                return leaf_str(k)
+                                    .map(|key| (key, it[2].clone()));
+                            }
+                        }
+                    }
+                }
+                None
+            })
+            .collect(),
+        _ => return Err((-32603, "no store".to_string())),
     };
     let na = |s: &str| N::A(Rc::new(Leaf::S(s.to_string())));
-    let cols = ev.mu(napp(
-        na("system:ev_cols"),
-        nseq(vec![na(noun), srv.nd.clone()]),
-    ));
-    let entry = ev.mu(napp(na("system:view_entry"), cols));
+    let inputs: Vec<N> = ev_cols_native(&spine, noun)
+        .into_iter()
+        .map(|(ft, kind, _other, col)| {
+            nseq(vec![na("input"), na(&ft), na(&col), na(&kind)])
+        })
+        .collect();
+    let entry = nseq(vec![na("entry"), nseq(inputs)]);
     let mut out = String::from("{\"views\":[");
     n_json(&entry, &mut out);
     out.push_str("]}");
