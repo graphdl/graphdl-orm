@@ -82,8 +82,92 @@ function sqlname(s) {
   return t || "t";
 }
 
+const INDEX_HTML = `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>arest</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { margin: 2rem auto; max-width: 46rem; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.2rem; letter-spacing: .06em; }
+  input, button, select { font: inherit; padding: .4rem .6rem; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: .25rem .9rem; }
+  dt { opacity: .65; }
+  .actions button { margin-right: .5rem; }
+  .bar { display: flex; gap: .5rem; margin: 1rem 0; flex-wrap: wrap; }
+  .receipt { font-size: .85rem; opacity: .75; margin-top: 1rem; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="module">
+import React from "https://esm.sh/react@19";
+import { createRoot } from "https://esm.sh/react-dom@19/client";
+const h = React.createElement;
+
+// THE BINDING CONTRACT: a component receives the representation and
+// the apply endpoint — nothing else. Facts render; events apply; the
+// store is the state (every commit refetches the representation).
+function Field({ name, value }) {
+  return h(React.Fragment, null,
+    h("dt", null, name),
+    h("dd", null, value === null ? h("i", null, "—") : String(value)));
+}
+function Detail({ view }) {
+  return h("dl", null,
+    Object.entries(view.fields || {}).map(([k, v]) =>
+      h(Field, { key: k, name: k, value: v })));
+}
+function Actions({ actions, onFollow }) {
+  if (!actions?.length) return null;
+  return h("p", { className: "actions" },
+    actions.map(a => h("button", {
+      key: a.event,
+      onClick: () => onFollow(a),   // the event IS a fact: apply it
+    }, a.event + " → " + a.to)));
+}
+
+function App() {
+  const [noun, setNoun] = React.useState("feature_request");
+  const [id, setId] = React.useState("fr-live-1");
+  const [view, setView] = React.useState(null);
+  const [actions, setActions] = React.useState([]);
+  const [receipt, setReceipt] = React.useState("");
+  const refetch = React.useCallback(async () => {
+    const v = await (await fetch("/" + noun + "/" + id)).json();
+    setView(v);
+    const a = await (await fetch("/" + noun + "/" + id + "/actions")).json();
+    setActions(a.actions || []);
+  }, [noun, id]);
+  const follow = async (a) => {
+    const r = await fetch("/" + noun + "/" + id + "/" + a.event, { method: "POST" });
+    setReceipt(JSON.stringify(await r.json(), null, 1));
+    await refetch();               // the store is the state
+  };
+  return h("div", null,
+    h("h1", null, "AREST — a fact renders itself"),
+    h("div", { className: "bar" },
+      h("input", { value: noun, onChange: e => setNoun(e.target.value) }),
+      h("input", { value: id, onChange: e => setId(e.target.value) }),
+      h("button", { onClick: refetch }, "fetch")),
+    view && h(Detail, { view }),
+    h(Actions, { actions, onFollow: follow }),
+    receipt && h("div", { className: "receipt" }, receipt));
+}
+createRoot(document.getElementById("root")).render(h(App));
+</script>
+</body>
+</html>`;
+
 export default {
   async fetch(request, env) {
+    const url0 = new URL(request.url);
+    if (request.method === "GET" && url0.pathname === "/") {
+      return new Response(INDEX_HTML, {
+        headers: { "content-type": "text/html; charset=utf-8" } });
+    }
     await ensure(env);
     const url = new URL(request.url);
     const seg = url.pathname.split("/").filter(Boolean);
