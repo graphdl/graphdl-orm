@@ -4832,12 +4832,35 @@ fn apply_core(args: &J, app: &str, srv: &mut Srv)
     // the operand ⟨fact_as_v, D⟩: the fact a sequence of atoms paired with the
     // retained store, exactly the ⟨input_fact, D⟩ ast.run reduces
     let fact_v = seq(from_vec(fact.iter().map(to_v).collect()));
-    let operand = seq(from_vec(vec![fact_v, srv.d.clone()]));
-    // reduce apply(handler, ⟨fact, D⟩) under D's DEFS (the frame carries the
-    // store's cells and D, Backus 14.6), then apply the transition rule: a
-    // result that is not a two-part pair is the ERROR case (engine.py
-    // _transition), which delegates so validate_for names the offenders
-    let res = reduce_over(srv, handler, operand, None);
+    // THE WRITE FLIP (2026-07-08): the handler evaluates on the NATIVE
+    // carrier exactly like the rules do — the Scott reduction of
+    // apply(handler, ⟨fact, D⟩) with the whole store as a Scott value
+    // measured 65 s at tasks scale (the read family's 30,000x lesson,
+    // write edition). NEval rides the coherent mirror; the answered D'
+    // stays native for the commit path (no re-conversion).
+    // AREST_APPLY_SCOTT restores the old reduction.
+    let mut d2_native: Option<N> = None;
+    let res = if std::env::var_os("AREST_APPLY_SCOTT").is_some() {
+        let operand = seq(from_vec(vec![fact_v.clone(), srv.d.clone()]));
+        reduce_over(srv, handler, operand, None)
+    } else {
+        let ev = NEval {
+            cells: srv.ncells.clone(),
+            process: srv.nprocess.clone(),
+            defs_n: srv.nd.clone(),
+            fuel: std::cell::Cell::new(-1),
+        };
+        let rn = ev.mu(napp(
+            v_to_n(&handler),
+            nseq(vec![v_to_n(&fact_v), srv.nd.clone()]),
+        ));
+        if let N::S(parts) = &rn {
+            if parts.len() == 2 {
+                d2_native = Some(parts[1].clone());
+            }
+        }
+        n_to_v(&rn)
+    };
     let it = items(&list_of(&res));
     if it.len() != 2 {
         return None;
@@ -4871,8 +4894,13 @@ fn apply_core(args: &J, app: &str, srv: &mut Srv)
         // changed=[ft])), which replaces the retained store with the fixpoint
         srv.d = d2;
         srv.cells = cells_of(&srv.d);
-        // mirror coherence: the native view refreshes with the store
-        srv.nd = v_to_n(&srv.d);
+        // mirror coherence: the native view refreshes with the store —
+        // from the handler's own native answer when the flip produced
+        // one (no 5 MB re-conversion), else the conversion
+        srv.nd = match d2_native.take() {
+            Some(n) => n,
+            None => v_to_n(&srv.d),
+        };
         srv.ncells = n_cells_of(&srv.nd);
         let derive_req = J::O(vec![("changed".to_string(), J::A(vec![J::S(ft.clone())]))]);
         let _ = op_run_rules(&derive_req, srv);
