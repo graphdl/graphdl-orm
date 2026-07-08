@@ -1594,11 +1594,6 @@ class Registry:
         # absorbs it as a column and the machine reads/overwrites it there; wired
         # before replay so the machine fires into the column, not the noun_status wart
         D = system.status_facts(D)
-        # readings-carried machine events fold here (the sm-migration class):
-        # the same fold the write path applies incrementally, run once over
-        # the compiled instance facts of every trigger fact type — BEFORE
-        # replay, whose entries are later-in-time applied events
-        D = system.machine_fold(D)
         # the event stream replays through the SAME create (facts are the source
         # of truth; the .db is disposable, set semantics make replay idempotent),
         # read from whatever sink the registry holds, never a file path
@@ -1606,6 +1601,14 @@ class Registry:
         if entries:
             D = persist.replay_entries(D, entries)
             D = system.run_rules(D)
+        # readings- AND log-carried machine events fold ONCE, after every
+        # event fact is present and the post-replay derive has run (the
+        # started-backfill implications are derivation consequents the fold
+        # consumes); the machine itself orders the walk. The derive after
+        # projects the folded column onto its derived heads (the Task has
+        # Task Status class) before the snapshot
+        D = system.machine_fold(D)
+        D = system.run_rules(D)
         # the snapshot records how much of the stream it holds, so a load can
         # replay exactly the tail another host appended after this save
         D = persist._with_watermark(D, len(entries))
