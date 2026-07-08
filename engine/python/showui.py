@@ -267,6 +267,63 @@ class Container:
 
 
 # ---- the tk toolkit: stdlib, in-module (the zero-dep desktop) ----
+# The content grids lay out through THE ABSTRACT ENGINE
+# (pyarest.uilayout — iFactr's PerformLayout): tk supplies exactly the
+# two platform primitives — MEASURE via tkfont metrics and PLACE via
+# the place() geometry manager (absolute positioning, the Canvas
+# analog). Chrome (menu bars, buttons docked at edges) stays native,
+# exactly as iFactr-WPF docks its header/toolbar outside the engine.
+
+def _tk_measure(widget, is_text=False):
+    """The tk MEASURE primitive: a closure answering (w, h) under
+    constraints from the widget's own font metrics; wrapping text
+    reflows (narrower means taller), fixed inputs answer their
+    requested size."""
+    import tkinter.font as tkfont
+
+    def measure(cw, ch):
+        if is_text:
+            f = tkfont.Font(font=widget.cget("font"))
+            text = widget.cget("text")
+            lines = text.split("\n") or [""]
+            wide = max((f.measure(t) for t in lines), default=0)
+            line_h = f.metrics("linespace")
+            if wide <= cw:
+                return (min(wide, cw), min(len(lines) * line_h, ch))
+            import math
+            wrapped = sum(max(1, math.ceil(f.measure(t) / max(cw, 1)))
+                          for t in lines)
+            return (min(cw, wide), min(wrapped * line_h, ch))
+        widget.update_idletasks()
+        return (min(widget.winfo_reqwidth(), cw),
+                min(widget.winfo_reqheight(), ch))
+    return measure
+
+
+def _tk_place(widget):
+    """The tk PLACE primitive: absolute positioning in the host frame;
+    wrapping labels get their wraplength pinned to the placed width
+    (the platform's realization of the reflowed rectangle)."""
+    def place(x, y, w, h):
+        try:
+            widget.configure(wraplength=max(int(w), 1))
+        except Exception:
+            pass
+        widget.place(x=int(x), y=int(y), width=max(int(w), 1),
+                     height=max(int(h), 1))
+    return place
+
+
+def _tk_grid_layout(host, grid, width):
+    """Run the abstract engine over the composed grid and size the host
+    frame to the answer (the GridView MeasureOverride handoff)."""
+    from .uilayout import INF, perform_layout
+    w, h = perform_layout(grid, (width, 0), (width, INF))
+    host.configure(width=int(w), height=int(h))
+    host.pack_propagate(False)
+    return w, h
+
+
 def _tk_list(parent, tree, ctx):
     import tkinter as tk
     frame = tk.Frame(parent)
@@ -286,15 +343,32 @@ def _tk_list(parent, tree, ctx):
 
 
 def _tk_detail(parent, tree, ctx):
+    """The detail grid THROUGH THE ABSTRACT ENGINE: one auto row per
+    field, columns ⟨auto label, star value⟩ — the same composition
+    iFactr's GridCell/Instructor builds; values are labels (the reflow
+    rule applies), placement is absolute."""
     import tkinter as tk
-    frame = tk.Frame(parent, padx=8, pady=4)
-    for i, node in enumerate(tree[1]):
-        if isinstance(node, tuple) and len(node) >= 3 and node[0] == "field":
-            tk.Label(frame, text=str(node[1]) + ":", anchor="e",
-                     font=("Segoe UI", 9, "bold")).grid(
-                row=i, column=0, sticky="ne", padx=(0, 6))
-            tk.Label(frame, text=str(node[2]), anchor="w", wraplength=420,
-                     justify="left").grid(row=i, column=1, sticky="nw")
+    from .uilayout import AUTO, NEAR, STAR, Element, Grid, Track
+    frame = tk.Frame(parent)
+    rows = [n for n in tree[1] if isinstance(n, tuple) and len(n) >= 3
+            and n[0] == "field"]
+    g = Grid(columns=[Track(AUTO), Track(STAR)],
+             rows=[Track(AUTO) for _ in rows],
+             padding=(8, 4, 8, 4))
+    for i, node in enumerate(rows):
+        k = tk.Label(frame, text=str(node[1]) + ":", anchor="ne",
+                     justify="right", font=("Segoe UI", 9, "bold"))
+        v = tk.Label(frame, text=str(node[2]), anchor="nw",
+                     justify="left")
+        g.add(Element(_tk_measure(k, is_text=True), _tk_place(k),
+                      row=i, col=0, halign=NEAR, valign=NEAR,
+                      margin=(0, 2, 6, 2)))
+        g.add(Element(_tk_measure(v, is_text=True), _tk_place(v),
+                      row=i, col=1, halign=NEAR, valign=NEAR,
+                      margin=(0, 2, 0, 2), is_label=True))
+    parent.update_idletasks()
+    width = max(parent.winfo_width(), 360)
+    _tk_grid_layout(frame, g, width)
     frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
     return frame
 
@@ -314,38 +388,51 @@ def _tk_menu(parent, tree, ctx):
 
 
 def _tk_entry(parent, tree, ctx):
+    """The entry grid THROUGH THE ABSTRACT ENGINE: ⟨auto label, star
+    input⟩ per row, the submit button on its own trailing row — the
+    iFactr entry-cell composition, absolutely placed."""
     import tkinter as tk
-    frame = tk.Frame(parent, padx=8, pady=6)
-    tk.Label(frame, text="id:", anchor="e",
-             font=("Segoe UI", 9, "bold")).grid(row=0, column=0,
-                                                sticky="e", padx=(0, 6))
+    from .uilayout import AUTO, NEAR, STAR, STRETCH, Element, Grid, Track
+    frame = tk.Frame(parent)
+    nodes = [n for n in tree[1] if isinstance(n, tuple) and len(n) >= 4
+             and n[0] == "input"]
+    g = Grid(columns=[Track(AUTO), Track(STAR)],
+             rows=[Track(AUTO) for _ in range(len(nodes) + 2)],
+             padding=(10, 6, 10, 6))
+
+    def add_row(i, label, widget, halign=STRETCH):
+        k = tk.Label(frame, text=label + ":", anchor="e")
+        g.add(Element(_tk_measure(k, is_text=True), _tk_place(k),
+                      row=i, col=0, halign=NEAR, valign=NEAR,
+                      margin=(0, 3, 6, 3)))
+        g.add(Element(_tk_measure(widget), _tk_place(widget),
+                      row=i, col=1, halign=halign, valign=NEAR,
+                      margin=(0, 3, 0, 3)))
+
     id_var = tk.StringVar()
-    tk.Entry(frame, textvariable=id_var, width=36).grid(
-        row=0, column=1, sticky="w")
+    add_row(0, "id", tk.Entry(frame, textvariable=id_var))
     inputs = []                     # (ft, kind, var) — ft IS the SubmitKey
-    row = 1
-    for node in tree[1]:
-        if not (isinstance(node, tuple) and len(node) >= 4
-                and node[0] == "input"):
-            continue
+    for i, node in enumerate(nodes, start=1):
         ft, name, kind = str(node[1]), str(node[2]), str(node[3])
-        tk.Label(frame, text=name + ":", anchor="e").grid(
-            row=row, column=0, sticky="e", padx=(0, 6))
         if kind == "unary":
             var = tk.BooleanVar()
-            tk.Checkbutton(frame, variable=var).grid(
-                row=row, column=1, sticky="w")
+            w = tk.Checkbutton(frame, variable=var)
+            add_row(i, name, w, halign=NEAR)
         else:
             var = tk.StringVar()
-            tk.Entry(frame, textvariable=var, width=36).grid(
-                row=row, column=1, sticky="w")
+            add_row(i, name, tk.Entry(frame, textvariable=var))
         inputs.append((ft, kind, var))
-        row += 1
-    tk.Button(frame, text="Create",
-              command=lambda: ctx["submit"](
-                  id_var.get(),
-                  [(ft, kind, var.get()) for ft, kind, var in inputs])
-              ).grid(row=row, column=1, sticky="w", pady=(8, 0))
+    btn = tk.Button(frame, text="Create",
+                    command=lambda: ctx["submit"](
+                        id_var.get(),
+                        [(ft, kind, var.get())
+                         for ft, kind, var in inputs]))
+    g.add(Element(_tk_measure(btn), _tk_place(btn),
+                  row=len(nodes) + 1, col=1, halign=NEAR, valign=NEAR,
+                  margin=(0, 8, 0, 0)))
+    parent.update_idletasks()
+    width = max(parent.winfo_width(), 480)
+    _tk_grid_layout(frame, g, width)
     frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
     return frame
 
