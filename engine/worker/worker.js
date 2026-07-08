@@ -41,8 +41,12 @@ export class ArestLog {
     }
     if (request.method === "GET" && url.pathname === "/tail") {
       const n = (await this.state.storage.get("n")) ?? 0;
+      const from = Number(url.searchParams.get("from") ?? 0);
       const out = [];
-      const rows = await this.state.storage.list({ prefix: "e:" });
+      const rows = await this.state.storage.list({
+        prefix: "e:",
+        start: `e:${String(from).padStart(9, "0")}`,
+      });
       for (const [, v] of rows) out.push(v);
       return new Response(JSON.stringify({ n, events: out }));
     }
@@ -187,6 +191,40 @@ export default {
       return null;
     };
 
+    if (request.method === "GET" && seg[0] === "events") {
+      // SSE over the Durable Object stream: the event log IS the feed
+      // (append = commit = emit). Last-Event-ID resumes from the log
+      // index; the poll is the v0 transport (the DO push upgrade is
+      // hardening). Each message is one committed event line.
+      if (!env?.LOG) return json('{"error":"no log binding"}', 501);
+      const idd = env.LOG.idFromName("log");
+      const stub = env.LOG.get(idd);
+      let cursor = Number(request.headers.get("last-event-id") ?? 0);
+      const enc = new TextEncoder();
+      const stream = new ReadableStream({
+        async start(controller) {
+          controller.enqueue(enc.encode(": arest event stream\n\n"));
+          for (let i = 0; i < 55; i++) {          // ~55 s per connection
+            const r = await stub.fetch("https://log/tail?from=" + cursor);
+            const { n, events } = await r.json();
+            let k = cursor;
+            for (const line of events) {
+              controller.enqueue(enc.encode(
+                "id: " + (++k) + "\ndata: " + line + "\n\n"));
+            }
+            cursor = Math.max(cursor, n);
+            await new Promise((res) => setTimeout(res, 1000));
+          }
+          controller.close();
+        },
+      });
+      return new Response(stream, {
+        headers: {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+        },
+      });
+    }
     if (request.method === "GET" && seg[0] === "openapi.json") {
       // OpenAPI 3.1 as a PROJECTION of the schema (Thm hateoas' pledge,
       // machine-readable: no undocumented endpoints, nothing for an
