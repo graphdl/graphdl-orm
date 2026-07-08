@@ -1356,6 +1356,147 @@ impl NEval {
                 }
                 _ => N::Bot,
             },
+            // CERTIFIED-EQUAL OVERRIDE of DEF("system:vb_fetch")
+            // (shared/system.canon) — the resident's first canon-NAMED
+            // native arm; the meaning stays in canon, this arm exists for
+            // SPEED only and is twinned by the parity pin (the canonical
+            // absorbed reassembly evaluates one interpretive ast:DynFetch
+            // per entity id: measured 301 s per fact type over the tasks
+            // store, 2026-07-08; this arm is one spine pass). Prim wins
+            // over the process/canon def by NEval's resolution order —
+            // cells still shadow it first, exactly as they shadow defs.
+            "system:vb_fetch" => match pairv(x) {
+                Some((ft, d)) => {
+                    let spine: Vec<(String, N)> = match &d {
+                        N::S(cells) => cells
+                            .iter()
+                            .filter_map(|c| {
+                                if let N::S(it) = c {
+                                    if it.len() == 3 {
+                                        if let (N::A(l0), N::A(k)) = (&it[0], &it[1]) {
+                                            if matches!(&**l0, Leaf::S(s) if s == "CELL") {
+                                                let key = match &**k {
+                                                    Leaf::S(s) => s.clone(),
+                                                    Leaf::I(i) => i.to_string(),
+                                                    _ => return None,
+                                                };
+                                                return Some((key, it[2].clone()));
+                                            }
+                                        }
+                                    }
+                                }
+                                None
+                            })
+                            .collect(),
+                        _ => return Some(N::Bot),
+                    };
+                    let hash = N::A(Rc::new(Leaf::S("#".into())));
+                    // ast:Fetch — the FIRST cell of that name (n_cells_of's
+                    // own precedence); ast:FetchPop — missing, or a value
+                    // eq to the "#" sentinel, answers the empty population
+                    let fetch = |name: &str| -> Option<N> {
+                        spine.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+                    };
+                    let pop = |name: &str| -> N {
+                        match fetch(name) {
+                            Some(v) if !n_eq(&v, &hash) => v,
+                            _ => N::S(Rc::new(vec![])),
+                        }
+                    };
+                    // system:vb_colrow — rmapColumns rows ⟨noun, col, ft⟩
+                    // filtered on this ft; a malformed row bottoms exactly
+                    // like the canonical selector-through-Filter would
+                    let rmap = pop("rmapColumns");
+                    let rrows = match &rmap {
+                        N::S(v) => v.clone(),
+                        _ => return Some(N::Bot),
+                    };
+                    let mut colrow: Option<(N, N)> = None;
+                    for r in rrows.iter() {
+                        match r {
+                            N::S(cols) if cols.len() >= 3 => {
+                                if n_eq(&cols[2], &ft) && colrow.is_none() {
+                                    colrow = Some((cols[0].clone(), cols[1].clone()));
+                                }
+                            }
+                            _ => return Some(N::Bot),
+                        }
+                    }
+                    let (noun, col) = match colrow {
+                        None => {
+                            // own-table: FetchPop(ft) : D — a non-atom ft
+                            // names no cell, so its population is empty
+                            let name = match &ft {
+                                N::A(l) => match &**l {
+                                    Leaf::S(s) => s.clone(),
+                                    Leaf::I(i) => i.to_string(),
+                                    _ => return Some(N::Bot),
+                                },
+                                _ => return Some(N::S(Rc::new(vec![]))),
+                            };
+                            return Some(pop(&name));
+                        }
+                        Some(nc) => nc,
+                    };
+                    let noun_s = match &noun {
+                        N::A(l) => match &**l {
+                            Leaf::S(s) => s.clone(),
+                            Leaf::I(i) => i.to_string(),
+                            _ => return Some(N::Bot),
+                        },
+                        _ => return Some(N::Bot),
+                    };
+                    // the composed column selector is a prim selector in
+                    // the canonical pipeline: integer, 1..=32, else ⊥
+                    let col_i = match &col {
+                        N::A(l) => match &**l {
+                            Leaf::I(i) if (1..=32).contains(i) => *i as usize,
+                            _ => return Some(N::Bot),
+                        },
+                        _ => return Some(N::Bot),
+                    };
+                    let table = pop(&noun_s);
+                    let trows = match &table {
+                        N::S(v) => v.clone(),
+                        _ => return Some(N::Bot),
+                    };
+                    // per spine id: ast:DynFetch of the per-entity cell
+                    // noun:id — missing or atom-valued answers "#" and the
+                    // outer Filter drops the pair; a wide row shorter than
+                    // the selector bottoms the whole answer (α strictness)
+                    let mut out: Vec<N> = Vec::new();
+                    for r in trows.iter() {
+                        let id = match r {
+                            N::S(cols) if !cols.is_empty() => cols[0].clone(),
+                            _ => return Some(N::Bot),
+                        };
+                        let id_s = match &id {
+                            N::A(l) => match &**l {
+                                Leaf::S(s) => s.clone(),
+                                Leaf::I(i) => i.to_string(),
+                                _ => return Some(N::Bot),
+                            },
+                            _ => return Some(N::Bot),
+                        };
+                        let val = match fetch(&format!("{}:{}", noun_s, id_s)) {
+                            None => hash.clone(),
+                            Some(N::A(_)) => hash.clone(),
+                            Some(N::S(w)) => {
+                                if w.len() < col_i {
+                                    return Some(N::Bot);
+                                }
+                                w[col_i - 1].clone()
+                            }
+                            Some(N::Bot) => return Some(N::Bot),
+                        };
+                        if !n_eq(&val, &hash) {
+                            out.push(N::S(Rc::new(vec![id, val])));
+                        }
+                    }
+                    N::S(Rc::new(out))
+                }
+                None => N::Bot,
+            },
             "escape_html" => match x {
                 N::A(l) => {
                     let s = match &**l {
@@ -1924,6 +2065,12 @@ fn handle(j: &J, srv: &mut Srv, serve: bool) -> String {
                 if it.len() == 2 && !isbot(&it[0]) {
                     srv.d = it[1].clone();
                     srv.cells = cells_of(&srv.d);
+                    // MIRROR COHERENCE (2026-07-08): every site that
+                    // replaces the retained store refreshes the native
+                    // mirror, and every native read TRUSTS it — the
+                    // stale-mirror caveat retires at the source
+                    srv.nd = v_to_n(&srv.d);
+                    srv.ncells = n_cells_of(&srv.nd);
                 }
             }
             let mut s = String::new();
@@ -1983,21 +2130,22 @@ fn reduce_over(srv: &Srv, f: V, x: V, fuel: Option<i64>) -> V {
 }
 
 // (system:verbalize : id) : D over the NATIVE carrier — the ~40x plumb
-// (2026-07-08). The native view builds FRESH from d (srv.nd may be stale:
-// op_run_rules' own idiom; trusting the mirror was the "priced lever"
-// mystery in full). Serves both the synthesize_pairs op (raw pairs) and
-// the MCP synthesize tool (rendered to the Registry's shape).
+// (2026-07-08). READS TRUST THE MIRROR: every site that replaces the
+// retained store refreshes srv.nd/srv.ncells (the coherence audit,
+// 2026-07-08), so the per-call v_to_n rebuild — 247 s at tasks scale —
+// retires with the staleness it guarded against. Serves both the
+// synthesize_pairs op (raw pairs) and the MCP synthesize tool (rendered
+// to the Registry's shape).
 fn native_verbalize(srv: &Srv, id: &V) -> V {
-    let nd = v_to_n(&srv.d);
     let ev = NEval {
-        cells: n_cells_of(&nd),
+        cells: srv.ncells.clone(),
         process: srv.nprocess.clone(),
-        defs_n: nd.clone(),
+        defs_n: srv.nd.clone(),
         fuel: std::cell::Cell::new(-1),
     };
     n_to_v(&ev.mu(napp(
         napp(N::A(Rc::new(Leaf::S("system:verbalize".into()))), v_to_n(id)),
-        nd,
+        srv.nd.clone(),
     )))
 }
 
@@ -2321,15 +2469,16 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     };
     let mut d = srv.d.clone();
     let mut cells = srv.cells.clone();
-    // The native view of the current store, built fresh from d (srv.nd may be
-    // stale: a prior run_rules replaced srv.d without refreshing the mirror).
+    // The native view of the current store, seeded from the resident mirror
+    // (coherent by the write-site audit, 2026-07-08 — every store replacement
+    // refreshes it, so the fresh v_to_n rebuild this seed used to pay is gone).
     // Every rule body evaluates through the native carrier NEval over this view
     // instead of the Scott mu, the measured fast path, and store_into keeps it
     // in lockstep with d/cells so a head is visible to later rules the instant
     // it is stored. The resident process defs carry the compiled canon; a
     // hand-built store without them falls through to NCANON in NEval.
-    let mut nd = v_to_n(&d);
-    let mut ncells = n_cells_of(&nd);
+    let mut nd = srv.nd.clone();
+    let mut ncells = srv.ncells.clone();
     let nprocess = srv.nprocess.clone();
     let mut changed: BTreeSet<String> = BTreeSet::new();
     let leaf = |s: &str| Leaf::S(s.to_string());
@@ -3411,14 +3560,13 @@ fn op_answer(op: &str, j: &J, srv: &mut Srv) -> Result<String, String> {
                 Some(v) => j_to_n(v),
                 None => return Err("neval needs x".to_string()),
             };
-            // the native view BUILT FRESH from d — srv.nd may be stale
-            // (op_run_rules' own idiom; trusting srv.nd was the probe's
-            // first false lead: length(D) natively answered 0)
-            let nd = v_to_n(&srv.d);
+            // the retained mirror — coherent since the write-site audit
+            // (2026-07-08); the probe now sees exactly what the native
+            // reads see, which is the point of a bisection probe
             let ev = NEval {
-                cells: n_cells_of(&nd),
+                cells: srv.ncells.clone(),
                 process: srv.nprocess.clone(),
-                defs_n: nd,
+                defs_n: srv.nd.clone(),
                 fuel: std::cell::Cell::new(-1),
             };
             let res = n_to_v(&ev.mu(napp(f, x)));
@@ -4033,6 +4181,9 @@ fn native_apply(args: &J, apps: &Apps, srv: &mut Srv) -> Option<Result<String, (
         // changed=[ft])), which replaces the retained store with the fixpoint
         srv.d = d2;
         srv.cells = cells_of(&srv.d);
+        // mirror coherence: the native view refreshes with the store
+        srv.nd = v_to_n(&srv.d);
+        srv.ncells = n_cells_of(&srv.nd);
         let derive_req = J::O(vec![("changed".to_string(), J::A(vec![J::S(ft.clone())]))]);
         let _ = op_run_rules(&derive_req, srv);
         // persist natively: the committed step to the event log, then the
@@ -4235,18 +4386,19 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
             let status_ft = pop_rows(&srv.cells, &leaf("smStatusFt")).iter()
                 .filter_map(two).find(|(bn, _)| *bn == gov)
                 .map(|(_, ft)| ft);
-            let nd = v_to_n(&srv.d);
+            // reads trust the mirror (the coherence audit, 2026-07-08):
+            // the 247 s per-call v_to_n rebuild at tasks scale retires
             let ev = NEval {
-                cells: n_cells_of(&nd),
+                cells: srv.ncells.clone(),
                 process: srv.nprocess.clone(),
-                defs_n: nd.clone(),
+                defs_n: srv.nd.clone(),
                 fuel: std::cell::Cell::new(-1),
             };
             let mut status: Option<String> = None;
             if let Some(ft) = status_ft {
                 let rows = ev.mu(napp(
                     N::A(Rc::new(Leaf::S("system:vb_fetch".into()))),
-                    nseq(vec![N::A(Rc::new(Leaf::S(ft))), nd.clone()]),
+                    nseq(vec![N::A(Rc::new(Leaf::S(ft))), srv.nd.clone()]),
                 ));
                 if let N::S(rs) = &rows {
                     for r in rs.iter() {

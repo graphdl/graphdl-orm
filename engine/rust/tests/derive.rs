@@ -998,3 +998,65 @@ fn the_derive_tool_is_idempotent_over_a_python_derived_app() {
     drop(c);
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+// ---- the vb_fetch override parity pin (the certified-equal twin) ----
+
+/// The resident's native system:vb_fetch prim answers BYTE-EQUAL to the
+/// canonical def on every shape the RMAP layout produces: an absorbed fact
+/// type (per-entity cells, a "#"-padded null, a missing per-entity cell),
+/// an own-table fact type, and an unknown name. The Scott side (cases)
+/// resolves system:vb_fetch through CANON — it has no native register — so
+/// each case IS the definition of record; the neval side resolves through
+/// NEval's prim table and hits the override. Doctrine: meaning in canon,
+/// overrides for speed only, every override twinned by test.
+#[test]
+fn the_native_vb_fetch_twins_the_canonical_def() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arest"))
+        .arg("--serve")
+        .env("AREST_NEVAL_TRACE", "1") // gates the neval probe op
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn arest --serve");
+    let out = BufReader::new(child.stdout.take().unwrap());
+    let mut s = Serve { child, out };
+
+    // the RMAP fixture: T_status absorbed into Task col 2; t2's value is the
+    // "#" pad (dropped), t3 has no per-entity cell (dropped), T_own is plain
+    assert_eq!(
+        s.rpc(concat!(
+            r#"{"d": ["#,
+            r#"["CELL","rmapColumns",[["Task",2,"T_status"]]],"#,
+            r#"["CELL","Task",[["t1"],["t2"],["t3"],["t4"]]],"#,
+            r#"["CELL","Task:t1",["t1","open","x"]],"#,
+            r##"["CELL","Task:t2",["t2","#"]],"##,
+            r#"["CELL","Task:t4",["t4","done"]],"#,
+            r#"["CELL","T_own",[["a","1"],["b","2"]]]"#,
+            r#"]}"#
+        )),
+        "[]"
+    );
+
+    for (ft, want) in [
+        ("T_status", r#"[["t1","open"],["t4","done"]]"#),
+        ("T_own", r#"[["a","1"],["b","2"]]"#),
+        ("Nope", r#"[]"#),
+    ] {
+        // canonical: Scott, f : ⟨x, D⟩ with the ft consed over the store
+        let canon = s.rpc(&format!(
+            r#"{{"cases":[{{"f":["COMP","system:vb_fetch",["CONS",["CONST","{ft}"],2]],"xd":[],"fuel":0}}]}}"#
+        ));
+        assert!(
+            canon.contains(want),
+            "the canonical def is the meaning ({ft}): {canon}"
+        );
+        // native: NEval resolves the same name through the prim table
+        let native = s.rpc(&format!(
+            r#"{{"op":"neval","f":["COMP","system:vb_fetch",["CONS",["CONST","{ft}"],"DEFS"]],"x":"x"}}"#
+        ));
+        assert!(
+            native.contains(want),
+            "the native override must answer the canonical rows ({ft}): {native}"
+        );
+    }
+}
