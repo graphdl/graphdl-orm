@@ -1901,8 +1901,6 @@ class Registry:
         hit = Registry._FED_MEMO.get(key)
         if hit is not None and now - hit[0] < Registry._FED_TTL:
             return hit[1]                # the refreshed D, TTL-fresh
-        sysrows = {r[1]: r[2] for r in system._pop_rows(
-            D, "External_System_has_URL") if False}
         def _prop(ft):
             return {r[0]: r[1] for r in system._pop_rows(D, ft)
                     if len(r) >= 2}
@@ -1945,6 +1943,18 @@ class Registry:
                 ft = noun_id + "_has_" + _re.sub(
                     r"[^0-9A-Za-z]+", "_", str(col)).strip("_")
                 by_ft.setdefault(ft, []).append([rid, str(val)])
+        # THE BRIDGE MINT (identity is transduction, 2026-07-08): a noun
+        # surfaced as another noun gets one same-id bridge row per fetched
+        # entity — rule-minted cross-noun bridges skolemize the new side,
+        # so the boundary asserts the identity link and the canon re-key
+        # rules derive every field from it
+        surfaced = next((r[1] for r in system._pop_rows(
+            D, "Noun_is_surfaced_as_Noun")
+            if len(r) >= 2 and r[0] == noun), None)
+        if surfaced and ids:
+            bft = (_re.sub(r"[^0-9A-Za-z]+", "_", surfaced).strip("_")
+                   + "_is_" + noun_id)
+            by_ft[bft] = [[rid, rid] for rid in ids]
         if not by_ft:
             Registry._FED_MEMO[key] = (now, D)
             return D

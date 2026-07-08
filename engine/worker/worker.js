@@ -158,15 +158,27 @@ async function ensureFederated(env, noun) {
   const data = payload?.data ?? [];
   const nid = noun.replace(/[^0-9A-Za-z]+/g, "_").replace(/^_+|_+$/g, "");
   const byFt = new Map();
+  const ids = [];
   for (const row of data) {
     const rid = String(row?.id ?? "").trim();
     if (!rid) continue;
+    ids.push(rid);
     for (const [col, val] of Object.entries(row)) {
       if (col === "id" || val === null || val === "") continue;
       const ft = nid + "_has_" + String(col).replace(/[^0-9A-Za-z]+/g, "_").replace(/^_+|_+$/g, "");
       if (!byFt.has(ft)) byFt.set(ft, []);
       byFt.get(ft).push([rid, String(val)]);
     }
+  }
+  // THE BRIDGE MINT (identity is transduction): a noun surfaced as
+  // another noun gets one same-id bridge row per fetched entity — the
+  // canon re-key rules derive the fields from the identity link
+  const surfaced = popRows("Noun_is_surfaced_as_Noun")
+    .find((r) => r[0] === noun);
+  if (surfaced && ids.length) {
+    const bft = surfaced[1].replace(/[^0-9A-Za-z]+/g, "_").replace(/^_+|_+$/g, "")
+      + "_is_" + nid;
+    byFt.set(bft, ids.map((rid) => [rid, rid]));
   }
   if (byFt.size > 0) {
     const entries = [...byFt.entries()].map(([ft, facts]) => ({ ft, facts }));
