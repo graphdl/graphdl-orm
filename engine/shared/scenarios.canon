@@ -70,5 +70,22 @@ DEF("case:escape-html-entities", S2(A("escape_html"), A("a<b>&\"c"))),
 
 DEF("case:escape-html-int-stringifies", S2(A("escape_html"), N(7))),
 
+DEF("case:sqlcol-unary-strips-noun",
+    S2(A("system:sqlcol"), S6(A("unary"), A("Task"), A("Task_is_started"),
+                              A("#"), A("#"), N(1)))),
+
+DEF("case:sqlcol-ref-joins-mode",
+    S2(A("system:sqlcol"), S6(A("ref"), A("Order"),
+                              A("Order_was_placed_by_Customer"),
+                              A("Customer"), A("nr"), N(1)))),
+
+DEF("case:sqlcol-value-names-player",
+    S2(A("system:sqlcol"), S6(A("value"), A("Task"), A("Task_has_Task_Priority"),
+                              A("Task Priority"), A("#"), N(1)))),
+
+DEF("case:sqlcol-dedup-suffixes-second",
+    S2(A("system:sqlcol"), S6(A("value"), A("Task"), A("Task_has_Task_Priority"),
+                              A("Task Priority"), A("#"), N(2)))),
+
 DEF("case:render-menu-canonical", S2(A("system:render_html"), S2(A("menu"), S1(S3(A("button"), A("go"), A("done"))))))
 )

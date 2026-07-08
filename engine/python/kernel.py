@@ -566,11 +566,45 @@ def _d_cond(mu, o):
     pv = mu((APP_D, whole[1], x))
     return mu((APP_D, whole[2], x)) if pv == _T else (mu((APP_D, whole[3], x)) if pv == _F else BOT_D)
 
+_ALPHA_POOL = None
+
+
+def _alpha_free_threaded():
+    import sys
+    return getattr(sys, "_is_gil_enabled", lambda: True)() is False
+
+
+_ALPHA_PARALLEL = _alpha_free_threaded()
+
+
+def _alpha_map(mu, f, xs):
+    """Backus's apply-to-all, THE OVERRIDE POINT per host (Samuel,
+    2026-07-08: performant and parallel in each language): the items are
+    independent pure reductions over immutable terms, alpha's whole
+    pitch in the FP paper, so a free-threaded host maps them across a
+    thread pool (order preserved; pool sized by the runtime). Under the
+    GIL the sequential map IS the performant form — threads only add
+    overhead to CPU-bound reduction — so the parallel path gates on
+    sys._is_gil_enabled() being False (python 3.13+ free-threaded
+    builds) and engages by itself the day the interpreter allows it."""
+    if _ALPHA_PARALLEL and len(xs) >= 8:
+        global _ALPHA_POOL
+        if _ALPHA_POOL is None:
+            import concurrent.futures
+            _ALPHA_POOL = concurrent.futures.ThreadPoolExecutor()
+        return list(_ALPHA_POOL.map(lambda xi: mu((APP_D, f, xi)), xs))
+    return [mu((APP_D, f, xi)) for xi in xs]
+
+
 def _d_alpha(mu, o):
     whole, x = o[0], o[1]
     if len(whole) < 2:
         return BOT_D
-    return () if x == () else (_mkseq(mu((APP_D, whole[1], xi)) for xi in x) if _isseq(x) else BOT_D)
+    if x == ():
+        return ()
+    if not _isseq(x):
+        return BOT_D
+    return _mkseq(_alpha_map(mu, whole[1], x))
 
 def _d_insert(mu, o):
     # /f as an iterative right fold: the same semantics as the recursive definition (each

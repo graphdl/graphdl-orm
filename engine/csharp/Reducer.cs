@@ -46,6 +46,101 @@ static class Reducer
     internal static object App(object f, object x) =>
         new object[] { AppTag.Value, f, x };
 
+    // stage-1 field extraction (spec D5, the 2026-07-07 ruling); see the
+    // Python/Rust/Java twins for the behavioral spec.
+    static string S1BlankQuotes(string s)
+    {
+        var outp = s.ToCharArray();
+        var open = -1;
+        for (var i = 0; i < outp.Length; i++)
+        {
+            if (outp[i] == '\'')
+            {
+                if (open < 0) { open = i; }
+                else { for (var j = open; j <= i; j++) outp[j] = ' '; open = -1; }
+            }
+        }
+        return new string(outp);
+    }
+
+    static bool S1Letter(char c)
+        => (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+
+    static bool S1WordHit(string hay, string needle, bool ci)
+    {
+        var n = needle.Length;
+        if (n == 0 || hay.Length < n) return false;
+        for (var s = 0; s + n <= hay.Length; s++)
+        {
+            var hit = true;
+            for (var k = 0; k < n; k++)
+            {
+                var a = hay[s + k]; var b = needle[k];
+                if (ci) { a = char.ToLowerInvariant(a); b = char.ToLowerInvariant(b); }
+                if (a != b) { hit = false; break; }
+            }
+            if (!hit) continue;
+            var beforeOk = s == 0 || !S1Letter(hay[s - 1]);
+            var e = s + n;
+            var afterOk = e >= hay.Length || !S1Letter(hay[e]);
+            if (beforeOk && afterOk) return true;
+        }
+        return false;
+    }
+
+    static System.Collections.Generic.List<string[]> Stage1Rows(
+        string text, System.Collections.Generic.List<string[]> vocab,
+        System.Collections.Generic.List<string> nouns, string sid)
+    {
+        var trimmed = text.Trim();
+        var end = trimmed.Length;
+        while (end > 0 && trimmed[end - 1] == '.') end--;
+        trimmed = trimmed.Substring(0, end);
+        var bare = S1BlankQuotes(trimmed);
+        var outp = new System.Collections.Generic.List<string[]>();
+        var order = new System.Collections.Generic.List<string[]>(vocab);
+        // stable by construction: OrderByDescending is a stable sort
+        var ordered = System.Linq.Enumerable.ToList(
+            System.Linq.Enumerable.OrderByDescending(order, p => p[1].Length));
+        foreach (var p in ordered)
+        {
+            if (!S1WordHit(bare, p[1], true)) continue;
+            if (p[0] == "Statement_has_Trailing_Marker"
+                && !bare.TrimEnd().ToLowerInvariant()
+                        .EndsWith(p[1].ToLowerInvariant(), System.StringComparison.Ordinal))
+                continue;
+            outp.Add(new[] { p[0], sid, p[1] });
+        }
+        foreach (var nn in nouns)
+        {
+            if (S1WordHit(bare, nn, false))
+                outp.Add(new[] { "Statement_has_Role_Reference", sid, nn });
+        }
+        var open = -1;
+        for (var i = 0; i < trimmed.Length; i++)
+        {
+            if (trimmed[i] == '\'')
+            {
+                if (open < 0) { open = i; }
+                else
+                {
+                    outp.Add(new[] { "Statement_has_Literal_Role", sid,
+                                     trimmed.Substring(open + 1, i - open - 1) });
+                    break;
+                }
+            }
+        }
+        foreach (var mark in new[] { ",", "(", ")", ": " })
+        {
+            if (bare.Contains(mark))
+            {
+                outp.Add(new[] { "Statement_has_Prose_Punctuation", sid, mark });
+                break;
+            }
+        }
+        return outp;
+    }
+
     static bool EqObj(object a, object b)
     {
         if (a is object[] sa && b is object[] sb)
@@ -164,11 +259,26 @@ static class Reducer
             }
             case "ALPHA":
             {
+                // Backus's apply-to-all is data-parallel by definition:
+                // independent pure reductions over immutable terms and a
+                // read-only Store, Parallel.For past a small threshold;
+                // order preserved by indexing. Mirrors the python/java
+                // overrides.
                 var o = Pair(); var whole = (object[])o[0]; var arg = o[1];
                 if (whole.Length < 2) return Bot.Value;
                 if (arg is object[] xs)
-                    return xs.Length == 0 ? Array.Empty<object>()
-                         : MkSeq(xs.Select(xi => Mu(App(whole[1], xi))));
+                {
+                    if (xs.Length == 0) return Array.Empty<object>();
+                    if (xs.Length >= 8)
+                    {
+                        var outp = new object[xs.Length];
+                        var f = whole[1];
+                        System.Threading.Tasks.Parallel.For(0, xs.Length,
+                            i => outp[i] = Mu(App(f, xs[i])));
+                        return MkSeq(outp);
+                    }
+                    return MkSeq(xs.Select(xi => Mu(App(whole[1], xi))));
+                }
                 return Bot.Value;
             }
             case "INSERT":
@@ -305,6 +415,58 @@ static class Reducer
                 if (ev is null) return Bot.Value;
                 return ev.Replace("&", "&amp;").Replace("<", "&lt;")
                          .Replace(">", "&gt;").Replace("\"", "&quot;");
+            }
+            case "stage1_fields":
+            {
+                // stage-1 at the lex boundary (spec D5); text and sid must
+                // be strings exactly as the python twin checks.
+                if (x is not object[] s1a || s1a.Length != 4) return Bot.Value;
+                if (s1a[0] is not string s1text || s1a[3] is not string s1sid)
+                    return Bot.Value;
+                var s1vocab = new System.Collections.Generic.List<string[]>();
+                if (s1a[1] is object[] s1ps)
+                {
+                    foreach (var p in s1ps)
+                    {
+                        if (p is object[] pi && pi.Length >= 2)
+                        {
+                            var a = pi[0] is string pa ? pa : pi[0] is long la ? la.ToString() : null;
+                            var b = pi[1] is string pb ? pb : pi[1] is long lb ? lb.ToString() : null;
+                            if (a is not null && b is not null)
+                                s1vocab.Add(new[] { a, b });
+                        }
+                    }
+                }
+                var s1nouns = new System.Collections.Generic.List<string>();
+                if (s1a[2] is object[] s1ns)
+                {
+                    foreach (var nx in s1ns)
+                    {
+                        var s = nx is string sn ? sn : nx is long ln ? ln.ToString() : null;
+                        if (s is null) return Bot.Value;
+                        s1nouns.Add(s);
+                    }
+                }
+                var s1rows = Stage1Rows(s1text, s1vocab, s1nouns, s1sid);
+                var s1out = new object[s1rows.Count];
+                for (var i = 0; i < s1rows.Count; i++)
+                {
+                    var r = s1rows[i];
+                    s1out[i] = new object[] { r[0], new object[] { r[1], r[2] } };
+                }
+                return s1out;
+            }
+            case "strip_prefix":
+            {
+                // the prefix-strip base op (spec D5, generic string algebra
+                // beside implode/slug): <prefix, s> answers s with a leading
+                // prefix removed, or s unchanged. Mirrors the four kernels.
+                if (x is not object[] sp || sp.Length != 2) return Bot.Value;
+                var pp = sp[0] is string spa ? spa : sp[0] is long spi ? spi.ToString() : null;
+                var ss = sp[1] is string spb ? spb : sp[1] is long spj ? spj.ToString() : null;
+                if (pp is null || ss is null) return Bot.Value;
+                return ss.StartsWith(pp, System.StringComparison.Ordinal)
+                     ? ss.Substring(pp.Length) : ss;
             }
             case "skolem":
             {

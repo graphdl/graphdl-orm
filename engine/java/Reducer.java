@@ -36,6 +36,90 @@ public class Reducer {
         return items;
     }
 
+    // stage-1 field extraction (spec D5, the 2026-07-07 ruling — a
+    // performant implementation proven to the interface; a canonical
+    // composition is not owed at the boundary). Mirrors the
+    // Python/Rust/C# twins: quoted spans blank length-preserving,
+    // vocabulary hits case-insensitive with no letter adjacent
+    // (longest literal first, stable), a Trailing Marker must trail,
+    // nouns case-sensitive, the FIRST quoted content is the Literal
+    // Role, the first structural mark is the prose tell.
+    static String s1BlankQuotes(String s) {
+        char[] out = s.toCharArray();
+        int open = -1;
+        for (int i = 0; i < out.length; i++) {
+            if (out[i] == '\'') {
+                if (open < 0) { open = i; }
+                else { for (int j = open; j <= i; j++) out[j] = ' '; open = -1; }
+            }
+        }
+        return new String(out);
+    }
+
+    static boolean s1Letter(char c) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+    }
+
+    static boolean s1WordHit(String hay, String needle, boolean ci) {
+        int n = needle.length();
+        if (n == 0 || hay.length() < n) return false;
+        for (int s = 0; s + n <= hay.length(); s++) {
+            boolean hit = true;
+            for (int k = 0; k < n; k++) {
+                char a = hay.charAt(s + k), b = needle.charAt(k);
+                if (ci) { a = Character.toLowerCase(a); b = Character.toLowerCase(b); }
+                if (a != b) { hit = false; break; }
+            }
+            if (!hit) continue;
+            boolean beforeOk = s == 0 || !s1Letter(hay.charAt(s - 1));
+            int e = s + n;
+            boolean afterOk = e >= hay.length() || !s1Letter(hay.charAt(e));
+            if (beforeOk && afterOk) return true;
+        }
+        return false;
+    }
+
+    static java.util.List<String[]> stage1Rows(String text, java.util.List<String[]> vocab,
+                                               java.util.List<String> nouns, String sid) {
+        String trimmed = text.trim();
+        int end = trimmed.length();
+        while (end > 0 && trimmed.charAt(end - 1) == '.') end--;
+        trimmed = trimmed.substring(0, end);
+        String bare = s1BlankQuotes(trimmed);
+        java.util.List<String[]> out = new java.util.ArrayList<>();
+        java.util.List<String[]> order = new java.util.ArrayList<>(vocab);
+        order.sort((a, b) -> b[1].length() - a[1].length());  // stable
+        for (String[] p : order) {
+            if (!s1WordHit(bare, p[1], true)) continue;
+            if (p[0].equals("Statement_has_Trailing_Marker")
+                    && !bare.replaceAll("\\s+$", "").toLowerCase()
+                            .endsWith(p[1].toLowerCase())) continue;
+            out.add(new String[]{p[0], sid, p[1]});
+        }
+        for (String nn : nouns) {
+            if (s1WordHit(bare, nn, false))
+                out.add(new String[]{"Statement_has_Role_Reference", sid, nn});
+        }
+        int open = -1;
+        for (int i = 0; i < trimmed.length(); i++) {
+            if (trimmed.charAt(i) == '\'') {
+                if (open < 0) { open = i; }
+                else {
+                    out.add(new String[]{"Statement_has_Literal_Role", sid,
+                                         trimmed.substring(open + 1, i)});
+                    break;
+                }
+            }
+        }
+        for (String mark : new String[]{",", "(", ")", ": "}) {
+            if (bare.contains(mark)) {
+                out.add(new String[]{"Statement_has_Prose_Punctuation", sid, mark});
+                break;
+            }
+        }
+        return out;
+    }
+
     static boolean eqObj(Object a, Object b) {
         if (isSeq(a) && isSeq(b)) {
             Object[] sa = (Object[]) a, sb = (Object[]) b;
@@ -161,11 +245,23 @@ public class Reducer {
             return val(BOT);
         }
         if (name.equals("ALPHA")) {
+            // Backus's apply-to-all is data-parallel by definition (the
+            // FP paper's pitch): independent pure reductions over
+            // immutable terms and a read-only STORE, mapped across the
+            // common pool past a small threshold; order preserved by
+            // indexing. Mirrors the python/C# overrides.
             Object[] whole = (Object[]) o[0];
             if (whole.length < 2 || !isSeq(o[1])) return val(BOT);
             Object[] xs = (Object[]) o[1];
             Object[] out = new Object[xs.length];
-            for (int i = 0; i < xs.length; i++) out[i] = mu(app(whole[1], xs[i]));
+            if (xs.length >= 8) {
+                final Object f = whole[1];
+                java.util.stream.IntStream.range(0, xs.length).parallel()
+                    .forEach(i -> out[i] = mu(app(f, xs[i])));
+            } else {
+                for (int i = 0; i < xs.length; i++)
+                    out[i] = mu(app(whole[1], xs[i]));
+            }
             return val(mkSeq(out));
         }
         if (name.equals("INSERT")) {
@@ -232,6 +328,57 @@ public class Reducer {
             if (v == null) return val(BOT);
             return val(v.replace("&", "&amp;").replace("<", "&lt;")
                         .replace(">", "&gt;").replace("\"", "&quot;"));
+        }
+        if (name.equals("stage1_fields")) {
+            // stage-1 at the lex boundary (spec D5); text and sid must be
+            // strings exactly as the python twin checks.
+            if (o == null || o.length != 4) return val(BOT);
+            if (!(o[0] instanceof String) || !(o[3] instanceof String))
+                return val(BOT);
+            String text = (String) o[0], sid = (String) o[3];
+            java.util.List<String[]> vocab = new java.util.ArrayList<>();
+            if (o[1] instanceof Object[]) {
+                for (Object p : (Object[]) o[1]) {
+                    if (p instanceof Object[]) {
+                        Object[] pi = (Object[]) p;
+                        if (pi.length >= 2) {
+                            String a = pi[0] instanceof String ? (String) pi[0]
+                                     : pi[0] instanceof Long ? pi[0].toString() : null;
+                            String b = pi[1] instanceof String ? (String) pi[1]
+                                     : pi[1] instanceof Long ? pi[1].toString() : null;
+                            if (a != null && b != null) vocab.add(new String[]{a, b});
+                        }
+                    }
+                }
+            }
+            java.util.List<String> nouns = new java.util.ArrayList<>();
+            if (o[2] instanceof Object[]) {
+                for (Object nx : (Object[]) o[2]) {
+                    String s = nx instanceof String ? (String) nx
+                             : nx instanceof Long ? nx.toString() : null;
+                    if (s == null) return val(BOT);
+                    nouns.add(s);
+                }
+            }
+            java.util.List<String[]> rows = stage1Rows(text, vocab, nouns, sid);
+            Object[] outRows = new Object[rows.size()];
+            for (int i = 0; i < rows.size(); i++) {
+                String[] r = rows.get(i);
+                outRows[i] = new Object[]{r[0], new Object[]{r[1], r[2]}};
+            }
+            return val(outRows);
+        }
+        if (name.equals("strip_prefix")) {
+            // the prefix-strip base op (spec D5, generic string algebra
+            // beside implode/slug): <prefix, s> answers s with a leading
+            // prefix removed, or s unchanged. Mirrors the four kernels.
+            if (o == null || o.length != 2) return val(BOT);
+            String p = o[0] instanceof String ? (String) o[0]
+                     : o[0] instanceof Long ? o[0].toString() : null;
+            String s = o[1] instanceof String ? (String) o[1]
+                     : o[1] instanceof Long ? o[1].toString() : null;
+            if (p == null || s == null) return val(BOT);
+            return val(s.startsWith(p) ? s.substring(p.length()) : s);
         }
         if (name.equals("skolem")) {
             // The skolem boundary op (task-970, spec D5 beside cellkey): an

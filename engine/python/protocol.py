@@ -654,6 +654,78 @@ def _entity_columns(table, partition, roles, ref, entities, entity_tables):
     return out
 
 
+def get_view(D, noun, entity_id):
+    """CERTIFIED-EQUAL OVERRIDE of DEF("system:entity_view")
+    (shared/system.canon) — the host's 3NF per-entity view, kept for
+    SPEED only; the canon def is the meaning and test_entity_view pins
+    the twin. Reads the SAME store knowledge the canon reads — the
+    rmapColumns cell (facts all the way down; a store without the cell
+    reads as all-own-table, layout_cells' own reading) — never a
+    per-call re-derivation of the partition. Field naming mirrors
+    system:sqlcol: unary strips the noun, ref joins the reference mode
+    (refScheme over refMode over id), value names the played type, the
+    seen-count ordinal suffixes from 2; the ref test is the entity test
+    alone (entities ⊆ entity_tables by construction, so the old
+    conjunction reduces). Answers ⟨seen, fields, facts⟩ raw;
+    Registry.get wraps the app envelope."""
+    colrows = [tuple(r) for r in system._pop_rows(D, "rmapColumns")
+               if len(r) >= 3 and r[0] == noun]
+    absorbed = {r[2] for r in system._pop_rows(D, "rmapColumns")
+                if len(r) >= 3}
+    roles = {}
+    for r in system._pop_rows(D, "role"):
+        if len(r) >= 4:
+            roles.setdefault(r[1], []).append((r[2], r[3]))
+    for ft in roles:
+        roles[ft].sort()
+    ref = {r[0]: r[1] for r in system._pop_rows(D, "refScheme")
+           if len(r) >= 2}
+    for r in system._pop_rows(D, "refMode"):
+        if len(r) >= 2:
+            ref.setdefault(r[0], r[1])
+    entities = {r[0] for r in system._pop_rows(D, "instanceOf")
+                if len(r) >= 2 and r[1] == "ObjectType"}
+    fields, facts, seen = {}, [], False
+    counts = {}
+    for (_noun, _col, ft) in colrows:
+        rs = roles.get(ft, [])
+        if len(rs) == 1:
+            kind, other = "unary", None
+        else:
+            other = next((t for (_p, t) in rs if t != noun), None)
+            kind = "ref" if other in entities else "value"
+        if kind == "unary":
+            base = _sql_name(ft[len(noun):] if ft.startswith(noun) else ft)
+        elif kind == "ref":
+            base = f"{_sql_name(other)}_{_sql_name(ref.get(other, 'id'))}"
+        else:
+            base = _sql_name(other) if other else _sql_name(ft)
+        counts[base] = counts.get(base, 0) + 1
+        col = base if counts[base] == 1 else f"{base}_{counts[base]}"
+        rows = [tuple(r) for r in system._pop_rows(D, ft)]
+        if kind == "unary":
+            fields[col] = any(r and r[0] == entity_id for r in rows)
+            seen = seen or fields[col]
+        else:
+            val = {r[0]: r[1] for r in rows if len(r) >= 2}
+            fields[other or col] = val.get(entity_id)     # the played type names the field
+            seen = seen or entity_id in val
+    for r in system._pop_rows(D, "factType"):
+        ft = r[0] if len(r) >= 1 else None
+        if not ft or ft in absorbed:
+            continue
+        rs = roles.get(ft, [])
+        for row in system._pop_rows(D, ft):
+            row = tuple(row)
+            if any(p <= len(row) and row[p - 1] == entity_id
+                   for (p, player) in rs if player == noun):
+                facts.append({"fact_type": ft, "row": list(row)})
+                seen = True
+    seen = seen or any(r and r[0] == entity_id
+                       for r in system._pop_rows(D, noun))
+    return seen, fields, facts
+
+
 def generate(D):
     """{table-or-ft: CREATE TABLE statement}."""
     partition, roles, ref, entities, mandatory = _analyze(D)
@@ -1738,35 +1810,11 @@ class Registry:
         return self._storage(name).query(statement)          # the 3NF surface (SQL backends)
 
     def get(self, name, noun, entity_id):
-        """The 3NF per-entity view: the key, absorbed functional values, unary
-        booleans, and every own-table fact the id participates in — the same
-        grouping the projection uses (one rmap, two consumers)."""
+        """The 3NF per-entity view envelope; the view itself is get_view,
+        the certified-equal override of the canon definition."""
         from . import ddl
         D = self._load(name)
-        partition, roles, ref, entities, _mand = ddl._analyze(D)
-        own = [ft for ft, key in partition.items() if key == ft]
-        entity_tables = entities | ({t for t in partition.values()} - set(own))
-        fields, facts, seen = {}, [], False
-        for (ft, col, kind, other) in ddl._entity_columns(
-                noun, partition, roles, ref, entities, entity_tables):
-            rows = [tuple(r) for r in system._pop_rows(D, ft)]
-            if kind == "unary":
-                fields[col] = any(r and r[0] == entity_id for r in rows)
-                seen = seen or fields[col]
-            else:
-                val = {r[0]: r[1] for r in rows if len(r) >= 2}
-                fields[other or col] = val.get(entity_id)     # the played type names the field
-                seen = seen or entity_id in val
-        for ft in own:
-            rs = roles.get(ft, [])
-            for row in system._pop_rows(D, ft):
-                row = tuple(row)
-                if any(p <= len(row) and row[p - 1] == entity_id
-                       for (p, player) in rs if player == noun):
-                    facts.append({"fact_type": ft, "row": list(row)})
-                    seen = True
-        seen = seen or any(r and r[0] == entity_id
-                           for r in system._pop_rows(D, noun))
+        seen, fields, facts = ddl.get_view(D, noun, entity_id)
         return {"app": name, "noun": noun, "id": entity_id,
                 "exists": bool(seen), "fields": fields,
                 "facts": facts}
@@ -1919,17 +1967,17 @@ class Registry:
         return {"app": name, "violations": violations}
 
     def verify(self, name):
-        """The migration report's derived-population check, IN PLACE (the swap
-        tool's parity evidence turned self-audit): for each head whose stored
-        cell IS rule materialization — the schedule's destructive passes
-        (sweep, dred, aggwhole) plus the derivation-owned keyed heads — re-
-        evaluate the rules over the settled store (rho within the step's D,
-        as explain does) and compare with the stored cell. A mismatch is a
-        materialization the current rules do not reproduce — a tampered .db,
-        or a store saved before the rules changed. ONE classification: the
-        audit reads system._classify_heads, the same schedule run_rules
-        executes and scheduler_cells materializes (keyed membership is
-        kind-blind there, so the owned-keyed corner consults the kinds)."""
+        """CERTIFIED-EQUAL OVERRIDE of DEF("system:verify_store")
+        (shared/system.canon, 2026-07-08 — the canonicalization arc's
+        last host-only meaning pocket): WHICH heads must reproduce and
+        WHAT reproducing means are canon (audit_heads = the destructive
+        passes off passHeads plus owned keyed, kept to the ruled;
+        audit_match = double set-inclusion of the stored cell against
+        the rules re-evaluated in rho); this host keeps the counts and
+        the try/except robustness as report decoration. Pinned by
+        test_verify_canon. A mismatch is a materialization the current
+        rules do not reproduce — a tampered .db, or a store saved
+        before the rules changed."""
         from .reduce import apply as _apply
         from .kernel import atom as A, from_lam
         from . import defs

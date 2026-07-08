@@ -9,3 +9,8 @@ path = "src/main.rs"
 
 [profile.release]
 opt-level = 2
+# incremental was TRIED for release (2026-07-08) and REVERTED same day:
+# on this one-large-file crate the incremental engine THRASHED (a single
+# rustc unit ran 18+ min where the classic cold build takes ~8 total).
+# The build-tax answer is batching changes per rebuild and smoking on
+# the debug binary, not incremental codegen.

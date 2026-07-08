@@ -1737,6 +1737,37 @@ def _register_escape_html():
 _register_escape_html()
 
 
+# The prefix-strip base op — generic string algebra beside implode and
+# slug (spec D5): ⟨prefix, s⟩ answers s with a leading prefix removed,
+# or s unchanged. No policy — the CHOICE of what to strip is canon's
+# (system:sqlcol_base strips the noun off a unary fact type's name).
+def _strip_prefix_impl(mu):
+    from . import defs as _d
+    import pyarest.lam as L
+
+    def g(o):
+        it = _d._items(L._list(o))
+        if len(it) != 2:
+            return L.BOT
+        vals = []
+        for x in it:
+            v = _d._aval(x)
+            if not isinstance(v, (str, int)) or isinstance(v, bool):
+                return L.BOT
+            vals.append(str(v))
+        pre, s = vals
+        return L.atom(s[len(pre):] if s.startswith(pre) else s)
+    return g
+
+
+def _register_strip_prefix():
+    from .defs import register
+    register("strip_prefix", _strip_prefix_impl)
+
+
+_register_strip_prefix()
+
+
 # The reference RENDER function (AREST.tex §Platform binding, verbatim:
 # "Binding a user interface is then registering a render function, so a
 # fact renders itself"). MEANING IN CANON: system:render_html is the

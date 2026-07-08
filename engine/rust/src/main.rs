@@ -789,6 +789,72 @@ fn register_base() {
         }
         atom(Leaf::S(format!("ve_{:016x}", h)))
     }));
+    // the prefix-strip base op — generic string algebra beside implode
+    // and slug (spec D5): ⟨prefix, s⟩ answers s with a leading prefix
+    // removed, or s unchanged. No policy — the CHOICE of what to strip
+    // is canon's (system:sqlcol_base). Mirrors the four kernels.
+    register("strip_prefix", Rc::new(|_mu, o| {
+        let it = items(&list_of(&o));
+        if it.len() != 2 {
+            return bot();
+        }
+        let p = match aval(&it[0]).and_then(|l| leaf_str(&l)) {
+            Some(s) => s,
+            None => return bot(),
+        };
+        let s = match aval(&it[1]).and_then(|l| leaf_str(&l)) {
+            Some(s) => s,
+            None => return bot(),
+        };
+        let t = s.strip_prefix(&p).map(|t| t.to_string()).unwrap_or(s);
+        atom(Leaf::S(t))
+    }));
+    // stage-1 field extraction at the lex boundary (spec D5; the
+    // 2026-07-07 ruling). Text and sid must be string atoms exactly as
+    // the python twin checks; vocabulary pairs and nouns stringify.
+    register("stage1_fields", Rc::new(|_mu, o| {
+        let it = items(&list_of(&o));
+        if it.len() != 4 {
+            return bot();
+        }
+        let strv = |x: &V| -> Option<String> {
+            match aval(x) {
+                Some(l) => match &*l { Leaf::S(s) => Some(s.clone()), _ => None },
+                None => None,
+            }
+        };
+        let text = match strv(&it[0]) { Some(s) => s, None => return bot() };
+        let sid = match strv(&it[3]) { Some(s) => s, None => return bot() };
+        let mut vocab: Vec<(String, String)> = Vec::new();
+        for p in items(&list_of(&it[1])) {
+            let pi = items(&list_of(&p));
+            if pi.len() >= 2 {
+                if let (Some(a), Some(b)) = (
+                    aval(&pi[0]).and_then(|l| leaf_str(&l)),
+                    aval(&pi[1]).and_then(|l| leaf_str(&l)),
+                ) {
+                    vocab.push((a, b));
+                }
+            }
+        }
+        let mut nouns: Vec<String> = Vec::new();
+        for nx in items(&list_of(&it[2])) {
+            match aval(&nx).and_then(|l| leaf_str(&l)) {
+                Some(s) => nouns.push(s),
+                None => return bot(),
+            }
+        }
+        let rows = stage1_rows_of(&text, &vocab, &nouns, &sid);
+        seqc(rows
+            .into_iter()
+            .map(|(ft, s, v)| {
+                seqc(vec![
+                    atom(Leaf::S(ft)),
+                    seqc(vec![atom(Leaf::S(s)), atom(Leaf::S(v))]),
+                ])
+            })
+            .collect())
+    }));
     // the html escape transducer (the render's ONE boundary piece; the
     // doctrine correction 2026-07-08): & < > " to entities, ints
     // stringify, sequences bottom. Mirrors the Python/Java/C# twins.
@@ -922,6 +988,112 @@ fn lex_rows(text: &str) -> Vec<(String, String, String, String, String, String, 
         rows.push((tok, nopunct, base, subscript, lower, qtext, title, post, k > 0, k as i64));
     }
     rows
+}
+
+// stage-1 field extraction (the bootstrap kernel's statement reader),
+// one implementation for both evaluator paths -- the D5 transducer beside
+// lex (the 2026-07-07 ruling: a performant implementation proven to the
+// interface; a canonical composition is not owed at the boundary).
+// Mirrors python engine.stage1_fields: quoted spans blank to spaces
+// length-preserving; vocabulary literals hit case-insensitively with no
+// letter adjacent, longest first (stable); a Trailing Marker must trail;
+// nouns hit case-sensitively; the FIRST quoted content is the Literal
+// Role; the first structural mark outside literals is the prose tell.
+fn s1_blank_quotes(cs: &[char]) -> Vec<char> {
+    let mut out = cs.to_vec();
+    let mut open: Option<usize> = None;
+    for (i, c) in cs.iter().enumerate() {
+        if *c == '\'' {
+            match open {
+                None => open = Some(i),
+                Some(a) => {
+                    for o in out.iter_mut().take(i + 1).skip(a) {
+                        *o = ' ';
+                    }
+                    open = None;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn s1_word_hit(hay: &[char], needle: &str, ci: bool) -> bool {
+    let n: Vec<char> = needle.chars().collect();
+    if n.is_empty() || hay.len() < n.len() {
+        return false;
+    }
+    let eqc = |a: char, b: char| {
+        if ci { a.to_ascii_lowercase() == b.to_ascii_lowercase() } else { a == b }
+    };
+    let letter = |c: char| c.is_ascii_alphabetic();
+    'outer: for s in 0..=(hay.len() - n.len()) {
+        for k in 0..n.len() {
+            if !eqc(hay[s + k], n[k]) {
+                continue 'outer;
+            }
+        }
+        let before_ok = s == 0 || !letter(hay[s - 1]);
+        let e = s + n.len();
+        let after_ok = e >= hay.len() || !letter(hay[e]);
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
+}
+
+fn stage1_rows_of(text: &str, vocab: &[(String, String)], nouns: &[String],
+                  sid: &str) -> Vec<(String, String, String)> {
+    let trimmed: &str = text.trim();
+    let trimmed: &str = trimmed.trim_end_matches('.');
+    let tcs: Vec<char> = trimmed.chars().collect();
+    let bare = s1_blank_quotes(&tcs);
+    let bare_s: String = bare.iter().collect();
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let mut order: Vec<usize> = (0..vocab.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(vocab[i].1.chars().count()));
+    for &i in &order {
+        let (ftb, lit) = &vocab[i];
+        if !s1_word_hit(&bare, lit, true) {
+            continue;
+        }
+        if ftb == "Statement_has_Trailing_Marker"
+            && !bare_s.trim_end().to_ascii_lowercase()
+                .ends_with(&lit.to_ascii_lowercase())
+        {
+            continue;
+        }
+        out.push((ftb.clone(), sid.to_string(), lit.clone()));
+    }
+    for nn in nouns {
+        if s1_word_hit(&bare, nn, false) {
+            out.push(("Statement_has_Role_Reference".into(),
+                      sid.to_string(), nn.clone()));
+        }
+    }
+    let mut open: Option<usize> = None;
+    for (i, c) in tcs.iter().enumerate() {
+        if *c == '\'' {
+            match open {
+                None => open = Some(i),
+                Some(a) => {
+                    let q: String = tcs[a + 1..i].iter().collect();
+                    out.push(("Statement_has_Literal_Role".into(),
+                              sid.to_string(), q));
+                    break;
+                }
+            }
+        }
+    }
+    for mark in [",", "(", ")", ": "] {
+        if bare_s.contains(mark) {
+            out.push(("Statement_has_Prose_Punctuation".into(),
+                      sid.to_string(), mark.to_string()));
+            break;
+        }
+    }
+    out
 }
 
 fn slug_str(t: &str) -> String {
@@ -1496,6 +1668,66 @@ impl NEval {
                     N::S(Rc::new(out))
                 }
                 None => N::Bot,
+            },
+            "stage1_fields" => match x {
+                N::S(v) if v.len() == 4 => {
+                    let strv = |n: &N| -> Option<String> {
+                        match n {
+                            N::A(l) => match &**l { Leaf::S(s) => Some(s.clone()), _ => None },
+                            _ => None,
+                        }
+                    };
+                    let anyv = |n: &N| -> Option<String> {
+                        match n { N::A(l) => leaf_str(l), _ => None }
+                    };
+                    let text = match strv(&v[0]) { Some(s) => s, None => return Some(N::Bot) };
+                    let sid = match strv(&v[3]) { Some(s) => s, None => return Some(N::Bot) };
+                    let mut vocab: Vec<(String, String)> = Vec::new();
+                    if let N::S(ps) = &v[1] {
+                        for p in ps.iter() {
+                            if let N::S(pi) = p {
+                                if pi.len() >= 2 {
+                                    if let (Some(a), Some(b)) = (anyv(&pi[0]), anyv(&pi[1])) {
+                                        vocab.push((a, b));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let mut nouns: Vec<String> = Vec::new();
+                    if let N::S(ns) = &v[2] {
+                        for nx in ns.iter() {
+                            match anyv(nx) {
+                                Some(s) => nouns.push(s),
+                                None => return Some(N::Bot),
+                            }
+                        }
+                    }
+                    let rows = stage1_rows_of(&text, &vocab, &nouns, &sid);
+                    N::S(Rc::new(rows
+                        .into_iter()
+                        .map(|(ft, s, vv)| {
+                            N::S(Rc::new(vec![
+                                N::A(Rc::new(Leaf::S(ft))),
+                                N::S(Rc::new(vec![
+                                    N::A(Rc::new(Leaf::S(s))),
+                                    N::A(Rc::new(Leaf::S(vv))),
+                                ])),
+                            ]))
+                        })
+                        .collect()))
+                }
+                _ => N::Bot,
+            },
+            "strip_prefix" => match pairv(x) {
+                Some((N::A(a), N::A(b))) => match (leaf_str(&a), leaf_str(&b)) {
+                    (Some(p), Some(s)) => {
+                        let t = s.strip_prefix(&p).map(|t| t.to_string()).unwrap_or(s);
+                        N::A(Rc::new(Leaf::S(t)))
+                    }
+                    _ => N::Bot,
+                },
+                _ => N::Bot,
             },
             "escape_html" => match x {
                 N::A(l) => {
@@ -4304,7 +4536,148 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
         // on the claude scratch: 264 s canonical Rust against 10.9 s
         // delegated). Plumbing the native carrier into op_answer is the
         // priced lever that brings it home.
-        "get" | "sql" | "explain" | "validate" | "verify" => {
+        "get" => {
+            // The 3NF per-entity view: the CANON's system:entity_view
+            // evaluated on the carrier (ev_cols rides along so the render
+            // knows a unary T from a binary value "T"), rendered to
+            // Registry.get's exact JSON shape. EXPERIMENTAL — opt in via
+            // AREST_NATIVE_GET: the interpretive evaluation is
+            // fixture-fast but MINUTES at tasks scale (ev_facts walks
+            // every own fact type's population through NEval — the same
+            // cost shape vb_fetch had before its native prim). The
+            // treatment is the same: native prims for the audit's hot
+            // pieces, certified by the existing canon pins; until that
+            // lands, get delegates like sql does.
+            if std::env::var_os("AREST_NATIVE_GET").is_none() {
+                return delegate_read(tool, args, apps);
+            }
+            let app = match &apps.current {
+                Some(n) => n.clone(),
+                None => return Err((-32602,
+                    "no app loaded; call apps_use before get".to_string())),
+            };
+            let noun = match jget(args, "noun") {
+                Some(J::S(s)) => s.clone(),
+                _ => return Err((-32602, "get needs a string noun".to_string())),
+            };
+            let id = match jget(args, "id") {
+                Some(J::S(s)) => s.clone(),
+                _ => return Err((-32602, "get needs a string id".to_string())),
+            };
+            let ev = NEval {
+                cells: srv.ncells.clone(),
+                process: srv.nprocess.clone(),
+                defs_n: srv.nd.clone(),
+                fuel: std::cell::Cell::new(-1),
+            };
+            let na = |s: &str| N::A(Rc::new(Leaf::S(s.to_string())));
+            let view = ev.mu(napp(
+                na("system:entity_view"),
+                nseq(vec![na(&noun), na(&id), srv.nd.clone()]),
+            ));
+            let cols = ev.mu(napp(
+                na("system:ev_cols"),
+                nseq(vec![na(&noun), srv.nd.clone()]),
+            ));
+            let (exists, fields, facts) = match &view {
+                N::S(v) if v.len() == 3 => (&v[0], &v[1], &v[2]),
+                _ => return Err((-32603,
+                    "entity_view answered an unexpected shape".to_string())),
+            };
+            let kinds: Vec<String> = match &cols {
+                N::S(cs) => cs.iter().map(|c| match c {
+                    N::S(cc) if cc.len() >= 2 => match &cc[1] {
+                        N::A(l) => leaf_str(l).unwrap_or_default(),
+                        _ => String::new(),
+                    },
+                    _ => String::new(),
+                }).collect(),
+                _ => Vec::new(),
+            };
+            fn njson(n: &N, out: &mut String) {
+                match n {
+                    N::A(l) => match &**l {
+                        Leaf::S(s) => esc(s, out),
+                        Leaf::I(i) => out.push_str(&i.to_string()),
+                        Leaf::F(f) => out.push_str(&f.to_string()),
+                        _ => out.push_str("null"),
+                    },
+                    N::S(v) => {
+                        out.push('[');
+                        for (i, e) in v.iter().enumerate() {
+                            if i > 0 { out.push(','); }
+                            njson(e, out);
+                        }
+                        out.push(']');
+                    }
+                    N::Bot => out.push_str("null"),
+                }
+            }
+            let mut out = String::from("{\"app\":");
+            esc(&app, &mut out);
+            out.push_str(",\"noun\":");
+            esc(&noun, &mut out);
+            out.push_str(",\"id\":");
+            esc(&id, &mut out);
+            out.push_str(",\"exists\":");
+            out.push_str(match exists {
+                N::A(l) if matches!(&**l, Leaf::S(s) if s == "T") => "true",
+                _ => "false",
+            });
+            out.push_str(",\"fields\":{");
+            if let N::S(fs) = fields {
+                let mut first = true;
+                for (i, f) in fs.iter().enumerate() {
+                    if let N::S(kv) = f {
+                        if kv.len() == 2 {
+                            if !first { out.push(','); }
+                            first = false;
+                            if let N::A(l) = &kv[0] {
+                                esc(&leaf_str(l).unwrap_or_default(), &mut out);
+                            } else {
+                                out.push_str("\"\"");
+                            }
+                            out.push(':');
+                            let unary = kinds.get(i).map(|k| k == "unary")
+                                .unwrap_or(false);
+                            match &kv[1] {
+                                N::A(l) if unary
+                                    && matches!(&**l, Leaf::S(s) if s == "T") =>
+                                    out.push_str("true"),
+                                N::A(l) if unary
+                                    && matches!(&**l, Leaf::S(s) if s == "F") =>
+                                    out.push_str("false"),
+                                N::A(l) if matches!(&**l, Leaf::S(s) if s == "#") =>
+                                    out.push_str("null"),
+                                other => njson(other, &mut out),
+                            }
+                        }
+                    }
+                }
+            }
+            out.push_str("},\"facts\":[");
+            if let N::S(fx) = facts {
+                for (i, f) in fx.iter().enumerate() {
+                    if i > 0 { out.push(','); }
+                    if let N::S(fr) = f {
+                        if fr.len() == 2 {
+                            out.push_str("{\"fact_type\":");
+                            if let N::A(l) = &fr[0] {
+                                esc(&leaf_str(l).unwrap_or_default(), &mut out);
+                            } else {
+                                out.push_str("\"\"");
+                            }
+                            out.push_str(",\"row\":");
+                            njson(&fr[1], &mut out);
+                            out.push('}');
+                        }
+                    }
+                }
+            }
+            out.push_str("]}");
+            Ok(out)
+        }
+        "sql" | "explain" | "validate" | "verify" => {
             delegate_read(tool, args, apps)
         }
         "actions" => {
