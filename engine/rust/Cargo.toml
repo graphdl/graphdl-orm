@@ -7,6 +7,19 @@ edition = "2021"
 name = "arest"
 path = "src/main.rs"
 
+# the same single file is also the LIBRARY (the wasm/Worker path):
+# rlib for rust consumers, cdylib for wasm-bindgen
+[lib]
+name = "arest_core"
+path = "src/main.rs"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+# THE CRATE'S FIRST DEPENDENCY, deliberate and OPTIONAL (Samuel,
+# 2026-07-09: "I think we'd need bindgen for workers") — only the
+# worker feature pulls it; the host build stays zero-dep.
+wasm-bindgen = { version = "0.2", optional = true }
+
 [profile.release]
 opt-level = 2
 # incremental was TRIED for release (2026-07-08) and REVERTED same day:
@@ -22,3 +35,4 @@ opt-level = 2
 # and gets the pure core (reducer, native carrier, canon).
 default = ["host"]
 host = []
+worker = ["dep:wasm-bindgen"]

@@ -4357,7 +4357,6 @@ fn esc_names(names: &[String], out: &mut String) {
     out.push(']');
 }
 
-#[cfg(feature = "host")]
 fn parse_json(text: &str) -> Option<J> {
     // P trusts protocol lines and panics on malformed bytes; the MCP transport
     // reads the wild, so a failed parse unwinds here and answers None instead
@@ -5796,6 +5795,47 @@ fn main() {
 }
 
 // a bin target must carry SOME main; the no-host build (wasm32 core)
-// gets a stub until the lib split gives the Worker its bindgen entry
+// gets a stub — the Worker consumes the LIBRARY target instead
 #[cfg(not(feature = "host"))]
 fn main() {}
+
+// ---- the Worker surface (feature = "worker", wasm-bindgen) ----
+// Step 2 of the wasm arc: prove the toolchain with the CORE exported —
+// the JS engine evaluates canon. arest_eval takes f and x as the
+// serve-op JSON term encoding (j_to_n), evaluates on the native
+// carrier with the compiled-in NCANON, and answers the result the
+// same way. The verb-table dispatch (init store + get/actions/...)
+// is step 3, the mcp_call_inner hostless refactor.
+#[cfg(feature = "worker")]
+mod worker {
+    use super::*;
+    use wasm_bindgen::prelude::*;
+
+    #[wasm_bindgen]
+    pub fn arest_version() -> String {
+        "arest 0.9.0 core (wasm)".to_string()
+    }
+
+    #[wasm_bindgen]
+    pub fn arest_eval(f_json: &str, x_json: &str) -> String {
+        let f = match parse_json(f_json) {
+            Some(v) => j_to_n(&v),
+            None => return "{\"error\":\"unparseable f\"}".to_string(),
+        };
+        let x = match parse_json(x_json) {
+            Some(v) => j_to_n(&v),
+            None => return "{\"error\":\"unparseable x\"}".to_string(),
+        };
+        let ev = NEval {
+            cells: Vec::new(),
+            process: Vec::new(),
+            defs_n: N::Bot,
+            fuel: std::cell::Cell::new(-1),
+        };
+        let res = n_to_v(&ev.mu(napp(f, x)));
+        let mut out = String::from("{\"result\":");
+        write_v(&res, &mut out);
+        out.push('}');
+        out
+    }
+}
