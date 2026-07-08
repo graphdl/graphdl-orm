@@ -1815,6 +1815,9 @@ def compile_model_selfhost(text, D=None, context_from=None):
                   tuple(sorted(plain))))
     if D is None:
         D = meta.initial_D()
+    _SM_SUSPECT = re.compile(
+        r"'[^']+'.*(is initial|is from Status|is to Status"
+        r"|is triggered by Fact Type|is defined in State Machine)")
     unclassified = []
     # BATCH classification (stratum 4): every statement's fields land first,
     # ONE derive answers all classifications — not one lfp per statement
@@ -1834,6 +1837,15 @@ def compile_model_selfhost(text, D=None, context_from=None):
             # Prose beats the GENERIC fallbacks only (the seed guard's exact
             # semantics): an enum's separator commas or a spanning form's
             # clause comma carry real recognizer classifications and proceed
+            # — EXCEPT machine-keyword statements (the arrow-glue-loud
+            # class, found twice in the wild: support's "Status 'Proposed'
+            # is initial." missing its machine clause silently prosed and
+            # the Feature Request machine lost its initial). A statement
+            # carrying quoted literals AND machine phrasing that parses as
+            # NOTHING is a malformed statement, reported loudly.
+            if _SM_SUSPECT.search(stmt):
+                unclassified.append(stmt)
+                continue
             prose.append(stmt)
             continue
         specific = cls - _GENERIC_CLASSIFICATIONS

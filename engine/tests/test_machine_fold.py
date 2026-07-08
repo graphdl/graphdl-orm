@@ -64,3 +64,21 @@ def test_an_unfireable_event_no_ops_but_init_covers_the_player():
 def test_no_events_no_fold():
     D = _fold(MODEL)
     assert _statuses(D) == {}
+
+
+import pytest
+
+
+@pytest.mark.xfail(reason='the specimen is consumed by an earlier '
+                   'recognizer before classification — it vanishes '
+                   'entirely (neither unparsed nor prose nor a fact '
+                   'type); the prose-path guard below it is in, the '
+                   'recognizer-path fix is the board p3',
+                   strict=True)
+def test_a_malformed_machine_statement_reports_loudly():
+    # the arrow-glue-loud class: "Status 'X' is initial." (machine
+    # clause missing) must land in unparsed, never silently in prose —
+    # the support board lost its Feature Request initial to this
+    line = "Status 'open' is initial." + chr(10)
+    D, rep = forml.compile_model(MODEL + line)
+    assert any("is initial" in u for u in rep["unparsed"])
