@@ -36,6 +36,7 @@ D5 = {"cellkey", "lex", "slug", "implode", "escape_html", "skolem",
 OVERRIDES = {
     "render:html": "system:render_html",
     "system:vb_fetch": "system:vb_fetch",
+    "system:entity_view": "system:entity_view",
     "get_view": "system:entity_view",
     "_classify_heads": "system:classify_heads",
     "verify": "system:verify_store",
@@ -62,7 +63,11 @@ def _rust_ops():
     i = src.find("fn prim(&self")
     j = src.find("\n    fn ", i + 10)
     # match-arm literals, including multi-pattern arms ("and" | "or" =>)
-    ops |= set(re.findall(r'"([^"]+)"\s*(?:\||=>)', src[i:j]))
+    # TOP-LEVEL match-arm literals only (indent 12): the prim bodies
+    # nest their own matches ("unary"/"ref"/"value" inside entity_view)
+    # and those are data, not dispatched ops
+    ops |= set(re.findall(r'^ {12}"([^"]+)"\s*(?:\||=>)', src[i:j],
+                          re.MULTILINE))
     return ops
 
 

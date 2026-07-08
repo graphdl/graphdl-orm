@@ -1096,6 +1096,15 @@ fn stage1_rows_of(text: &str, vocab: &[(String, String)], nouns: &[String],
     out
 }
 
+// system:sqlname's composition, natively: slug then lowercase (the
+// single-token lex row's lower field over slug output is exactly
+// ASCII lowercase), empty falling back to "t". Serves the
+// system:entity_view prim's column naming.
+fn sql_name(s: &str) -> String {
+    let t = slug_str(s).to_ascii_lowercase();
+    if t.is_empty() { "t".into() } else { t }
+}
+
 fn slug_str(t: &str) -> String {
     let mut out = String::new();
     let mut run = false;
@@ -1537,6 +1546,264 @@ impl NEval {
             // store, 2026-07-08; this arm is one spine pass). Prim wins
             // over the process/canon def by NEval's resolution order —
             // cells still shadow it first, exactly as they shadow defs.
+            // CERTIFIED-EQUAL OVERRIDE of DEF("system:entity_view") — the
+            // whole 3NF per-entity view in one spine pass (the vb_fetch
+            // treatment: the canon def is the meaning, this arm exists
+            // because the interpretive evaluation is minutes at tasks
+            // scale). Answers the canon shape ⟨exists, fields, facts⟩
+            // with the canon encodings (unary T/F, absent "#"); kinds
+            // ride system:ev_cols for the render. Twinned by the
+            // entity-view parity pin (tests/derive.rs).
+            "system:entity_view" => match x {
+                N::S(v3) if v3.len() == 3 => {
+                    let noun = match &v3[0] {
+                        N::A(l) => match leaf_str(l) { Some(s) => s, None => return Some(N::Bot) },
+                        _ => return Some(N::Bot),
+                    };
+                    let id = match &v3[1] {
+                        N::A(l) => match leaf_str(l) { Some(s) => s, None => return Some(N::Bot) },
+                        _ => return Some(N::Bot),
+                    };
+                    let spine: Vec<(String, N)> = match &v3[2] {
+                        N::S(cells) => cells
+                            .iter()
+                            .filter_map(|c| {
+                                if let N::S(it) = c {
+                                    if it.len() == 3 {
+                                        if let (N::A(l0), N::A(k)) = (&it[0], &it[1]) {
+                                            if matches!(&**l0, Leaf::S(s) if s == "CELL") {
+                                                return leaf_str(k).map(|key| (key, it[2].clone()));
+                                            }
+                                        }
+                                    }
+                                }
+                                None
+                            })
+                            .collect(),
+                        _ => return Some(N::Bot),
+                    };
+                    let fetch = |name: &str| -> Option<&N> {
+                        spine.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+                    };
+                    let rows_of = |name: &str| -> Vec<N> {
+                        match fetch(name) {
+                            Some(N::S(v)) => v.to_vec(),
+                            _ => Vec::new(),
+                        }
+                    };
+                    let sv2 = |n: &N| -> Option<String> {
+                        match n { N::A(l) => leaf_str(l), _ => None }
+                    };
+                    // the classification (system:ev_cols' semantics):
+                    // rmapColumns rows for the noun in cell order
+                    let colrows: Vec<(i64, String)> = rows_of("rmapColumns")
+                        .iter()
+                        .filter_map(|r| {
+                            if let N::S(cc) = r {
+                                if cc.len() >= 3 {
+                                    if sv2(&cc[0]).as_deref() == Some(noun.as_str()) {
+                                        if let (N::A(cl), Some(ft)) = (&cc[1], sv2(&cc[2])) {
+                                            if let Leaf::I(ci) = &**cl {
+                                                return Some((*ci, ft));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            None
+                        })
+                        .collect();
+                    let mut roles: Vec<(String, i64, String)> = Vec::new();
+                    for r in rows_of("role") {
+                        if let N::S(cc) = &r {
+                            if cc.len() >= 4 {
+                                if let (Some(ft), N::A(pl), Some(player)) =
+                                    (sv2(&cc[1]), &cc[2], sv2(&cc[3]))
+                                {
+                                    if let Leaf::I(p) = &**pl {
+                                        roles.push((ft, *p, player));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let mut entities: Vec<String> = Vec::new();
+                    for r in rows_of("instanceOf") {
+                        if let N::S(cc) = &r {
+                            if cc.len() >= 2 && sv2(&cc[1]).as_deref() == Some("ObjectType") {
+                                if let Some(e) = sv2(&cc[0]) {
+                                    entities.push(e);
+                                }
+                            }
+                        }
+                    }
+                    let mut refmode: Vec<(String, String)> = Vec::new();
+                    for cell in ["refScheme", "refMode"] {
+                        for r in rows_of(cell) {
+                            if let N::S(cc) = &r {
+                                if cc.len() >= 2 {
+                                    if let (Some(a), Some(b)) = (sv2(&cc[0]), sv2(&cc[1])) {
+                                        if !refmode.iter().any(|(k, _)| *k == a) {
+                                            refmode.push((a, b));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let hash = N::A(Rc::new(Leaf::S("#".into())));
+                    let t_at = N::A(Rc::new(Leaf::S("T".into())));
+                    let f_at = N::A(Rc::new(Leaf::S("F".into())));
+                    let mut fields: Vec<N> = Vec::new();
+                    let mut counts: Vec<(String, i64)> = Vec::new();
+                    let mut any_seen = false;
+                    let mut cr_sorted = colrows.clone();
+                    cr_sorted.sort_by_key(|(c, _)| *c);
+                    for (_c, ft) in &cr_sorted {
+                        let rs: Vec<(i64, String)> = {
+                            let mut v: Vec<(i64, String)> = roles
+                                .iter()
+                                .filter(|(f, _, _)| f == ft)
+                                .map(|(_, p, pl)| (*p, pl.clone()))
+                                .collect();
+                            v.sort();
+                            v
+                        };
+                        let (kind, other): (&str, Option<String>) = if rs.len() == 1 {
+                            ("unary", None)
+                        } else {
+                            let o = rs.iter().find(|(_, pl)| *pl != noun).map(|(_, pl)| pl.clone());
+                            match &o {
+                                Some(pl) if entities.iter().any(|e| e == pl) => ("ref", o.clone()),
+                                Some(_) => ("value", o.clone()),
+                                None => ("value", None),
+                            }
+                        };
+                        let base = match kind {
+                            "unary" => sql_name(ft.strip_prefix(noun.as_str()).unwrap_or(ft)),
+                            "ref" => {
+                                let o = other.clone().unwrap_or_default();
+                                let m = refmode
+                                    .iter()
+                                    .find(|(k, _)| *k == o)
+                                    .map(|(_, v)| v.clone())
+                                    .unwrap_or_else(|| "id".into());
+                                format!("{}_{}", sql_name(&o), sql_name(&m))
+                            }
+                            _ => match &other {
+                                Some(o) => sql_name(o),
+                                None => sql_name(ft),
+                            },
+                        };
+                        let n = {
+                            let e = counts.iter_mut().find(|(b, _)| *b == base);
+                            match e {
+                                Some((_, c)) => { *c += 1; *c }
+                                None => { counts.push((base.clone(), 1)); 1 }
+                            }
+                        };
+                        let col = if n >= 2 { format!("{}_{}", base, n) } else { base };
+                        let key = if kind == "unary" {
+                            col
+                        } else {
+                            other.clone().unwrap_or(col)
+                        };
+                        let pop = rows_of(ft);
+                        let val: N = if kind == "unary" {
+                            let hit = pop.iter().any(|r| match r {
+                                N::S(cc) if !cc.is_empty() =>
+                                    sv2(&cc[0]).as_deref() == Some(id.as_str()),
+                                _ => false,
+                            });
+                            if hit { any_seen = true; t_at.clone() } else { f_at.clone() }
+                        } else {
+                            let mut last: Option<N> = None;
+                            for r in pop.iter() {
+                                if let N::S(cc) = r {
+                                    if cc.len() >= 2
+                                        && sv2(&cc[0]).as_deref() == Some(id.as_str())
+                                    {
+                                        last = Some(cc[1].clone());
+                                    }
+                                }
+                            }
+                            match last {
+                                Some(v) => { any_seen = true; v }
+                                None => hash.clone(),
+                            }
+                        };
+                        fields.push(N::S(Rc::new(vec![
+                            N::A(Rc::new(Leaf::S(key))),
+                            val,
+                        ])));
+                    }
+                    // own facts: factType order, minus absorbed, the noun's
+                    // role positions, any position matching the id
+                    let absorbed: Vec<String> =
+                        colrows.iter().map(|(_, f)| f.clone()).collect();
+                    let all_absorbed: Vec<String> = rows_of("rmapColumns")
+                        .iter()
+                        .filter_map(|r| {
+                            if let N::S(cc) = r {
+                                if cc.len() >= 3 { return sv2(&cc[2]); }
+                            }
+                            None
+                        })
+                        .collect();
+                    let _ = absorbed;
+                    let mut facts: Vec<N> = Vec::new();
+                    for fr in rows_of("factType") {
+                        let ft = match &fr {
+                            N::S(cc) if !cc.is_empty() => match sv2(&cc[0]) {
+                                Some(f) => f,
+                                None => continue,
+                            },
+                            _ => continue,
+                        };
+                        if all_absorbed.iter().any(|a| *a == ft) {
+                            continue;
+                        }
+                        let positions: Vec<i64> = roles
+                            .iter()
+                            .filter(|(f, _, pl)| *f == ft && *pl == noun)
+                            .map(|(_, p, _)| *p)
+                            .collect();
+                        if positions.is_empty() {
+                            continue;
+                        }
+                        for r in rows_of(&ft) {
+                            if let N::S(cc) = &r {
+                                let hit = positions.iter().any(|p| {
+                                    let idx = (*p as usize).saturating_sub(1);
+                                    cc.len() > idx
+                                        && sv2(&cc[idx]).as_deref() == Some(id.as_str())
+                                });
+                                if hit {
+                                    any_seen = true;
+                                    facts.push(N::S(Rc::new(vec![
+                                        N::A(Rc::new(Leaf::S(ft.clone()))),
+                                        r.clone(),
+                                    ])));
+                                }
+                            }
+                        }
+                    }
+                    let spine_hit = rows_of(&noun).iter().any(|r| match r {
+                        N::S(cc) if !cc.is_empty() =>
+                            sv2(&cc[0]).as_deref() == Some(id.as_str()),
+                        _ => false,
+                    });
+                    let exists = any_seen || spine_hit;
+                    Some(N::S(Rc::new(vec![
+                        if exists { t_at } else { f_at },
+                        N::S(Rc::new(fields)),
+                        N::S(Rc::new(facts)),
+                    ]))).map(|r| r)
+                    .unwrap_or(N::Bot)
+                    .into()
+                }
+                _ => N::Bot,
+            },
             "system:vb_fetch" => match pairv(x) {
                 Some((ft, d)) => {
                     let spine: Vec<(String, N)> = match &d {
@@ -4537,18 +4804,13 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
         // delegated). Plumbing the native carrier into op_answer is the
         // priced lever that brings it home.
         "get" => {
-            // The 3NF per-entity view: the CANON's system:entity_view
-            // evaluated on the carrier (ev_cols rides along so the render
-            // knows a unary T from a binary value "T"), rendered to
-            // Registry.get's exact JSON shape. EXPERIMENTAL — opt in via
-            // AREST_NATIVE_GET: the interpretive evaluation is
-            // fixture-fast but MINUTES at tasks scale (ev_facts walks
-            // every own fact type's population through NEval — the same
-            // cost shape vb_fetch had before its native prim). The
-            // treatment is the same: native prims for the audit's hot
-            // pieces, certified by the existing canon pins; until that
-            // lands, get delegates like sql does.
-            if std::env::var_os("AREST_NATIVE_GET").is_none() {
+            // NATIVE: the 3NF per-entity view — system:entity_view resolves
+            // to its canon-named prim (the vb_fetch treatment: one spine
+            // pass; the interpretive evaluation measured minutes at tasks
+            // scale), ev_cols rides along so the render knows a unary T
+            // from a binary value "T", rendered to Registry.get's exact
+            // JSON shape. AREST_DELEGATE_READS is the escape hatch.
+            if std::env::var_os("AREST_DELEGATE_READS").is_some() {
                 return delegate_read(tool, args, apps);
             }
             let app = match &apps.current {

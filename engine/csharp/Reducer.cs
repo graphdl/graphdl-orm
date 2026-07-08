@@ -141,6 +141,13 @@ static class Reducer
         return outp;
     }
 
+    /// The Register/Resolve slot for apply-to-all: a target registers a
+    /// strategy (GPU, distributed) and the ALPHA branch resolves it
+    /// before the built-in parallel default.
+    internal static System.Func<object[], object> AlphaOverride;
+    public static void RegisterAlpha(System.Func<object[], object> s)
+        => AlphaOverride = s;
+
     static bool EqObj(object a, object b)
     {
         if (a is object[] sa && b is object[] sb)
@@ -259,12 +266,14 @@ static class Reducer
             }
             case "ALPHA":
             {
-                // Backus's apply-to-all is data-parallel by definition:
-                // independent pure reductions over immutable terms and a
-                // read-only Store, Parallel.For past a small threshold;
-                // order preserved by indexing. Mirrors the python/java
-                // overrides.
-                var o = Pair(); var whole = (object[])o[0]; var arg = o[1];
+                // Backus's apply-to-all through Register/Resolve (the
+                // MonoCross MXContainer pattern): the registered instance
+                // resolves first, the built-in Parallel.For map is the
+                // default, the sequential Select the structural fallback.
+                // Mirrors the python/java registries.
+                var o = Pair();
+                if (AlphaOverride is not null) return AlphaOverride(o);
+                var whole = (object[])o[0]; var arg = o[1];
                 if (whole.Length < 2) return Bot.Value;
                 if (arg is object[] xs)
                 {

@@ -1060,3 +1060,68 @@ fn the_native_vb_fetch_twins_the_canonical_def() {
         );
     }
 }
+
+/// The entity_view parity pin: the native prim answers the canonical
+/// def byte-for-byte over an RMAP fixture — unary and value fields
+/// (last-wins), an own-table fact at both noun positions, exists. The
+/// Scott side (cases) evaluates the canon as the meaning; neval hits
+/// the prim. The prim exists because interpretive evaluation measured
+/// minutes at tasks scale (the vb_fetch cost shape).
+#[test]
+fn the_native_entity_view_twins_the_canonical_def() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arest"))
+        .arg("--serve")
+        .env("AREST_NEVAL_TRACE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn arest --serve");
+    let out = BufReader::new(child.stdout.take().unwrap());
+    let mut s = Serve { child, out };
+
+    assert_eq!(
+        s.rpc(concat!(
+            r#"{"d": ["#,
+            r#"["CELL","rmapColumns",[["Task",2,"Task_is_started"],["Task",3,"Task_has_Task_Priority"]]],"#,
+            r#"["CELL","role",[["r1","Task_is_started",1,"Task"],"#,
+            r#"["r2","Task_has_Task_Priority",1,"Task"],["r3","Task_has_Task_Priority",2,"Task Priority"],"#,
+            r#"["r4","Task_blocks_Task",1,"Task"],["r5","Task_blocks_Task",2,"Task"]]],"#,
+            r#"["CELL","instanceOf",[["Task","ObjectType"]]],"#,
+            r#"["CELL","factType",[["Task_is_started","{0} is started"],"#,
+            r#"["Task_has_Task_Priority","{0} has {1}"],["Task_blocks_Task","{0} blocks {1}"]]],"#,
+            r#"["CELL","Task",[["t1"],["t2"]]],"#,
+            r#"["CELL","Task_is_started",[["t1"]]],"#,
+            r#"["CELL","Task_has_Task_Priority",[["t1","p0"],["t1","p2"]]],"#,
+            r#"["CELL","Task_blocks_Task",[["t1","t2"]]]"#,
+            r#"]}"#
+        )),
+        "[]"
+    );
+
+    let want_t1 = concat!(
+        r#"["T",[["is_started","T"],["Task Priority","p2"]],"#,
+        r#"[["Task_blocks_Task",["t1","t2"]]]]"#
+    );
+    let canon = s.rpc(concat!(
+        r#"{"cases":[{"f":["COMP","system:entity_view","#,
+        r#"["CONS",["CONST","Task"],["CONST","t1"],2]],"xd":[],"fuel":0}]}"#
+    ));
+    assert!(canon.contains(want_t1), "the canonical def is the meaning: {canon}");
+    let native = s.rpc(concat!(
+        r#"{"op":"neval","f":["COMP","system:entity_view","#,
+        r#"["CONS",["CONST","Task"],["CONST","t1"],"DEFS"]],"x":"x"}"#
+    ));
+    assert!(native.contains(want_t1), "the native prim must answer the canon: {native}");
+
+    // t2: no fields set, but it plays position 2 of the blocks row and
+    // rides the spine — exists via the fact
+    let want_t2 = concat!(
+        r##"["T",[["is_started","F"],["Task Priority","#"]],"##,
+        r#"[["Task_blocks_Task",["t1","t2"]]]]"#
+    );
+    let native2 = s.rpc(concat!(
+        r#"{"op":"neval","f":["COMP","system:entity_view","#,
+        r#"["CONS",["CONST","Task"],["CONST","t2"],"DEFS"]],"x":"x"}"#
+    ));
+    assert!(native2.contains(want_t2), "position-2 fact + spine: {native2}");
+}

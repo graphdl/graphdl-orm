@@ -566,6 +566,34 @@ def _d_cond(mu, o):
     pv = mu((APP_D, whole[1], x))
     return mu((APP_D, whole[2], x)) if pv == _T else (mu((APP_D, whole[3], x)) if pv == _F else BOT_D)
 
+# ---- the functional-form override registry (Register/Resolve) ----
+# The MonoCross MXContainer pattern (Samuel, 2026-07-08: "Read the
+# Register/Resolve methods that I wrote into MonoCross"): an ABSTRACT
+# key — the functional form's name — plus an optional NAMED INSTANCE
+# maps to a native implementation, and resolution falls back in layers:
+# the named instance first, the default instance next, the structural
+# evaluation last (exactly MXContainer.Resolve repackaging an unknown
+# name and constructing unregistered types anyway). The evaluator's
+# form branches consult resolve_form; registering is open to hosts and
+# targets (a GPU alpha, a distributed alpha) without touching the
+# kernel.
+_FORM_OVERRIDES = {}
+
+
+def register_form(form, impl, name=None):
+    """Register a native implementation for a functional form. impl is
+    (mu, o) -> value over the same o the structural branch receives."""
+    _FORM_OVERRIDES[(form, name)] = impl
+
+
+def resolve_form(form, name=None):
+    """The layered lookup: named instance, then the default instance,
+    then None — the caller's structural path is the final fallback."""
+    if name is not None and (form, name) in _FORM_OVERRIDES:
+        return _FORM_OVERRIDES[(form, name)]
+    return _FORM_OVERRIDES.get((form, None))
+
+
 _ALPHA_POOL = None
 
 
@@ -578,15 +606,14 @@ _ALPHA_PARALLEL = _alpha_free_threaded()
 
 
 def _alpha_map(mu, f, xs):
-    """Backus's apply-to-all, THE OVERRIDE POINT per host (Samuel,
-    2026-07-08: performant and parallel in each language): the items are
-    independent pure reductions over immutable terms, alpha's whole
-    pitch in the FP paper, so a free-threaded host maps them across a
-    thread pool (order preserved; pool sized by the runtime). Under the
-    GIL the sequential map IS the performant form — threads only add
-    overhead to CPU-bound reduction — so the parallel path gates on
-    sys._is_gil_enabled() being False (python 3.13+ free-threaded
-    builds) and engages by itself the day the interpreter allows it."""
+    """Backus's apply-to-all: the items are independent pure reductions
+    over immutable terms — alpha's whole pitch in the FP paper — so a
+    free-threaded host maps them across a thread pool (order preserved;
+    pool sized by the runtime). Under the GIL the sequential map IS the
+    performant form — threads only add overhead to CPU-bound reduction —
+    so the parallel path gates on sys._is_gil_enabled() being False
+    (python 3.13+ free-threaded builds) and engages by itself the day
+    the interpreter allows it."""
     if _ALPHA_PARALLEL and len(xs) >= 8:
         global _ALPHA_POOL
         if _ALPHA_POOL is None:
@@ -594,6 +621,16 @@ def _alpha_map(mu, f, xs):
             _ALPHA_POOL = concurrent.futures.ThreadPoolExecutor()
         return list(_ALPHA_POOL.map(lambda xi: mu((APP_D, f, xi)), xs))
     return [mu((APP_D, f, xi)) for xi in xs]
+
+
+def _alpha_impl(mu, o):
+    """The registered default ALPHA instance (parallel where the
+    runtime allows), same o as the structural branch."""
+    whole, x = o[0], o[1]
+    return _mkseq(_alpha_map(mu, whole[1], x))
+
+
+register_form("ALPHA", _alpha_impl)
 
 
 def _d_alpha(mu, o):
@@ -604,6 +641,9 @@ def _d_alpha(mu, o):
         return ()
     if not _isseq(x):
         return BOT_D
+    over = resolve_form("ALPHA")
+    if over is not None:
+        return over(mu, o)
     return _mkseq(_alpha_map(mu, whole[1], x))
 
 def _d_insert(mu, o):

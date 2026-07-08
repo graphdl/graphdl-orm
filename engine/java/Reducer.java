@@ -120,6 +120,13 @@ public class Reducer {
         return out;
     }
 
+    /** The Register/Resolve slot for apply-to-all: a target registers
+     *  a strategy (GPU, distributed) and the ALPHA branch resolves it
+     *  before the built-in parallel default. */
+    public interface AlphaStrategy { Object map(Object[] o); }
+    static volatile AlphaStrategy ALPHA_OVERRIDE = null;
+    public static void registerAlpha(AlphaStrategy s) { ALPHA_OVERRIDE = s; }
+
     static boolean eqObj(Object a, Object b) {
         if (isSeq(a) && isSeq(b)) {
             Object[] sa = (Object[]) a, sb = (Object[]) b;
@@ -245,11 +252,14 @@ public class Reducer {
             return val(BOT);
         }
         if (name.equals("ALPHA")) {
-            // Backus's apply-to-all is data-parallel by definition (the
-            // FP paper's pitch): independent pure reductions over
-            // immutable terms and a read-only STORE, mapped across the
-            // common pool past a small threshold; order preserved by
-            // indexing. Mirrors the python/C# overrides.
+            // Backus's apply-to-all through Register/Resolve (the
+            // MonoCross MXContainer pattern): the registered instance
+            // resolves first, the built-in data-parallel map is the
+            // default (independent pure reductions over immutable terms
+            // and a read-only STORE, common pool past a threshold,
+            // order preserved by indexing), the sequential loop is the
+            // structural fallback. Mirrors the python/C# registries.
+            if (ALPHA_OVERRIDE != null) return val(ALPHA_OVERRIDE.map(o));
             Object[] whole = (Object[]) o[0];
             if (whole.length < 2 || !isSeq(o[1])) return val(BOT);
             Object[] xs = (Object[]) o[1];
