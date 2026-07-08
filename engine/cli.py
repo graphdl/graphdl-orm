@@ -71,9 +71,12 @@ def main(argv):
             return 0
         print(json.dumps(out, default=str))
         return 0
-    if verb == "show" and len(rest) in (1, 2):
+    if verb == "show" and 1 <= len(rest) <= 3:
         from pyarest import showui
-        showui.show(reg, rest[0], rest[1] if len(rest) > 1 else None)
+        ff = 'single' if '--single' in rest else 'auto'
+        pos = [r for r in rest if not r.startswith('--')]
+        showui.show(reg, pos[0], pos[1] if len(pos) > 1 else None,
+                    form_factor=ff)
         return 0
     if verb == "call" and len(rest) == 2:
         # the generic form: EVERY first-class verb through the one dispatch

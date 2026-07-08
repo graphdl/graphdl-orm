@@ -259,6 +259,15 @@ class Container:
         should open with; answers it (the renderer navigates)."""
         return frame[4] if frame and len(frame) > 4 else None
 
+    def topmost_pane(self):
+        """TopmostPane: the highest-ordinal occupied pane of the active
+        tab — what a SINGLE-PANE surface shows (detail covers master;
+        the popover covers everything)."""
+        for p in reversed(PANES):
+            if self.stack_for(p).current is not None:
+                return p
+        return None
+
     @property
     def stack(self):
         """The flattened view state of the ACTIVE tab in pane ordinal
@@ -487,7 +496,7 @@ register_form("control:menu", _tk_menu, "tk")
 register_form("control:entry", _tk_entry, "tk")
 
 
-def show(registry, app, noun=None, mainloop=True):
+def show(registry, app, noun=None, mainloop=True, form_factor="auto"):
     """The cli's desktop verb: one window over the app's store, laid out
     by pane — TABS across the top (one per entity noun), MASTER on the
     left (the noun's list), DETAIL on the right (fields + the machine
@@ -517,6 +526,29 @@ def show(registry, app, noun=None, mainloop=True):
         for w in widget.winfo_children():
             w.destroy()
 
+    # ADAPTIVE RENDERING (Samuel 2026-07-08): "auto" = the width
+    # decides (FormFactor.SplitView), "split" = always master|detail,
+    # "single" = always one pane (the topmost covers; back pops home)
+    SPLIT_MIN = 680
+
+    def is_split():
+        if form_factor == "split":
+            return True
+        if form_factor == "single":
+            return False
+        return root.winfo_width() >= SPLIT_MIN
+
+    def apply_mode(_e=None):
+        split = is_split()
+        if split == state.get("split"):
+            return
+        state["split"] = split
+        if split:
+            if not left.winfo_ismapped():
+                left.pack(side=tk.LEFT, fill=tk.BOTH, before=right)
+        elif c.topmost_pane() == "detail" and left.winfo_ismapped():
+            left.pack_forget()
+
     def render_detail(id):
         clear(right)
         noun = state["noun"]
@@ -530,6 +562,8 @@ def show(registry, app, noun=None, mainloop=True):
                 render_detail(prev[2])
             else:
                 clear(right)
+                if not is_split() and not left.winfo_ismapped():
+                    left.pack(side=tk.LEFT, fill=tk.BOTH, before=right)
         tk.Button(bar, text="◀ Back", command=go_back).pack(side=tk.LEFT,
                                                             padx=3)
         fields = sorted((k, v) for k, v in (got.get("fields") or {}).items()
@@ -550,6 +584,8 @@ def show(registry, app, noun=None, mainloop=True):
                 render_detail(id)
             c.render(right, menu, {"fire": fire})
         c.navigate(("detail", noun, id))
+        if not is_split() and left.winfo_ismapped():
+            left.pack_forget()      # detail covers, single pane
 
     def render_entry():
         noun = state["noun"]
@@ -598,6 +634,10 @@ def show(registry, app, noun=None, mainloop=True):
             side=tk.LEFT, padx=2)
     c.navigate(("tabs", state["noun"], nouns.index(state["noun"])))
     render_list()
+    state["split"] = None
+    root.bind("<Configure>", apply_mode)
+    root.update_idletasks()
+    apply_mode()
     if mainloop:
         root.mainloop()
     return root, c
