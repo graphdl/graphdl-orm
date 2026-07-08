@@ -4993,6 +4993,158 @@ fn mcp_call(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Result<Stri
 // escape). The app name is envelope text, passed in. None = not a
 // store-only verb, the caller's dispatch continues.
 #[allow(clippy::needless_return)]
+// The native carrier rendered as JSON (hoisted from the get arm so the
+// view surface shares it): atoms escape as scalars, seqs as arrays, ⊥
+// as null.
+fn n_json(n: &N, out: &mut String) {
+    match n {
+        N::A(l) => match &**l {
+            Leaf::S(s) => esc(s, out),
+            Leaf::I(i) => out.push_str(&i.to_string()),
+            Leaf::F(f) => out.push_str(&f.to_string()),
+            _ => out.push_str("null"),
+        },
+        N::S(v) => {
+            out.push('[');
+            for (i, e) in v.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                n_json(e, out);
+            }
+            out.push(']');
+        }
+        N::Bot => out.push_str("null"),
+    }
+}
+
+// THE VIEW TREES over the wire (the abstract UI, 2026-07-08): the same
+// trees the desktop containers render — system:view_detail over the
+// entity's field pairs (entity_view's fields leg) and system:view_menu
+// over ⟨status, sm-triples⟩ — evaluated ON THE CARRIER and answered as
+// JSON. A client is a TRANSDUCER (kind dispatch over the tree), never a
+// meaning site; its buttons POST the menu's event fact types back (the
+// >>= over HTTP).
+fn view_trees_json(noun: &str, id: &str, srv: &Srv) -> Result<String, (i64, String)> {
+    let ev = NEval {
+        cells: srv.ncells.clone(),
+        process: srv.nprocess.clone(),
+        defs_n: srv.nd.clone(),
+        fuel: std::cell::Cell::new(-1),
+    };
+    let na = |s: &str| N::A(Rc::new(Leaf::S(s.to_string())));
+    let view = ev.mu(napp(
+        na("system:entity_view"),
+        nseq(vec![na(noun), na(id), srv.nd.clone()]),
+    ));
+    let fields = match &view {
+        N::S(v) if v.len() == 3 => v[1].clone(),
+        _ => return Err((-32603,
+            "entity_view answered an unexpected shape".to_string())),
+    };
+    // the boundary transduction the get arm also performs: the hole
+    // sentinel is internal representation; absence renders as the
+    // empty value, never as '#'
+    let fields = match &fields {
+        N::S(pairs) => nseq(pairs.iter().map(|p| match p {
+            N::S(kv) if kv.len() >= 2 => {
+                let hole = matches!(&kv[1],
+                    N::A(l) if matches!(&**l, Leaf::S(s) if s == "#"));
+                if hole {
+                    nseq(vec![kv[0].clone(),
+                              N::A(Rc::new(Leaf::S(String::new())))])
+                } else {
+                    p.clone()
+                }
+            }
+            _ => p.clone(),
+        }).collect()),
+        _ => fields,
+    };
+    let detail = ev.mu(napp(na("system:view_detail"), fields));
+    let leaf = |s: &str| Leaf::S(s.to_string());
+    let sv = |l: &Leaf| match l {
+        Leaf::S(s) => Some(s.clone()),
+        Leaf::I(i) => Some(i.to_string()),
+        _ => None,
+    };
+    let two = |r: &V| {
+        let it = items(&list_of(r));
+        if it.len() >= 2 {
+            match (aval(&it[0]).and_then(|l| sv(&l)),
+                   aval(&it[1]).and_then(|l| sv(&l))) {
+                (Some(a), Some(b)) => Some((a, b)),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    };
+    let bound: Vec<(String, String)> = pop_rows(&srv.cells, &leaf("smDef"))
+        .iter().filter_map(two).map(|(sm, n)| (n, sm)).collect();
+    let subs: Vec<(String, String)> = pop_rows(&srv.cells, &leaf("subtype"))
+        .iter().filter_map(two).collect();
+    let mut n = noun.to_string();
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let smd = loop {
+        if let Some((_n, sm)) = bound.iter().find(|(bn, _)| *bn == n) {
+            break Some(sm.clone());
+        }
+        if !seen.insert(n.clone()) {
+            break None;
+        }
+        match subs.iter().find(|(s, _)| *s == n) {
+            Some((_s, sup)) => n = sup.clone(),
+            None => break None,
+        }
+    };
+    let mut out = String::from("{\"views\":[");
+    n_json(&detail, &mut out);
+    if let Some(smd) = smd {
+        let gov = bound.iter().find(|(_n, sm)| *sm == smd)
+            .map(|(n, _)| n.clone()).unwrap_or_else(|| noun.to_string());
+        let status_ft = pop_rows(&srv.cells, &leaf("smStatusFt")).iter()
+            .filter_map(two).find(|(bn, _)| *bn == gov)
+            .map(|(_, ft)| ft);
+        let mut status: Option<String> = None;
+        if let Some(ft) = status_ft {
+            let rows = ev.mu(napp(
+                na("system:vb_fetch"),
+                nseq(vec![na(&ft), srv.nd.clone()]),
+            ));
+            if let N::S(rs) = &rows {
+                for r in rs.iter() {
+                    if let N::S(cols) = r {
+                        if cols.len() >= 2 {
+                            if let (N::A(a), N::A(b)) = (&cols[0], &cols[1]) {
+                                if sv(a).as_deref() == Some(id) {
+                                    status = sv(b);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(st) = status {
+            let pops: Vec<N> = ["smFrom", "smTrigger", "smTo"].iter()
+                .map(|c| {
+                    let rows = pop_rows(&srv.cells, &leaf(c));
+                    v_to_n(&seq(from_vec(rows)))
+                })
+                .collect();
+            let triples = ev.mu(napp(na("system:sm_join"), nseq(pops)));
+            let menu = ev.mu(napp(
+                na("system:view_menu"),
+                nseq(vec![na(&st), triples]),
+            ));
+            out.push(',');
+            n_json(&menu, &mut out);
+        }
+    }
+    out.push_str("]}");
+    Ok(out)
+}
+
 fn store_call(tool: &str, args: &J, app: &str, srv: &mut Srv)
     -> Option<Result<String, (i64, String)>> {
     let _ = app;
@@ -5043,25 +5195,7 @@ fn store_call(tool: &str, args: &J, app: &str, srv: &mut Srv)
                 }).collect(),
                 _ => Vec::new(),
             };
-            fn njson(n: &N, out: &mut String) {
-                match n {
-                    N::A(l) => match &**l {
-                        Leaf::S(s) => esc(s, out),
-                        Leaf::I(i) => out.push_str(&i.to_string()),
-                        Leaf::F(f) => out.push_str(&f.to_string()),
-                        _ => out.push_str("null"),
-                    },
-                    N::S(v) => {
-                        out.push('[');
-                        for (i, e) in v.iter().enumerate() {
-                            if i > 0 { out.push(','); }
-                            njson(e, out);
-                        }
-                        out.push(']');
-                    }
-                    N::Bot => out.push_str("null"),
-                }
-            }
+            let njson = n_json;
             let mut out = String::from("{\"app\":");
             esc(&app, &mut out);
             out.push_str(",\"noun\":");
@@ -6006,6 +6140,25 @@ mod worker {
                     out
                 }
                 None => "{\"error\":\"not a store-only verb\"}".to_string(),
+            }
+        })
+    }
+
+    #[wasm_bindgen]
+    pub fn arest_view(noun: &str, id: &str) -> String {
+        // the abstract UI's trees over the wire: the client transduces
+        // (kind dispatch), the menu's buttons POST the event fact
+        // types back — the >>= over HTTP
+        ensure_base();
+        WSRV.with(|s| match view_trees_json(noun, id, &s.borrow()) {
+            Ok(r) => r,
+            Err((code, msg)) => {
+                let mut out = String::from("{\"error\":");
+                esc(&msg, &mut out);
+                out.push_str(",\"code\":");
+                out.push_str(&code.to_string());
+                out.push('}');
+                out
             }
         })
     }

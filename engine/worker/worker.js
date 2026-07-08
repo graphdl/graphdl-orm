@@ -15,7 +15,7 @@
 //                                 fact (WRITE PATH: step 5 — the
 //                                 Worker is read-only until the write
 //                                 story lands; 501 meanwhile)
-import init, { arest_load, arest_call, arest_apply } from "./arest_core.js";
+import init, { arest_load, arest_call, arest_apply, arest_view } from "./arest_core.js";
 import wasmModule from "./arest_core_bg.wasm";
 import SIDECAR from "./sidecar.js";
 
@@ -114,36 +114,36 @@ const h = React.createElement;
 // THE BINDING CONTRACT: a component receives the representation and
 // the apply endpoint — nothing else. Facts render; events apply; the
 // store is the state (every commit refetches the representation).
-function Field({ name, value }) {
-  return h(React.Fragment, null,
-    h("dt", null, name),
-    h("dd", null, value === null ? h("i", null, "—") : String(value)));
-}
-function Detail({ view }) {
-  return h("dl", null,
-    Object.entries(view.fields || {}).map(([k, v]) =>
-      h(Field, { key: k, name: k, value: v })));
-}
-function Actions({ actions, onFollow }) {
-  if (!actions?.length) return null;
-  return h("p", { className: "actions" },
-    actions.map(a => h("button", {
-      key: a.event,
-      onClick: () => onFollow(a),   // the event IS a fact: apply it
-    }, a.event + " → " + a.to)));
+// THE TREE TRANSDUCER: the server answers the CANON's view trees
+// (system:view_detail / view_menu evaluated on the wasm carrier); the
+// client dispatches on node kind and NEVER derives structure — the
+// same trees the tk and WPF containers render.
+function Tree({ node, onFollow }) {
+  if (!Array.isArray(node)) return null;
+  const [kind, body] = node;
+  if (kind === "detail")
+    return h("dl", null, (body || []).map((f, i) =>
+      f && f[0] === "field" ? h(React.Fragment, { key: i },
+        h("dt", null, String(f[1])),
+        h("dd", null, f[2] === null || f[2] === "" ? h("i", null, "—")
+                      : String(f[2]))) : null));
+  if (kind === "menu")
+    return h("p", { className: "actions" }, (body || []).map((b, i) =>
+      b && b[0] === "button" ? h("button", {
+        key: i,
+        onClick: () => onFollow({ event: String(b[1]), to: String(b[2]) }),
+      }, String(b[1]) + " → " + String(b[2])) : null));
+  return null;
 }
 
 function App() {
   const [noun, setNoun] = React.useState("feature_request");
   const [id, setId] = React.useState("fr-live-1");
-  const [view, setView] = React.useState(null);
-  const [actions, setActions] = React.useState([]);
+  const [views, setViews] = React.useState([]);
   const [receipt, setReceipt] = React.useState("");
   const refetch = React.useCallback(async () => {
-    const v = await (await fetch("/" + noun + "/" + id)).json();
-    setView(v);
-    const a = await (await fetch("/" + noun + "/" + id + "/actions")).json();
-    setActions(a.actions || []);
+    const v = await (await fetch("/" + noun + "/" + id + "/view")).json();
+    setViews(v.views || []);
   }, [noun, id]);
   const follow = async (a) => {
     const r = await fetch("/" + noun + "/" + id + "/" + a.event, { method: "POST" });
@@ -156,8 +156,7 @@ function App() {
       h("input", { value: noun, onChange: e => setNoun(e.target.value) }),
       h("input", { value: id, onChange: e => setId(e.target.value) }),
       h("button", { onClick: refetch }, "fetch")),
-    view && h(Detail, { view }),
-    h(Actions, { actions, onFollow: follow }),
+    views.map((v, i) => h(Tree, { key: i, node: v, onFollow: follow })),
     receipt && h("div", { className: "receipt" }, receipt));
 }
 createRoot(document.getElementById("root")).render(h(App));
@@ -311,6 +310,8 @@ export default {
           return json(arest_call("actions", JSON.stringify({ noun, id })));
         if (seg[2] === "repr")
           return json(arest_call("synthesize", JSON.stringify({ id })));
+        if (seg[2] === "view")
+          return json(arest_view(noun, id));
         return json(arest_call("get", JSON.stringify({ noun, id })));
       }
       if (request.method === "POST" && seg[2]) {
@@ -340,6 +341,6 @@ export default {
         return json(JSON.stringify(r), r.receipt?.committed ? 200 : 422);
       }
     }
-    return json('{"error":"routes: GET /{noun}/{id}[/actions|/repr], GET /schema/{noun}"}', 404);
+    return json('{"error":"routes: GET /{noun}/{id}[/actions|/repr|/view], GET /schema/{noun}"}', 404);
   },
 };
