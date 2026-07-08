@@ -1787,6 +1787,11 @@ class Registry:
             violations = [list(x) if isinstance(x, tuple) else [x] for x in v]
         if not refused:
             D2 = system.run_rules(D2, changed=[fact_type])
+            # the write path's SM init: a create that BIRTHS a governed
+            # entity seeds the machine's initial on the status column
+            # (identity when no machine, no governed player, or a status
+            # already stands — see sm_init_entity)
+            D2 = system.sm_init_entity(D2, fact_type, row)
             self._sink(name).append({"ft": fact_type, "fact": list(row)})
             wm = persist._watermark(D2)
             if wm is not None:

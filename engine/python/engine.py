@@ -2615,6 +2615,61 @@ def machine_fold(D):
     return D
 
 
+def sm_init_entity(D, ft, row):
+    """The write path's SM init: a committed create can BIRTH a governed
+    entity — a non-trigger fact whose role-1 key has no status row yet
+    (fr-live-1's null status, 2026-07-08). The compile-time fold covers
+    readings- and log-carried events wholesale; this covers ONE write for
+    ONE entity: land the machine's initial on the status column through
+    the same commit convention (no log append — the next compile's fold
+    re-derives the same initial deterministically), then derive
+    delta-scoped over the status fact type. Identity when the app has no
+    machines, the fact plays no governed noun, or the entity already has
+    a status — the apply path pays a few marker-pop reads and nothing
+    else. Trigger facts stay create_routed's business (the machine
+    advances within the routed step); this only seeds birth."""
+    from .lam import to_lam
+    machines = {r[1]: r[0] for r in _pop_rows(D, "smDef") if len(r) >= 2}
+    if not machines:
+        return D
+    row = tuple(row)
+    if not row or row[0] in ("", "φ"):
+        return D
+    noun = next((r[3] for r in _pop_rows(D, "role")
+                 if len(r) >= 4 and r[1] == ft and r[2] == 1), None)
+    if noun is None:
+        return D
+    gov = {r[0]: r[1] for r in _pop_rows(D, "governedBy") if len(r) >= 2}
+    status_fts = {r[0]: r[1] for r in _pop_rows(D, "smStatusFt")
+                  if len(r) >= 2}
+    g = gov.get(noun, noun)
+    sft = status_fts.get(g)
+    m = machines.get(g, machines.get(noun))
+    if sft is None or m is None or ft == sft:
+        return D
+    initials = {r[1]: r[0] for r in _pop_rows(
+        D, "Status_is_initial_in_State_Machine_Definition") if len(r) >= 2}
+    init = initials.get(m)
+    if init is None:
+        return D
+    part = rmap_partition(D)
+    key = row[0]
+    if any(isinstance(r, tuple) and r and r[0] == key
+           for r in ft_view(D, sft, part)):
+        return D
+    table = part.get(sft, sft)
+    if table == sft:
+        from . import ast as _ast
+        from .reduce import apply as _apply
+        keep = {tuple(r) for r in _pop_rows(D, sft)}
+        D = _apply(_ast.Store(sft),
+                   _S(to_lam(_rowsort(keep | {(key, init)})), D))
+    else:
+        D = bulk_absorbed_install(D, part, table, sft, [(key, init)],
+                                  replace_keys=True)
+    return run_rules(D, changed=[sft])
+
+
 def moore_view(D, noun):
     """The Moore output function as a view: for each live instance whose status carries an
     emission, the ρ-application of the named definition to ⟨entity, status⟩ (outputs are

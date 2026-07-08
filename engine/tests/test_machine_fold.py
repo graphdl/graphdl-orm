@@ -82,3 +82,38 @@ def test_a_malformed_machine_statement_reports_loudly():
     line = "Status 'open' is initial." + chr(10)
     D, rep = forml.compile_model(MODEL + line)
     assert any("is initial" in u for u in rep["unparsed"])
+
+
+def _mk_registry_app(tmp_path):
+    import os
+    from pyarest import apps
+    d = os.path.join(str(tmp_path), "tickets", "readings")
+    os.makedirs(d)
+    with open(os.path.join(d, "core.md"), "w", encoding="utf-8") as f:
+        f.write(MODEL + "Title is a value type." + chr(10)
+                + "Ticket has Title." + chr(10))
+    return apps.Registry(str(tmp_path))
+
+
+def test_a_write_births_the_initial_status(tmp_path):
+    # the write path's SM init (fr-live-1's null status): a committed
+    # create of an ORDINARY fact for a FRESH governed entity seeds the
+    # machine's initial on the status column — no compile in between
+    reg = _mk_registry_app(tmp_path)
+    reg.compile("tickets")
+    r = reg.apply("tickets", "Ticket_has_Title", ("t9", "hello"))
+    assert r["committed"]
+    assert dict(reg.query("tickets",
+                          "Ticket_is_currently_in_Status")).get("t9") == "open"
+
+
+def test_a_second_write_leaves_the_status_alone(tmp_path):
+    # the already-has-a-status identity: more facts for the same entity
+    # never re-seed (exactly one status row, still the initial)
+    reg = _mk_registry_app(tmp_path)
+    reg.compile("tickets")
+    reg.apply("tickets", "Ticket_has_Title", ("t9", "hello"))
+    reg.apply("tickets", "Ticket_has_Title", ("t9", "renamed"))
+    rows = [r for r in reg.query("tickets", "Ticket_is_currently_in_Status")
+            if r and r[0] == "t9"]
+    assert rows == [("t9", "open")]
