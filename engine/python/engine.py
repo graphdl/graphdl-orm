@@ -2539,8 +2539,6 @@ def machine_fold(D):
         for row in _pop_rows(D, ft):
             if len(row) >= pos and row[pos - 1] not in ("", "φ"):
                 events.setdefault((noun, row[pos - 1]), []).append(ft)
-    if not events:
-        return D
     part = rmap_partition(D)
     current = {}
     for noun in sorted({n for (n, _e) in events}):
@@ -2573,6 +2571,25 @@ def machine_fold(D):
         # an entity whose every event is unfireable stays untouched
         if fired_any and cur != current.get((noun, e)):
             changed.append((sft, e, cur))
+    # SM init, the design's second half ("SM init covers the rest"):
+    # every governed entity carried by the noun's own table and holding
+    # no status row materializes the machine's initial. An event-less
+    # compile with no table (unit fixtures) is a no-op; the live table
+    # arrives with the log's bulk installs and replay.
+    written = {(s, e) for s, e, _c in changed}
+    for noun, m in sorted(machines.items()):
+        sft = status_fts.get(noun)
+        init = initials.get(m)
+        if sft is None or init is None:
+            continue
+        have = {r[0] for r in ft_view(D, sft, part)
+                if isinstance(r, tuple) and r}
+        for row in _pop_rows(D, noun):
+            k = row[0] if row else None
+            if (k and k not in ("", "φ") and k not in have
+                    and (sft, k) not in written):
+                written.add((sft, k))
+                changed.append((sft, k, init))
     by_sft = {}
     for sft, e, cur in changed:
         by_sft.setdefault(sft, []).append((e, cur))
@@ -3172,8 +3189,18 @@ def status_facts(D):
     # Status is unknown to this compile and the status fact type mints UNARY
     D, _rep = forml.compile_model("\n".join(lines) + "\n", D=D, context_from=D)
     role1 = {r[1]: r[3] for r in _pop_rows(D, "role") if len(r) >= 4 and r[2] == 1}
-    new_fts = [r[0] for r in _pop_rows(D, "factType") if r[0] not in before]
-    markers = tuple((role1[ft], ft) for ft in new_fts if ft in role1)
+    # the marker is extracted by the fact type's READING identity, not by
+    # newness: a model may declare its own "<Noun> is currently in Status"
+    # fact type (the tasks board's status bridge does, so the rule catalog
+    # resolves it), and the declared form IS the status column exactly as
+    # the synthesized one would be
+    templ = {f[0]: str(f[1]) for f in _pop_rows(D, "factType") if len(f) >= 2}
+    have = {tuple(r[:2]) for r in _pop_rows(D, "smStatusFt") if len(r) >= 2}
+    markers = tuple(
+        (noun, ft) for noun in nouns
+        for ft in sorted(templ)
+        if role1.get(ft) == noun and "is currently in" in templ[ft]
+        and (noun, ft) not in have)
     rows = tuple(tuple(r) for r in _pop_rows(D, "smStatusFt")) + markers
     return _apply(ast.Store("smStatusFt"), _S(to_lam(rows), D))
 
