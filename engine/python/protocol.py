@@ -217,7 +217,8 @@ def replay_entries(D, entries):
             part = system.rmap_partition(D)
             table = part.get(ft, ft)
             if table != ft:
-                D = _bulk_absorbed_install(D, part, table, ft, entry["facts"])
+                D = system.bulk_absorbed_install(D, part, table, ft,
+                                                  entry["facts"])
                 continue
             rows = {tuple(r) for r in system._pop_rows(D, ft)}
             rows |= {_untuple(f) for f in entry["facts"]}
@@ -244,55 +245,6 @@ def _with_watermark(D, n):
                   if not (isinstance(c, tuple) and len(c) >= 2
                           and c[1] == "eventWatermark"))
     return to_lam(cells + (("CELL", "eventWatermark", ((n,),)),))
-
-
-def _bulk_absorbed_install(D, part, table, ft, facts):
-    """The batch install of an absorbed fact type's rows: each ⟨key, value⟩
-    lands on the entity's 3NF row (fresh rows hole-padded, the row_resolve
-    shape), the key joins the table index, and the fact type's ** view cache
-    unions — one from_lam/to_lam pass instead of N routed creates. A unary
-    absorbed fact type's ⟨key⟩ sets its boolean column to T."""
-    from .lam import from_lam as _fl, to_lam as _tl
-    cols = system.table_columns(part, table)
-    col = 2 + cols.index(ft)
-    width = 1 + len(cols)
-    unary = max((r[2] for r in system._pop_rows(D, "role")
-                 if len(r) >= 3 and r[1] == ft), default=2) == 1
-    cells_l = list(_fl(D))
-    idx = {c[1]: i for i, c in enumerate(cells_l)
-           if isinstance(c, tuple) and len(c) >= 3 and c[0] == "CELL"}
-
-    def setcell(name, val):
-        if name in idx:
-            cells_l[idx[name]] = ("CELL", name, val)
-        else:
-            idx[name] = len(cells_l)
-            cells_l.append(("CELL", name, val))
-
-    tbl = list(cells_l[idx[table]][2]) if table in idx else []
-    keys = {r[0] for r in tbl if r}
-    rows = [_untuple(f) for f in facts]
-    for r in rows:
-        if not r:
-            continue
-        k = r[0]
-        v = "T" if unary else (r[1] if len(r) >= 2 else "#")
-        rc = f"{table}:{k}"
-        row = list(cells_l[idx[rc]][2]) if rc in idx else []
-        if not row:
-            row = [k] + ["#"] * (width - 1)
-        while len(row) < width:
-            row.append("#")
-        row[col - 1] = v
-        setcell(rc, tuple(row))
-        if k not in keys:
-            keys.add(k)
-            tbl.append((k,))
-    setcell(table, tuple(tbl))
-    view = {tuple(r) for r in (cells_l[idx[ft]][2] if ft in idx else ())}
-    view |= {tuple(r) for r in rows}
-    setcell(ft, tuple(system._rowsort(view)))
-    return _tl(tuple(cells_l))
 
 
 # ============================ the event sink interface =======================
@@ -1642,6 +1594,11 @@ class Registry:
         # absorbs it as a column and the machine reads/overwrites it there; wired
         # before replay so the machine fires into the column, not the noun_status wart
         D = system.status_facts(D)
+        # readings-carried machine events fold here (the sm-migration class):
+        # the same fold the write path applies incrementally, run once over
+        # the compiled instance facts of every trigger fact type — BEFORE
+        # replay, whose entries are later-in-time applied events
+        D = system.machine_fold(D)
         # the event stream replays through the SAME create (facts are the source
         # of truth; the .db is disposable, set semantics make replay idempotent),
         # read from whatever sink the registry holds, never a file path

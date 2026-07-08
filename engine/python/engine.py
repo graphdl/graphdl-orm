@@ -2436,6 +2436,163 @@ def _status_rows(D, noun):
     return sorted(ft_view(D, status_ft, rmap_partition(D)))
 
 
+def _plain_rows(facts):
+    """Rows as tuples all the way down (json lists arrive from the event
+    sink; the fold passes tuples already)."""
+    out = []
+    for f in facts:
+        out.append(tuple(f) if isinstance(f, (list, tuple)) else (f,))
+    return out
+
+
+def bulk_absorbed_install(D, part, table, ft, facts, replace_keys=False):
+    """The batch install of an absorbed fact type's rows: each <key, value>
+    lands on the entity's 3NF row (fresh rows hole-padded, the row_resolve
+    shape), the key joins the table index, and the fact type's ** view cache
+    unions -- one from_lam/to_lam pass instead of N routed creates. A unary
+    absorbed fact type's <key> sets its boolean column to T. replace_keys
+    makes the write an OVERWRITE: the installed keys' stale view-cache rows
+    are pruned instead of unioned (the machine fold's semantics -- one
+    status per entity)."""
+    from .lam import from_lam as _fl, to_lam as _tl
+    cols = table_columns(part, table)
+    col = 2 + cols.index(ft)
+    width = 1 + len(cols)
+    unary = max((r[2] for r in _pop_rows(D, "role")
+                 if len(r) >= 3 and r[1] == ft), default=2) == 1
+    cells_l = list(_fl(D))
+    idx = {c[1]: i for i, c in enumerate(cells_l)
+           if isinstance(c, tuple) and len(c) >= 3 and c[0] == "CELL"}
+
+    def setcell(name, val):
+        if name in idx:
+            cells_l[idx[name]] = ("CELL", name, val)
+        else:
+            idx[name] = len(cells_l)
+            cells_l.append(("CELL", name, val))
+
+    tbl = list(cells_l[idx[table]][2]) if table in idx else []
+    keys = {r[0] for r in tbl if r}
+    rows = _plain_rows(facts)
+    for r in rows:
+        if not r:
+            continue
+        k = r[0]
+        v = "T" if unary else (r[1] if len(r) >= 2 else "#")
+        rc = f"{table}:{k}"
+        row = list(cells_l[idx[rc]][2]) if rc in idx else []
+        if not row:
+            row = [k] + ["#"] * (width - 1)
+        while len(row) < width:
+            row.append("#")
+        row[col - 1] = v
+        setcell(rc, tuple(row))
+        if k not in keys:
+            keys.add(k)
+            tbl.append((k,))
+    setcell(table, tuple(tbl))
+    view = {tuple(r) for r in (cells_l[idx[ft]][2] if ft in idx else ())}
+    if replace_keys:
+        installed = {r[0] for r in rows if r}
+        view = {r for r in view if not r or r[0] not in installed}
+    view |= {tuple(r) for r in rows}
+    setcell(ft, tuple(_rowsort(view)))
+    return _tl(tuple(cells_l))
+
+
+def machine_fold(D):
+    """Readings-carried machine events, folded at compile: instance facts of
+    trigger fact types ARE the event stream when it arrives as readings (the
+    tasks board's sm-migration class), and the write path's incremental fold
+    never sees them — the promised "event-fold after compile" was missing
+    (found 2026-07-08: 75 tasks wedged at init while their readings said
+    finished). Per governed entity: start from the column's current status
+    (else the machine's initial), fire the first fireable event in a fixed
+    order, remove it, repeat until nothing fires — the machine itself orders
+    the walk (readings carry no timestamps; a deterministic machine makes the
+    greedy walk deterministic). Events invalid from every reachable status
+    stay as rows, the write path's no-op semantics. One create per changed
+    entity lands the final status on the RMAP column (replay_entries' commit
+    convention), so recompiles re-derive the same statuses from scratch."""
+    from .lam import to_lam, atom as A
+    from .reduce import apply as _apply
+    triples = sm_triples(D)
+    if not triples:
+        return D
+    trig_fts = sorted({r[1] for r in _pop_rows(D, "smTrigger")
+                       if len(r) >= 2})
+    initials = {r[1]: r[0] for r in _pop_rows(
+        D, "Status_is_initial_in_State_Machine_Definition") if len(r) >= 2}
+    status_fts = {r[0]: r[1] for r in _pop_rows(D, "smStatusFt")
+                  if len(r) >= 2}
+    machines = {r[1]: r[0] for r in _pop_rows(D, "smDef") if len(r) >= 2}
+    gov = {r[0]: r[1] for r in _pop_rows(D, "governedBy") if len(r) >= 2}
+    events = {}
+    for ft in trig_fts:
+        noun = _governed_player(D, ft)
+        if noun is None:
+            continue
+        pos = next((r[2] for r in _pop_rows(D, "role")
+                    if len(r) >= 4 and r[1] == ft and r[3] == noun), None)
+        if pos is None:
+            continue
+        for row in _pop_rows(D, ft):
+            if len(row) >= pos and row[pos - 1] not in ("", "φ"):
+                events.setdefault((noun, row[pos - 1]), []).append(ft)
+    if not events:
+        return D
+    part = rmap_partition(D)
+    current = {}
+    for noun in sorted({n for (n, _e) in events}):
+        sft = status_fts.get(gov.get(noun, noun))
+        if sft is None:
+            continue
+        for row in ft_view(D, sft, part):
+            if isinstance(row, tuple) and len(row) >= 2:
+                current[(noun, row[0])] = row[1]
+    changed = []
+    for (noun, e), evs in sorted(events.items()):
+        sft = status_fts.get(gov.get(noun, noun))
+        if sft is None:
+            continue
+        m = machines.get(gov.get(noun, noun), machines.get(noun))
+        start = current.get((noun, e), initials.get(m))
+        cur, evs = start, sorted(evs)
+        fired_any, fired = False, True
+        while fired and evs:
+            fired = False
+            for i, ev in enumerate(evs):
+                to = next((t for (f, g, t) in triples
+                           if g == ev and f == cur), None)
+                if to is not None:
+                    cur, fired, fired_any = to, True, True
+                    evs.pop(i)
+                    break
+        # write iff the machine RAN for this entity — a round-trip back
+        # to the initial still materializes (the write path would have);
+        # an entity whose every event is unfireable stays untouched
+        if fired_any and cur != current.get((noun, e)):
+            changed.append((sft, e, cur))
+    by_sft = {}
+    for sft, e, cur in changed:
+        by_sft.setdefault(sft, []).append((e, cur))
+    for sft, rows in sorted(by_sft.items()):
+        table = part.get(sft, sft)
+        if table == sft:
+            # own-table status (a machine before status_facts absorbs it):
+            # union-overwrite the pop directly
+            from . import ast as _ast
+            keys = {r[0] for r in rows}
+            keep = [tuple(r) for r in _pop_rows(D, sft)
+                    if r and r[0] not in keys]
+            D = _apply(_ast.Store(sft),
+                       _S(to_lam(_rowsort(set(keep) | set(rows))), D))
+        else:
+            D = bulk_absorbed_install(D, part, table, sft, rows,
+                                      replace_keys=True)
+    return D
+
+
 def moore_view(D, noun):
     """The Moore output function as a view: for each live instance whose status carries an
     emission, the ρ-application of the named definition to ⟨entity, status⟩ (outputs are
