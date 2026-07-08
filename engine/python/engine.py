@@ -1635,7 +1635,8 @@ def generator_cells(D):
     opted = {r[1] for r in _pop_rows(D, "App_uses_Generator")
              if len(r) >= 2}
     active = opted.intersection(("xsd", "owl", "edm", "html", "dtd",
-                                 "wsdl", "xforms", "plix", "nav"))
+                                 "wsdl", "xforms", "plix", "nav",
+                                 "solidity"))
     if active:
         import json as _json
         from .reduce import apply as _xap
@@ -1845,8 +1846,101 @@ def generator_cells(D):
                        "navigation": navs, "transitions": trs}
                 cells["nav:" + noun] = (
                     (_json.dumps(doc, sort_keys=True),),)
+
+            if "solidity" in active:
+                # the oracle: generators/solidity.rs (d3104058~1). The
+                # machine's bytes32 status REPLACES the status value
+                # column (0.9: status(e) = RMAP column, one meaning)
+                def _camel(s):
+                    w = _pascal(s)
+                    return w[:1].lower() + w[1:] if w else w
+
+                has_sm = bool(trans)
+                scols = [(ft, ckind, other, cname)
+                         for ft, ckind, other, cname in cols
+                         if not (has_sm and cname == "status")]
+                lines = ["// SPDX-License-Identifier: MIT",
+                         "// Generated from FORML2 readings by AREST",
+                         "pragma solidity ^0.8.20;",
+                         "",
+                         "contract %s {" % x,
+                         "    struct Data {",
+                         "        string id;"]
+                for _ft, ckind, _other, cname in scols:
+                    stype = "bool" if ckind == "unary" else "string"
+                    lines.append("        %s %s;" % (stype, _camel(cname)))
+                if has_sm:
+                    lines.append("        bytes32 status;"
+                                 "  // SM current state")
+                lines.append("    }")
+                lines.append("")
+                lines.append("    mapping(string => Data) public"
+                             " records;")
+                lines.append("")
+                for ft, ckind, _other, cname in cols:
+                    stype = "bool" if ckind == "unary" else "string"
+                    lines.append("    event %s(string indexed id,"
+                                 " %s %s);" % (_pascal(ft), stype,
+                                               _camel(cname)))
+                if has_sm:
+                    lines.append("")
+                    lines.append("    modifier onlyInStatus(string"
+                                 " memory id, bytes32 expected) {")
+                    lines.append("        require(records[id].status =="
+                                 ' expected, "SM: wrong state");')
+                    lines.append("        _;")
+                    lines.append("    }")
+                params = ["string memory id"]
+                for _ft, ckind, _other, cname in scols:
+                    stype = "bool" if ckind == "unary" else "string"
+                    params.append("%s memory %s" % (stype, _camel(cname))
+                                  if stype == "string"
+                                  else "%s %s" % (stype, _camel(cname)))
+                lines.append("")
+                lines.append("    function create(%s) external {"
+                             % ", ".join(params))
+                lines.append("        require(bytes(records[id].id)"
+                             '.length == 0, "UC: %s already exists");'
+                             % x)
+                mc_fields = set()
+                for ckind_, text in (cells["dsl:" + noun][0][3] or ()):
+                    if ckind_ == "MC" and " some " in str(text):
+                        tail = str(text).split(" some ", 1)[1]
+                        tail = tail.rstrip(".").split(",")[0].strip()
+                        if tail:
+                            mc_fields.add(_camel(_sqlname(tail)))
+                for _ft, ckind, _other, cname in scols:
+                    f = _camel(cname)
+                    if f in mc_fields and ckind != "unary":
+                        lines.append("        require(bytes(%s).length"
+                                     ' > 0, "MC: %s required");'
+                                     % (f, cname))
+                lines.append("        records[id].id = id;")
+                for ft, ckind, _other, cname in scols:
+                    f = _camel(cname)
+                    lines.append("        records[id].%s = %s;" % (f, f))
+                    lines.append("        emit %s(id, %s);"
+                                 % (_pascal(ft), f))
+                initial = sorted({t[1] for t in trans if len(t) >= 3
+                                  and t[1]})
+                if has_sm and initial:
+                    lines.append("        records[id].status ="
+                                 ' keccak256(bytes("%s"));' % initial[0])
+                lines.append("    }")
+                for trig, frm, to in sorted(set(
+                        t for t in trans if len(t) >= 3)):
+                    lines.append("")
+                    lines.append("    function %s(string memory id)"
+                                 " external onlyInStatus(id,"
+                                 ' keccak256(bytes("%s"))) {'
+                                 % (_camel(_sqlname(trig)), frm))
+                    lines.append("        records[id].status ="
+                                 ' keccak256(bytes("%s"));' % to)
+                    lines.append("    }")
+                lines.append("}")
+                cells["solidity:" + noun] = (("\n".join(lines),),)
     _GEN = ("dsl:", "xsd:", "owl:", "edm:", "html:", "dtd:", "wsdl:",
-            "xforms:", "plix:", "nav:")
+            "xforms:", "plix:", "nav:", "solidity:")
     keep = tuple(c for c in from_lam(D)
                  if not (isinstance(c, tuple) and len(c) >= 2
                          and str(c[1]).startswith(_GEN)))

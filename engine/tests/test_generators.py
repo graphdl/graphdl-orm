@@ -132,3 +132,57 @@ def test_the_generator_family_transduces_one_canon_classification():
     for fam in ("owl", "edm", "html", "dtd", "wsdl", "xforms",
                 "plix", "nav"):
         assert not system._pop_rows(D0, fam + ":Ticket")
+
+
+def _solidity_fixture():
+    OPTED = MODEL + (
+        "Customer is an entity type.\n"
+        "Ticket is assigned to Customer.\n"
+        "Each Ticket is assigned to at most one Customer.\n"
+        "App 'flowapp' uses Generator 'solidity'.\n")
+    return _pipeline(OPTED)
+
+
+def test_the_solidity_generator_emits_the_docs07_contract():
+    # docs/07 + the recovered oracle (generators/solidity.rs at
+    # d3104058~1): struct Data, facts-as-events, onlyInStatus guard,
+    # create with UC require + initial status, one function per
+    # transition. 0.9 correction: the machine's bytes32 status
+    # REPLACES the status value column (status(e) = RMAP column)
+    D = _pipeline(MODEL + "App 'flowapp' uses Generator 'solidity'.\n")
+    sol = system._pop_rows(D, "solidity:Ticket")[0][0]
+    assert "pragma solidity ^0.8.20;" in sol
+    assert "contract Ticket {" in sol
+    assert "string id;" in sol
+    assert "bytes32 status;" in sol
+    assert sol.count(" status;") == 1              # replaced, not doubled
+    assert "event TicketHasStatus(string indexed id," in sol
+    assert "modifier onlyInStatus(string memory id," in sol
+    assert 'require(bytes(records[id].id).length == 0, "UC:' in sol
+    assert 'records[id].status = keccak256(bytes("open"));' in sol
+    assert ('function close(string memory id) external onlyInStatus(id,'
+            ' keccak256(bytes("open")))') in sol
+    assert 'records[id].status = keccak256(bytes("done"));' in sol
+
+
+def test_the_solidity_output_forge_builds(tmp_path):
+    # the Foundry leg of the chip: the emitted contracts are real
+    # solc-compilable Solidity, proven by forge build
+    import shutil
+    import subprocess
+    forge = shutil.which("forge")
+    if forge is None:
+        import pytest
+        pytest.skip("foundry not on disk")
+    D = _solidity_fixture()
+    (tmp_path / "src").mkdir()
+    for noun in ("Ticket", "Customer"):
+        sol = system._pop_rows(D, "solidity:" + noun)[0][0]
+        (tmp_path / "src" / (noun + ".sol")).write_text(
+            sol, encoding="utf-8")
+    (tmp_path / "foundry.toml").write_text(
+        '[profile.default]\nsrc = "src"\nout = "out"\n',
+        encoding="utf-8")
+    r = subprocess.run([forge, "build", "--root", str(tmp_path)],
+                       capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
