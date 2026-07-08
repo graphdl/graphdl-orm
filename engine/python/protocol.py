@@ -859,7 +859,7 @@ def project(D, con):
                 per_id[i][col] = val.get(i)
         ensure_columns(table, colnames, coltypes)
         marks = ", ".join("?" for _ in colnames)
-        for i in sorted(ids):
+        for i in sorted(ids, key=str):     # ids may mix ints and strings
             con.execute(
                 f"INSERT OR REPLACE INTO {_q(_sql_name(table))} "
                 f"({', '.join(_q(c) for c in colnames)}) VALUES ({marks})",
