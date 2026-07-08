@@ -415,9 +415,15 @@ static class Program
     [STAThread]
     static int Main(string[] args)
     {
+        if (args.Contains("--layout-selftest"))
+        {
+            // the cross-host twin gate: the same seven golden cases as
+            // tests/test_uilayout.py
+            return LayoutSelfTest.Run();
+        }
         if (args.Length < 2)
         {
-            Console.Error.WriteLine("usage: arest-show <apps-dir> <app> [noun] [--probe]");
+            Console.Error.WriteLine("usage: arest-show <apps-dir> <app> [noun] [--probe | --layout-selftest]");
             return 2;
         }
         var cli = new Cli(args[0], args[1]);

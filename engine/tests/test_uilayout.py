@@ -133,3 +133,30 @@ def test_minimum_stretches_the_last_auto():
     assert w == 200                   # floored by the minimum
     # the LAST non-zero auto column absorbed the slack
     assert b.rect[0] == 30
+
+
+def test_the_csharp_engine_twins_the_golden_cases():
+    # the cross-host gate: arest-show --layout-selftest runs the SAME
+    # seven cases against the C# transliteration (certified-equal, one
+    # meaning); skips where dotnet or the build is absent
+    import os
+    import shutil
+    import subprocess
+
+    import pytest
+    exe = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "csharp", "show", "bin", "Debug",
+        "net10.0-windows", "arest-show.exe")
+    if not os.path.exists(exe):
+        if shutil.which("dotnet") is None:
+            pytest.skip("dotnet not on disk")
+        proj = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "csharp", "show")
+        subprocess.run(["dotnet", "build", "-v", "q"], cwd=proj,
+                       capture_output=True, timeout=600)
+    if not os.path.exists(exe):
+        pytest.skip("arest-show build unavailable")
+    r = subprocess.run([exe, "--layout-selftest"], capture_output=True,
+                       text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "layout-selftest ok" in r.stdout
