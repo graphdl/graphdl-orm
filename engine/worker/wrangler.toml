@@ -1,0 +1,18 @@
+# The AREST successor Worker: the wasm core + worker.js routes.
+# Build the wasm first:
+#   cd ../rust
+#   cargo build --release --target wasm32-unknown-unknown \
+#     --no-default-features --features worker
+#   wasm-bindgen --target web --out-dir ../worker \
+#     target/wasm32-unknown-unknown/release/arest_core.wasm
+name = "arest-worker"
+main = "worker.js"
+compatibility_date = "2026-07-01"
+
+# the store: either a KV binding holding the sidecar payload under
+# the key "sidecar", or an inline var for small apps
+# [[kv_namespaces]]
+# binding = "STORE"
+# id = "..."
+# [vars]
+# SIDECAR_JSON = "{...}"
