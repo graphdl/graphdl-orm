@@ -1697,8 +1697,23 @@ class Registry:
         committed, the violation set, and the representation parts."""
         from .lam import to_lam, from_lam, atom as _A
         from .reduce import apply as _ap
-        D = self._load(name)
         row = tuple(fact)
+        # THE ID-SENTINEL GUARD (the phi phantom, 2026-07-08: an empty id
+        # leaked as the empty-store atom through an old write and its
+        # ragged wide row bottomed every absorbed fetch of the table).
+        # A key position carrying the phi atom or the empty string is
+        # never a modeling intent — refuse before any evaluation. Replay
+        # stays ungated: the log is history, and retract must still
+        # reach such rows to clean them.
+        if row and isinstance(row[0], str) and row[0] in ("", "φ"):
+            receipt = {"app": name, "fact_type": fact_type,
+                       "fact": list(row), "committed": False,
+                       "violations": [["id-sentinel",
+                                       "a key must not be empty or the "
+                                       "phi atom"]]}
+            self.last_receipt = receipt
+            return receipt
+        D = self._load(name)
         res = system.create(D, fact_type, to_lam(row))
         o = from_lam(_ap(_A(1), res))
         D2 = _ap(_A(2), res)

@@ -14,3 +14,11 @@ opt-level = 2
 # rustc unit ran 18+ min where the classic cold build takes ~8 total).
 # The build-tax answer is batching changes per rebuild and smoking on
 # the debug binary, not incremental codegen.
+
+[features]
+# the HOST feature carries everything a wasm32 build must not: process
+# spawning (the python delegate), the apps-dir filesystem, and the
+# stdio serve/mcp loops. Default on; wasm builds --no-default-features
+# and gets the pure core (reducer, native carrier, canon).
+default = ["host"]
+host = []

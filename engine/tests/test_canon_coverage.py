@@ -37,6 +37,7 @@ OVERRIDES = {
     "render:html": "system:render_html",
     "system:vb_fetch": "system:vb_fetch",
     "system:entity_view": "system:entity_view",
+    "system:ev_cols": "system:ev_cols",
     "get_view": "system:entity_view",
     "_classify_heads": "system:classify_heads",
     "verify": "system:verify_store",
@@ -60,14 +61,33 @@ def _src(*parts):
 def _rust_ops():
     src = _src("rust", "src", "main.rs")
     ops = set(re.findall(r'register\("([^"]+)"', src))
+    # DIRECT arms of fn prim's dispatch match only, by BRACE DEPTH
+    # twice over (indent and next-method heuristics both break: prim
+    # bodies nest matches and tuple data — "unary"/"ref" inside
+    # entity_view are values — and top-level helper fns sit between
+    # methods). First bound fn prim at ITS closing brace, then walk the
+    # dispatch block collecting arms entered at depth 1.
     i = src.find("fn prim(&self")
-    j = src.find("\n    fn ", i + 10)
-    # match-arm literals, including multi-pattern arms ("and" | "or" =>)
-    # TOP-LEVEL match-arm literals only (indent 12): the prim bodies
-    # nest their own matches ("unary"/"ref"/"value" inside entity_view)
-    # and those are data, not dispatched ops
-    ops |= set(re.findall(r'^ {12}"([^"]+)"\s*(?:\||=>)', src[i:j],
-                          re.MULTILINE))
+    depth = 0
+    end = i
+    opened = False
+    for off, ch in enumerate(src[i:], start=i):
+        if ch == "{":
+            depth += 1
+            opened = True
+        elif ch == "}":
+            depth -= 1
+            if opened and depth == 0:
+                end = off
+                break
+    body = src[i:end]
+    k = body.find("match s {")
+    depth = 0
+    for line in body[k:].splitlines():
+        if depth == 1 and "=>" in line and re.match(r'\s*"', line):
+            for lit in re.findall(r'"([^"]+)"', line.split("=>")[0]):
+                ops.add(lit)
+        depth += line.count("{") - line.count("}")
     return ops
 
 

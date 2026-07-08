@@ -4312,6 +4312,7 @@ const MCP_TOOLS: &str = concat!(
     r#""inputSchema":{"type":"object","properties":{"status":{"type":"string"}}}}]"#
 );
 
+#[cfg(feature = "host")]
 struct Apps {
     dir: std::path::PathBuf,
     current: Option<String>,
@@ -4323,6 +4324,7 @@ struct Apps {
     cli: Option<std::path::PathBuf>,
 }
 
+#[cfg(feature = "host")]
 impl Apps {
     fn sidecar(&self, name: &str) -> std::path::PathBuf {
         self.dir.join(name).join(format!("{}.store.json", name))
@@ -4343,6 +4345,7 @@ impl Apps {
     }
 }
 
+#[cfg(feature = "host")]
 fn esc_names(names: &[String], out: &mut String) {
     out.push('[');
     for (i, n) in names.iter().enumerate() {
@@ -4354,6 +4357,7 @@ fn esc_names(names: &[String], out: &mut String) {
     out.push(']');
 }
 
+#[cfg(feature = "host")]
 fn parse_json(text: &str) -> Option<J> {
     // P trusts protocol lines and panics on malformed bytes; the MCP transport
     // reads the wild, so a failed parse unwinds here and answers None instead
@@ -4368,6 +4372,7 @@ fn parse_json(text: &str) -> Option<J> {
 // and answers the first ancestor directory's cli.py; the exe lives at
 // <root>/rust/target/<profile>/arest.exe, so the repository root is the
 // first hit. The --py-cli flag overrides the walk entirely.
+#[cfg(feature = "host")]
 fn find_cli() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     for dir in exe.ancestors().skip(1) {
@@ -4381,6 +4386,7 @@ fn find_cli() -> Option<std::path::PathBuf> {
 
 // tail_text answers the last few hundred characters of a child's stderr,
 // enough to name a failure inside one protocol line without flooding it.
+#[cfg(feature = "host")]
 fn tail_text(s: &str) -> String {
     let t = s.trim();
     let n = t.chars().count();
@@ -4395,6 +4401,7 @@ fn tail_text(s: &str) -> String {
 // ingestion path a --serve stdin line takes; apps_use rides it to boot an
 // app, and the delegated write verbs ride it to reload one. It never touches
 // the current-app marker, so a reload cannot switch apps.
+#[cfg(feature = "host")]
 fn load_sidecar(apps: &Apps, name: &str, srv: &mut Srv) -> Result<(), String> {
     let path = apps.sidecar(name);
     let text = match std::fs::read_to_string(&path) {
@@ -4419,6 +4426,7 @@ fn load_sidecar(apps: &Apps, name: &str, srv: &mut Srv) -> Result<(), String> {
 // stderr, as do a spawn failure, a missing cli.py, and unparseable stdout.
 // The parse both proves an answer arrived and lets the caller re-serialize
 // it compactly through write_j.
+#[cfg(feature = "host")]
 fn run_cli(apps: &Apps, verb: &str, app: &str, tail: &[String], ok: &[i32])
     -> Result<(i32, J), (i64, String)>
 {
@@ -4475,6 +4483,7 @@ fn run_cli(apps: &Apps, verb: &str, app: &str, tail: &[String], ok: &[i32])
 // directory-derived): exists, readings count, compiled (<name>.db present),
 // stale (any reading newer than the .db; an uncompiled app with readings is
 // stale by definition). Mirrors protocol.Registry.status key for key.
+#[cfg(feature = "host")]
 fn app_status_json(apps: &Apps, name: &str) -> String {
     let d = std::path::Path::new(&apps.dir).join(name);
     let rd = d.join("readings");
@@ -4518,6 +4527,7 @@ fn app_status_json(apps: &Apps, name: &str) -> String {
 // The retained app is injected when the caller names none, so the one-shot
 // process needs no marker state; `reload` re-ingests the retained sidecar
 // after a mutating verb (the live additive compile).
+#[cfg(feature = "host")]
 fn delegate_call(verb: &str, args: &J, apps: &Apps, srv: &mut Srv, reload: bool)
     -> Result<String, (i64, String)>
 {
@@ -4543,6 +4553,7 @@ fn delegate_call(verb: &str, args: &J, apps: &Apps, srv: &mut Srv, reload: bool)
     Ok(r)
 }
 
+#[cfg(feature = "host")]
 fn delegate_verb(tool: &str, args: &J, apps: &Apps, srv: &mut Srv)
     -> Result<String, (i64, String)>
 {
@@ -4593,6 +4604,7 @@ fn delegate_verb(tool: &str, args: &J, apps: &Apps, srv: &mut Srv)
 // passes, and the answer is whatever one JSON value the CLI prints; sql
 // answers an array of arrays, so no object envelope is assumed. synthesize
 // stays native over the retained store and never routes here.
+#[cfg(feature = "host")]
 fn delegate_read(tool: &str, args: &J, apps: &Apps) -> Result<String, (i64, String)> {
     let app = match &apps.current {
         Some(n) => n.clone(),
@@ -4626,6 +4638,7 @@ fn delegate_read(tool: &str, args: &J, apps: &Apps) -> Result<String, (i64, Stri
 // spaces). The log is the durable source of truth a recompile replays through
 // the same create, so a native write lands in the same stream the delegated
 // write does, and a mixed history replays clean.
+#[cfg(feature = "host")]
 fn append_event(apps: &Apps, app: &str, ft: &str, fact: &[J]) -> std::io::Result<()> {
     use std::io::Write;
     let path = apps.dir.join(app).join(format!("{}.events.jsonl", app));
@@ -4652,6 +4665,7 @@ fn append_event(apps: &Apps, app: &str, ft: &str, fact: &[J]) -> std::io::Result
 // tmp-then-rename, so a concurrent reader never sees a torn file, exactly as
 // _sidecar's os.replace. A fresh resident boots this file through the same
 // ingestion apps_use takes, so the native write is durable to the resident.
+#[cfg(feature = "host")]
 fn write_sidecar(apps: &Apps, app: &str, srv: &Srv) -> std::io::Result<()> {
     let mut payload = String::from("{\"d\":");
     write_v(&srv.d, &mut payload);
@@ -4694,6 +4708,7 @@ fn write_sidecar(apps: &Apps, app: &str, srv: &Srv) -> std::io::Result<()> {
 // reduction does not yield a proper ⟨representation, D'⟩ pair — the bare-ERROR
 // refusal, where Python re-runs validate for the offenders, stays the
 // delegate's job.
+#[cfg(feature = "host")]
 fn native_apply(args: &J, apps: &Apps, srv: &mut Srv) -> Option<Result<String, (i64, String)>> {
     // the target app must be the retained store; a write to any other app
     // delegates, exactly as the delegated path only reloads the current app
@@ -4712,6 +4727,29 @@ fn native_apply(args: &J, apps: &Apps, srv: &mut Srv) -> Option<Result<String, (
         Some(J::A(xs)) => xs.clone(),
         _ => return None,
     };
+    // THE ID-SENTINEL GUARD (the phi phantom, 2026-07-08): a key
+    // position carrying the phi atom or the empty string is a leak,
+    // never modeling intent — refuse before evaluation, mirroring
+    // Registry.apply's receipt (replay ungated; retract stays open)
+    if let Some(J::S(k)) = fact.first() {
+        if k.is_empty() || k == "\u{03c6}" {
+            let mut r = String::from("{\"app\":");
+            esc(&app, &mut r);
+            r.push_str(",\"fact_type\":");
+            esc(&ft, &mut r);
+            r.push_str(",\"fact\":[");
+            for (i, f) in fact.iter().enumerate() {
+                if i > 0 { r.push(','); }
+                match f {
+                    J::S(s) => esc(s, &mut r),
+                    J::I(n) => r.push_str(&n.to_string()),
+                    _ => r.push_str("null"),
+                }
+            }
+            r.push_str("],\"committed\":false,\"violations\":[[\"id-sentinel\",\"a key must not be empty or the phi atom\"]]}");
+            return Some(Ok(r));
+        }
+    }
     // a create:<ft> handler cell serves BOTH shapes now (phase two done):
     // an own-table handler carries its fixed cell name; an absorbed handler
     // computes cellkey(table, key) from the fact at reduce time. Absence
@@ -4818,6 +4856,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(feature = "host")]
 fn mcp_call(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Result<String, (i64, String)> {
     let out = mcp_call_inner(tool, args, apps, srv);
     if matches!(tool, "apply" | "retract") {
@@ -4828,6 +4867,7 @@ fn mcp_call(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Result<Stri
     out
 }
 
+#[cfg(feature = "host")]
 fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Result<String, (i64, String)> {
     match tool {
         "context" => Ok(LAST_RECEIPT.with(|c| c.borrow().clone())
@@ -5462,6 +5502,7 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
     }
 }
 
+#[cfg(feature = "host")]
 fn run_mcp() {
     use std::io::{BufRead, Write};
     let (dir, python, py_cli) = {
@@ -5577,6 +5618,7 @@ fn run_mcp() {
     }
 }
 
+#[cfg(feature = "host")]
 fn show_case(v: &V, out: &mut String) {
     match shape(v) {
         Shape::Bot => out.push('\u{22a5}'),
@@ -5603,6 +5645,7 @@ fn show_case(v: &V, out: &mut String) {
     }
 }
 
+#[cfg(feature = "host")]
 fn run() {
     // the intersection source loads ON THE WORKER (CANON is a thread_local; the
     // reduction thread must hold it)
@@ -5741,6 +5784,7 @@ fn scenario_defs() -> Vec<(String, V)> {
     out.into_inner()
 }
 
+#[cfg(feature = "host")]
 fn main() {
     // mu recurses deeply through closures; give it room
     std::thread::Builder::new()
@@ -5750,3 +5794,8 @@ fn main() {
         .join()
         .unwrap();
 }
+
+// a bin target must carry SOME main; the no-host build (wasm32 core)
+// gets a stub until the lib split gives the Worker its bindgen entry
+#[cfg(not(feature = "host"))]
+fn main() {}

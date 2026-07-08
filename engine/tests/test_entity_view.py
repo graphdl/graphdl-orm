@@ -267,3 +267,121 @@ def test_the_host_view_twins_the_canon_definition():
         assert {k: m.get(v, v) for (k, v) in canon[1]} == fields, tid
         assert {(ft, tuple(r)) for (ft, r) in canon[2]} == \
             {(f["fact_type"], tuple(f["row"])) for f in facts}, tid
+
+
+# ---- the read-side representation (Thm hateoas, first cut) ----
+
+def _DM():
+    """_DV() plus a machine: Task SM with pending->start->in_progress
+    and in_progress->finish->completed; t1's live status is pending
+    (the smStatusFt column rides Task col 5 in this fixture's rmap...
+    kept OWN-TABLE for the pin: the status ft has its own cell)."""
+    return _S(
+        _S(A("CELL"), A("rmapColumns"),
+           _S(_S(A("Task"), A(2), A("Task_is_started")))),
+        _S(A("CELL"), A("role"),
+           _S(_S(A("Task_is_started.1"), A("Task_is_started"), A(1), A("Task")),
+              _S(A("Task_status.1"), A("Task_status"), A(1), A("Task")),
+              _S(A("Task_status.2"), A("Task_status"), A(2), A("Status")))),
+        _S(A("CELL"), A("instanceOf"), _S(_S(A("Task"), A("ObjectType")))),
+        _S(A("CELL"), A("factType"),
+           _S(_S(A("Task_is_started"), A("{0} is started")),
+              _S(A("Task_status"), A("{0} is currently in {1}")))),
+        _S(A("CELL"), A("smStatusFt"), _S(_S(A("Task"), A("Task_status")))),
+        _S(A("CELL"), A("smFrom"),
+           _S(_S(A("start"), A("pending")),
+              _S(A("finish"), A("in_progress")))),
+        _S(A("CELL"), A("smTrigger"),
+           _S(_S(A("start"), A("Task_is_started")),
+              _S(A("finish"), A("Task_is_finished")))),
+        _S(A("CELL"), A("smTo"),
+           _S(_S(A("start"), A("in_progress")),
+              _S(A("finish"), A("completed")))),
+        _S(A("CELL"), A("Task"), _S(_S(A("t1")))),
+        _S(A("CELL"), A("Task_is_started"), _S()),
+        _S(A("CELL"), A("Task_status"), _S(_S(A("t1"), A("pending"))))
+    )
+
+
+def test_repr_status_reads_the_machine_column():
+    D = _DM()
+    got = from_lam(apply(A("system:repr_status"), _S(A("Task"), A("t1"), D)))
+    assert got == "pending"
+    got = from_lam(apply(A("system:repr_status"), _S(A("Task"), A("t9"), D)))
+    assert got == "#"
+
+
+def test_repr_transitions_filter_to_the_live_status():
+    D = _DM()
+    got = from_lam(apply(A("system:repr_transitions"),
+                         _S(A("Task"), A("t1"), D)))
+    assert got == (("pending", "Task_is_started", "in_progress"),)
+    got = from_lam(apply(A("system:repr_transitions"),
+                         _S(A("Task"), A("t9"), D)))
+    assert got == ()
+
+
+def test_repr_assembles_view_and_controls():
+    D = _DM()
+    got = from_lam(apply(A("system:repr"), _S(A("Task"), A("t1"), D)))
+    assert len(got) == 2
+    view, controls = got
+    assert view[0] == "T"
+    assert controls == (("pending", "Task_is_started", "in_progress"),)
+
+
+def _DN():
+    """A nav fixture: Task plays Task_blocks_Task (a spanning UC over
+    both roles — the pair is the key: PEER), Task_owns_Widget (a UC on
+    Task's role only — Widget rows are CHILDREN of the key), and
+    Task_notes (no UC at all — a related COLLECTION)."""
+    return _S(
+        _S(A("CELL"), A("rmapColumns"), _S()),
+        _S(A("CELL"), A("role"),
+           _S(_S(A("b1"), A("Task_blocks_Task"), A(1), A("Task")),
+              _S(A("b2"), A("Task_blocks_Task"), A(2), A("Task")),
+              _S(A("o1"), A("Task_owns_Widget"), A(1), A("Task")),
+              _S(A("o2"), A("Task_owns_Widget"), A(2), A("Widget")),
+              _S(A("n1"), A("Task_notes"), A(1), A("Task")),
+              _S(A("n2"), A("Task_notes"), A(2), A("Note")))),
+        _S(A("CELL"), A("instanceOf"),
+           _S(_S(A("Task"), A("ObjectType")),
+              _S(A("Widget"), A("ObjectType")))),
+        _S(A("CELL"), A("factType"),
+           _S(_S(A("Task_blocks_Task"), A("{0} blocks {1}")),
+              _S(A("Task_owns_Widget"), A("{0} owns {1}")),
+              _S(A("Task_notes"), A("{0} notes {1}")))),
+        _S(A("CELL"), A("constraint"),
+           _S(_S(A("blocks_uc"), A("uniqueness"), A("Task_blocks_Task"),
+                 A("alethic")),
+              _S(A("owns_uc"), A("uniqueness"), A("Task_owns_Widget"),
+                 A("alethic")))),
+        _S(A("CELL"), A("spans"),
+           _S(_S(A("blocks_uc"), A(1)),
+              _S(A("blocks_uc"), A(2)),
+              _S(A("owns_uc"), A(1))))
+    )
+
+
+def test_nav_labels_controls_by_the_uniqueness_structure():
+    got = from_lam(apply(A("system:nav"), _S(A("Task"), _DN())))
+    assert got == (
+        ("peer", "Task_blocks_Task", ("Task",)),
+        ("child", "Task_owns_Widget", ("Widget",)),
+        ("collection", "Task_notes", ("Note",)),
+    )
+
+
+def test_nav_of_an_unplayed_noun_is_empty():
+    got = from_lam(apply(A("system:nav"), _S(A("Zebra"), _DN())))
+    assert got == ()
+
+
+def test_links_is_the_theorems_union():
+    # Thm hateoas: links(e) = nav(e) ∪ transitions(status(e)) — answered
+    # as the pair (the control shapes differ; the HTTP layer renders)
+    D = _DM()
+    got = from_lam(apply(A("system:links"), _S(A("Task"), A("t1"), D)))
+    nav, transitions = got
+    assert transitions == (("pending", "Task_is_started", "in_progress"),)
+    assert isinstance(nav, tuple)
