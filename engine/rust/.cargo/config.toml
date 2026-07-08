@@ -1,0 +1,7 @@
+# the wasm target needs a real stack: the Scott reduction recurses
+# deep (the python host runs at a 1M recursion limit; wasm's default
+# ~1 MB shadow stack overflows on tasks-scale handler evaluation —
+# the local write smoke's out-of-bounds). 32 MB matches the native
+# thread budget.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=-zstack-size=33554432"]

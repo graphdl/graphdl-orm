@@ -4779,17 +4779,16 @@ fn write_sidecar(apps: &Apps, app: &str, srv: &Srv) -> std::io::Result<()> {
 // reduction does not yield a proper ⟨representation, D'⟩ pair — the bare-ERROR
 // refusal, where Python re-runs validate for the offenders, stays the
 // delegate's job.
-#[cfg(feature = "host")]
-fn native_apply(args: &J, apps: &Apps, srv: &mut Srv) -> Option<Result<String, (i64, String)>> {
-    // the target app must be the retained store; a write to any other app
-    // delegates, exactly as the delegated path only reloads the current app
-    let app = match jget(args, "app") {
-        Some(J::S(a)) => a.clone(),
-        _ => return None,
-    };
-    if apps.current.as_deref() != Some(app.as_str()) {
-        return None;
-    }
+// The HOSTLESS write core: the create:<ft> handler evaluation, the
+// bounded derive, and the receipt — persistence is the CALLER'S
+// (native_apply appends the fs event log + sidecar; the wasm Worker
+// returns the committed event for the Durable Object to append — the
+// same single-writer stream Def. iso demands, two storages). None =
+// this write needs the compiler host (no handler / absorbed shapes
+// the delegate serves).
+fn apply_core(args: &J, app: &str, srv: &mut Srv)
+    -> Option<Result<(String, Option<(String, Vec<J>)>), (i64, String)>> {
+    let app = app.to_string();
     let ft = match jget(args, "fact_type") {
         Some(J::S(f)) => f.clone(),
         _ => return None,
@@ -4818,7 +4817,7 @@ fn native_apply(args: &J, apps: &Apps, srv: &mut Srv) -> Option<Result<String, (
                 }
             }
             r.push_str("],\"committed\":false,\"violations\":[[\"id-sentinel\",\"a key must not be empty or the phi atom\"]]}");
-            return Some(Ok(r));
+            return Some(Ok((r, None)));
         }
     }
     // a create:<ft> handler cell serves BOTH shapes now (phase two done):
@@ -4865,6 +4864,7 @@ fn native_apply(args: &J, apps: &Apps, srv: &mut Srv) -> Option<Result<String, (
             }
         }
     }
+    let mut committed_event: Option<(String, Vec<J>)> = None;
     if !refused {
         // retain D' as the resident store, then run the native derive bounded
         // to the written fact type (Registry.apply's run_rules(D2,
@@ -4878,18 +4878,7 @@ fn native_apply(args: &J, apps: &Apps, srv: &mut Srv) -> Option<Result<String, (
         let _ = op_run_rules(&derive_req, srv);
         // persist natively: the committed step to the event log, then the
         // store sidecar refreshed so a fresh resident boots the written store
-        if let Err(e) = append_event(apps, &app, &ft, &fact) {
-            return Some(Err((
-                -32603,
-                format!("native apply committed but could not append the event log: {}", e),
-            )));
-        }
-        if let Err(e) = write_sidecar(apps, &app, srv) {
-            return Some(Err((
-                -32603,
-                format!("native apply committed but could not write the store sidecar: {}", e),
-            )));
-        }
+committed_event = Some((ft.clone(), fact.clone()));
     }
     // the receipt, protocol.py Registry.apply's shape and key order, compact
     // like the delegated path (run_cli re-serializes the CLI receipt the same
@@ -4915,7 +4904,7 @@ fn native_apply(args: &J, apps: &Apps, srv: &mut Srv) -> Option<Result<String, (
         write_v(v, &mut r);
     }
     r.push_str("]}");
-    Some(Ok(r))
+    Some(Ok((r, committed_event)))
 }
 
 // A tool call answers its bare JSON, or a JSON-RPC error pair: -32601 names
@@ -4925,6 +4914,38 @@ thread_local! {
     // (protocol.Registry.last_receipt's analog)
     static LAST_RECEIPT: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "host")]
+fn native_apply(args: &J, apps: &Apps, srv: &mut Srv) -> Option<Result<String, (i64, String)>> {
+    // the target app must be the retained store; a write to any other app
+    // delegates, exactly as the delegated path only reloads the current app
+    let app = match jget(args, "app") {
+        Some(J::S(a)) => a.clone(),
+        _ => return None,
+    };
+    if apps.current.as_deref() != Some(app.as_str()) {
+        return None;
+    }
+    match apply_core(args, &app, srv)? {
+        Ok((receipt, committed)) => {
+            if let Some((ft, fact)) = committed {
+                // persist natively: the committed step to the event log,
+                // then the store sidecar refreshed so a fresh resident
+                // boots the written store
+                if let Err(e) = append_event(apps, &app, &ft, &fact) {
+                    return Some(Err((-32603,
+                        format!("committed but the event log write failed: {}", e))));
+                }
+                if let Err(e) = write_sidecar(apps, &app, srv) {
+                    return Some(Err((-32603,
+                        format!("committed but the sidecar write failed: {}", e))));
+                }
+            }
+            Some(Ok(receipt))
+        }
+        Err(e) => Some(Err(e)),
+    }
 }
 
 #[cfg(feature = "host")]
@@ -5895,6 +5916,24 @@ mod worker {
     }
 
     use std::cell::RefCell;
+
+    // the base + override registries install once per isolate — the
+    // native binaries do this in main(); the wasm entries must do it
+    // themselves or every handler body evaluates against empty
+    // registers and reads as refused (the local-smoke lesson).
+    fn ensure_base() {
+        thread_local! {
+            static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        INIT.with(|i| {
+            if !i.get() {
+                register_base();
+                register_overrides();
+                i.set(true);
+            }
+        });
+    }
+
     thread_local! {
         // wasm is single-threaded: ONE retained store per Worker
         // instance, loaded once and served by the same store_call the
@@ -5911,6 +5950,7 @@ mod worker {
 
     #[wasm_bindgen]
     pub fn arest_load(store_json: &str) -> String {
+        ensure_base();
         match parse_json(store_json) {
             Some(payload) if jget(&payload, "d").is_some() => {
                 WSRV.with(|s| handle(&payload, &mut s.borrow_mut(), true))
@@ -5921,6 +5961,7 @@ mod worker {
 
     #[wasm_bindgen]
     pub fn arest_call(tool: &str, args_json: &str) -> String {
+        ensure_base();
         let args = match parse_json(args_json) {
             Some(a) => a,
             None => return "{\"error\":\"unparseable args\"}".to_string(),
@@ -5942,7 +5983,60 @@ mod worker {
     }
 
     #[wasm_bindgen]
+    pub fn arest_apply(args_json: &str) -> String {
+        ensure_base();
+        // the write path: apply_core evaluates and commits to the
+        // RETAINED store; the COMMITTED EVENT rides the envelope for
+        // the caller to append to its Durable Object stream — the
+        // single-writer cell (Def. iso), worker storage edition.
+        let args = match parse_json(args_json) {
+            Some(a) => a,
+            None => return "{\"error\":\"unparseable args\"}".to_string(),
+        };
+        WSRV.with(|s| {
+            let mut srv = s.borrow_mut();
+            match apply_core(&args, "worker", &mut srv) {
+                Some(Ok((receipt, committed))) => {
+                    let mut out = String::from("{\"receipt\":");
+                    out.push_str(&receipt);
+                    out.push_str(",\"event\":");
+                    match committed {
+                        Some((ft, fact)) => {
+                            out.push_str("{\"ft\":");
+                            esc(&ft, &mut out);
+                            out.push_str(",\"fact\":[");
+                            for (i, f) in fact.iter().enumerate() {
+                                if i > 0 { out.push(','); }
+                                match f {
+                                    J::S(v) => esc(v, &mut out),
+                                    J::I(n) => out.push_str(&n.to_string()),
+                                    _ => out.push_str("null"),
+                                }
+                            }
+                            out.push_str("]}");
+                        }
+                        None => out.push_str("null"),
+                    }
+                    out.push('}');
+                    out
+                }
+                Some(Err((code, msg))) => {
+                    let mut out = String::from("{\"error\":");
+                    esc(&msg, &mut out);
+                    out.push_str(",\"code\":");
+                    out.push_str(&code.to_string());
+                    out.push('}');
+                    out
+                }
+                None => "{\"error\":\"this write needs the compiler host\"}"
+                    .to_string(),
+            }
+        })
+    }
+
+    #[wasm_bindgen]
     pub fn arest_eval(f_json: &str, x_json: &str) -> String {
+        ensure_base();
         let f = match parse_json(f_json) {
             Some(v) => j_to_n(&v),
             None => return "{\"error\":\"unparseable f\"}".to_string(),

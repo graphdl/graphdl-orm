@@ -16,6 +16,8 @@
 //                                 Worker is read-only until the write
 //                                 story lands; 501 meanwhile)
 import init, { arest_load, arest_call } from "./arest_core.js";
+import wasmModule from "./arest_core_bg.wasm";
+import SIDECAR from "./sidecar.js";
 
 const PLURAL = {}; // e.g. { order: "orders" } — inverse applied on route parse
 
@@ -23,8 +25,9 @@ let ready = null;
 async function ensure(env) {
   if (!ready) {
     ready = (async () => {
-      await init();
-      const sidecar = env.SIDECAR_JSON ?? (await env.STORE.get("sidecar"));
+      await init(wasmModule);
+      const sidecar =
+        env?.SIDECAR_JSON ?? (env?.STORE ? await env.STORE.get("sidecar") : null) ?? SIDECAR;
       arest_load(sidecar);
     })();
   }
