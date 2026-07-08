@@ -127,9 +127,12 @@ sealed class Shell
     readonly Cli cli;
     readonly string app;
     string noun;
+    readonly bool single;
     readonly Window window = new();
     readonly Pane master = new();
     readonly Pane detail = new();
+    ColumnDefinition masterCol = null!;
+    ColumnDefinition splitCol = null!;
     readonly TextBlock status = new()
     { Padding = new Thickness(6, 3, 6, 3), Background = Defaults.HeaderBg };
 
@@ -137,11 +140,12 @@ sealed class Shell
     // Register/Resolve seam as kernel.register_form("control:<role>")
     readonly Dictionary<string, Func<JsonElement, UIElement>> controls;
 
-    public Shell(Cli cli, string app, string noun)
+    public Shell(Cli cli, string app, string noun, bool single = false)
     {
         this.cli = cli;
         this.app = app;
         this.noun = noun;
+        this.single = single;
         controls = new()
         {
             ["control:list"] = RenderListControl,
@@ -168,10 +172,11 @@ sealed class Shell
         }
 
         var grid = new Grid();
-        grid.ColumnDefinitions.Add(new ColumnDefinition
-        { Width = new GridLength(1, GridUnitType.Star) });
-        grid.ColumnDefinitions.Add(new ColumnDefinition
-        { Width = GridLength.Auto });
+        masterCol = new ColumnDefinition
+        { Width = new GridLength(1, GridUnitType.Star) };
+        splitCol = new ColumnDefinition { Width = GridLength.Auto };
+        grid.ColumnDefinitions.Add(masterCol);
+        grid.ColumnDefinitions.Add(splitCol);
         grid.ColumnDefinitions.Add(new ColumnDefinition
         { Width = new GridLength(2.5, GridUnitType.Star) });
         Grid.SetColumn(master, 0);
@@ -191,7 +196,33 @@ sealed class Shell
         dock.Children.Add(grid);
         window.Content = dock;
         RenderList();
+        // ADAPTIVE RENDERING: auto by width (FormFactor.SplitView's
+        // rule), --single forces one pane; the detail covers the
+        // master when narrow, Back restores it
+        window.SizeChanged += (_, _) => ApplyMode();
+        ApplyMode();
         return window;
+    }
+
+    bool IsSplit() => !single && window.ActualWidth >= 680;
+
+    void ApplyMode()
+    {
+        if (masterCol == null) return;
+        bool split = IsSplit();
+        bool detailShowing = detail.Content != null;
+        if (split || !detailShowing)
+        {
+            master.Visibility = Visibility.Visible;
+            masterCol.Width = new GridLength(1, GridUnitType.Star);
+            splitCol.Width = GridLength.Auto;
+        }
+        else
+        {
+            master.Visibility = Visibility.Collapsed;
+            masterCol.Width = new GridLength(0);
+            splitCol.Width = new GridLength(0);
+        }
     }
 
     void Status(string s) => status.Text = s;
@@ -271,6 +302,18 @@ sealed class Shell
     {
         var got = cli.Get(noun, id);
         var panel = new DockPanel();
+        var bar = new StackPanel
+        { Orientation = Orientation.Horizontal };
+        var back = new Button
+        { Content = "\u25C0 Back", Margin = new Thickness(3), Padding = new Thickness(8, 2, 8, 2) };
+        back.Click += (_, _) =>
+        {
+            detail.Pop();
+            ApplyMode();                    // empty detail restores master
+        };
+        bar.Children.Add(back);
+        DockPanel.SetDock(bar, Dock.Top);
+        panel.Children.Add(bar);
         var acts = cli.Actions(noun, id);
         if (acts.TryGetProperty("status", out var st)
             && st.ValueKind == JsonValueKind.String)
@@ -297,6 +340,7 @@ sealed class Shell
         }
         panel.Children.Add(controls["control:detail"](got));
         detail.Push(panel);
+        ApplyMode();                        // single pane: detail covers
     }
 
     // -- THE ABSTRACT ENGINE over a Canvas (the WPF read's contract:
@@ -525,7 +569,8 @@ static class Program
         var noun = args.Length > 2 && !args[2].StartsWith("--")
             ? args[2] : nouns[0];
         var app = new Application();
-        var shell = new Shell(cli, args[1], noun);
+        var shell = new Shell(cli, args[1], noun,
+                              single: args.Contains("--single"));
         var window = shell.Build(nouns);
         if (args.Contains("--probe"))
         {
