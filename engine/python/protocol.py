@@ -1317,6 +1317,31 @@ def _translator_impl(fn):
     return impl
 
 
+_FED_FETCH_OVERRIDE = None
+
+
+def set_federated_fetch(fn):
+    """Swap the row-fetch with a fixture twin (tests); None restores."""
+    global _FED_FETCH_OVERRIDE
+    _FED_FETCH_OVERRIDE = fn
+
+
+def _fed_fetch(url, headers):
+    """GET url with headers, answering parsed JSON (the noun-backed
+    row fetch; ClickHouse FORMAT JSON answers {data:[...]}). Distinct
+    from httpFetch (vocabulary imports, no headers)."""
+    if _FED_FETCH_OVERRIDE is not None:
+        return _FED_FETCH_OVERRIDE(url, headers)
+    from urllib.request import urlopen, Request
+    try:
+        req = Request(url, headers={
+            "User-Agent": "pyarest-federation/0.1", **headers})
+        with urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return None                      # OWA: unreachable = empty
+
+
 def register_bindings():
     """Register the federation names into DEFS. Idempotent; call again to restore the
     real bindings after a test swapped them."""
@@ -1848,12 +1873,93 @@ class Registry:
             return sorted(system.ft_view(D, fact_type, system.rmap_partition(D)))
         return [tuple(r) for r in system._pop_rows(D, fact_type)]
 
+    _FED_MEMO = {}
+    _FED_TTL = 60.0
+
+    def _federated_refresh(self, name, noun, D):
+        """The noun-backed demand fetch (contact-federation.md's
+        contract; framework 08-federation): a noun backed by an
+        External System refreshes ITS population on read — never bulk,
+        never unprompted (the federation rule). The fetch is the
+        DEFS-registered federatedFetch (tests swap it with a fixture
+        twin); columns map to <Noun>_has_<Field> fact types (the
+        has-only ingest symmetry); rows land through the migrate bulk
+        path; provenance lands as federatedFrom citations."""
+        import time as _t
+        backed = next((r[1] for r in system._pop_rows(
+            D, "Noun_is_backed_by_External_System")
+            if len(r) >= 2 and r[0] == noun), None)
+        if backed is None:
+            return D
+        key = (name, noun)
+        now = _t.time()
+        hit = Registry._FED_MEMO.get(key)
+        if hit is not None and now - hit[0] < Registry._FED_TTL:
+            return hit[1]                # the refreshed D, TTL-fresh
+        sysrows = {r[1]: r[2] for r in system._pop_rows(
+            D, "External_System_has_URL") if False}
+        def _prop(ft):
+            return {r[0]: r[1] for r in system._pop_rows(D, ft)
+                    if len(r) >= 2}
+        urls = _prop("External_System_has_URL")
+        headers = _prop("External_System_has_Header")
+        prefixes = _prop("External_System_has_Prefix")
+        uris = _prop("Noun_has_URI")
+        base = urls.get(backed)
+        uri = uris.get(noun)
+        if not base or not uri:
+            return D
+        import os as _os
+        import re as _re
+        secret = _os.environ.get(
+            "AREST_SECRET_" + _re.sub(r"[^0-9A-Za-z]+", "_",
+                                      backed).upper())
+        hdrs = {}
+        if headers.get(backed) and secret:
+            hdrs[headers[backed]] = (
+                (prefixes.get(backed, "") + " " + secret).strip())
+        from .defs import latest as _latest
+        from . import defs as _defs
+        payload = _fed_fetch(base + uri, hdrs)
+        if not isinstance(payload, dict):
+            return D
+        data = payload.get("data") or []
+        noun_id = _re.sub(r"[^0-9A-Za-z]+", "_", noun).strip("_")
+        by_ft = {}
+        ids = []
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            rid = str(row.get("id", "")).strip()
+            if not rid or rid == "φ":
+                continue
+            ids.append(rid)
+            for col, val in row.items():
+                if col == "id" or val in (None, ""):
+                    continue
+                ft = noun_id + "_has_" + _re.sub(
+                    r"[^0-9A-Za-z]+", "_", str(col)).strip("_")
+                by_ft.setdefault(ft, []).append([rid, str(val)])
+        if not by_ft:
+            Registry._FED_MEMO[key] = (now, D)
+            return D
+        entries = [{"op": "migrate", "ft": ft, "facts": rows}
+                   for ft, rows in sorted(by_ft.items())]
+        D = persist.replay_entries(D, entries)
+        cites = {tuple(r) for r in system._pop_rows(D, "federatedFrom")}
+        cites |= {(rid, backed) for rid in ids}
+        D = _ap(ast.Store("federatedFrom"),
+                _S(to_lam(tuple(sorted(cites))), D))
+        D = system.run_rules(D)
+        Registry._FED_MEMO[key] = (now, D)
+        return D
+
     def entities(self, name, noun):
         """The noun's population for the UI containers: its own table's
         keys unioned with the role-1 keys of every fact type it heads —
         a fresh compile carries pops before any table cell
         materializes, and an entity is an entity by playing a fact."""
-        D = self._load(name)
+        D = self._federated_refresh(name, noun, self._load(name))
         keys = {str(r[0]) for r in system._pop_rows(D, noun) if r}
         for r in system._pop_rows(D, "role"):
             if len(r) >= 4 and r[2] == 1 and r[3] == noun:
@@ -1867,7 +1973,7 @@ class Registry:
         ContentCell bindings: text from the noun's first binary fact
         type population (one pop read), value from the machine column
         when governed. One home; both desktop containers read it."""
-        D = self._load(name)
+        D = self._federated_refresh(name, noun, self._load(name))
         ids = self.entities(name, noun)
         text_ft = next(
             (r[1] for r in sorted(system._pop_rows(D, "role"))
@@ -1889,7 +1995,7 @@ class Registry:
         """The 3NF per-entity view envelope; the view itself is get_view,
         the certified-equal override of the canon definition."""
         from . import ddl
-        D = self._load(name)
+        D = self._federated_refresh(name, noun, self._load(name))
         seen, fields, facts = ddl.get_view(D, noun, entity_id)
         return {"app": name, "noun": noun, "id": entity_id,
                 "exists": bool(seen), "fields": fields,
