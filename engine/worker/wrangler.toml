@@ -9,6 +9,12 @@ name = "arest-worker"
 main = "worker.js"
 compatibility_date = "2026-07-01"
 
+# the support site rides this worker (Samuel 2026-07-08: the first
+# production consumer of the abstract UI at the edge)
+routes = [
+  { pattern = "support.auto.dev/*", zone_name = "auto.dev" }
+]
+
 # the store: either a KV binding holding the sidecar payload under
 # the key "sidecar", or an inline var for small apps
 # [[kv_namespaces]]
