@@ -20,6 +20,8 @@
 //! newline-delimited JSON-RPC 2.0 over stdio against an apps directory of
 //! persisted stores; see "the MCP binding" below.
 
+mod uilayout;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Read;
