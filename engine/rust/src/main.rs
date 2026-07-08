@@ -6225,6 +6225,182 @@ mod worker {
     }
 
     #[wasm_bindgen]
+    pub fn arest_ingest(entries_json: &str) -> String {
+        // the bulk federated ingest: [{ft, facts:[[id, val], ...]}, ...]
+        // — one pass over the V-side store, absorbed routing per
+        // rmapColumns, pops unioned, mirror refreshed ONCE (coherence)
+        ensure_base();
+        let entries = match parse_json(entries_json) {
+            Some(J::A(es)) => es,
+            _ => return "{\"error\":\"entries must be an array\"}".to_string(),
+        };
+        WSRV.with(|s| {
+            let mut srv = s.borrow_mut();
+            let mut cells: Vec<(String, V)> = cells_of(&srv.d)
+                .into_iter()
+                .filter_map(|(k, v)| leaf_str(&std::rc::Rc::new(k))
+                    .map(|n| (n, v)))
+                .collect();
+            let find = |cells: &Vec<(String, V)>, name: &str| -> Option<usize> {
+                cells.iter().position(|(k, _)| k == name)
+            };
+            // rmapColumns: (table, pos, ft) — the absorbed routing map
+            let mut route: std::collections::HashMap<String, (String, i64)> =
+                std::collections::HashMap::new();
+            let mut widths: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            if let Some(i) = find(&cells, "rmapColumns") {
+                for r in items(&list_of(&cells[i].1)) {
+                    let it = items(&list_of(&r));
+                    if it.len() >= 3 {
+                        if let (Some(t), Some(pv), Some(f)) =
+                            (aval(&it[0]), aval(&it[1]), aval(&it[2]))
+                        {
+                            if let (Leaf::S(ts), Leaf::I(pi), Leaf::S(fs)) =
+                                (&*t, &*pv, &*f)
+                            {
+                                route.insert(fs.clone(), (ts.clone(), *pi));
+                                let w = widths.entry(ts.clone()).or_insert(0);
+                                if *pi > *w {
+                                    *w = *pi;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let sat = |s: &str| atom(Leaf::S(s.to_string()));
+            let mut ingested = 0usize;
+            for e in &entries {
+                let ft = match jget(e, "ft") {
+                    Some(J::S(f)) => f.clone(),
+                    _ => continue,
+                };
+                let facts = match jget(e, "facts") {
+                    Some(J::A(fs)) => fs,
+                    _ => continue,
+                };
+                // union into the ft pop
+                let mut pop: Vec<V> = match find(&cells, &ft) {
+                    Some(i) => items(&list_of(&cells[i].1)),
+                    None => Vec::new(),
+                };
+                let vkey = |v: &V| -> String {
+                    let mut s = String::new();
+                    write_v(v, &mut s);
+                    s
+                };
+                let mut seen: std::collections::HashSet<String> =
+                    pop.iter().map(|p| vkey(p)).collect();
+                for f in facts {
+                    let row: Vec<V> = match f {
+                        J::A(cols) => cols
+                            .iter()
+                            .map(|c| match c {
+                                J::S(s) => sat(s),
+                                J::I(i) => atom(Leaf::I(*i)),
+                                _ => sat(""),
+                            })
+                            .collect(),
+                        _ => continue,
+                    };
+                    if row.is_empty() {
+                        continue;
+                    }
+                    let rv = seq(from_vec(row.clone()));
+                    let mut wrote = false;
+                    let rk = vkey(&rv);
+                    if !seen.contains(&rk) {
+                        seen.insert(rk);
+                        pop.push(rv);
+                        wrote = true;
+                    }
+                    // absorbed routing: land on the table row + index
+                    if let Some((table, pos)) = route.get(&ft) {
+                        let width = *widths.get(table).unwrap_or(pos);
+                        let key = match aval(&row[0]) {
+                            Some(l) => match &*l {
+                                Leaf::S(s) => s.clone(),
+                                Leaf::I(i) => i.to_string(),
+                                _ => continue,
+                            },
+                            None => continue,
+                        };
+                        let val = if row.len() >= 2 {
+                            row[1].clone()
+                        } else {
+                            sat("T")
+                        };
+                        let rc = format!("{}:{}", table, key);
+                        let mut rowv: Vec<V> = match find(&cells, &rc) {
+                            Some(i) => items(&list_of(&cells[i].1)),
+                            None => Vec::new(),
+                        };
+                        if rowv.is_empty() {
+                            rowv.push(sat(&key));
+                            while (rowv.len() as i64) < width {
+                                rowv.push(sat("#"));
+                            }
+                        }
+                        while (rowv.len() as i64) < width {
+                            rowv.push(sat("#"));
+                        }
+                        let idx = (*pos as usize).saturating_sub(1);
+                        if idx < rowv.len() {
+                            rowv[idx] = val;
+                        }
+                        let rvv = seq(from_vec(rowv));
+                        match find(&cells, &rc) {
+                            Some(i) => cells[i].1 = rvv,
+                            None => cells.push((rc, rvv)),
+                        }
+                        // the table index
+                        let mut tbl: Vec<V> = match find(&cells, table) {
+                            Some(i) => items(&list_of(&cells[i].1)),
+                            None => Vec::new(),
+                        };
+                        let krow = seq(from_vec(vec![sat(&key)]));
+                        if !tbl.iter().any(|t| {
+                            let ti = items(&list_of(t));
+                            !ti.is_empty()
+                                && aval(&ti[0]).map(|l| matches!(&*l,
+                                    Leaf::S(s) if *s == key))
+                                    .unwrap_or(false)
+                        }) {
+                            tbl.push(krow);
+                            let tv = seq(from_vec(tbl));
+                            match find(&cells, table.as_str()) {
+                                Some(i) => cells[i].1 = tv,
+                                None => cells.push((table.clone(), tv)),
+                            }
+                        }
+                    }
+                    if wrote {
+                        ingested += 1;
+                    }
+                }
+                let pv = seq(from_vec(pop));
+                match find(&cells, &ft) {
+                    Some(i) => cells[i].1 = pv,
+                    None => cells.push((ft, pv)),
+                }
+            }
+            // rebuild D + the native mirror ONCE (the coherence pattern)
+            let triples: Vec<V> = cells
+                .into_iter()
+                .map(|(k, v)| seq(from_vec(vec![
+                    atom(Leaf::S("CELL".to_string())), atom(Leaf::S(k)), v,
+                ])))
+                .collect();
+            srv.d = seq(from_vec(triples));
+            srv.cells = cells_of(&srv.d);
+            srv.nd = v_to_n(&srv.d);
+            srv.ncells = n_cells_of(&srv.nd);
+            format!("{{\"ingested\":{}}}", ingested)
+        })
+    }
+
+    #[wasm_bindgen]
     pub fn arest_apply(args_json: &str) -> String {
         ensure_base();
         // the write path: apply_core evaluates and commits to the

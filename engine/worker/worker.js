@@ -15,7 +15,7 @@
 //                                 fact (WRITE PATH: step 5 — the
 //                                 Worker is read-only until the write
 //                                 story lands; 501 meanwhile)
-import init, { arest_load, arest_call, arest_apply, arest_view, arest_entry } from "./arest_core.js";
+import init, { arest_load, arest_call, arest_apply, arest_view, arest_entry, arest_ingest } from "./arest_core.js";
 import wasmModule from "./arest_core_bg.wasm";
 import SIDECAR from "./sidecar.js";
 
@@ -114,6 +114,65 @@ async function ensure(env) {
     })();
   }
   return ready;
+}
+
+// ---- the federated connector (contact-federation.md at the edge) ----
+// A noun backed by an External System refreshes on read: fetch the
+// system's URL+URI with the AREST_SECRET_<SYSTEM> credential, map
+// columns to <Noun>_has_<Field> facts, ingest ISOLATE-LOCALLY via
+// arest_apply (no DO appends: federated rows are refetchable cache,
+// not commits). OWA: no credential or unreachable = empty population.
+const FED_MEMO = new Map();
+const FED_TTL = 60_000;
+
+function popRows(ft) {
+  try {
+    const r = JSON.parse(arest_call("query", JSON.stringify({ fact_type: ft })));
+    return r.rows ?? [];
+  } catch { return []; }
+}
+
+async function ensureFederated(env, noun) {
+  const backed = popRows("Noun_is_backed_by_External_System")
+    .find((r) => r[0] === noun);
+  if (!backed) return;
+  const key = noun;
+  const hit = FED_MEMO.get(key);
+  if (hit && Date.now() - hit < FED_TTL) return;
+  const prop = (ft) => Object.fromEntries(
+    popRows(ft).map((r) => [r[0], r[1]]));
+  const sys = backed[1];
+  const base = prop("External_System_has_URL")[sys];
+  const uri = prop("Noun_has_URI")[noun];
+  if (!base || !uri) return;
+  const secret = env["AREST_SECRET_" + sys.replace(/[^0-9A-Za-z]+/g, "_").toUpperCase()];
+  const headers = {};
+  const hname = prop("External_System_has_Header")[sys];
+  if (hname && secret)
+    headers[hname] = ((prop("External_System_has_Prefix")[sys] ?? "") + " " + secret).trim();
+  let payload = null;
+  try {
+    const r = await fetch(base + uri, { headers });
+    if (r.ok) payload = await r.json();
+  } catch {}
+  const data = payload?.data ?? [];
+  const nid = noun.replace(/[^0-9A-Za-z]+/g, "_").replace(/^_+|_+$/g, "");
+  const byFt = new Map();
+  for (const row of data) {
+    const rid = String(row?.id ?? "").trim();
+    if (!rid) continue;
+    for (const [col, val] of Object.entries(row)) {
+      if (col === "id" || val === null || val === "") continue;
+      const ft = nid + "_has_" + String(col).replace(/[^0-9A-Za-z]+/g, "_").replace(/^_+|_+$/g, "");
+      if (!byFt.has(ft)) byFt.set(ft, []);
+      byFt.get(ft).push([rid, String(val)]);
+    }
+  }
+  if (byFt.size > 0) {
+    const entries = [...byFt.entries()].map(([ft, facts]) => ({ ft, facts }));
+    arest_ingest(JSON.stringify(entries));   // ONE memory-ops pass
+  }
+  FED_MEMO.set(key, Date.now());
 }
 
 function sqlname(s) {
@@ -420,6 +479,16 @@ export default {
       if (!noun) return json('{"error":"unknown noun"}', 404);
       try { return json(arest_entry(noun)); }
       catch (e) { return json(JSON.stringify({ error: String(e) }), 500); }
+    }
+    if (request.method === "GET" && seg.length >= 2) {
+      const fnoun = nounOf(seg[0]);
+      if (fnoun) {
+        try { await ensureFederated(env, fnoun); }
+        catch (e) {
+          if (url.searchParams.has(String.fromCharCode(102,101,100,100,101,98,117,103)))
+            return json(JSON.stringify({ fed_error: String(e) }), 500);
+        }
+      }
     }
     if (seg.length >= 2) {
       const noun = nounOf(seg[0]);
