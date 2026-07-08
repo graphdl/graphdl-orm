@@ -27,8 +27,9 @@ const PLURAL = {}; // e.g. { order: "orders" } — inverse applied on route pars
 // snapshot (the bundled sidecar) plus this log's tail, replayed at
 // boot exactly like the resident's stream-watermark discipline.
 export class ArestLog {
-  constructor(state) {
+  constructor(state, env) {
     this.state = state;
+    this.env = env;
   }
   async fetch(request) {
     const url = new URL(request.url);
@@ -37,7 +38,27 @@ export class ArestLog {
       const n = (await this.state.storage.get("n")) ?? 0;
       await this.state.storage.put(`e:${String(n).padStart(9, "0")}`, line);
       await this.state.storage.put("n", n + 1);
+      // the KV mirror (do-minimize): SSE and boot read KV, so the DO
+      // is touched only by THIS append — its single-writer commit role
+      if (this.env?.AREST_LOG) {
+        await this.env.AREST_LOG.put(`e:${String(n).padStart(9, "0")}`, line);
+        await this.env.AREST_LOG.put("n", String(n + 1));
+      }
       return new Response(JSON.stringify({ appended: n + 1 }));
+    }
+    if (request.method === "POST" && url.pathname === "/mirror") {
+      // one-time backfill of the KV mirror from the DO's own storage
+      if (!this.env?.AREST_LOG)
+        return new Response('{"error":"no AREST_LOG binding"}', { status: 501 });
+      const n = (await this.state.storage.get("n")) ?? 0;
+      const rows = await this.state.storage.list({ prefix: "e:" });
+      let copied = 0;
+      for (const [k, v] of rows) {
+        await this.env.AREST_LOG.put(k, v);
+        copied++;
+      }
+      await this.env.AREST_LOG.put("n", String(n));
+      return new Response(JSON.stringify({ mirrored: copied, n }));
     }
     if (request.method === "GET" && url.pathname === "/tail") {
       const n = (await this.state.storage.get("n")) ?? 0;
@@ -63,18 +84,32 @@ async function ensure(env) {
         env?.SIDECAR_JSON ?? (env?.STORE ? await env.STORE.get("sidecar") : null) ?? SIDECAR;
       arest_load(sidecar);
       // replay the log tail over the snapshot (a replayed duplicate
-      // reads as refused — D' == D — and changes nothing)
-      if (env?.LOG) {
+      // reads as refused — D' == D — and changes nothing). The KV
+      // mirror serves the tail (do-minimize); the DO is asked only
+      // when the mirror is empty (pre-mirror deployments)
+      let events = null;
+      if (env?.AREST_LOG) {
+        const n = Number(await env.AREST_LOG.get("n"));
+        if (Number.isFinite(n) && n > 0) {
+          events = [];
+          const rows = await env.AREST_LOG.list({ prefix: "e:" });
+          for (const k of rows.keys) {
+            const v = await env.AREST_LOG.get(k.name);
+            if (v) events.push(v);
+          }
+        }
+      }
+      if (events === null && env?.LOG) {
         const id = env.LOG.idFromName("log");
         const stub = env.LOG.get(id);
         const r = await stub.fetch("https://log/tail");
-        const { events } = await r.json();
-        for (const line of events) {
-          try {
-            const e = JSON.parse(line);
-            arest_apply(JSON.stringify({ fact_type: e.ft, fact: e.fact }));
-          } catch {}
-        }
+        events = (await r.json()).events;
+      }
+      for (const line of events ?? []) {
+        try {
+          const e = JSON.parse(line);
+          arest_apply(JSON.stringify({ fact_type: e.ft, fact: e.fact }));
+        } catch {}
       }
     })();
   }
@@ -244,17 +279,32 @@ export default {
       // (append = commit = emit). Last-Event-ID resumes from the log
       // index; the poll is the v0 transport (the DO push upgrade is
       // hardening). Each message is one committed event line.
-      if (!env?.LOG) return json('{"error":"no log binding"}', 501);
-      const idd = env.LOG.idFromName("log");
-      const stub = env.LOG.get(idd);
+      if (!env?.LOG && !env?.AREST_LOG)
+        return json('{"error":"no log binding"}', 501);
+      // do-minimize: the poll reads the KV MIRROR (cheap reads), never
+      // the DO; the DO fallback covers pre-mirror deploys only
+      const stub = env?.LOG ? env.LOG.get(env.LOG.idFromName("log")) : null;
+      const readTail = async (from) => {
+        if (env?.AREST_LOG) {
+          const n = Number(await env.AREST_LOG.get("n")) || 0;
+          const events = [];
+          for (let j = from; j < n; j++) {
+            const v = await env.AREST_LOG.get(
+              "e:" + String(j).padStart(9, "0"));
+            if (v) events.push(v);
+          }
+          return { n, events };
+        }
+        const r = await stub.fetch("https://log/tail?from=" + from);
+        return r.json();
+      };
       let cursor = Number(request.headers.get("last-event-id") ?? 0);
       const enc = new TextEncoder();
       const stream = new ReadableStream({
         async start(controller) {
           controller.enqueue(enc.encode(": arest event stream\n\n"));
           for (let i = 0; i < 55; i++) {          // ~55 s per connection
-            const r = await stub.fetch("https://log/tail?from=" + cursor);
-            const { n, events } = await r.json();
+            const { n, events } = await readTail(cursor);
             let k = cursor;
             for (const line of events) {
               controller.enqueue(enc.encode(
@@ -330,6 +380,13 @@ export default {
       const noun = nounOf(seg[1]);
       if (!noun) return json('{"error":"unknown noun"}', 404);
       return json(arest_call("schema", JSON.stringify({ noun })));
+    }
+    if (request.method === "POST" && url.pathname === "/__mirror") {
+      // one-shot: backfill the KV mirror from the DO log (do-minimize)
+      if (!env?.LOG) return json('{' + String.fromCharCode(34) + 'error' + String.fromCharCode(34) + ':' + String.fromCharCode(34) + 'no log' + String.fromCharCode(34) + '}', 501);
+      const stub = env.LOG.get(env.LOG.idFromName('log'));
+      const r = await stub.fetch('https://log/mirror', { method: 'POST' });
+      return json(await r.text());
     }
     if (request.method === "POST" && seg.length === 1) {
       // POST /{noun}: the whitepaper's create ("A POST /orders request

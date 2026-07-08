@@ -23,6 +23,14 @@ routes = [
 # [vars]
 # SIDECAR_JSON = "{...}"
 
+# the log's KV mirror (worker-do-minimize, Samuel 2026-07-08: DOs are
+# getting expensive — appends WRITE THROUGH here; SSE and boot READ
+# here; the DO is touched only by appends, its irreducible
+# single-writer commit role)
+[[kv_namespaces]]
+binding = "AREST_LOG"
+id = "0cefc55f151b421e9773ef52a073f122"
+
 [[durable_objects.bindings]]
 name = "LOG"
 class_name = "ArestLog"
