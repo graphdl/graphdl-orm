@@ -74,6 +74,11 @@ sealed class Cli(string appsDir, string app)
         [.. Call("entities", noun).EnumerateArray()
             .Select(e => e.GetString()!)];
 
+    public (string id, string text, string value)[] Items(string noun) =>
+        [.. Call("items", noun).EnumerateArray()
+            .Select(r => (r[0].GetString()!, r[1].GetString()!,
+                          r[2].GetString()!))];
+
     public JsonElement Get(string noun, string id) => Call("get", noun, id);
 
     public JsonElement Actions(string noun, string id) =>
@@ -195,7 +200,7 @@ sealed class Shell
     public void RenderList()
     {
         var doc = JsonSerializer.SerializeToElement(
-            cli.Entities(noun).Select(i => new[] { i, i }));
+            cli.Items(noun).Select(r => new[] { r.id, r.text, r.value }));
         var panel = new DockPanel();
         var neu = new Button
         { Content = $"New {noun}", Margin = new Thickness(4) };
@@ -207,21 +212,58 @@ sealed class Shell
         Status($"{app} · {noun}");
     }
 
+    // the shared ContentCell recipe (uicells): ⟨auto | star text |
+    // auto value⟩ over two auto rows, subtext spanning — each cell an
+    // engine-laid Canvas, exactly the tk realization
     UIElement RenderListControl(JsonElement items)
     {
-        var box = new ListBox { BorderThickness = new Thickness(0) };
+        var stack = new StackPanel();
+        const double width = 300;
         foreach (var it in items.EnumerateArray())
         {
-            var id = it[0].GetString();
-            box.Items.Add(new ListBoxItem
-            { Content = id, Tag = id, Height = double.NaN });
+            string id = it[0].GetString()!, text = it[1].GetString()!,
+                value = it.GetArrayLength() > 2 ? it[2].GetString()! : "";
+            var cellCanvas = new Canvas { Width = width };
+            var g = new LayoutGrid
+            {
+                Rows = [new Track(Unit.Auto), new Track(Unit.Auto)],
+                Columns = [new Track(Unit.Auto), new Track(Unit.Star),
+                           new Track(Unit.Auto)],
+                Padding = (16, 10, 16, 10),
+            };
+            var t = new TextBlock
+            { Text = text, TextWrapping = TextWrapping.NoWrap };
+            var s = new TextBlock
+            {
+                Text = id, FontSize = 10.5,
+                Foreground = Defaults.SubText,
+            };
+            g.Add(El(t, cellCanvas, 0, 1, Align.Near, Align.Center,
+                     (0, 0, 0, 0), isLabel: true));
+            g.Add(El(s, cellCanvas, 1, 1, Align.Near, Align.Center,
+                     (0, 0, 0, 0), isLabel: true));
+            if (value.Length > 0)
+            {
+                var v = new TextBlock
+                { Text = value, Foreground = Defaults.SubText };
+                g.Add(El(v, cellCanvas, 0, 2, Align.Far, Align.Center,
+                         (7, 0, 0, 0), isLabel: true));
+            }
+            var (_w, h) = Layout.Perform(
+                g, (width, Defaults.CellHeight),
+                (width, double.PositiveInfinity));
+            cellCanvas.Height = h;
+            var cid = id;
+            cellCanvas.MouseLeftButtonUp += (_, _) => RenderDetail(cid);
+            stack.Children.Add(cellCanvas);
+            stack.Children.Add(new Border
+            {
+                Height = 1,
+                Background = new SolidColorBrush(
+                    Color.FromRgb(0xE4, 0xE4, 0xE4)),
+            });
         }
-        box.SelectionChanged += (_, _) =>
-        {
-            if (box.SelectedItem is ListBoxItem { Tag: string id })
-                RenderDetail(id);
-        };
-        return box;
+        return new ScrollViewer { Content = stack };
     }
 
     // -- the detail pane: fields + the machine menu --

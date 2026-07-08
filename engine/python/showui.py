@@ -144,25 +144,8 @@ class Container:
         return self.reg.entities(self.app, noun)
 
     def items(self, noun):
-        """The list perspective's rows as ⟨id, text, value⟩ — the
-        ContentCell's TextLabel/SubtextLabel/ValueLabel bindings: text
-        from the noun's first binary fact type population (subject-ish,
-        one pop read), value from the machine column when governed."""
-        from . import system
-        D = self.reg._load(self.app)
-        ids = self.entities(noun)
-        text_ft = next(
-            (r[1] for r in sorted(system._pop_rows(D, "role"))
-             if len(r) >= 4 and r[2] == 1 and r[3] == noun
-             and any(len(q) >= 3 and q[1] == r[1] and q[2] == 2
-                     for q in system._pop_rows(D, "role"))), None)
-        texts = {}
-        if text_ft:
-            for r in system._pop_rows(D, text_ft):
-                if len(r) >= 2 and str(r[0]) not in texts:
-                    texts[str(r[0])] = str(r[1])
-        status = dict(system._status_rows(D, noun))
-        return [(i, texts.get(i, i), status.get(i, "")) for i in ids]
+        """The list rows — Registry.items is the one home."""
+        return [tuple(r) for r in self.reg.items(self.app, noun)]
 
     def entity(self, noun, id):
         return self.reg.get(self.app, noun, id)
