@@ -1664,9 +1664,13 @@ class Registry:
         # started-backfill implications are derivation consequents the fold
         # consumes); the machine itself orders the walk. The derive after
         # projects the folded column onto its derived heads (the Task has
-        # Task Status class) before the snapshot
-        D = system.machine_fold(D)
-        D = system.run_rules(D)
+        # Task Status class) before the snapshot — and BOTH skip when the
+        # fold changed nothing (identity answer: no machines, no events,
+        # nothing to init — the common probe-app case pays one fixpoint,
+        # not three; the fold-derive-cost lever's cheap half)
+        D2 = system.machine_fold(D)
+        if D2 is not D:
+            D = system.run_rules(D2)
         # the snapshot records how much of the stream it holds, so a load can
         # replay exactly the tail another host appended after this save
         D = persist._with_watermark(D, len(entries))
