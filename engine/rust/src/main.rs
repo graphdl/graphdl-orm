@@ -915,6 +915,16 @@ fn register_base() {
         }
         atom(Leaf::S(parts.join(&sep)))
     }));
+    // the JSON view emitter (react/Worker target): the element tree
+    // itself, compact JSON. Mirrors python/java/C#.
+    register("render:json", Rc::new(|_mu, o| {
+        let mut out = String::new();
+        if v_json(&o, &mut out) {
+            atom(Leaf::S(out))
+        } else {
+            bot()
+        }
+    }));
     register("slug", Rc::new(|_mu, o| {
         match aval(&o).and_then(|l| leaf_str(&l)) {
             Some(t) => atom(Leaf::S(slug_str(&t))),
@@ -1103,6 +1113,59 @@ fn stage1_rows_of(text: &str, vocab: &[(String, String)], nouns: &[String],
 fn sql_name(s: &str) -> String {
     let t = slug_str(s).to_ascii_lowercase();
     if t.is_empty() { "t".into() } else { t }
+}
+
+// the JSON spelling of a value (render:json, the react/Worker view
+// target): atoms to scalars, seqs to arrays — python json.dumps
+// compact, ensure_ascii=False: only quote, backslash, and C0 controls
+// escape. A pure format transducer (the implode class).
+fn json_escape_into(s: &str, out: &mut String) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn v_json(v: &V, out: &mut String) -> bool {
+    match aval(v) {
+        Some(l) => {
+            match &*l {
+                Leaf::S(s) => json_escape_into(s, out),
+                Leaf::I(i) => out.push_str(&i.to_string()),
+                Leaf::F(f) => out.push_str(&f.to_string()),
+                _ => return false,
+            }
+            true
+        }
+        None => {
+            let it = items(&list_of(v));
+            if isbot(v) {
+                return false;
+            }
+            out.push('[');
+            for (i, e) in it.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                if !v_json(e, out) {
+                    return false;
+                }
+            }
+            out.push(']');
+            true
+        }
+    }
 }
 
 fn slug_str(t: &str) -> String {
@@ -1942,6 +2005,15 @@ impl NEval {
                 }
                 _ => N::Bot,
             },
+            "render:json" => {
+                let v = n_to_v(x);
+                let mut out = String::new();
+                if v_json(&v, &mut out) {
+                    N::A(Rc::new(Leaf::S(out)))
+                } else {
+                    N::Bot
+                }
+            }
             "strip_prefix" => match pairv(x) {
                 Some((N::A(a), N::A(b))) => match (leaf_str(&a), leaf_str(&b)) {
                     (Some(p), Some(s)) => {

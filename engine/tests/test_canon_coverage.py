@@ -31,7 +31,11 @@ BASE = {"id", "tl", "atom", "null", "eq", "apndl", "apndr", "distl",
         "tlr", "rotl", "rotr", "trans", "+", "-", "*", "div", "ge",
         "gt", "le", "lt", "apply"}
 D5 = {"cellkey", "lex", "slug", "implode", "escape_html", "skolem",
-      "strip_prefix", "stage1_fields"}
+      "strip_prefix", "stage1_fields",
+      # the JSON view emitter (2026-07-09): the react/Worker target
+      # consumes the element TREE itself — its "render" is the tree's
+      # JSON spelling, pure format transduction (the implode class)
+      "render:json"}
 # certified-equal overrides: the host name -> the canon DEF of record
 OVERRIDES = {
     "render:html": "system:render_html",

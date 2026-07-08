@@ -148,6 +148,41 @@ static class Reducer
     public static void RegisterAlpha(System.Func<object[], object> s)
         => AlphaOverride = s;
 
+    static bool JsonValue(object x, System.Text.StringBuilder outp)
+    {
+        if (x is string s)
+        {
+            outp.Append('"');
+            foreach (var c in s)
+            {
+                if (c == '"') outp.Append("\\\"");
+                else if (c == '\\') outp.Append("\\\\");
+                else if (c == '\n') outp.Append("\\n");
+                else if (c == '\t') outp.Append("\\t");
+                else if (c == '\r') outp.Append("\\r");
+                else if (c < (char)0x20)
+                    outp.Append("\\u").Append(((int)c).ToString("x4"));
+                else outp.Append(c);
+            }
+            outp.Append('"');
+            return true;
+        }
+        if (x is long l) { outp.Append(l); return true; }
+        if (x is double d) { outp.Append(d); return true; }
+        if (x is object[] xs)
+        {
+            outp.Append('[');
+            for (var i = 0; i < xs.Length; i++)
+            {
+                if (i > 0) outp.Append(',');
+                if (!JsonValue(xs[i], outp)) return false;
+            }
+            outp.Append(']');
+            return true;
+        }
+        return false;
+    }
+
     static bool EqObj(object a, object b)
     {
         if (a is object[] sa && b is object[] sb)
@@ -464,6 +499,14 @@ static class Reducer
                     s1out[i] = new object[] { r[0], new object[] { r[1], r[2] } };
                 }
                 return s1out;
+            }
+            case "render:json":
+            {
+                // the JSON view emitter (react/Worker target): the
+                // element tree itself, compact JSON. Mirrors the twins.
+                var outp = new System.Text.StringBuilder();
+                if (!JsonValue(x, outp)) return Bot.Value;
+                return outp.ToString();
             }
             case "strip_prefix":
             {

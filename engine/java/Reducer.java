@@ -127,6 +127,38 @@ public class Reducer {
     static volatile AlphaStrategy ALPHA_OVERRIDE = null;
     public static void registerAlpha(AlphaStrategy s) { ALPHA_OVERRIDE = s; }
 
+    static boolean jsonValue(Object x, StringBuilder out) {
+        if (x instanceof String) {
+            String s = (String) x;
+            out.append('"');
+            for (int i = 0; i < s.length(); i++) {
+                char c = s.charAt(i);
+                if (c == '"') out.append("\\\"");
+                else if (c == '\\') out.append("\\\\");
+                else if (c == '\n') out.append("\\n");
+                else if (c == '\t') out.append("\\t");
+                else if (c == '\r') out.append("\\r");
+                else if (c < 0x20) out.append(String.format("\\u%04x", (int) c));
+                else out.append(c);
+            }
+            out.append('"');
+            return true;
+        }
+        if (x instanceof Long) { out.append(x.toString()); return true; }
+        if (x instanceof Double) { out.append(x.toString()); return true; }
+        if (x instanceof Object[]) {
+            Object[] xs = (Object[]) x;
+            out.append('[');
+            for (int i = 0; i < xs.length; i++) {
+                if (i > 0) out.append(',');
+                if (!jsonValue(xs[i], out)) return false;
+            }
+            out.append(']');
+            return true;
+        }
+        return false;
+    }
+
     static boolean eqObj(Object a, Object b) {
         if (isSeq(a) && isSeq(b)) {
             Object[] sa = (Object[]) a, sb = (Object[]) b;
@@ -377,6 +409,13 @@ public class Reducer {
                 outRows[i] = new Object[]{r[0], new Object[]{r[1], r[2]}};
             }
             return val(outRows);
+        }
+        if (name.equals("render:json")) {
+            // the JSON view emitter (react/Worker target): the element
+            // tree itself, compact JSON. Mirrors python/rust/C#.
+            StringBuilder out = new StringBuilder();
+            if (!jsonValue(x, out)) return val(BOT);
+            return val(out.toString());
         }
         if (name.equals("strip_prefix")) {
             // the prefix-strip base op (spec D5, generic string algebra

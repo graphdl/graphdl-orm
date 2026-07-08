@@ -134,3 +134,12 @@ def test_the_list_view_projects_id_caption_rows():
                    (("item", "t1", "fix the door"),
                     ("item", "t2", "paint it")))
     assert from_lam(apply(A("system:view_list"), to_lam(()))) == ("list", ())
+
+def test_the_json_render_emits_the_tree_itself():
+    # the react target (binding doctrine): components consume the
+    # element TREE; render:json is the tree as compact JSON, a pure
+    # transducer beside render:html
+    menu = to_lam(("menu", (("button", "finish", "completed"),)))
+    got = from_lam(apply(A("render:json"), menu))
+    assert got == '["menu",[["button","finish","completed"]]]'
+

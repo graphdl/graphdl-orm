@@ -1760,6 +1760,39 @@ def _strip_prefix_impl(mu):
     return g
 
 
+# The JSON view emitter — the react/Worker render target (the binding
+# doctrine: a react component consumes the element TREE + the apply
+# endpoint and nothing else, so the "render" is the tree itself as
+# JSON — a pure transducer beside render:html, no widget knowledge).
+def _render_json_impl(mu):
+    from . import defs as _d
+    import pyarest.lam as L
+    import json
+
+    def _plain(o):
+        v = _d._aval(o)
+        if v is not None and not isinstance(v, tuple):
+            return v
+        it = _d._items(L._list(o))
+        return [_plain(x) for x in it]
+
+    def g(o):
+        try:
+            return L.atom(json.dumps(_plain(o), ensure_ascii=False,
+                                     separators=(",", ":")))
+        except Exception:
+            return L.BOT
+    return g
+
+
+def _register_render_json():
+    from .defs import register
+    register("render:json", _render_json_impl)
+
+
+_register_render_json()
+
+
 def _register_strip_prefix():
     from .defs import register
     register("strip_prefix", _strip_prefix_impl)

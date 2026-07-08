@@ -106,5 +106,9 @@ DEF("case:entity-view-canonical",
              S3(A("CELL"), A("Task_has_Task_Priority"),
                 S2(S2(A("t1"), A("p0")), S2(A("t1"), A("p2")))))))),
 
+DEF("case:render-json-tree",
+    S2(A("render:json"),
+       S2(A("menu"), S1(S3(A("button"), A("finish"), A("completed")))))),
+
 DEF("case:render-menu-canonical", S2(A("system:render_html"), S2(A("menu"), S1(S3(A("button"), A("go"), A("done"))))))
 )
