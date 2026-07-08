@@ -123,3 +123,12 @@ Person 'p2' holds Rank 'fellow'.
     ranks = dict(con.execute(
         "SELECT person_nr, rank FROM person").fetchall())
     assert ranks["p2"] == "fellow" and ranks["p1"] is None
+
+
+def test_sqlite_reserved_names_are_prefixed():
+    # sqlite reserves sqlite_*; a noun projecting into that namespace
+    # gets the t_ prefix instead of a refused CREATE (the codex app)
+    from pyarest.protocol import _sql_name
+    assert _sql_name("SQLite Fact Base") == "t_sqlite_fact_base"
+    assert _sql_name("sqlite_master") == "t_sqlite_master"
+    assert _sql_name("Order Line") == "order_line"

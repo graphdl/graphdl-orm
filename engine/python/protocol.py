@@ -605,6 +605,11 @@ from . import system
 
 def _sql_name(name):
     s = re.sub(r"[^0-9A-Za-z]+", "_", name).strip("_").lower()
+    # sqlite reserves the sqlite_* namespace for its own schema objects
+    # (the codex app's 'SQLite Fact Base' noun projected to
+    # sqlite_fact_base and the CREATE refused) — prefix our way out
+    if s.startswith("sqlite_"):
+        s = "t_" + s
     return s or "t"
 
 
