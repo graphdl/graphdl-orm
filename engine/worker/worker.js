@@ -187,6 +187,59 @@ export default {
       return null;
     };
 
+    if (request.method === "GET" && seg[0] === "openapi.json") {
+      // OpenAPI 3.1 as a PROJECTION of the schema (Thm hateoas' pledge,
+      // machine-readable: no undocumented endpoints, nothing for an
+      // agent to hallucinate). Paths derive from the nouns; the write
+      // paths from the whitepaper's create + follow-the-action forms.
+      const schema = JSON.parse(arest_call("schema", "{}"));
+      const nouns = (schema.nouns ?? schema.object_types ?? [])
+        .map((n) => (typeof n === "string" ? n : n.name))
+        .filter((n) => n && (typeof n === "string"));
+      const paths = {};
+      for (const n of nouns) {
+        const slug = sqlname(n);
+        paths["/" + slug + "/{id}"] = {
+          get: { summary: "The 3NF representation of a " + n,
+                 parameters: [{ name: "id", in: "path", required: true,
+                                schema: { type: "string" } }],
+                 responses: { "200": { description: "the entity view" } } },
+        };
+        paths["/" + slug + "/{id}/actions"] = {
+          get: { summary: "Status + available transitions (Theorem 4)",
+                 parameters: [{ name: "id", in: "path", required: true,
+                                schema: { type: "string" } }],
+                 responses: { "200": { description: "status and transitions" } } },
+        };
+        paths["/" + slug] = {
+          post: { summary: "Create: the body names the fact",
+                  requestBody: { content: { "application/json": { schema: {
+                    type: "object",
+                    properties: { fact_type: { type: "string" },
+                                  fact: { type: "array",
+                                          items: { type: "string" } } },
+                    required: ["fact_type", "fact"] } } } },
+                  responses: { "201": { description: "committed" },
+                               "422": { description: "refused with violations" } } },
+        };
+        paths["/" + slug + "/{id}/{event}"] = {
+          post: { summary: "Follow a transition offered by the live status",
+                  parameters: [
+                    { name: "id", in: "path", required: true,
+                      schema: { type: "string" } },
+                    { name: "event", in: "path", required: true,
+                      schema: { type: "string" } }],
+                  responses: { "200": { description: "committed" },
+                               "409": { description: "not offered from this status" } } },
+        };
+      }
+      return json(JSON.stringify({
+        openapi: "3.1.0",
+        info: { title: "AREST", version: "0.9.0",
+                description: "Generated projection of the compiled schema — complete and current as a function of P and S (Thm hateoas)." },
+        paths,
+      }));
+    }
     if (request.method === "GET" && seg[0] === "schema" && seg[1]) {
       const noun = nounOf(seg[1]);
       if (!noun) return json('{"error":"unknown noun"}', 404);
