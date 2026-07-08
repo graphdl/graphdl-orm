@@ -257,12 +257,61 @@ sealed class Shell
         detail.Push(panel);
     }
 
+    // -- THE ABSTRACT ENGINE over a Canvas (the WPF read's contract:
+    //    Measure -> FrameworkElement.DesiredSize, place ->
+    //    Canvas.SetLeft/SetTop; text rounds up like iFactr's Label) --
+    static LayoutElement El(FrameworkElement fe, Canvas host,
+                            int row, int col, Align halign, Align valign,
+                            (double, double, double, double) margin,
+                            bool isLabel = false)
+    {
+        host.Children.Add(fe);
+        return new LayoutElement
+        {
+            Measure = (cw, ch) =>
+            {
+                fe.Width = double.NaN;
+                fe.Height = double.NaN;
+                fe.Measure(new Size(cw >= 1e307
+                        ? double.PositiveInfinity : cw,
+                    ch >= 1e307 ? double.PositiveInfinity : ch));
+                return (fe.DesiredSize.Width, fe.DesiredSize.Height);
+            },
+            Place = (x, y, w, h) =>
+            {
+                bool text = fe is TextBlock;
+                fe.Width = text ? Math.Ceiling(w) : w;
+                fe.Height = text ? Math.Ceiling(h) : h;
+                Canvas.SetLeft(fe, x);
+                Canvas.SetTop(fe, y);
+            },
+            Row = row,
+            Col = col,
+            HAlign = halign,
+            VAlign = valign,
+            Margin = margin,
+            IsLabel = isLabel,
+        };
+    }
+
+    UIElement RunLayout(LayoutGrid grid, Canvas canvas)
+    {
+        double width = Math.Max(detail.ActualWidth, 420);
+        var (w, h) = Layout.Perform(grid, (width, 0),
+                                    (width, double.PositiveInfinity));
+        canvas.Width = w;
+        canvas.Height = h;
+        return new ScrollViewer { Content = canvas };
+    }
+
     UIElement RenderDetailControl(JsonElement got)
     {
-        var grid = new Grid { Margin = new Thickness(8) };
-        grid.ColumnDefinitions.Add(new ColumnDefinition
-        { Width = GridLength.Auto });
-        grid.ColumnDefinitions.Add(new ColumnDefinition());
+        var canvas = new Canvas();
+        var grid = new LayoutGrid
+        {
+            Columns = [new Track(Unit.Auto), new Track(Unit.Star)],
+            Padding = (8, 4, 8, 4),
+        };
         int row = 0;
         if (got.TryGetProperty("fields", out var fields))
             foreach (var f in fields.EnumerateObject()
@@ -270,28 +319,22 @@ sealed class Shell
                             (JsonValueKind.True or JsonValueKind.False))
                      .OrderBy(f => f.Name))
             {
-                grid.RowDefinitions.Add(new RowDefinition
-                { Height = GridLength.Auto });
+                grid.Rows.Add(new Track(Unit.Auto));
                 var k = new TextBlock
-                {
-                    Text = f.Name + ":",
-                    FontWeight = FontWeights.Bold,
-                    Margin = new Thickness(0, 2, 8, 2),
-                };
-                Grid.SetRow(k, row); Grid.SetColumn(k, 0);
+                { Text = f.Name + ":", FontWeight = FontWeights.Bold };
                 var v = new TextBlock
                 {
                     Text = f.Value.ValueKind == JsonValueKind.Null
                         ? "" : f.Value.ToString(),
                     TextWrapping = TextWrapping.Wrap,
-                    Margin = new Thickness(0, 2, 0, 2),
                 };
-                Grid.SetRow(v, row); Grid.SetColumn(v, 1);
-                grid.Children.Add(k);
-                grid.Children.Add(v);
+                grid.Add(El(k, canvas, row, 0, Align.Near, Align.Near,
+                            (0, 2, 8, 2)));
+                grid.Add(El(v, canvas, row, 1, Align.Near, Align.Near,
+                            (0, 2, 0, 2), isLabel: true));
                 row++;
             }
-        return new ScrollViewer { Content = grid };
+        return RunLayout(grid, canvas);
     }
 
     UIElement RenderMenuControl(JsonElement acts)
@@ -334,23 +377,24 @@ sealed class Shell
         // answers fact types and the container filters the noun's
         // functional ones (role-1 = noun, binary or unary).
         var schema = cli.Call("schema");
-        var grid = new Grid { Margin = new Thickness(10) };
-        grid.ColumnDefinitions.Add(new ColumnDefinition
-        { Width = GridLength.Auto });
-        grid.ColumnDefinitions.Add(new ColumnDefinition());
+        var canvas = new Canvas();
+        var grid = new LayoutGrid
+        {
+            Columns = [new Track(Unit.Auto), new Track(Unit.Star)],
+            Padding = (10, 6, 10, 6),
+        };
         var inputs = new List<(string ft, bool unary, Func<string> read)>();
         int row = 0;
 
-        void AddRow(string label, UIElement input)
+        void AddRow(string label, FrameworkElement input,
+                    Align halign = Align.Stretch)
         {
-            grid.RowDefinitions.Add(new RowDefinition
-            { Height = GridLength.Auto });
-            var k = new TextBlock
-            { Text = label + ":", Margin = new Thickness(0, 3, 8, 3) };
-            Grid.SetRow(k, row); Grid.SetColumn(k, 0);
-            Grid.SetRow(input, row); Grid.SetColumn(input, 1);
-            grid.Children.Add(k);
-            grid.Children.Add(input);
+            grid.Rows.Add(new Track(Unit.Auto));
+            var k = new TextBlock { Text = label + ":" };
+            grid.Add(El(k, canvas, row, 0, Align.Near, Align.Near,
+                        (0, 3, 8, 3)));
+            grid.Add(El(input, canvas, row, 1, halign, Align.Near,
+                        (0, 3, 0, 3)));
             row++;
         }
 
@@ -367,7 +411,7 @@ sealed class Shell
             {
                 var cb = new CheckBox();
                 inputs.Add((id, true, () => cb.IsChecked == true ? "T" : ""));
-                AddRow(id, cb);
+                AddRow(id, cb, Align.Near);
             }
             else
             {
@@ -377,7 +421,7 @@ sealed class Shell
             }
         }
         var create = new Button
-        { Content = "Create", Margin = new Thickness(0, 10, 0, 0), Padding = new Thickness(10, 4, 10, 4) };
+        { Content = "Create", Padding = new Thickness(10, 4, 10, 4) };
         create.Click += (_, _) =>
         {
             var id = idBox.Text;
@@ -401,11 +445,14 @@ sealed class Shell
             RenderList();
             RenderDetail(id);
         };
-        grid.RowDefinitions.Add(new RowDefinition
-        { Height = GridLength.Auto });
-        Grid.SetRow(create, row); Grid.SetColumn(create, 1);
-        grid.Children.Add(create);
-        top.Content = new ScrollViewer { Content = grid };
+        grid.Rows.Add(new Track(Unit.Auto));
+        grid.Add(El(create, canvas, row, 1, Align.Near, Align.Near,
+                    (0, 10, 0, 0)));
+        var (w, h) = Layout.Perform(grid, (520, 0),
+                                    (520, double.PositiveInfinity));
+        canvas.Width = w;
+        canvas.Height = h;
+        top.Content = new ScrollViewer { Content = canvas };
         top.ShowDialog();
     }
 }
