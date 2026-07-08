@@ -252,7 +252,11 @@ export default {
   async fetch(request, env) {
     const url0 = new URL(request.url);
     if (request.method === "GET" && url0.pathname === "/") {
-      return new Response(INDEX_HTML, {
+      // the site presents as its host (support.auto.dev, not arest)
+      const page = INDEX_HTML
+        .replace(/<title>[^<]*<\/title>/, "<title>" + url0.hostname + "</title>")
+        .replace(/AREST — a fact renders itself/, url0.hostname);
+      return new Response(page, {
         headers: { "content-type": "text/html; charset=utf-8" } });
     }
     await ensure(env);
@@ -384,9 +388,13 @@ export default {
     if (request.method === "POST" && url.pathname === "/__mirror") {
       // one-shot: backfill the KV mirror from the DO log (do-minimize)
       if (!env?.LOG) return json('{' + String.fromCharCode(34) + 'error' + String.fromCharCode(34) + ':' + String.fromCharCode(34) + 'no log' + String.fromCharCode(34) + '}', 501);
-      const stub = env.LOG.get(env.LOG.idFromName('log'));
-      const r = await stub.fetch('https://log/mirror', { method: 'POST' });
-      return json(await r.text());
+      try {
+        const stub = env.LOG.get(env.LOG.idFromName('log'));
+        const r = await stub.fetch('https://log/mirror', { method: 'POST' });
+        return json(await r.text());
+      } catch (e) {
+        return json(JSON.stringify({ error: String(e) }), 500);
+      }
     }
     if (request.method === "POST" && seg.length === 1) {
       // POST /{noun}: the whitepaper's create ("A POST /orders request
