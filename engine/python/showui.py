@@ -143,6 +143,27 @@ class Container:
         (the WPF adapter reads the same verb through the cli)."""
         return self.reg.entities(self.app, noun)
 
+    def items(self, noun):
+        """The list perspective's rows as ⟨id, text, value⟩ — the
+        ContentCell's TextLabel/SubtextLabel/ValueLabel bindings: text
+        from the noun's first binary fact type population (subject-ish,
+        one pop read), value from the machine column when governed."""
+        from . import system
+        D = self.reg._load(self.app)
+        ids = self.entities(noun)
+        text_ft = next(
+            (r[1] for r in sorted(system._pop_rows(D, "role"))
+             if len(r) >= 4 and r[2] == 1 and r[3] == noun
+             and any(len(q) >= 3 and q[1] == r[1] and q[2] == 2
+                     for q in system._pop_rows(D, "role"))), None)
+        texts = {}
+        if text_ft:
+            for r in system._pop_rows(D, text_ft):
+                if len(r) >= 2 and str(r[0]) not in texts:
+                    texts[str(r[0])] = str(r[1])
+        status = dict(system._status_rows(D, noun))
+        return [(i, texts.get(i, i), status.get(i, "")) for i in ids]
+
     def entity(self, noun, id):
         return self.reg.get(self.app, noun, id)
 
@@ -230,7 +251,14 @@ class Container:
         stack = self.stack_for(pane)
         if clear_history:
             stack.views.clear()
-        stack.push(frame)
+        # iApp.Navigate's dedup: a view already ON the stack is popped
+        # TO, never pushed twice — back-behavior stays truthful; the
+        # split-view clearing below still applies (a re-navigated
+        # master invalidates its detail like any master navigation)
+        if frame in stack.views:
+            stack.pop_to(frame)
+        else:
+            stack.push(frame)
         if pane == "master":
             self.stack_for("detail").views.clear()
             self.stack_for("popover").views.clear()
@@ -325,19 +353,52 @@ def _tk_grid_layout(host, grid, width):
 
 
 def _tk_list(parent, tree, ctx):
+    """The list pane as CONTENT CELLS (the shared ContentCell recipe,
+    uicells.content_cell): text star column, the id as subtext, the
+    machine status right-aligned as the value — each cell its own
+    absolutely-laid frame, clicks bound to the selection."""
     import tkinter as tk
+    from .uicells import CELL_HEIGHT, content_cell
+    from .uilayout import INF, perform_layout
     frame = tk.Frame(parent)
-    box = tk.Listbox(frame, width=44, activestyle="dotbox")
-    ids = []
-    for node in tree[1]:
-        if isinstance(node, tuple) and len(node) >= 3 and node[0] == "item":
-            ids.append(str(node[1]))
-            box.insert(tk.END, f"{node[1]}  —  {node[2]}")
-    box.pack(fill=tk.BOTH, expand=True)
-    if ctx.get("on_select"):
-        box.bind("<<ListboxSelect>>",
-                 lambda _e: (box.curselection()
-                             and ctx["on_select"](ids[box.curselection()[0]])))
+    canvas = tk.Canvas(frame, width=300, highlightthickness=0)
+    bar = tk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=bar.set)
+    inner = tk.Frame(canvas)
+    canvas.create_window((0, 0), window=inner, anchor="nw")
+    y = 0
+    width = 300
+    items = ctx.get("items") or [
+        (str(n[1]), str(n[2]), "") for n in tree[1]
+        if isinstance(n, tuple) and len(n) >= 3 and n[0] == "item"]
+    for id, text, value in items:
+        cell = tk.Frame(inner, width=width, bd=0, relief=tk.FLAT)
+        t = tk.Label(cell, text=text, anchor="w",
+                     font=("Segoe UI", 10))
+        s = tk.Label(cell, text=id, anchor="w", fg="#868686",
+                     font=("Segoe UI", 8))
+        widgets = [cell, t, s]
+        kwargs = {"text": (_tk_measure(t, is_text=True), _tk_place(t)),
+                  "subtext": (_tk_measure(s, is_text=True), _tk_place(s))}
+        if value:
+            v = tk.Label(cell, text=value, fg="#868686",
+                         font=("Segoe UI", 9))
+            widgets.append(v)
+            kwargs["value"] = (_tk_measure(v, is_text=True), _tk_place(v))
+        g = content_cell(**kwargs)
+        _w, h = perform_layout(g, (width, CELL_HEIGHT), (width, INF))
+        cell.configure(height=int(h))
+        cell.pack_propagate(False)
+        cell.place(x=0, y=y, width=width, height=int(h))
+        if ctx.get("on_select"):
+            for w in widgets:
+                w.bind("<Button-1>",
+                       lambda _e, i=id: ctx["on_select"](i))
+        y += int(h) + 1
+    inner.configure(width=width, height=y)
+    canvas.configure(scrollregion=(0, 0, width, y))
+    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    bar.pack(side=tk.RIGHT, fill=tk.Y)
     frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     return frame
 

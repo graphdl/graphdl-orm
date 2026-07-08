@@ -132,6 +132,12 @@ def test_the_pane_stack_assigns_and_clears(tmp_path):
     assert c.back("detail") is None
     # the flattened view state walks pane ordinal order
     assert c.stack[0][0] == "tabs" and c.stack[-1][0] == "list"
+    # iApp.Navigate's dedup: navigating to a frame already on the
+    # stack POPS TO it instead of pushing a duplicate
+    c.navigate(("detail", "Ticket", "a"))
+    c.navigate(("detail", "Ticket", "b"))
+    c.navigate(("detail", "Ticket", "a"))
+    assert c.stacks["detail"].views == [("detail", "Ticket", "a")]
 
 
 def test_the_stack_is_keyed_per_tab(tmp_path):
