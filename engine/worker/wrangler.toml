@@ -16,3 +16,11 @@ compatibility_date = "2026-07-01"
 # id = "..."
 # [vars]
 # SIDECAR_JSON = "{...}"
+
+[[durable_objects.bindings]]
+name = "LOG"
+class_name = "ArestLog"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ArestLog"]
