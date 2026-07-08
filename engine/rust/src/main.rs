@@ -5145,6 +5145,29 @@ fn view_trees_json(noun: &str, id: &str, srv: &Srv) -> Result<String, (i64, Stri
     Ok(out)
 }
 
+// THE ENTRY TREE over the wire: system:view_entry over the canon's
+// classification (system:ev_cols), evaluated on the carrier — the
+// per-noun create form; each input's SubmitKey IS its fact type, and
+// the client POSTs one {fact_type, fact} per filled input.
+fn entry_tree_json(noun: &str, srv: &Srv) -> Result<String, (i64, String)> {
+    let ev = NEval {
+        cells: srv.ncells.clone(),
+        process: srv.nprocess.clone(),
+        defs_n: srv.nd.clone(),
+        fuel: std::cell::Cell::new(-1),
+    };
+    let na = |s: &str| N::A(Rc::new(Leaf::S(s.to_string())));
+    let cols = ev.mu(napp(
+        na("system:ev_cols"),
+        nseq(vec![na(noun), srv.nd.clone()]),
+    ));
+    let entry = ev.mu(napp(na("system:view_entry"), cols));
+    let mut out = String::from("{\"views\":[");
+    n_json(&entry, &mut out);
+    out.push_str("]}");
+    Ok(out)
+}
+
 fn store_call(tool: &str, args: &J, app: &str, srv: &mut Srv)
     -> Option<Result<String, (i64, String)>> {
     let _ = app;
@@ -6151,6 +6174,23 @@ mod worker {
         // types back — the >>= over HTTP
         ensure_base();
         WSRV.with(|s| match view_trees_json(noun, id, &s.borrow()) {
+            Ok(r) => r,
+            Err((code, msg)) => {
+                let mut out = String::from("{\"error\":");
+                esc(&msg, &mut out);
+                out.push_str(",\"code\":");
+                out.push_str(&code.to_string());
+                out.push('}');
+                out
+            }
+        })
+    }
+
+    #[wasm_bindgen]
+    pub fn arest_entry(noun: &str) -> String {
+        // the create form's tree; submits POST one fact each
+        ensure_base();
+        WSRV.with(|s| match entry_tree_json(noun, &s.borrow()) {
             Ok(r) => r,
             Err((code, msg)) => {
                 let mut out = String::from("{\"error\":");
