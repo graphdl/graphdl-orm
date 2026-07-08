@@ -50,11 +50,13 @@ def test_the_machine_orders_the_walk():
     assert _statuses(D).get("t2") == "open"
 
 
-def test_an_unfireable_event_no_ops_and_stays_a_row():
+def test_an_unfireable_event_no_ops_but_init_covers_the_player():
     # reopen from initial 'open' cannot fire (write-path no-op
-    # semantics); the event row itself remains a fact
+    # semantics) — the event row remains a fact, and SM init still
+    # materializes the initial for its player (an entity is an entity
+    # by playing a fact)
     D = _fold(MODEL + "Ticket 't3' is reopened.\n")
-    assert "t3" not in _statuses(D)
+    assert _statuses(D).get("t3") == "open"
     assert ("t3",) in {tuple(r) for r in
                        system._pop_rows(D, "Ticket_is_reopened")}
 

@@ -28,7 +28,9 @@ _USAGE = ("usage: cli.py <verb> --apps-dir <dir> <app> [args...]\n"
           " retract <app> <fact_type> <row-json>\n"
           "read verbs: get <app> <noun> <id> | schema <app> | sql <app>"
           " <statement> | explain <app> <id> | validate <app> | verify <app>"
-          " | actions <app> <noun> <id> | synthesize <app> <id>\n")
+          " | actions <app> <noun> <id> | synthesize <app> <id>\n"
+          "desktop: show <app> [noun] — the store as a native window;"
+          " controls resolve through DEFS, events apply facts\n")
 
 # Each read verb names its Registry method and the arity of its trailing
 # arguments; the CLI is a thin delegate, so outputs pass through as the
@@ -68,6 +70,10 @@ def main(argv):
                              default=str))
             return 0
         print(json.dumps(out, default=str))
+        return 0
+    if verb == "show" and len(rest) in (1, 2):
+        from pyarest import showui
+        showui.show(reg, rest[0], rest[1] if len(rest) > 1 else None)
         return 0
     if verb == "call" and len(rest) == 2:
         # the generic form: EVERY first-class verb through the one dispatch

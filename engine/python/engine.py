@@ -2572,10 +2572,12 @@ def machine_fold(D):
         if fired_any and cur != current.get((noun, e)):
             changed.append((sft, e, cur))
     # SM init, the design's second half ("SM init covers the rest"):
-    # every governed entity carried by the noun's own table and holding
-    # no status row materializes the machine's initial. An event-less
-    # compile with no table (unit fixtures) is a no-op; the live table
-    # arrives with the log's bulk installs and replay.
+    # every governed entity with no status row materializes the
+    # machine's initial. The entity source is the noun's own table
+    # UNIONED with the role-1 keys of every fact type the noun heads —
+    # a fresh compile carries pops before any table cell materializes,
+    # and an entity is an entity by playing a fact (an unfireable
+    # event still evidences its player).
     written = {(s, e) for s, e, _c in changed}
     for noun, m in sorted(machines.items()):
         sft = status_fts.get(noun)
@@ -2584,8 +2586,11 @@ def machine_fold(D):
             continue
         have = {r[0] for r in ft_view(D, sft, part)
                 if isinstance(r, tuple) and r}
-        for row in _pop_rows(D, noun):
-            k = row[0] if row else None
+        keys = {r[0] for r in _pop_rows(D, noun) if r}
+        for r in _pop_rows(D, "role"):
+            if len(r) >= 4 and r[2] == 1 and r[3] == noun and r[1] != sft:
+                keys |= {x[0] for x in _pop_rows(D, r[1]) if x}
+        for k in sorted(keys, key=str):
             if (k and k not in ("", "φ") and k not in have
                     and (sft, k) not in written):
                 written.add((sft, k))

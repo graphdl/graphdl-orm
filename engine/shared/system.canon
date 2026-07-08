@@ -5532,6 +5532,14 @@ DEF("system:view_list",
        S2(A("ALPHA"),
           S4(A("CONS"), K(A("item")), N(1), N(2))))),
 
+"THE ENTRY VIEW (2026-07-08, the abstract UI's create perspective — iFactr's SubmitKey pattern): system:view_entry over the ev_cols classification answers ⟨entry, ⟨⟨input, ft, name, kind⟩…⟩⟩ — one input node per classified column, the fact type ITSELF the node's SubmitKey (a control binds to the fact's function, never to app code). The id input is the container's (eq. (sys): identity addresses the entity; it is not a column).",
+
+DEF("system:view_entry",
+    S3(A("CONS"),
+       K(A("entry")),
+       S2(A("ALPHA"),
+          S5(A("CONS"), K(A("input")), N(1), N(4), N(2))))),
+
 "THE RENDER AS CANON (2026-07-08, the doctrine correction: meaning in canon, boundary for transduction only): system:render_html is the definition of record turning the view trees into semantic html — the kind dispatch, the per-row element construction, and the joins are ALL combinator structure here; the ONLY boundary piece is escape_html (byte-level entity substitution, the lex family). Host render functions are certified-equal performance overrides. The else branch bottoms via tl-of-an-atom (a non-tree input answers no html).",
 
 DEF("system:render_html",
