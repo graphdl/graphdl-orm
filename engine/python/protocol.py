@@ -23,6 +23,7 @@ commit); jsonl carries the log for audit and replication."""
 import json
 import os
 import sqlite3
+import zlib
 
 from . import ast, system
 from .lam import to_lam, from_lam, atom as _A
@@ -49,43 +50,100 @@ def _untuple(v):
     return v
 
 
-# ============================ sqlite: cells one-to-one ========================
-def save_sqlite(D, path, seal_key=None):
-    """Snapshot every cell (fact populations AND definitions — both are data) into a
-    cells table, insertion order preserved (first match wins on load, as in D). With a
-    seal_key, the roles the schema derives as sensitive (seal.plan) are sealed before
-    they touch disk — field-level encryption at rest, mode per constraint."""
+# ==================== sqlite: cells one-to-one, symbols once ==================
+def _sym_encode(doc, index, texts):
+    """Interned encoding: lists stay lists, every LEAF becomes the id of its
+    symbol. Symbol text is the leaf's own JSON, so int/str/bool/float round
+    trip exactly."""
+    if isinstance(doc, list):
+        return [_sym_encode(x, index, texts) for x in doc]
+    key = json.dumps(doc, ensure_ascii=False)
+    i = index.get(key)
+    if i is None:
+        i = len(texts)
+        index[key] = i
+        texts.append(key)
+    return i
+
+
+def _sym_decode(doc, texts):
+    if isinstance(doc, list):
+        return tuple(_sym_decode(x, texts) for x in doc)
+    return json.loads(texts[doc])
+
+
+def save_sqlite(D, path, seal_key=None, compress=None):
+    """Snapshot every cell (fact populations AND definitions — both are data)
+    into a cells table, insertion order preserved (first match wins on load,
+    as in D). SYMBOLS BY DEFAULT (Samuel 2026-07-08): every distinct leaf
+    atom is stored once in a symbols table and cells reference it by id —
+    the cross-cell repetition (hole markers, statuses, the compiled defs'
+    combinator spellings) collapses ~2x, and the db stays join-inspectable.
+    COMPRESSION IS OPT-IN (AREST_DB_COMPRESS=zlib, or the compress kwarg):
+    another ~2.8x on the fleet's boards, at the cost of an opaque contents
+    column. With a seal_key, the roles the schema derives as sensitive
+    (seal.plan) are sealed before they touch disk — field-level encryption
+    at rest, mode per constraint."""
+    if compress is None:
+        compress = os.environ.get("AREST_DB_COMPRESS", "") or "none"
     sealing = seal_plan(D)["roles"] if seal_key else {}
     bycol = {}
     for ((ft, pos), mode) in sealing.items():
         bycol.setdefault(ft, []).append((pos, mode))
     con = sqlite3.connect(path)
     try:
-        # replace, never assume: a pre-existing db (the old engine's, at swap time)
-        # may carry a cells table of another shape; ours is the contract
+        # replace, never assume: a pre-existing db (another format era's)
+        # may carry tables of another shape; ours is the contract
         con.execute("DROP TABLE IF EXISTS cells")
+        con.execute("DROP TABLE IF EXISTS symbols")
+        con.execute("DROP TABLE IF EXISTS format")
         con.execute("CREATE TABLE cells (ord INTEGER PRIMARY KEY, "
                     "name TEXT, contents TEXT)")
+        con.execute("CREATE TABLE symbols (id INTEGER PRIMARY KEY, text TEXT)")
+        con.execute("CREATE TABLE format (key TEXT PRIMARY KEY, value TEXT)")
+        index, texts = {}, []
         for i, c in enumerate(from_lam(D)):
             if isinstance(c, tuple) and len(c) == 3 and c[0] == "CELL":
                 contents = c[2]
                 if seal_key and c[1] in bycol and isinstance(contents, tuple):
                     contents = seal_rows(seal_key, contents, bycol[c[1]])
-                con.execute("INSERT INTO cells (ord, name, contents) VALUES (?, ?, ?)",
-                            (i, json.dumps(c[1]), json.dumps(_conv(contents),
-                                                             ensure_ascii=False)))
+                enc = json.dumps(_sym_encode(_conv(contents), index, texts),
+                                 separators=(",", ":"), ensure_ascii=False)
+                payload = (zlib.compress(enc.encode("utf-8"), 6)
+                           if compress == "zlib" else enc)
+                con.execute("INSERT INTO cells (ord, name, contents) "
+                            "VALUES (?, ?, ?)",
+                            (i, json.dumps(c[1]), payload))
+        con.executemany("INSERT INTO symbols (id, text) VALUES (?, ?)",
+                        list(enumerate(texts)))
+        con.execute("INSERT INTO format (key, value) VALUES ('encoding', "
+                    "'symbolic-v1')")
+        con.execute("INSERT INTO format (key, value) VALUES ('compress', ?)",
+                    (compress,))
         con.commit()
     finally:
         con.close()
 
 
 def load_sqlite(path, seal_key=None):
+    """The symbolic format only — no legacy reads (no paying customers, no
+    legacy): a pre-symbols db raises sqlite's own no-such-table, and the
+    remedy is recompile."""
     con = sqlite3.connect(path)
     try:
         rows = con.execute("SELECT name, contents FROM cells ORDER BY ord").fetchall()
+        texts = [t for (t,) in
+                 con.execute("SELECT text FROM symbols ORDER BY id")]
+        fmt = dict(con.execute("SELECT key, value FROM format"))
     finally:
         con.close()
-    cells = tuple(("CELL", json.loads(n), _untuple(json.loads(c))) for (n, c) in rows)
+
+    def body(c):
+        if fmt.get("compress") == "zlib":
+            c = zlib.decompress(c).decode("utf-8")
+        return _sym_decode(json.loads(c), texts)
+
+    cells = tuple(("CELL", json.loads(n), body(c)) for (n, c) in rows)
     if seal_key:
         cells = tuple(
             (t, n, unseal_rows(seal_key, v)

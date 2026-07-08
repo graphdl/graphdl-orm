@@ -82,5 +82,9 @@ def test_sql_over_the_app(tmp_path):
     _mk_app(root, "t", TASKS)
     reg = apps.Registry(root)
     reg.compile("t")
+    # symbols by default (2026-07-08): cells reference the symbols table;
+    # atom text is reached by the join, which keeps the db inspectable
     rows = reg.sql("t", "SELECT name, contents FROM cells WHERE name LIKE '%Task_has_Status%'")
-    assert rows and "t1" in rows[0][1]
+    assert rows and rows[0][1]
+    syms = reg.sql("t", "SELECT text FROM symbols")
+    assert any("t1" in t for (t,) in syms)
