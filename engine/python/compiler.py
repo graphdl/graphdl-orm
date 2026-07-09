@@ -1005,9 +1005,31 @@ def _h_disjunctive(g, k, m):
 
 def _h_subset(g, k, m):
     ante, cons_txt = g
-    conseq, _, _where = cons_txt.partition(" where ")         # a 'where' join condition, if present
+    conseq, _sep, where = cons_txt.partition(" where ")
+    a_ft = _clause_ft(ante, k)
+    c_ft = _clause_ft(conseq, k)
+    fts = getattr(k, "fts", None) or ()
+    # resolve-or-refuse (the composite-UC discipline, f09449e5): a side
+    # that names no DECLARED fact type refuses loudly — a subset over
+    # phantom cells is a silently unenforced constraint (_clause_ft's
+    # own lesson). A ' where ' join refuses too: this thin path used to
+    # DISCARD it. Both sides resolving to the SAME ft is the
+    # reversed-binding class (a tuple-wise P minus P is vacuously
+    # satisfied, never the symmetry the author meant).
+    if where or a_ft not in fts or c_ft not in fts or a_ft == c_ft:
+        raise ValueError(
+            "subset clause does not resolve to two declared fact types: "
+            f"{ante!r} -> {conseq!r}")
+    # THE ROLE-PROJECTION GATE (set-comparison arc): scoped_subset
+    # compares tuple-wise and the clause context carries no role
+    # signatures yet, so a mint here could silently check the wrong
+    # columns. Refuse until the projection slice lands; delete this
+    # raise with it.
+    raise ValueError(
+        "subset translation awaits role projection (set-comparison arc): "
+        f"{ante!r} -> {conseq!r}")
     return _cs_call("subset", "",
-                    [_clause_ft(ante, k), _clause_ft(conseq, k)],
+                    [a_ft, c_ft],
                     [ante, conseq], m)
 
 def _h_equality(g, k, m):
@@ -1973,9 +1995,14 @@ def compile_model_selfhost(text, D=None, context_from=None):
         if not translators:
             unclassified.append(stmt)
             continue
+        accepted = False
         for t in translators:
             if _dm.latest.get(t, ("",))[0] != "registered":
-                continue                                       # a name M declares, this
+                # a name M declares that this host has not registered is
+                # GRACEFUL ABSENCE (gate three's contract): the surface is
+                # intentionally not present, which is handled, not refused
+                accepted = True
+                continue
             # deontic carries its operator sign through the modality field
             # (deontic:positive = obligatory, deontic:negative = forbidden);
             # the translator impl splits it back before handlers see it
@@ -1989,15 +2016,25 @@ def compile_model_selfhost(text, D=None, context_from=None):
             with _dm.step(D):
                 try:
                     D = _apply(_A(t), operand)                 # rho: dispatch through DEFS
+                    accepted = True
                     if _tr0 is not None:
                         TRACE_STMTS.append(
                             (_time.perf_counter() - _tr0, stmt[:140]))
                 except ValueError:
-                    # a handler REFUSING its statement (unresolved UC
-                    # columns) reports loudly — never a silent vanish
-                    # or a silently narrowed constraint
-                    unclassified.append(stmt)
-                    break
+                    # a handler REFUSING its statement is that handler's
+                    # verdict, never the statement's fate: dispatch
+                    # continues to the next classification's translator
+                    # (the set-comparison arc, 2026-07-09 — the old break
+                    # made every leading-if sentence die at the
+                    # Derivation-Rule-on-'if' recognizer before
+                    # translate_set_constraints could run, and marked
+                    # multi-classified statements unclassified even after
+                    # an earlier translator had ACCEPTED them).
+                    continue
+        if not accepted:
+            # NO translator accepted: reported loudly — never a silent
+            # vanish or a silently narrowed constraint
+            unclassified.append(stmt)
     return D, {"unclassified": unclassified, "prose": prose}
 
 
