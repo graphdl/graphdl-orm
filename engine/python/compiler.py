@@ -188,10 +188,34 @@ def statements(text):
             s = f"{mm.group(1)} {mm.group(2)}."
         buf.append(s)
         if s.endswith("."):
-            out.append(" ".join(buf)); buf = []
+            out.extend(_split_sentences(" ".join(buf))); buf = []
     if buf:
-        out.append(" ".join(buf))
+        out.extend(_split_sentences(" ".join(buf)))
     return out
+
+
+def _split_sentences(s):
+    """A line carrying SEVERAL sentences splits at quote-aware sentence
+    boundaries ('. ' followed by a capital or a marker) — spd-1's
+    authoring style put three facts per line and ALL of them vanished
+    (one multi-sentence string matches no recognizer; found 2026-07-09).
+    Periods inside quoted values ('Auto.dev 2.0') never split."""
+    parts, cur, q, i = [], [], False, 0
+    while i < len(s):
+        c = s[i]
+        if c == "'":
+            q = not q
+        cur.append(c)
+        if (not q and c == "." and i + 2 < len(s) and s[i + 1] == " "
+                and (s[i + 2].isupper() or s[i + 2] in "'*+")):
+            parts.append("".join(cur).strip())
+            cur = []
+            i += 1
+        i += 1
+    tail = "".join(cur).strip()
+    if tail:
+        parts.append(tail)
+    return parts
 
 
 # ---- modality: strip a leading modal operator, yielding (modality, sign, inner) ----
@@ -1792,6 +1816,12 @@ def _stmt_translator_impl(kinds):
                 for name, obj in objs:
                     D = _apply(ast.DefineIn(name, obj), D)
                 break
+            else:
+                # NO Stage-1 production matched the classified statement:
+                # raising feeds the dispatcher's except -> unclassified —
+                # the vanish class (spd-1's multi-sentence lines were
+                # consumed HERE without a trace, 2026-07-09)
+                raise ValueError("no production matched the statement")
             return D
         return g
     return impl
