@@ -1,9 +1,18 @@
-// The full target's splash: the first TEXT on bare firmware. Glyphs
-// embed at build time (slint-build, EmbedForSoftwareRenderer); the
-// version strings arrive as properties — never hard-coded.
+// The full target's home: the canon DETAIL tree of a real entity —
+// the fourth realization of the same trees tk, WPF, and the react
+// Tree render. Glyphs embed at build time (slint-build,
+// EmbedForSoftwareRenderer); versions and the tree arrive as
+// properties — never hard-coded.
+export struct FieldRow {
+    k: string,
+    v: string,
+}
+
 export component Splash inherits Window {
     in property <string> os-version: "";
     in property <string> engine-version: "";
+    in property <string> detail-title: "";
+    in property <[FieldRow]> fields: [];
     background: #101828;
     Rectangle {
         x: 40px; y: 40px;
@@ -12,26 +21,39 @@ export component Splash inherits Window {
         background: @linear-gradient(135deg, #c41f3a 0%, #101840 100%);
         border-radius: 24px;
         VerticalLayout {
-            alignment: center;
-            spacing: 12px;
+            padding: 48px;
+            spacing: 10px;
             Text {
                 text: "AREST OS";
                 color: white;
-                font-size: 56px;
+                font-size: 44px;
                 font-weight: 700;
-                horizontal-alignment: center;
             }
             Text {
-                text: root.os-version;
-                color: #e8e8f0;
-                font-size: 22px;
-                horizontal-alignment: center;
-            }
-            Text {
-                text: root.engine-version;
+                text: root.os-version + "  ·  " + root.engine-version;
                 color: #c8c8d8;
-                font-size: 18px;
-                horizontal-alignment: center;
+                font-size: 16px;
+            }
+            Rectangle { height: 18px; }
+            Text {
+                text: root.detail-title;
+                color: white;
+                font-size: 26px;
+                font-weight: 600;
+            }
+            for f in root.fields: HorizontalLayout {
+                spacing: 16px;
+                Text {
+                    text: f.k;
+                    color: #e0b8c0;
+                    font-size: 17px;
+                    width: 220px;
+                }
+                Text {
+                    text: f.v;
+                    color: white;
+                    font-size: 17px;
+                }
             }
         }
     }
