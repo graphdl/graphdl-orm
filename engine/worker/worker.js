@@ -166,8 +166,23 @@ async function verifyActor(request) {
     const r = await fetch("https://auth.vin/api/users/me", { headers });
     if (r.ok) {
       const u = await r.json();
-      const email = u?.user?.email ?? u?.email ?? null;
-      if (email) actor = String(email);
+      const user = u?.user ?? u ?? {};
+      const email = user?.email ?? null;
+      if (email) {
+        actor = String(email);
+        // THE IDENTITY MINT: the caller's own answer federates as
+        // facts (isolate-local, never logged) — the DECLARED
+        // subscription link anchors the customer policy rules
+        const sub = user?.subscription;
+        if (sub) {
+          try {
+            arest_ingest(JSON.stringify([{
+              ft: "Subscription_belongs_to_Customer",
+              facts: [[String(sub), actor]],
+            }]));
+          } catch {}
+        }
+      }
     }
   } catch {}
   AUTH_MEMO.set(key, { t: Date.now(), actor });
