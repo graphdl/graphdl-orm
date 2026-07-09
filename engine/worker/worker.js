@@ -620,13 +620,25 @@ export default {
       // but every committed event carries WHO (replay ignores the
       // extra field; provenance is append-only history)
       const actor = await verifyActor(request);
+      // AUTHORIZATION IS FACTS: the derived triples (authorization.md)
+      // answer whether THIS actor may 'create' THIS noun. OBSERVING
+      // for now — the verdict rides the receipt while production write
+      // paths are enumerated; enforcement flips per-operation once the
+      // customer anchors land.
+      const authorized = actor !== null && popRows(
+        "User_is_authorized_for_Operation_on_Resource"
+      ).some((t) => t.length >= 3 && t[0] === actor
+                 && t[1] === "create" && t[2] === noun);
       const r = JSON.parse(arest_apply(JSON.stringify(
         { fact_type: body.fact_type, fact: body.fact })));
       if (r.receipt?.committed && r.event) {
         const ev = { ...r.event, actor: actor ?? undefined };
         await appendEvent(env, JSON.stringify(ev));
       }
-      if (r.receipt && actor) r.receipt.actor = actor;
+      if (r.receipt) {
+        if (actor) r.receipt.actor = actor;
+        r.receipt.authorized = authorized;
+      }
       return json(JSON.stringify(r), r.receipt?.committed ? 201 : 422);
     }
     if (seg.length === 2 && seg[1] === "new") {
