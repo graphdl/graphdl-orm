@@ -5232,6 +5232,88 @@ fn store_call(tool: &str, args: &J, app: &str, srv: &mut Srv)
     -> Option<Result<String, (i64, String)>> {
     let _ = app;
     Some(match tool {
+        "list" => {
+            // NATIVE noun listing: the population's ids off the table
+            // INDEX cell, the table resolved through the noun's role-1
+            // fts (subtypes list their top supertype's table — the
+            // same resolution the entity view uses). One spine pass;
+            // the interpretive query never belongs on a serving path.
+            let noun = match jget(args, "noun") {
+                Some(J::S(s)) => s.clone(),
+                _ => return Some(Err((-32602,
+                    "list needs a string noun".to_string()))),
+            };
+            let spine: Vec<(String, N)> = srv
+                .ncells
+                .iter()
+                .filter_map(|(k, v)| match k {
+                    Leaf::S(s) => Some((s.clone(), v.clone())),
+                    _ => None,
+                })
+                .collect();
+            let cols = ev_cols_native(&spine, &noun);
+            // the table is where the noun's first classified ft lives;
+            // a noun with no absorbed fts reads its own-name cell
+            let table = cols
+                .first()
+                .and_then(|(ft, _, _, _)| {
+                    spine.iter().find_map(|(k, v)| {
+                        if k != "rmapColumns" {
+                            return None;
+                        }
+                        if let N::S(rows) = v {
+                            for r in rows.iter() {
+                                if let N::S(cc) = r {
+                                    if cc.len() >= 3 {
+                                        if let (N::A(t), N::A(f)) =
+                                            (&cc[0], &cc[2])
+                                        {
+                                            if matches!(&**f, Leaf::S(s) if s == ft) {
+                                                return leaf_str(t);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        None
+                    })
+                })
+                .unwrap_or_else(|| noun.clone());
+            let mut ids: Vec<String> = Vec::new();
+            if let Some((_, N::S(rows))) =
+                srv.ncells.iter().find(|(k, _)| matches!(k, Leaf::S(s) if *s == table))
+            {
+                for r in rows.iter() {
+                    let key = match r {
+                        N::S(cc) if !cc.is_empty() => match &cc[0] {
+                            N::A(l) => leaf_str(l),
+                            _ => None,
+                        },
+                        N::A(l) => leaf_str(l),
+                        _ => None,
+                    };
+                    if let Some(k) = key {
+                        if !k.is_empty() && k != "#" && k != "φ" {
+                            ids.push(k);
+                        }
+                    }
+                }
+            }
+            ids.sort();
+            ids.dedup();
+            let mut out = String::from("{\"noun\":");
+            esc(&noun, &mut out);
+            out.push_str(",\"ids\":[");
+            for (i, id) in ids.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                esc(id, &mut out);
+            }
+            out.push_str("]}");
+            Ok(out)
+        }
         "get" => {
             // NATIVE: the 3NF per-entity view — system:entity_view resolves
             // to its canon-named prim (the vb_fetch treatment: one spine

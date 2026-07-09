@@ -34,6 +34,9 @@ fn main() {
         "get",
         "{\"noun\":\"Contact Submission\",\"id\":\"ef998c6716463931\"}");
     println!("get: {}", &got[..got.len().min(160)]);
+    let listed = arest::worker::arest_call(
+        "list", "{\"noun\":\"GitHub Project\"}");
+    println!("list: {}", &listed[..listed.len().min(160)]);
     net_probe();
     #[cfg(feature = "full")]
     gop_probe();
