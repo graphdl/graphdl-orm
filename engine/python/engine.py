@@ -2654,17 +2654,30 @@ def sm_init_entity(D, ft, row):
         return D
     part = rmap_partition(D)
     key = row[0]
-    if any(isinstance(r, tuple) and r and r[0] == key
-           for r in ft_view(D, sft, part)):
-        return D
     table = part.get(sft, sft)
     if table == sft:
+        if any(isinstance(r, tuple) and r and r[0] == key
+               for r in _pop_rows(D, sft)):
+            return D
         from . import ast as _ast
         from .reduce import apply as _apply
         keep = {tuple(r) for r in _pop_rows(D, sft)}
         D = _apply(_ast.Store(sft),
                    _S(to_lam(_rowsort(keep | {(key, init)})), D))
     else:
+        # THE ONE-CELL CHECK (the write unit, Def. iso): the entity's own
+        # row cell carries the status column — never reassemble the whole
+        # ft_view per write (O(entities) lam reduction; the board's
+        # applies ground on it, 2026-07-08)
+        cols = table_columns(part, table)
+        if sft not in cols:
+            return D
+        pos = 1 + cols.index(sft)
+        cell = list(_pop_rows(D, f"{table}:{key}"))
+        if cell and isinstance(cell[0], tuple):
+            cell = list(cell[0])              # a listed row form
+        if len(cell) > pos and cell[pos] not in ("", "#", None):
+            return D
         D = bulk_absorbed_install(D, part, table, sft, [(key, init)],
                                   replace_keys=True)
     return run_rules(D, changed=[sft])
