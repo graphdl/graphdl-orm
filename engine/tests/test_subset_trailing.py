@@ -119,3 +119,52 @@ def test_forbidden_disjoint_is_clean():
     # o2 defied but only o1 obeyed: disjoint on Order, exclusion satisfied
     v = _violations(D, "Agent_defies_Order", [("a1", "o2")])
     assert not v, v
+
+
+# --- the VALUE-RESTRICTION slice: 'X if that E has Attr <lit>' ---
+VALUE = """
+Ticket(.Ticket Id) is an entity type.
+Municipality(.Name) is an entity type.
+Ticket Id is a value type.
+Name is a value type.
+Closure Reason is a value type.
+  The possible values of Closure Reason are 'Paid', 'Open'.
+
+Ticket has Closure Reason.
+Municipality replaces Ticket.
+
+It is obligatory that Municipality replaces Ticket if that Ticket has Closure Reason 'Paid'.
+"""
+
+
+def _compile_value():
+    D, rep = forml.compile_model(VALUE)
+    assert not rep.get("unclassified"), rep
+    return D
+
+
+def test_value_restricted_subset_mints():
+    D = _compile_value()
+    rows = [tuple(r) for r in system._pop_rows(D, "constraint")]
+    assert any(len(r) >= 2 and r[1] == "subset" for r in rows), rows
+
+
+def test_value_paid_unreplaced_violates():
+    D = _compile_value()
+    v = _violations(D, "Ticket_has_Closure_Reason", [("t1", "Paid")])
+    assert v, "a Paid ticket not replaced must violate the obligation"
+
+
+def test_value_paid_replaced_is_clean():
+    D = _compile_value()
+    D = _apply(L.atom(2), __import__("pyarest").ast.run(
+        to_lam(("m1", "t1")), D, cell_name="Municipality_replaces_Ticket"))
+    v = _violations(D, "Ticket_has_Closure_Reason", [("t1", "Paid")])
+    assert not v, v
+
+
+def test_value_open_unreplaced_is_clean():
+    D = _compile_value()
+    # Open filtered OUT by the value restriction: not obligated to replace
+    v = _violations(D, "Ticket_has_Closure_Reason", [("t2", "Open")])
+    assert not v, v

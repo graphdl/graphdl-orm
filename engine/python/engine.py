@@ -537,6 +537,42 @@ def scoped_subset(consequent_cell):
     return _scoped("constraints:scoped_subset", consequent_cell, host)
 
 
+def _value_filter(pos, lit):
+    """A transform keeping rows whose element at 1-based POS equals LIT
+    (the value-restriction slice's condition filter; same eq/CONST shape
+    as value_comparison)."""
+    return T.Filter(_S(_COMP, A("eq"),
+                       _S(_CONS, A(pos), _S(_CONST, A(lit)))))
+
+
+def scoped_subset_projected_filtered(consequent_cell, proj_p, proj_c,
+                                     filter_pos, filter_lit):
+    """Value-restricted subset: 'It is obligatory that X if that E has Attr
+    <lit>' — the condition Y (P) is FILTERED to rows where its value role
+    holds <lit> before projecting the bound entity role, then subset
+    against the head X. V = π_p(σ_{filter_pos=lit}(P)) ∖ π_c(↑X)."""
+    def host():
+        pa = _S(_COMP, T.Project(list(proj_p)),
+                _S(_COMP, _value_filter(filter_pos, filter_lit), _P))
+        pb = _S(_COMP, T.Project(list(proj_c)), _pop_of(consequent_cell))
+        return _S(_COMP, T.setminus, _S(_CONS, pa, pb))
+    return host()
+
+
+def scoped_exclusion_projected_filtered(other_cell, proj_p, proj_c,
+                                        filter_pos, filter_lit):
+    """Value-restricted exclusion: 'It is forbidden that X if that E has Attr
+    <lit>' — the <lit>-holding entities must be disjoint from the head X.
+    V = π_p(σ_{filter_pos=lit}(P)) ∩ π_c(↑X)."""
+    def host():
+        pa = _S(_COMP, T.Project(list(proj_p)),
+                _S(_COMP, _value_filter(filter_pos, filter_lit), _P))
+        pb = _S(_COMP, T.Project(list(proj_c)), _pop_of(other_cell))
+        diff = _S(_COMP, T.setminus, _S(_CONS, pa, pb))
+        return _S(_COMP, T.setminus, _S(_CONS, pa, diff))
+    return host()
+
+
 def scoped_exclusion_projected(other_cell, proj_p, proj_c):
     """Exclusion on BOUND ROLE POSITIONS: π_p(A) ∩ π_c(B) = ∅, attached to
     A (P = A) — V = π_p(P) ∩ π_c(↑B). The set-comparison arc's FORBIDDEN

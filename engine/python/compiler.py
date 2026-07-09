@@ -1088,12 +1088,25 @@ def _h_subset_trailing(g, k, m, sign="positive"):
     head_txt, cond_txt = g
     fts = getattr(k, "fts", None) or ()
     plain = getattr(k, "plain", None) or ()
-    if "'" in head_txt or "'" in cond_txt:
-        raise ValueError("value-restricted subset clause awaits the "
-                         "restriction slice: " + head_txt[:60])
+    if "'" in head_txt:
+        raise ValueError("value-restricted HEAD awaits its slice: "
+                         + head_txt[:60])
     if " and " in cond_txt or " or " in cond_txt:
         raise ValueError("compound subset condition awaits the join "
                          "slice: " + cond_txt[:60])
+    # THE VALUE-RESTRICTION SLICE: a quoted literal in the condition
+    # ('that E has Attr <lit>') filters the condition population to the
+    # <lit>-holding rows before the projected subset/exclusion. The
+    # literal fills the LAST (value) role; the anaphor binds the entity.
+    filter_pos = filter_lit = None
+    cond_ft_txt = cond_txt
+    lits = _QUOTED.findall(cond_txt)
+    if lits:
+        if len(lits) > 1:
+            raise ValueError("multi-literal condition awaits its slice: "
+                             + cond_txt[:60])
+        filter_lit = lits[0]
+        cond_ft_txt = re.sub(r"\s+", " ", _QUOTED.sub("", cond_txt)).strip()
     x_ft, x_roles = _clause_ft_roles(head_txt, k)
     if x_ft not in fts:
         raise ValueError("subset head does not resolve to a declared "
@@ -1101,10 +1114,12 @@ def _h_subset_trailing(g, k, m, sign="positive"):
     if x_ft not in plain:
         raise ValueError("derived head: the rule path owns the "
                          "implication clause: " + head_txt[:60])
-    y_ft, y_roles = _clause_ft_roles(cond_txt, k)
+    y_ft, y_roles = _clause_ft_roles(cond_ft_txt, k)
     if y_ft not in fts or y_ft == x_ft:
         raise ValueError("subset condition does not resolve to a "
-                         "distinct declared fact type: " + cond_txt[:60])
+                         "distinct declared fact type: " + cond_ft_txt[:60])
+    if filter_lit is not None:
+        filter_pos = len(y_roles)                # the value role is last
     bound = []
     for mm in _ANAPHOR.finditer(cond_txt):
         name = mm.group(1)
@@ -1120,18 +1135,27 @@ def _h_subset_trailing(g, k, m, sign="positive"):
         if y_roles.count(n) != 1 or x_roles.count(n) != 1:
             raise ValueError("ambiguous role binding for " + n +
                              " (role-path work pending)")
-        proj_y.append(y_roles.index(n) + 1)
+        yp = y_roles.index(n) + 1
+        if yp == filter_pos:
+            raise ValueError("anaphor binds the value role: " + cond_txt[:60])
+        proj_y.append(yp)
         proj_x.append(x_roles.index(n) + 1)
     forbidden = sign == "negative"
     # the 'subset' cs_rows shape is PROVEN partition-safe (spd-1's mint);
-    # reuse it for both and let the CHECKER object carry the semantics
-    # (subset vs projected exclusion). The row-kind stays 'subset' — a
-    # cosmetic mismatch for the forbidden case's violation-template text
-    # only, the enforcement is the exclusion checker.
+    # reuse it for both signs and both the plain and value-filtered forms,
+    # letting the CHECKER object carry the semantics. The row-kind stays
+    # 'subset' (a cosmetic violation-template mismatch for the forbidden
+    # case only); enforcement is the checker.
     A_, objs = _cs_call("subset", "", [y_ft, x_ft],
                         [cond_txt.strip(), head_txt.strip()], m)
-    check = (C.scoped_exclusion_projected if forbidden
-             else C.scoped_subset_projected)
+    if filter_lit is not None:
+        check = ((lambda xf, py, px: C.scoped_exclusion_projected_filtered(
+                    xf, py, px, filter_pos, filter_lit)) if forbidden
+                 else (lambda xf, py, px: C.scoped_subset_projected_filtered(
+                    xf, py, px, filter_pos, filter_lit)))
+    else:
+        check = (C.scoped_exclusion_projected if forbidden
+                 else C.scoped_subset_projected)
     objs = [(cell, check(x_ft, proj_y, proj_x)) for (cell, _o) in objs]
     return A_, objs
 
