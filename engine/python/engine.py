@@ -887,11 +887,13 @@ def transitions_of(sm, status_pos):
 
 def links_of(key_pos, sm=None, status_pos=None):
     """links(e) = nav(e) ∪ transitions(status(e))  (Thm. hateoas). Without a state machine,
-    the links are just the navigation."""
-    nav = nav_of(key_pos)
+    the links are just the navigation. Canon: system:links_of (system.canon) — the CAT
+    union (nav_of/transitions_of already dispatch); the host stays as the twin."""
     if sm is None:
-        return nav
-    return _S(_COMP, _CAT, _S(_CONS, nav, transitions_of(sm, status_pos)))  # nav ∪ transitions
+        return nav_of(key_pos)                        # nav only (dispatches to system:nav_of)
+    from .reduce import apply as _apply
+    from .lam import to_lam as _tl
+    return _apply(A("system:links_of"), _tl((key_pos, sm, status_pos)))
 
 
 # --- S1: membership is application, as a construction (Def. pop / eq. (1)) ---
