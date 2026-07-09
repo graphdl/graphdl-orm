@@ -529,6 +529,34 @@ export default {
       try { return json(arest_entry(noun)); }
       catch (e) { return json(JSON.stringify({ error: String(e) }), 500); }
     }
+    if (request.method === "GET" && seg.length === 1 && seg[0] === "nouns") {
+      // the store's noun inventory (the native nouns op) — the menu
+      // surface the queue and the OS share
+      try { return json(arest_call("nouns", "{}")); }
+      catch (e) { return json(JSON.stringify({ error: String(e) }), 500); }
+    }
+    if (request.method === "GET" && seg.length === 1) {
+      // the noun's population (the native list op): the queue page's
+      // fuel — ids only, one spine pass, federating first so surfaced
+      // nouns list their runtime-minted entities too
+      const lnoun = nounOf(seg[0]);
+      if (lnoun) {
+        try {
+          await ensureFederated(env, lnoun);
+          for (const r of popRows("Noun_is_surfaced_as_Noun")) {
+            if (r.length >= 2 && r[1] === lnoun) {
+              await ensureFederated(env, r[0]);
+            }
+          }
+        } catch {}
+        try {
+          return json(arest_call(
+            "list", JSON.stringify({ noun: lnoun })));
+        } catch (e) {
+          return json(JSON.stringify({ error: String(e) }), 500);
+        }
+      }
+    }
     if (request.method === "GET" && seg.length >= 2) {
       const fnoun = nounOf(seg[0]);
       if (fnoun) {
