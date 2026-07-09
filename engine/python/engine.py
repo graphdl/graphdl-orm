@@ -537,6 +537,18 @@ def scoped_subset(consequent_cell):
     return _scoped("constraints:scoped_subset", consequent_cell, host)
 
 
+def scoped_subset_projected(consequent_cell, proj_p, proj_c):
+    """Subset on BOUND ROLE POSITIONS (the set-comparison arc's projected
+    form): π_p(A) ⊆ π_c(B), attached to the antecedent cell (P = A) —
+    V = π_p(P) ∖ π_c(↑B). The anaphors in the trailing-if condition name
+    which roles bind; unbound roles project away existentially."""
+    def host():
+        pa = _S(_COMP, T.Project(list(proj_p)), _P)
+        pb = _S(_COMP, T.Project(list(proj_c)), _pop_of(consequent_cell))
+        return _S(_COMP, T.setminus, _S(_CONS, pa, pb))
+    return _scoped("constraints:scoped_subset_projected", consequent_cell, host)
+
+
 def scoped_equality_side(other_cell):
     """Equality A = B, attached to ONE side (P = this side): the symmetric difference
     (P ∖ ↑other) ∪ (↑other ∖ P). Canonical for a named sibling."""

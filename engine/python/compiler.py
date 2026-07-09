@@ -328,6 +328,18 @@ _CLASSIFY = [
     # NORMA's unary negation pattern: the reading creates the PAIRED negation fact type
     ("neg_pair", re.compile(r"^(\S+) (does not|is not) (\S.*)\.$")),
     ("negation", re.compile(r"^(.+) ~(.+)\.$")),
+    # FORML 2 / Datalog semantics (Halpin — Mapping ORM to Datalog:
+    # '<-' is READ AS 'if', the converse implication; CWA closes the
+    # n same-head bodies into the iff condition): trailing 'x if y'
+    # is the implication clause. On an ASSERTED head it can only
+    # CHECK — the '->' constraint direction, a subset — while a
+    # derived/marked head is the rule path's derivation clause
+    # (Halpin's asserted/derived/semiderived trichotomy dispatches).
+    # Quote-aware: an ' if ' inside a literal is not the keyword.
+    # Ordered just above the fact_type_reading catch-all so
+    # trailing-if prose stops prepass-declaring junk fact types.
+    ("subset_trailing", re.compile(
+        r"^(?![*+])((?:[^']|'[^']*')+?) if ((?:[^']|'[^']*')+)\.$")),
     ("fact_type_reading", re.compile(r"^(.+)\.$")),
 ]
 
@@ -1037,6 +1049,93 @@ def _h_equality(g, k, m):
                     [_clause_ft(g[0], k), _clause_ft(g[1], k)],
                     [g[0], g[1]], m)
 
+
+_ANAPHOR = re.compile(r"\bthat ((?:[A-Z][\w-]*)(?: [A-Z][\w-]*)*)")
+
+
+def _clause_ft_roles(text, known):
+    """A constraint clause → (ft, roles) under _clause_ft's strip
+    discipline (minimal quantifier strip preferred, declared hit wins);
+    roles are the reading's noun sequence in role order — the
+    projection's coordinates."""
+    t = re.sub(r"\s+", " ", text.strip())
+    best = None
+    for pat in (_QUANT_MIN, _QUANT):
+        stripped = pat.sub("", t).strip()
+        template, roles = _reading(stripped, known)
+        ft = _ftid_from(template, roles)
+        if best is None:
+            best = (ft, tuple(roles))
+        if ft in (getattr(known, "fts", None) or ()):
+            return ft, tuple(roles)
+    return best
+
+
+def _h_subset_trailing(g, k, m):
+    """FORML 2's implication clause on an ASSERTED head is the subset
+    constraint (Halpin, Mapping ORM to Datalog: 'if' reads the converse
+    implication; CWA closes same-head rule bodies into the iff — but an
+    asserted head has no rule to close, so the implication can only
+    CHECK, the '->' constraint direction). A derived or marked head
+    belongs to the rule path and refuses here (the asserted/derived/
+    semiderived trichotomy dispatches). Role-projected: 'that <Noun>'
+    anaphors in the condition bind the head's roles; the check is
+    pi_bound(condition) minus pi_bound(head). Value literals and
+    compound conditions refuse until their slices land."""
+    head_txt, cond_txt = g
+    fts = getattr(k, "fts", None) or ()
+    plain = getattr(k, "plain", None) or ()
+    if "'" in head_txt or "'" in cond_txt:
+        raise ValueError("value-restricted subset clause awaits the "
+                         "restriction slice: " + head_txt[:60])
+    if " and " in cond_txt or " or " in cond_txt:
+        raise ValueError("compound subset condition awaits the join "
+                         "slice: " + cond_txt[:60])
+    x_ft, x_roles = _clause_ft_roles(head_txt, k)
+    if x_ft not in fts:
+        raise ValueError("subset head does not resolve to a declared "
+                         "fact type: " + head_txt[:60])
+    if x_ft not in plain:
+        raise ValueError("derived head: the rule path owns the "
+                         "implication clause: " + head_txt[:60])
+    y_ft, y_roles = _clause_ft_roles(cond_txt, k)
+    if y_ft not in fts or y_ft == x_ft:
+        raise ValueError("subset condition does not resolve to a "
+                         "distinct declared fact type: " + cond_txt[:60])
+    bound = []
+    for mm in _ANAPHOR.finditer(cond_txt):
+        name = mm.group(1)
+        while name and name not in k:
+            name = name.rsplit(" ", 1)[0] if " " in name else ""
+        if name and name not in bound:
+            bound.append(name)
+    if not bound:
+        raise ValueError("no anaphoric role binding in the subset "
+                         "condition: " + cond_txt[:60])
+    proj_y, proj_x = [], []
+    for n in bound:
+        if y_roles.count(n) != 1 or x_roles.count(n) != 1:
+            raise ValueError("ambiguous role binding for " + n +
+                             " (role-path work pending)")
+        proj_y.append(y_roles.index(n) + 1)
+        proj_x.append(x_roles.index(n) + 1)
+    # THE PARTITION GATE (the mint is one line from live): a subset
+    # constraint row — hand-rolled OR through the cs_rows canon —
+    # crashes system:partition's constraint fold ('not enough values
+    # to unpack', engine.py rmap_partition; the kind has never minted
+    # in the system's history, so the fold never met one). Un-gate by
+    # deleting this raise once the partition canon digests non-UC
+    # constraint kinds (a polyglot shared/*.canon slice with twins).
+    raise ValueError(
+        "subset mint awaits the partition-canon slice: "
+        f"{cond_txt.strip()!r} -> {head_txt.strip()!r} "
+        f"(projection ready: {proj_y} ⊆ {proj_x})")
+    A_, objs = _cs_call("subset", "", [y_ft, x_ft],
+                        [cond_txt.strip(), head_txt.strip()], m)
+    objs = [(cell, C.scoped_subset_projected(x_ft, proj_y, proj_x))
+            for (cell, _o) in objs]
+    return A_, objs
+
 def _h_negation(g, k, m):
     a, pred = _subject(g[0], k)
     return [("negation", (a, pred + " " + g[1]))], []
@@ -1671,7 +1770,8 @@ _PLAN = {
     "frequency": _h_frequency, "ring": _h_ring, "subtype_of": _h_subtype,
     "brace_subtypes": _h_brace_subtypes,
     "set_comparison": _h_set_comparison, "disjunctive_mandatory": _h_disjunctive,
-    "subset": _h_subset, "equality": _h_equality, "derivation_rule": _h_derivation_rule,
+    "subset": _h_subset, "subset_trailing": _h_subset_trailing,
+    "equality": _h_equality, "derivation_rule": _h_derivation_rule,
     "rule_if": _h_rule_if,
     "rule_iff": _h_rule_iff,
     "negation": _h_negation, "neg_pair": _h_neg_pair, "class_rule": _h_class_rule,
@@ -1877,7 +1977,8 @@ def register_translators():
                                                "for_each_mandatory",
                                                "neg_mandatory"]),
         ("translate_ring_constraints", ["ring"]),
-        ("translate_set_constraints", ["set_comparison", "subset", "equality",
+        ("translate_set_constraints", ["set_comparison", "subset",
+                                       "subset_trailing", "equality",
                                        "disjunctive_mandatory"]),
         ("translate_value_constraints", ["value_constraint"]),
         ("translate_state_machines", ["sm_def", "sm_initial", "sm_from", "sm_to",

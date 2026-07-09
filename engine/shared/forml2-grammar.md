@@ -282,6 +282,7 @@ Statement has Classification 'Mandatory Role Constraint' iff Statement has Quant
 Statement has Classification 'Uniqueness Constraint' iff Statement has Quantifier 'more than one'.
 Statement has Classification 'Disjunctive Mandatory Constraint' iff Statement has Quantifier 'each' and Statement has Disjunction 'or'.
 Statement has Classification 'Subset Constraint' iff Statement has Keyword 'if' and Statement has Consequence 'then'.
+Statement has Classification 'Subset Constraint' iff Statement has Keyword 'if'.
 Statement has Classification 'Derivation Rule' iff Statement has Extraction Clause Keyword 'is derived from'.
 Statement has Classification 'Derivation Rule' iff Statement has Extraction Clause Keyword 'is extracted from'.
 Statement has Classification 'Derivation Rule' iff Statement has Quantifier 'each' and Statement has Relative Pronoun 'who'.
