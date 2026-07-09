@@ -12,68 +12,23 @@
 //   GET  /{noun}/{id}/repr     -> synthesize (the verbalized facts)
 //   GET  /schema/{noun}        -> schema
 //   POST /{noun}/{id}/{event}  -> apply of the transition's trigger
-//                                 fact (WRITE PATH: step 5 — the
-//                                 Worker is read-only until the write
-//                                 story lands; 501 meanwhile)
+//                                 fact (the write path: commit appends
+//                                 to the D1 event stream)
 import init, { arest_load, arest_call, arest_apply, arest_view, arest_entry, arest_ingest } from "./arest_core.js";
 import wasmModule from "./arest_core_bg.wasm";
 import SIDECAR from "./sidecar.js";
 
 const PLURAL = {}; // e.g. { order: "orders" } — inverse applied on route parse
 
-// The event-log Durable Object: Def. iso's single-writer cell, worker
-// storage edition — ONE instance per app, append = the commit point,
-// the stream is the store of record. The isolate's wasm store is the
-// snapshot (the bundled sidecar) plus this log's tail, replayed at
-// boot exactly like the resident's stream-watermark discipline.
-export class ArestLog {
-  constructor(state, env) {
-    this.state = state;
-    this.env = env;
-  }
-  async fetch(request) {
-    const url = new URL(request.url);
-    if (request.method === "POST" && url.pathname === "/append") {
-      const line = await request.text();
-      const n = (await this.state.storage.get("n")) ?? 0;
-      await this.state.storage.put(`e:${String(n).padStart(9, "0")}`, line);
-      await this.state.storage.put("n", n + 1);
-      // the KV mirror (do-minimize): SSE and boot read KV, so the DO
-      // is touched only by THIS append — its single-writer commit role
-      if (this.env?.AREST_LOG) {
-        await this.env.AREST_LOG.put(`e:${String(n).padStart(9, "0")}`, line);
-        await this.env.AREST_LOG.put("n", String(n + 1));
-      }
-      return new Response(JSON.stringify({ appended: n + 1 }));
-    }
-    if (request.method === "POST" && url.pathname === "/mirror") {
-      // one-time backfill of the KV mirror from the DO's own storage
-      if (!this.env?.AREST_LOG)
-        return new Response('{"error":"no AREST_LOG binding"}', { status: 501 });
-      const n = (await this.state.storage.get("n")) ?? 0;
-      const rows = await this.state.storage.list({ prefix: "e:" });
-      let copied = 0;
-      for (const [k, v] of rows) {
-        await this.env.AREST_LOG.put(k, v);
-        copied++;
-      }
-      await this.env.AREST_LOG.put("n", String(n));
-      return new Response(JSON.stringify({ mirrored: copied, n }));
-    }
-    if (request.method === "GET" && url.pathname === "/tail") {
-      const n = (await this.state.storage.get("n")) ?? 0;
-      const from = Number(url.searchParams.get("from") ?? 0);
-      const out = [];
-      const rows = await this.state.storage.list({
-        prefix: "e:",
-        start: `e:${String(from).padStart(9, "0")}`,
-      });
-      for (const [, v] of rows) out.push(v);
-      return new Response(JSON.stringify({ n, events: out }));
-    }
-    return new Response("{}", { status: 404 });
-  }
-}
+// The event log: Def. iso's single serialized append per app stream,
+// D1 edition — the events table's single-writer SQLite serializes
+// commits (INSERT..RETURNING mints n atomically), the KV mirror is
+// the read path (SSE + boot), the stream is the store of record. The
+// isolate's wasm store is the snapshot (the bundled sidecar) plus
+// this log's tail, replayed at boot exactly like the resident's
+// stream-watermark discipline. (The ArestLog Durable Object held the
+// commit role until 2026-07-09; retired via migration v2 once a
+// production write proved the D1 append.)
 
 let ready = null;
 async function ensure(env) {
@@ -89,33 +44,50 @@ async function ensure(env) {
       arest_load(sidecar);
       // replay the log tail over the snapshot (a replayed duplicate
       // reads as refused — D' == D — and changes nothing). The KV
-      // mirror serves the tail (do-minimize); the DO is asked only
-      // when the mirror is empty (pre-mirror deployments)
+      // mirror is a MEMO of a restriction over the D1 stream (Prop.
+      // derive: every served value is a rho-application over the
+      // record; Cor. middleware's note: a cache's policy is denoted
+      // inside the system, so the memo is never authoritative and
+      // never hand-repaired). Boot walks it by the stream's own index;
+      // any structural miss FALSIFIES the memo and the whole tail
+      // re-derives from D1.
       let events = null;
       if (env?.AREST_LOG) {
         const n = Number(await env.AREST_LOG.get("n"));
         if (Number.isFinite(n) && n > 0) {
           events = [];
-          const rows = await env.AREST_LOG.list({ prefix: "e:" });
-          for (const k of rows.keys) {
-            const v = await env.AREST_LOG.get(k.name);
-            if (v) events.push(v);
+          for (let j = 1; j <= n; j++) {
+            const v = await env.AREST_LOG.get(
+              "e:" + String(j).padStart(9, "0"));
+            if (v === null) { events = null; break; }
+            events.push(v);
           }
         }
       }
       if (events === null && env?.DB) {
-        // the D1 stream (Def. iso with ZERO DOs: the single-writer
-        // SQLite serializes appends; n orders the replay)
+        // the D1 stream is the record (Def. iso with ZERO DOs: the
+        // single-writer SQLite serializes appends; n orders the
+        // replay). Re-deriving the memo writes each line at the
+        // stream's own n and drops keys the derivation does not yield
+        // (compaction that preserves the population rho observes).
         const q = await env.DB.prepare(
-          "SELECT line FROM events WHERE app = ?1 ORDER BY n"
+          "SELECT n, line FROM events WHERE app = ?1 ORDER BY n"
         ).bind(APP_STREAM).all();
-        events = (q.results ?? []).map((r) => r.line);
-      }
-      if (events === null && env?.LOG) {
-        const id = env.LOG.idFromName("log");
-        const stub = env.LOG.get(id);
-        const r = await stub.fetch("https://log/tail");
-        events = (await r.json()).events;
+        const rows = q.results ?? [];
+        events = rows.map((r) => r.line);
+        if (env?.AREST_LOG && rows.length) {
+          const want = new Set(["n"]);
+          for (const r of rows) {
+            const k = "e:" + String(r.n).padStart(9, "0");
+            want.add(k);
+            await env.AREST_LOG.put(k, r.line);
+          }
+          const listed = await env.AREST_LOG.list({ prefix: "e:" });
+          for (const k of listed.keys) {
+            if (!want.has(k.name)) await env.AREST_LOG.delete(k.name);
+          }
+          await env.AREST_LOG.put("n", String(rows[rows.length - 1].n));
+        }
       }
       for (const line of events ?? []) {
         try {
@@ -191,8 +163,11 @@ async function verifyActor(request) {
 
 // ONE serialized append (Def. iso, ZERO DOs): the INSERT mints n
 // atomically in a single statement — D1's SQLite single-writer is the
-// serializer. The KV mirror write-through keeps SSE + boot fast; the
-// DO remains the legacy fallback until it retires.
+// serializer at the constrained key. The stream's n is the ONE
+// identity end to end: the D1 row, the mirror key e:{n}, and the SSE
+// event id are the same number (the DO era kept a second, 0-indexed
+// numbering for the mirror — the off-by-one class died with it). The
+// KV write-through keeps the memo current for SSE + boot.
 async function appendEvent(env, line) {
   let n = null;
   if (env?.DB) {
@@ -202,11 +177,6 @@ async function appendEvent(env, line) {
       "RETURNING n"
     ).bind(APP_STREAM, line).first();
     n = row?.n ?? null;
-  } else if (env?.LOG) {
-    const stub = env.LOG.get(env.LOG.idFromName("log"));
-    const r = await stub.fetch("https://log/append", {
-      method: "POST", body: line });
-    n = (await r.json())?.n ?? null;
   }
   if (n !== null && env?.AREST_LOG) {
     await env.AREST_LOG.put("e:" + String(n).padStart(9, "0"), line);
@@ -473,28 +443,23 @@ export default {
     };
 
     if (request.method === "GET" && seg[0] === "events") {
-      // SSE over the Durable Object stream: the event log IS the feed
-      // (append = commit = emit). Last-Event-ID resumes from the log
-      // index; the poll is the v0 transport (the DO push upgrade is
-      // hardening). Each message is one committed event line.
-      if (!env?.LOG && !env?.AREST_LOG)
+      // SSE over the event stream: the log IS the feed (append =
+      // commit = emit; Cor. stream — a subscriber is a rho-application
+      // awaiting its next evaluation, and Last-Event-ID is the
+      // restriction's lower bound). The event id IS the stream's n.
+      if (!env?.AREST_LOG)
         return json('{"error":"no log binding"}', 501);
-      // do-minimize: the poll reads the KV MIRROR (cheap reads), never
-      // the DO; the DO fallback covers pre-mirror deploys only
-      const stub = env?.LOG ? env.LOG.get(env.LOG.idFromName("log")) : null;
+      // do-minimize: the poll reads the KV MEMO (cheap reads), never
+      // the commit store
       const readTail = async (from) => {
-        if (env?.AREST_LOG) {
-          const n = Number(await env.AREST_LOG.get("n")) || 0;
-          const events = [];
-          for (let j = from; j < n; j++) {
-            const v = await env.AREST_LOG.get(
-              "e:" + String(j).padStart(9, "0"));
-            if (v) events.push(v);
-          }
-          return { n, events };
+        const n = Number(await env.AREST_LOG.get("n")) || 0;
+        const events = [];
+        for (let j = from + 1; j <= n; j++) {
+          const v = await env.AREST_LOG.get(
+            "e:" + String(j).padStart(9, "0"));
+          if (v) events.push(v);
         }
-        const r = await stub.fetch("https://log/tail?from=" + from);
-        return r.json();
+        return { n, events };
       };
       let cursor = Number(request.headers.get("last-event-id") ?? 0);
       const enc = new TextEncoder();
@@ -579,50 +544,10 @@ export default {
       if (!noun) return json('{"error":"unknown noun"}', 404);
       return json(arest_call("schema", JSON.stringify({ noun })));
     }
-    if (request.method === "POST" && url.pathname === "/__migrate-d1") {
-      // one-shot: copy the DO stream into D1 (the zero-DO endgame) —
-      // idempotent: refuses when the D1 stream already has rows
-      if (!env?.DB || !env?.LOG) {
-        return json(JSON.stringify({ error: "needs DB and LOG" }), 501);
-      }
-      try {
-        const have = await env.DB.prepare(
-          "SELECT COUNT(*) AS c FROM events WHERE app = ?1"
-        ).bind(APP_STREAM).first();
-        if ((have?.c ?? 0) > 0) {
-          return json(JSON.stringify({ migrated: 0, existing: have.c }));
-        }
-        const stub = env.LOG.get(env.LOG.idFromName("log"));
-        const r = await stub.fetch("https://log/tail");
-        const events = (await r.json()).events ?? [];
-        let copied = 0;
-        for (const line of events) {
-          await env.DB.prepare(
-            "INSERT INTO events (app, n, line) VALUES (?1, " +
-            "(SELECT COALESCE(MAX(n), 0) + 1 FROM events WHERE app = ?1), ?2)"
-          ).bind(APP_STREAM, line).run();
-          copied++;
-        }
-        return json(JSON.stringify({ migrated: copied }));
-      } catch (e) {
-        return json(JSON.stringify({ error: String(e) }), 500);
-      }
-    }
-    if (request.method === "POST" && url.pathname === "/__mirror") {
-      // one-shot: backfill the KV mirror from the DO log (do-minimize)
-      if (!env?.LOG) return json('{' + String.fromCharCode(34) + 'error' + String.fromCharCode(34) + ':' + String.fromCharCode(34) + 'no log' + String.fromCharCode(34) + '}', 501);
-      try {
-        const stub = env.LOG.get(env.LOG.idFromName('log'));
-        const r = await stub.fetch('https://log/mirror', { method: 'POST' });
-        return json(await r.text());
-      } catch (e) {
-        return json(JSON.stringify({ error: String(e) }), 500);
-      }
-    }
     if (request.method === "POST" && seg.length === 1) {
       // POST /{noun}: the whitepaper's create ("A POST /orders request
       // creates an Order...") — the body names the fact: {fact_type,
-      // fact}. Commit appends to the Durable Object stream.
+      // fact}. Commit appends to the D1 event stream.
       const noun = nounOf(seg[0]);
       if (!noun) return json('{"error":"unknown noun"}', 404);
       let body = null;
@@ -739,15 +664,17 @@ export default {
           const body = await request.json();
           if (Array.isArray(body?.fact)) fact = body.fact;
         } catch {}
+        // the same commit discipline as create: the proven appendEvent
+        // (this path wrote straight to the DO before the retirement —
+        // and would have silently dropped the append without it)
+        const actor = await verifyActor(request);
         const r = JSON.parse(
           arest_apply(JSON.stringify({ fact_type: hit.event, fact })));
-        if (r.receipt?.committed && r.event && env?.LOG) {
-          const idd = env.LOG.idFromName("log");
-          await env.LOG.get(idd).fetch("https://log/append", {
-            method: "POST",
-            body: JSON.stringify(r.event),
-          });
+        if (r.receipt?.committed && r.event) {
+          const ev = { ...r.event, actor: actor ?? undefined };
+          await appendEvent(env, JSON.stringify(ev));
         }
+        if (r.receipt && actor) r.receipt.actor = actor;
         return json(JSON.stringify(r), r.receipt?.committed ? 200 : 422);
       }
     }

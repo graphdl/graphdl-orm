@@ -25,19 +25,22 @@ routes = [
 
 # the log's KV mirror (worker-do-minimize, Samuel 2026-07-08: DOs are
 # getting expensive — appends WRITE THROUGH here; SSE and boot READ
-# here; the DO is touched only by appends, its irreducible
-# single-writer commit role)
+# here; D1 below is the commit point)
 [[kv_namespaces]]
 binding = "AREST_LOG"
 id = "0cefc55f151b421e9773ef52a073f122"
 
-[[durable_objects.bindings]]
-name = "LOG"
-class_name = "ArestLog"
-
+# migration history: v1 birthed the ArestLog DO (the original commit
+# cell); v2 retires it (2026-07-09) — the production write proved the
+# D1 append, so the DO's storage (one event, long since in D1 + KV)
+# deletes with the class
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ArestLog"]
+
+[[migrations]]
+tag = "v2"
+deleted_classes = ["ArestLog"]
 
 # THE D1 ENDGAME (the whitepaper's Def. iso: ONE serialized append per
 # app stream — D1's single-writer SQLite gives it with ZERO DOs; the
