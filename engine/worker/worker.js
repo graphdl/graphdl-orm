@@ -141,6 +141,39 @@ async function ensure(env) {
 // app today; multi-tenant streams key by app)
 const APP_STREAM = "support.auto.dev";
 
+// FEDERATED VERIFICATION (the dissolved auth gate, 2026-07-08): the
+// worker PRESENTS the caller's credential to auth.vin — the session
+// cookie or 'Authorization: users API-Key <k>' forwards to
+// GET /api/users/me — and the answered identity IS the actor. NO
+// secrets live here; identity is demand-driven federated data,
+// memoized ~60s per isolate (apis' AUTH_MEMO precedent). Anonymous
+// answers null (OWA — routes decide what anonymity may do).
+const AUTH_MEMO = new Map();
+const AUTH_TTL = 60_000;
+
+async function verifyActor(request) {
+  const auth = request.headers.get("Authorization") ?? "";
+  const cookie = request.headers.get("Cookie") ?? "";
+  if (!auth && !cookie) return null;
+  const key = auth || ("c:" + cookie);
+  const hit = AUTH_MEMO.get(key);
+  if (hit && Date.now() - hit.t < AUTH_TTL) return hit.actor;
+  let actor = null;
+  try {
+    const headers = {};
+    if (auth) headers["Authorization"] = auth;
+    if (cookie) headers["Cookie"] = cookie;
+    const r = await fetch("https://auth.vin/api/users/me", { headers });
+    if (r.ok) {
+      const u = await r.json();
+      const email = u?.user?.email ?? u?.email ?? null;
+      if (email) actor = String(email);
+    }
+  } catch {}
+  AUTH_MEMO.set(key, { t: Date.now(), actor });
+  return actor;
+}
+
 // ONE serialized append (Def. iso, ZERO DOs): the INSERT mints n
 // atomically in a single statement — D1's SQLite single-writer is the
 // serializer. The KV mirror write-through keeps SSE + boot fast; the
@@ -581,11 +614,19 @@ export default {
       try { body = await request.json(); } catch {}
       if (!body?.fact_type || !Array.isArray(body?.fact))
         return json('{"error":"body needs fact_type and fact"}', 400);
+      // the actor threads from federated verification: the identity
+      // auth.vin answers for the caller's own credential. Writes stay
+      // OPEN for now (the policy-derivation gate is the next rung) —
+      // but every committed event carries WHO (replay ignores the
+      // extra field; provenance is append-only history)
+      const actor = await verifyActor(request);
       const r = JSON.parse(arest_apply(JSON.stringify(
         { fact_type: body.fact_type, fact: body.fact })));
       if (r.receipt?.committed && r.event) {
-        await appendEvent(env, JSON.stringify(r.event));
+        const ev = { ...r.event, actor: actor ?? undefined };
+        await appendEvent(env, JSON.stringify(ev));
       }
+      if (r.receipt && actor) r.receipt.actor = actor;
       return json(JSON.stringify(r), r.receipt?.committed ? 201 : 422);
     }
     if (seg.length === 2 && seg[1] === "new") {
