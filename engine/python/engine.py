@@ -541,12 +541,20 @@ def scoped_subset_projected(consequent_cell, proj_p, proj_c):
     """Subset on BOUND ROLE POSITIONS (the set-comparison arc's projected
     form): π_p(A) ⊆ π_c(B), attached to the antecedent cell (P = A) —
     V = π_p(P) ∖ π_c(↑B). The anaphors in the trailing-if condition name
-    which roles bind; unbound roles project away existentially."""
+    which roles bind; unbound roles project away existentially.
+
+    The HOST composition IS the definition here: no canonical sibling
+    exists in system.canon yet, and _scoped's string branch resolves the
+    NAME through the canon — an undefined name applies to bottom, and a
+    bottom checker object DefineIn'd under the constraint id poisoned
+    the whole store's evaluation (the 2026-07-09 poisoned-cell
+    diagnosis; the base was innocent). A canonical sibling also needs
+    the projections as data, which the one-argument name cannot carry."""
     def host():
         pa = _S(_COMP, T.Project(list(proj_p)), _P)
         pb = _S(_COMP, T.Project(list(proj_c)), _pop_of(consequent_cell))
         return _S(_COMP, T.setminus, _S(_CONS, pa, pb))
-    return _scoped("constraints:scoped_subset_projected", consequent_cell, host)
+    return host()
 
 
 def scoped_equality_side(other_cell):
