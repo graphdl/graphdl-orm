@@ -470,9 +470,26 @@ createRoot(document.getElementById("root")).render(h(App));
 </body>
 </html>`;
 
+// usage IS facts at window grain (Cor. middleware: a rate limit is a
+// cardinality constraint over timestamped request facts; the slack
+// principle licenses a counter far from its bound). One UPSERT per
+// request, serialized by D1's single writer, off the response path.
+// The record a Usage Window noun federates from (metering.md is the
+// vocabulary); window = the UTC hour.
+function meter(env, ctx, app) {
+  if (!env?.DB || !ctx?.waitUntil) return;
+  const w = new Date().toISOString().slice(0, 13);
+  ctx.waitUntil(env.DB.prepare(
+    "INSERT INTO usage (app, window, n) VALUES (?1, ?2, 1) " +
+    "ON CONFLICT(app, window) DO UPDATE SET n = n + 1"
+  ).bind(app, w).run().catch(() => {}));
+}
+
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url0 = new URL(request.url);
+    const app0 = appOf(url0.hostname, request, env);
+    meter(env, ctx, app0);
     if (request.method === "GET" && url0.pathname === "/") {
       // the site presents as its host (support.auto.dev, not arest)
       const page = INDEX_HTML
@@ -481,7 +498,7 @@ export default {
       return new Response(page, {
         headers: { "content-type": "text/html; charset=utf-8" } });
     }
-    const app = appOf(url0.hostname, request, env);
+    const app = app0;
     await ensure(env, app);
     use_(app);                    // ensure suspended; re-select the cell
     const url = new URL(request.url);
