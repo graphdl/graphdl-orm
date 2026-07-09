@@ -55,6 +55,12 @@ slint = { version = "1.8", optional = true, default-features = false, features =
     "compat-1-2", "renderer-software", "unsafe-single-threaded", "libm",
 ] }
 
+[build-dependencies]
+# compiles ui/*.slint with glyphs EMBEDDED for the software renderer
+# (rasterized on the build host) — text on bare firmware needs no
+# font machinery at runtime
+slint-build = "1.8"
+
 [profile.release]
 lto = true
 opt-level = "z"

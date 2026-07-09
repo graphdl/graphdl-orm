@@ -149,18 +149,7 @@ mod fb {
     use slint::platform::{Platform, WindowAdapter};
     use uefi::proto::console::gop::{BltOp, BltPixel, GraphicsOutput};
 
-    slint::slint! {
-        export component Splash inherits Window {
-            background: #101828;
-            Rectangle {
-                x: 40px; y: 40px;
-                width: parent.width - 80px;
-                height: parent.height - 80px;
-                background: @linear-gradient(135deg, #c41f3a 0%, #101840 100%);
-                border-radius: 24px;
-            }
-        }
-    }
+    slint::include_modules!();
 
     struct FirmwarePlatform {
         window: Rc<MinimalSoftwareWindow>,
@@ -206,6 +195,10 @@ mod fb {
         }))
         .expect("slint platform");
         let ui = Splash::new().expect("slint component");
+        ui.set_os_version(
+            format!("v{}", env!("CARGO_PKG_VERSION")).into());
+        ui.set_engine_version(
+            arest::worker::arest_version().into());
         window.set_size(slint::PhysicalSize::new(w as u32, hgt as u32));
         ui.show().expect("show");
 

@@ -21,4 +21,14 @@ fn main() {
         fs::write(&dst, "{\"d\":[]}").unwrap();
     }
     println!("cargo:rerun-if-changed=build.rs");
+
+    // the full target's UI compiles with glyphs EMBEDDED for the
+    // software renderer — text on firmware without runtime fonts
+    if env::var("CARGO_FEATURE_FULL").is_ok() {
+        let cfg = slint_build::CompilerConfiguration::new()
+            .embed_resources(
+                slint_build::EmbedResourcesKind::EmbedForSoftwareRenderer);
+        slint_build::compile_with_config("ui/splash.slint", cfg).unwrap();
+        println!("cargo:rerun-if-changed=ui/splash.slint");
+    }
 }
