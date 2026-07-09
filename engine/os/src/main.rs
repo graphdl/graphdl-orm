@@ -106,7 +106,7 @@ fn net_probe() {
 // (the pre-0.9.0 kernel's slint feature is the blueprint).
 #[cfg(feature = "full")]
 fn gop_probe() {
-    use uefi::proto::console::gop::GraphicsOutput;
+    use uefi::proto::console::gop::{BltOp, BltPixel, GraphicsOutput};
     match uefi::boot::get_handle_for_protocol::<GraphicsOutput>() {
         Ok(h) => match uefi::boot::open_protocol_exclusive::<GraphicsOutput>(h) {
             Ok(mut gop) => {
@@ -115,6 +115,15 @@ fn gop_probe() {
                 println!("gop: {} mode(s); current {}x{} {:?} stride {}",
                          gop.modes().count(), w, hgt,
                          m.pixel_format(), m.stride());
+                // pixels prove out through blt (works on every pixel
+                // format including BltOnly): the canon-tree renderer
+                // paints into exactly this surface next
+                let fill = gop.blt(BltOp::VideoFill {
+                    color: BltPixel::new(196, 30, 58),
+                    dest: (40, 40),
+                    dims: (w.saturating_sub(80), hgt.saturating_sub(80)),
+                });
+                println!("fb: fill {:?}", fill);
             }
             Err(e) => println!("gop: open failed ({e:?})"),
         },
