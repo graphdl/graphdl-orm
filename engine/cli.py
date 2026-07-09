@@ -13,6 +13,18 @@ import json
 import os
 import sys
 
+# UTF-8 on both streams REGARDLESS of the console codepage: the usage
+# text carries an em-dash, and receipts carry app values — on a cp1252
+# Windows console those bytes crash the SPAWNING side's utf-8 reader
+# thread (subprocess.run text=True), turning stderr/stdout into None
+# (found 2026-07-09 via test_cli; the resident's receipt reads share
+# the class).
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 
 if "pyarest" not in sys.modules:

@@ -9,6 +9,16 @@
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
+  <!-- the WPF show renderer is its OWN project: without this exclusion
+       the kernel's default glob compiles show/obj's GENERATED
+       AssemblyInfo alongside its own (duplicate-attribute CS0579 —
+       found 2026-07-09 when the parity test broke after show landed) -->
+  <ItemGroup>
+    <Compile Remove="show/**" />
+    <EmbeddedResource Remove="show/**" />
+    <None Remove="show/**" />
+  </ItemGroup>
+
   <!-- The include! equivalent: each shared intersection file becomes the body
        of a varargs method call by BYTE CONCATENATION (prefix + file + suffix),
        never parsing. The same bytes CPython execs and rustc tokenizes. -->
