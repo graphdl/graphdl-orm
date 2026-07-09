@@ -252,9 +252,46 @@ def replay_entries(D, entries):
     """Replay an event ENTRY LIST, sink-agnostic: the file sink reads them from
     jsonl, a memory or broadcast sink from its own store. The event STREAM is an
     interface (EventSink); reconstruction reads whatever the sink yields, never a
-    file path."""
+    file path.
+
+    PLAIN entries BATCH (the trace named it, 2026-07-09: ~5s per entry
+    through the gated create = 71.6s of a support compile for ~15
+    entries): consecutive applies buffer by fact type and flush through
+    the SAME bulk paths the migrate op rides — the log is history,
+    already validated at commit time, and the post-replay machine_fold
+    re-derives transitions either way. Retract/migrate ops flush first,
+    so ordering across op boundaries is preserved."""
+    buf = {}
+    # ONE partition for the whole replay: the schema never changes here,
+    # but every bulk install mints a new D and the per-D memo misses —
+    # the traced compile showed ~12s PER MIGRATE ENTRY going to
+    # recomputes (the 71-83s replay phase, 2026-07-09)
+    part_box = []
+
+    def _part(D):
+        if not part_box:
+            part_box.append(system.rmap_partition(D))
+        return part_box[0]
+
+    def _flush(D):
+        if not buf:
+            return D
+        part = _part(D)
+        for ft, rows in buf.items():
+            table = part.get(ft, ft)
+            if table != ft:
+                D = system.bulk_absorbed_install(D, part, table, ft, rows)
+            else:
+                have = {tuple(r) for r in system._pop_rows(D, ft)}
+                have |= {tuple(r) for r in rows}
+                D = _ap(ast.Store(ft),
+                        _S(to_lam(system._rowsort(have)), D))
+        buf.clear()
+        return D
+
     for entry in entries:
         if entry.get("op") == "retract":
+            D = _flush(D)
             ft = entry["ft"]
             row = _untuple(entry["fact"])
             rows = tuple(t for t in (tuple(r) for r in system._pop_rows(D, ft))
@@ -262,6 +299,7 @@ def replay_entries(D, entries):
             D = _ap(ast.Store(ft), to_lam(rows) if False else _S(to_lam(rows), D))
             continue
         if entry.get("op") == "migrate":
+            D = _flush(D)
             # a migration BATCH. An OWN-TABLE fact type unions in as one Store
             # write (one derive pass rides the caller's run_rules — the old
             # engine's atomic collection apply is the precedent; the report at
@@ -272,7 +310,7 @@ def replay_entries(D, entries):
             # ** view cache) in one pass: the same batch precedent, where N
             # validated creates would cost hours on the big apps.
             ft = entry["ft"]
-            part = system.rmap_partition(D)
+            part = _part(D)
             table = part.get(ft, ft)
             if table != ft:
                 D = system.bulk_absorbed_install(D, part, table, ft,
@@ -282,8 +320,8 @@ def replay_entries(D, entries):
             rows |= {_untuple(f) for f in entry["facts"]}
             D = _ap(ast.Store(ft), _S(to_lam(system._rowsort(rows)), D))
             continue
-        D = _ap(_A(2), system.create(D, entry["ft"], to_lam(_untuple(entry["fact"]))))
-    return D
+        buf.setdefault(entry["ft"], []).append(_untuple(entry["fact"]))
+    return _flush(D)
 
 
 def _watermark(D):
