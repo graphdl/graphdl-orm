@@ -1417,6 +1417,9 @@ def _pop_rows(D, name):
     return list(rows) if isinstance(rows, tuple) else []
 
 
+_PART_MEMO = None
+
+
 def rmap_partition(D):
     """M-facts → the cell partition {fact type: table key}, by the RMAP grouping rules. The
     meaning is the canonical system:partition (shared/system.canon), the sub-DEF family
@@ -1424,11 +1427,32 @@ def rmap_partition(D):
     ch.10): a spanning UC or none at all gives the fact type its own table (rule 1); a
     single-role UC absorbs it into its role-1 player's top supertype, or the mandatory
     side for a 1:1 (rule 2, §10.3). This host binding applies that def through the reducer,
-    so every host reads one definition; the twin is pinned in test_shared_builders."""
+    so every host reads one definition; the twin is pinned in test_shared_builders.
+
+    MEMOIZED per D object (weak keys): the compile pipeline asks for the
+    partition at every stage (28 calls, ~12s each under profile — ~20% of
+    a support compile) and the answer is a pure function of D. A mutation
+    yields a NEW D object, so a stale hit is impossible by construction;
+    dead Ds fall out with the GC. Non-weakref-able Ds just compute."""
+    global _PART_MEMO
+    if _PART_MEMO is None:
+        import weakref
+        _PART_MEMO = weakref.WeakKeyDictionary()
+    try:
+        hit = _PART_MEMO.get(D)
+    except TypeError:
+        hit = None
+    if hit is not None:
+        return dict(hit)
     from .lam import atom as A, from_lam
     from .reduce import apply as _apply
     pairs = from_lam(_apply(A("system:partition"), D))
-    return {ft: key for (key, ft) in pairs}
+    part = {ft: key for (key, ft) in pairs}
+    try:
+        _PART_MEMO[D] = dict(part)
+    except TypeError:
+        pass
+    return part
 
 
 def layout_cells(D):
