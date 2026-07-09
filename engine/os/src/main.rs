@@ -154,6 +154,23 @@ mod fb {
 
     slint::include_modules!();
 
+    // the nouns inventory off the native nouns verb
+    fn nouns() -> Vec<String> {
+        let out = arest::worker::arest_call("nouns", "{}");
+        let mut ns = Vec::new();
+        if let Some(a) = out.find("\"nouns\":[") {
+            let body = &out[a + 9..];
+            let end = body.find(']').unwrap_or(body.len());
+            for part in body[..end].split(',') {
+                let n = part.trim().trim_matches('"');
+                if !n.is_empty() {
+                    ns.push(n.to_string());
+                }
+            }
+        }
+        ns
+    }
+
     // the list answer's ids leg: ["a","b",...] out of the native list
     // verb (the same dependency-free scanning discipline)
     fn list_ids(noun: &str) -> Vec<String> {
@@ -250,8 +267,18 @@ mod fb {
         // THE PANE PAIR, realized a fourth time: the master lists the
         // noun's population (the native list verb), the detail shows
         // the first entity — the same split showui renders
-        let noun = "GitHub Project";
-        let ids = list_ids(noun);
+        let all_nouns = nouns();
+        println!("ui: {} nouns available", all_nouns.len());
+        let mut noun_idx = all_nouns
+            .iter()
+            .position(|n| n == "GitHub Project")
+            .unwrap_or(0);
+        let noun = all_nouns
+            .get(noun_idx)
+            .cloned()
+            .unwrap_or_else(|| "GitHub Project".to_string());
+        let noun = noun.as_str();
+        let mut ids = list_ids(noun);
         ui.set_master_title(format!("{}s", noun).into());
         ui.set_items(std::rc::Rc::new(slint::VecModel::from(
             ids.iter().map(|s| slint::SharedString::from(s.as_str()))
@@ -331,6 +358,7 @@ mod fb {
         loop {
             use uefi::proto::console::text::{Key, ScanCode};
             let mut moved = false;
+            let mut renoun = false;
             while let Ok(Some(k)) = keys.read_key() {
                 match k {
                     Key::Special(ScanCode::DOWN) => {
@@ -345,13 +373,55 @@ mod fb {
                             moved = true;
                         }
                     }
+                    Key::Special(ScanCode::RIGHT) => {
+                        if !all_nouns.is_empty() {
+                            noun_idx = (noun_idx + 1) % all_nouns.len();
+                            renoun = true;
+                        }
+                    }
+                    Key::Special(ScanCode::LEFT) => {
+                        if !all_nouns.is_empty() {
+                            noun_idx =
+                                (noun_idx + all_nouns.len() - 1)
+                                % all_nouns.len();
+                            renoun = true;
+                        }
+                    }
                     _ => {}
                 }
+            }
+            if renoun {
+                let n = all_nouns[noun_idx].clone();
+                ids = list_ids(&n);
+                selected = 0;
+                ui.set_master_title(format!("{}s", n).into());
+                ui.set_items(std::rc::Rc::new(slint::VecModel::from(
+                    ids.iter()
+                        .map(|s| slint::SharedString::from(s.as_str()))
+                        .collect::<Vec<_>>())).into());
+                ui.set_selected(0);
+                if let Some(first) = ids.first() {
+                    let (title, rows) = detail_rows(&n, first);
+                    ui.set_detail_title(title.into());
+                    let model: Vec<FieldRow> = rows
+                        .into_iter()
+                        .map(|(k, v)| FieldRow { k: k.into(), v: v.into() })
+                        .collect();
+                    ui.set_fields(std::rc::Rc::new(
+                        slint::VecModel::from(model)).into());
+                } else {
+                    ui.set_detail_title(format!("{} · (empty)", n).into());
+                    ui.set_fields(std::rc::Rc::new(
+                        slint::VecModel::from(Vec::<FieldRow>::new())).into());
+                }
+                println!("ui: noun {}", n);
+                moved = false;
             }
             if moved {
                 ui.set_selected(selected as i32);
                 if let Some(id) = ids.get(selected as usize) {
-                    let (title, rows) = detail_rows(noun, id);
+                    let (title, rows) =
+                        detail_rows(&all_nouns[noun_idx], id);
                     ui.set_detail_title(title.into());
                     let model: Vec<FieldRow> = rows
                         .into_iter()

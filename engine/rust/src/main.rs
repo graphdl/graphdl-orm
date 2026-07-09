@@ -5232,6 +5232,41 @@ fn store_call(tool: &str, args: &J, app: &str, srv: &mut Srv)
     -> Option<Result<String, (i64, String)>> {
     let _ = app;
     Some(match tool {
+        "nouns" => {
+            // the store's noun inventory: the DISTINCT rmapColumns
+            // tables (a table's name IS its top noun) — one pass, the
+            // menu surface every host shares
+            let mut nouns: Vec<String> = Vec::new();
+            if let Some((_, N::S(rows))) = srv
+                .ncells
+                .iter()
+                .find(|(k, _)| matches!(k, Leaf::S(s) if s == "rmapColumns"))
+            {
+                for r in rows.iter() {
+                    if let N::S(cc) = r {
+                        if !cc.is_empty() {
+                            if let N::A(l) = &cc[0] {
+                                if let Some(t) = leaf_str(l) {
+                                    if !nouns.contains(&t) {
+                                        nouns.push(t);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            nouns.sort();
+            let mut out = String::from("{\"nouns\":[");
+            for (i, n) in nouns.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                esc(n, &mut out);
+            }
+            out.push_str("]}");
+            Ok(out)
+        }
         "list" => {
             // NATIVE noun listing: the population's ids off the table
             // INDEX cell, the table resolved through the noun's role-1
