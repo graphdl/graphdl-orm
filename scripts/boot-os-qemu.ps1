@@ -130,6 +130,13 @@ while ((Get-Date) -lt $deadline) {
               $wirePass = $true
               Write-Host ("wire get: " + $g.Content.Substring(0, [Math]::Min(140, $g.Content.Length)))
             }
+            # SUBTYPE probe (non-fatal): a Support Request's fields live
+            # on the Agent Chat table — renders only with the
+            # top-supertype resolution (ev_cols_native, a314ff32)
+            try {
+              $s2 = Invoke-WebRequest -Uri 'http://127.0.0.1:18080/get?args=%7B%22noun%22%3A%22Support%20Request%22%2C%22id%22%3A%22smoketest-profile%22%7D' -TimeoutSec 10 -UseBasicParsing
+              Write-Host ("wire subtype get: " + $s2.Content.Substring(0, [Math]::Min(300, $s2.Content.Length)))
+            } catch { Write-Host "subtype get failed: $_" }
           }
         } catch { Write-Host "wire curl failed: $_" }
       }
