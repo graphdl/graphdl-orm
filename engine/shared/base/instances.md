@@ -153,7 +153,18 @@ This association with Fact, Resource, Role provides the preferred identification
 State Machine is instance of State Machine Definition.
   Each State Machine is instance of exactly one State Machine Definition.
 State Machine is instance of Noun.
-  Each State Machine is instance of exactly one Noun.
+  Each State Machine is instance of some Noun.
+<!-- 'exactly one Noun' relaxed 2026-07-09 (Samuel: fix the SM readings),
+     the SAME non-canonical case as Resource (see the Resource note). This
+     ft is a REFLECTION cell (protocol.py REFLECTION set) like
+     Resource_is_instance_of_Noun, populated by schema self-description,
+     so an SMD reflects as an instance of Noun AND State Machine
+     Definition via SMD < Status < Noun (deliberate — the Harel nesting,
+     state.md). Transitive membership is correct; the uniqueness was not.
+     The sibling 'exactly one State Machine Definition' (line above) is
+     NOT a reflection cell and stays exactly-one pending its own
+     disambiguation. -->
+
 <!-- task-987 / junk-writer-3: the SM seed has ALWAYS written this
      triple at runtime (compile.rs sm seed: instance_of_Noun +
      for_Resource + currently_in_Status), but the fact type was never
