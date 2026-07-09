@@ -34,11 +34,45 @@ fn main() {
     println!("get: {}", &got[..got.len().min(160)]);
     println!("boot: complete");
 
-    // The engine loop replaces this spin: the server target parks on
-    // the network poll once virtio-net lands. (std::thread::sleep has
-    // no clock on bare firmware; the harness kills QEMU at its cap.)
+    // mini: the console IS the verb table — one line in (<verb>
+    // [args-json]), one JSON answer out, the same store_call the
+    // Worker and the MCP host dispatch through. uefi std wires stdin
+    // to the firmware's Simple Text Input, stdout to ConOut.
+    #[cfg(feature = "mini")]
+    console_loop();
+
+    // server: the engine parks here until the verb table goes over
+    // the wire (virtio-net / SNP + smoltcp — the lane's next
+    // milestone). std::thread::sleep has no clock on bare firmware;
+    // the harness kills QEMU at its cap.
+    #[allow(unreachable_code)]
     loop {
         std::hint::spin_loop();
+    }
+}
+
+#[cfg(feature = "mini")]
+fn console_loop() -> ! {
+    use std::io::{self, BufRead, Write};
+    println!("console: <verb> [args-json]   (e.g. get {{\"noun\":\"Contact Submission\",\"id\":\"...\"}})");
+    loop {
+        print!("arest> ");
+        io::stdout().flush().ok();
+        let mut line = String::new();
+        if io::stdin().lock().read_line(&mut line).is_err() {
+            continue;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (verb, args) = match line.split_once(' ') {
+            Some((v, a)) => (v, a.trim()),
+            None => (line, ""),
+        };
+        let out = arest::worker::arest_call(
+            verb, if args.is_empty() { "{}" } else { args });
+        println!("{}", out);
     }
 }
 
