@@ -13,6 +13,7 @@ export component Splash inherits Window {
     in property <string> engine-version: "";
     in property <string> master-title: "";
     in property <[string]> items: [];
+    in property <int> selected: 0;
     in property <string> detail-title: "";
     in property <[FieldRow]> fields: [];
     background: #101828;
@@ -51,9 +52,9 @@ export component Splash inherits Window {
                         font-size: 18px;
                         font-weight: 600;
                     }
-                    for it in root.items: Rectangle {
+                    for it[i] in root.items: Rectangle {
                         height: 44px;
-                        background: #223054;
+                        background: i == root.selected ? #3a5088 : #223054;
                         border-radius: 8px;
                         Text {
                             x: 14px;

@@ -56,7 +56,7 @@ fn main() {
     // [args-json]), one JSON answer out, the same store_call the
     // Worker and the MCP host dispatch through. uefi std wires stdin
     // to the firmware's Simple Text Input, stdout to ConOut.
-    #[cfg(feature = "mini")]
+    #[cfg(all(feature = "mini", not(feature = "full")))]
     console_loop();
 
     // server: the engine parks here until the verb table goes over
@@ -277,31 +277,95 @@ mod fb {
 
         let mut pixels =
             vec![Rgb565Pixel(0); w * hgt];
-        let rendered = window.draw_if_needed(|renderer| {
-            renderer.render(&mut pixels, w);
-        });
-        if !rendered {
-            println!("slint: nothing to draw");
-            return;
+        let mut push_frame = |window: &MinimalSoftwareWindow,
+                              gop: &mut uefi::boot::ScopedProtocol<GraphicsOutput>|
+         -> bool {
+            let rendered = window.draw_if_needed(|renderer| {
+                renderer.render(&mut pixels, w);
+            });
+            if rendered {
+                // widen 565 -> Blt pixels, one BufferToVideo per frame
+                let blt: Vec<BltPixel> = pixels
+                    .iter()
+                    .map(|p| {
+                        let r = ((p.0 >> 11) & 0x1f) as u8;
+                        let g = ((p.0 >> 5) & 0x3f) as u8;
+                        let b = (p.0 & 0x1f) as u8;
+                        BltPixel::new(r << 3 | r >> 2, g << 2 | g >> 4,
+                                      b << 3 | b >> 2)
+                    })
+                    .collect();
+                gop.blt(BltOp::BufferToVideo {
+                    buffer: &blt,
+                    src: uefi::proto::console::gop::BltRegion::Full,
+                    dest: (0, 0),
+                    dims: (w, hgt),
+                }).ok();
+            }
+            rendered
+        };
+        push_frame(&window, &mut gop);
+        println!("slint: frame {}x{} rendered; blt Ok(())", w, hgt);
+
+        // THE LIVE LOOP — the UI is the full target's life: firmware
+        // key events drive the master selection (Up/Down), each change
+        // refetches the canon detail and repaints. The pointer joins
+        // through the same loop when its protocol is present.
+        let key_input = uefi::boot::get_handle_for_protocol::<
+            uefi::proto::console::text::Input>()
+            .ok()
+            .and_then(|h| uefi::boot::open_protocol_exclusive::<
+                uefi::proto::console::text::Input>(h).ok());
+        let mut keys = match key_input {
+            Some(k) => k,
+            None => {
+                println!("ui: no key input; parking on the splash");
+                loop {
+                    std::hint::spin_loop();
+                }
+            }
+        };
+        println!("boot: complete");
+        println!("ui: loop live; arrows move the selection");
+        let mut selected: i64 = 0;
+        loop {
+            use uefi::proto::console::text::{Key, ScanCode};
+            let mut moved = false;
+            while let Ok(Some(k)) = keys.read_key() {
+                match k {
+                    Key::Special(ScanCode::DOWN) => {
+                        if (selected as usize) + 1 < ids.len() {
+                            selected += 1;
+                            moved = true;
+                        }
+                    }
+                    Key::Special(ScanCode::UP) => {
+                        if selected > 0 {
+                            selected -= 1;
+                            moved = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if moved {
+                ui.set_selected(selected as i32);
+                if let Some(id) = ids.get(selected as usize) {
+                    let (title, rows) = detail_rows(noun, id);
+                    ui.set_detail_title(title.into());
+                    let model: Vec<FieldRow> = rows
+                        .into_iter()
+                        .map(|(k, v)| FieldRow { k: k.into(), v: v.into() })
+                        .collect();
+                    ui.set_fields(std::rc::Rc::new(
+                        slint::VecModel::from(model)).into());
+                }
+                println!("ui: selection {}", selected);
+            }
+            slint::platform::update_timers_and_animations();
+            push_frame(&window, &mut gop);
+            uefi::boot::stall(15_000);            // ~66 fps ceiling
         }
-        // widen 565 -> Blt pixels and push the frame in one blt
-        let blt: Vec<BltPixel> = pixels
-            .iter()
-            .map(|p| {
-                let r = ((p.0 >> 11) & 0x1f) as u8;
-                let g = ((p.0 >> 5) & 0x3f) as u8;
-                let b = (p.0 & 0x1f) as u8;
-                BltPixel::new(r << 3 | r >> 2, g << 2 | g >> 4,
-                              b << 3 | b >> 2)
-            })
-            .collect();
-        let out = gop.blt(BltOp::BufferToVideo {
-            buffer: &blt,
-            src: uefi::proto::console::gop::BltRegion::Full,
-            dest: (0, 0),
-            dims: (w, hgt),
-        });
-        println!("slint: frame {}x{} rendered; blt {:?}", w, hgt, out);
     }
 }
 
