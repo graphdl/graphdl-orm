@@ -1925,11 +1925,37 @@ def _compile_model_seed(text, D=None, context_from=None):
                "rule_diagnostics": diags}
 
 
+_CELLS_MEMO = None
+
+
 def _cells(D, name):
-    for c in from_lam(D):
-        if isinstance(c, tuple) and len(c) == 3 and c[:2] == ("CELL", name):
-            return list(c[2])
-    return []
+    """One cell's rows off D — MEMOIZED per D object (weak keys): the
+    validate verb builds 234 per-ft validates against ONE settled D,
+    and each build asked for three cells, each answer walking the WHOLE
+    store spine through from_lam (117M calls, 97% of a 9-minute
+    validate — the 2026-07-08 profile). One walk now indexes every
+    cell; same-D callers hit the dict. A mutation mints a new D object,
+    so a stale hit is impossible by construction; non-weakref-able Ds
+    walk as before."""
+    global _CELLS_MEMO
+    if _CELLS_MEMO is None:
+        import weakref
+        _CELLS_MEMO = weakref.WeakKeyDictionary()
+    per = None
+    try:
+        per = _CELLS_MEMO.get(D)
+    except TypeError:
+        pass
+    if per is None:
+        per = {}
+        for c in from_lam(D):
+            if isinstance(c, tuple) and len(c) == 3 and c[0] == "CELL":
+                per.setdefault(c[1], list(c[2]))
+        try:
+            _CELLS_MEMO[D] = per
+        except TypeError:
+            pass
+    return list(per.get(name, []))
 
 
 # How each constraint KIND attaches to a cell's validate: fact (cid, kind, …scope…, modality) +
