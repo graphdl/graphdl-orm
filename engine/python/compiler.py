@@ -1119,17 +1119,20 @@ def _h_subset_trailing(g, k, m):
                              " (role-path work pending)")
         proj_y.append(y_roles.index(n) + 1)
         proj_x.append(x_roles.index(n) + 1)
-    # THE PARTITION GATE (the mint is one line from live): a subset
-    # constraint row — hand-rolled OR through the cs_rows canon —
-    # crashes system:partition's constraint fold ('not enough values
-    # to unpack', engine.py rmap_partition; the kind has never minted
-    # in the system's history, so the fold never met one). Un-gate by
-    # deleting this raise once the partition canon digests non-UC
-    # constraint kinds (a polyglot shared/*.canon slice with twins).
+    # THE PARTITION GATE (the mint is one line from live). Diagnosis
+    # 2026-07-09 (probes: tmp/probe_partition*.py in the job dir): the
+    # minted row is canon-shaped and a BASE-LESS D partitions fine
+    # with it; under the base metamodel, run_rules leaves the
+    # 'constraint' CELL ITSELF reading as bottom (FetchPop answers ⊥,
+    # so system:partition answers ⊥ and rmap_partition's unpack dies).
+    # A base reflection/validation mechanism meets the 'subset' kind
+    # for the first time in the system's history and poisons the cell.
+    # The set-comparison arc's partition-canon slice carries this; un-
+    # gate by deleting this raise when the base digests the kind.
     raise ValueError(
         "subset mint awaits the partition-canon slice: "
         f"{cond_txt.strip()!r} -> {head_txt.strip()!r} "
-        f"(projection ready: {proj_y} ⊆ {proj_x})")
+        f"(projection ready: {proj_y} <= {proj_x})")
     A_, objs = _cs_call("subset", "", [y_ft, x_ft],
                         [cond_txt.strip(), head_txt.strip()], m)
     objs = [(cell, C.scoped_subset_projected(x_ft, proj_y, proj_x))
