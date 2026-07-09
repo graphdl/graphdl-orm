@@ -78,6 +78,10 @@ export class ArestLog {
 let ready = null;
 async function ensure(env) {
   if (!ready) {
+    // a failed boot must NOT poison the isolate: a cached REJECTED
+    // promise turns every later request into an instant 1101 (the
+    // 2026-07-08 flap — 200s and 1101s alternating by isolate).
+    // Reset on failure so the next request retries the boot.
     ready = (async () => {
       await init(wasmModule);
       const sidecar =
@@ -111,7 +115,10 @@ async function ensure(env) {
           arest_apply(JSON.stringify({ fact_type: e.ft, fact: e.fact }));
         } catch {}
       }
-    })();
+    })().catch((e) => {
+      ready = null;
+      throw e;
+    });
   }
   return ready;
 }
@@ -171,14 +178,44 @@ async function ensureFederated(env, noun) {
     }
   }
   // THE BRIDGE MINT (identity is transduction): a noun surfaced as
-  // another noun gets one same-id bridge row per fetched entity — the
-  // canon re-key rules derive the fields from the identity link
+  // another noun gets one same-id bridge row per fetched entity. The
+  // FIELD projection rides the boundary too — the canon re-key rules
+  // (contact-derivation.md) are the SPEC this table mirrors, because
+  // the wasm derive op is the interpretive class and blew the Worker
+  // CPU budget both bare and changed-scoped (1101 x2, 2026-07-08;
+  // rolled back twice). When the native rules path lands, this table
+  // retires and the derive call replaces it.
   const surfaced = popRows("Noun_is_surfaced_as_Noun")
     .find((r) => r[0] === noun);
   if (surfaced && ids.length) {
-    const bft = surfaced[1].replace(/[^0-9A-Za-z]+/g, "_").replace(/^_+|_+$/g, "")
-      + "_is_" + nid;
-    byFt.set(bft, ids.map((rid) => [rid, rid]));
+    const sid = surfaced[1].replace(/[^0-9A-Za-z]+/g, "_").replace(/^_+|_+$/g, "");
+    byFt.set(sid + "_is_" + nid, ids.map((rid) => [rid, rid]));
+    if (noun === "Contact Submission" && surfaced[1] === "Support Request") {
+      // mirrors contact-derivation.md's re-keys + constants, one row
+      // per submission field that arrived
+      const REKEY = [
+        ["Body", "Support_Request_has_Description"],
+        ["Issue Type", "Support_Request_has_Subject"],
+        ["Email Address", "Support_Request_has_Email_Address"],
+        ["Submitter Name", "Support_Request_has_contact_Name"],
+        ["Company Name", "Support_Request_has_company_Name"],
+        ["Issue Type", "Support_Request_has_Category"],
+        ["API Reference", "Support_Request_has_API_Reference"],
+        ["Date", "Support_Request_occurred_at_Timestamp"],
+        ["User Id", "Support_Request_is_for_User"],
+      ];
+      for (const [src, dft] of REKEY) {
+        const rows = byFt.get(nid + "_has_" +
+          src.replace(/[^0-9A-Za-z]+/g, "_"));
+        if (rows && rows.length) byFt.set(dft, rows.map((r) => [...r]));
+      }
+      byFt.set("Support_Request_has_Intake_Source",
+               ids.map((rid) => [rid, "contact-form"]));
+      byFt.set("Support_Request_uses_Streaming_Mode",
+               ids.map((rid) => [rid, "non-streaming"]));
+      byFt.set("Support_Request_is_with_Agent",
+               ids.map((rid) => [rid, "contact-form"]));
+    }
   }
   if (byFt.size > 0) {
     const entries = [...byFt.entries()].map(([ft, facts]) => ({ ft, facts }));
@@ -495,7 +532,18 @@ export default {
     if (request.method === "GET" && seg.length >= 2) {
       const fnoun = nounOf(seg[0]);
       if (fnoun) {
-        try { await ensureFederated(env, fnoun); }
+        try {
+          await ensureFederated(env, fnoun);
+          // isolate locality: a noun SURFACED AS the requested one
+          // must federate in THIS isolate too — its fetched rows are
+          // where the requested noun's facts come from (the SR view
+          // was empty in fresh isolates until the CS fetch ran here)
+          for (const r of popRows("Noun_is_surfaced_as_Noun")) {
+            if (r.length >= 2 && r[1] === fnoun) {
+              await ensureFederated(env, r[0]);
+            }
+          }
+        }
         catch (e) {
           if (url.searchParams.has(String.fromCharCode(102,101,100,100,101,98,117,103)))
             return json(JSON.stringify({ fed_error: String(e) }), 500);

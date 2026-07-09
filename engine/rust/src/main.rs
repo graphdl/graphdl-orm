@@ -2185,11 +2185,50 @@ fn ev_cols_native(
     let sv2 = |n: &N| -> Option<String> {
         match n { N::A(l) => leaf_str(l), _ => None }
     };
+    // THE SUBTYPE TABLE RESOLUTION (2026-07-08): a subtype's fact
+    // types absorb into its TOP SUPERTYPE's table (RMAP rule 2 — the
+    // Support Request row lives in "Agent Chat"), so matching the
+    // requested noun's NAME against the table column classifies ZERO
+    // columns for every subtype. Resolve the noun's table through its
+    // role-1 fact types first; a noun with no absorbed fts keeps its
+    // own name (the own-table case).
+    let noun_fts: Vec<String> = rows_of("role")
+        .iter()
+        .filter_map(|r| {
+            if let N::S(cc) = r {
+                if cc.len() >= 4
+                    && sv2(&cc[3]).as_deref() == Some(noun)
+                {
+                    if let N::A(pl) = &cc[2] {
+                        if matches!(&**pl, Leaf::I(1)) {
+                            return sv2(&cc[1]);
+                        }
+                    }
+                }
+            }
+            None
+        })
+        .collect();
+    let table: String = rows_of("rmapColumns")
+        .iter()
+        .find_map(|r| {
+            if let N::S(cc) = r {
+                if cc.len() >= 3 {
+                    if let (Some(t), Some(ft)) = (sv2(&cc[0]), sv2(&cc[2])) {
+                        if noun_fts.iter().any(|f| *f == ft) {
+                            return Some(t);
+                        }
+                    }
+                }
+            }
+            None
+        })
+        .unwrap_or_else(|| noun.to_string());
     let mut colrows: Vec<(i64, String)> = rows_of("rmapColumns")
         .iter()
         .filter_map(|r| {
             if let N::S(cc) = r {
-                if cc.len() >= 3 && sv2(&cc[0]).as_deref() == Some(noun) {
+                if cc.len() >= 3 && sv2(&cc[0]).as_deref() == Some(table.as_str()) {
                     if let (N::A(cl), Some(ft)) = (&cc[1], sv2(&cc[2])) {
                         if let Leaf::I(ci) = &**cl {
                             return Some((*ci, ft));
