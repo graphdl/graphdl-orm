@@ -154,6 +154,25 @@ mod fb {
 
     slint::include_modules!();
 
+    // the list answer's ids leg: ["a","b",...] out of the native list
+    // verb (the same dependency-free scanning discipline)
+    fn list_ids(noun: &str) -> Vec<String> {
+        let out = arest::worker::arest_call(
+            "list", &format!("{{\"noun\":\"{}\"}}", noun));
+        let mut ids = Vec::new();
+        if let Some(a) = out.find("\"ids\":[") {
+            let body = &out[a + 7..];
+            let end = body.find(']').unwrap_or(body.len());
+            for part in body[..end].split(',') {
+                let id = part.trim().trim_matches('"');
+                if !id.is_empty() {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+        ids
+    }
+
     // the get answer's fields leg -> ⟨key, value⟩ rows: a minimal
     // scanner over the flat {"fields":{"K":"V"|null,...}} shape (no
     // JSON dep; the shape is the worker's own get contract)
@@ -228,21 +247,30 @@ mod fb {
             format!("v{}", env!("CARGO_PKG_VERSION")).into());
         ui.set_engine_version(
             arest::worker::arest_version().into());
-        // THE CANON TREE, realized a fourth time: the same get the
-        // Worker serves feeds the field rows (a naive JSON scan keeps
-        // the adapter dependency-free; the tree kinds are stable)
-        let (title, rows) = detail_rows(
-            "GitHub Project", "Auto.dev 2.0");
-        ui.set_detail_title(title.into());
-        let model: Vec<FieldRow> = rows
-            .into_iter()
-            .map(|(k, v)| FieldRow { k: k.into(), v: v.into() })
-            .collect();
-        ui.set_fields(std::rc::Rc::new(
-            slint::VecModel::from(model)).into());
+        // THE PANE PAIR, realized a fourth time: the master lists the
+        // noun's population (the native list verb), the detail shows
+        // the first entity — the same split showui renders
+        let noun = "GitHub Project";
+        let ids = list_ids(noun);
+        ui.set_master_title(format!("{}s", noun).into());
+        ui.set_items(std::rc::Rc::new(slint::VecModel::from(
+            ids.iter().map(|s| slint::SharedString::from(s.as_str()))
+                .collect::<Vec<_>>())).into());
+        if let Some(first) = ids.first() {
+            let (title, rows) = detail_rows(noun, first);
+            ui.set_detail_title(title.into());
+            let model: Vec<FieldRow> = rows
+                .into_iter()
+                .map(|(k, v)| FieldRow { k: k.into(), v: v.into() })
+                .collect();
+            ui.set_fields(std::rc::Rc::new(
+                slint::VecModel::from(model)).into());
+        }
         {
             use slint::Model;
-            println!("slint: detail rows {}", ui.get_fields().row_count());
+            println!("slint: master {} rows; detail rows {}",
+                     ui.get_items().row_count(),
+                     ui.get_fields().row_count());
         }
         window.set_size(slint::PhysicalSize::new(w as u32, hgt as u32));
         ui.show().expect("show");
