@@ -1673,22 +1673,43 @@ class Registry:
 
     # ---- compile: readings -> M -> lfp -> replay -> snapshot ----
     def compile(self, name):
+        # AREST_TRACE: semantic-level compile traces — per-phase wall
+        # time, the slowest statements (monkey-wrench readings), the
+        # costliest rules with their delta/full modes and rounds.
+        # Written beside the store as <app>.trace.json.
+        import time as _t
+        _tracing = bool(os.environ.get("AREST_TRACE"))
+        _phases, _rule_stats = {}, ([] if _tracing else None)
+        forml.TRACE_STMTS.clear()
+
+        def _phase(label, t0):
+            if _tracing:
+                _phases[label] = round(_t.perf_counter() - t0, 3)
+            return _t.perf_counter()
+
+        _tp = _t.perf_counter()
         texts = [open(p, encoding="utf-8").read() for p in self._readings(name)]
         base = self._base_D()
+        _tp = _phase("read+base", _tp)
         D, rep = forml.compile_model("\n\n".join(texts), D=base,
                                      context_from=base)
-        D = system.run_rules(D)
+        _tp = _phase("compile_model", _tp)
+        D = system.run_rules(D, stats=_rule_stats)
+        _tp = _phase("run_rules:post-model", _tp)
         # status(e) is an ORM fact type ("<Noun> is currently in Status"), so RMAP
         # absorbs it as a column and the machine reads/overwrites it there; wired
         # before replay so the machine fires into the column, not the noun_status wart
         D = system.status_facts(D)
+        _tp = _phase("status_facts", _tp)
         # the event stream replays through the SAME create (facts are the source
         # of truth; the .db is disposable, set semantics make replay idempotent),
         # read from whatever sink the registry holds, never a file path
         entries = self._sink(name).read()
         if entries:
             D = persist.replay_entries(D, entries)
-            D = system.run_rules(D)
+            _tp = _phase("replay", _tp)
+            D = system.run_rules(D, stats=_rule_stats)
+            _tp = _phase("run_rules:post-replay", _tp)
         # readings- AND log-carried machine events fold ONCE, after every
         # event fact is present and the post-replay derive has run (the
         # started-backfill implications are derivation consequents the fold
@@ -1699,24 +1720,55 @@ class Registry:
         # nothing to init — the common probe-app case pays one fixpoint,
         # not three; the fold-derive-cost lever's cheap half)
         D2 = system.machine_fold(D)
+        _tp = _phase("machine_fold", _tp)
         if D2 is not D:
-            D = system.run_rules(D2)
+            D = system.run_rules(D2, stats=_rule_stats)
+            _tp = _phase("run_rules:post-fold", _tp)
         # the snapshot records how much of the stream it holds, so a load can
         # replay exactly the tail another host appended after this save
         D = persist._with_watermark(D, len(entries))
         D = system.layout_cells(D)
         D = system.scheduler_cells(D)
         D = system.generator_cells(D)
+        _tp = _phase("layout+scheduler+generator", _tp)
         D = system.create_handlers(D)                         # create:<ft> defs, native apply
+        _tp = _phase("create_handlers", _tp)
         drv = self._storage(name)
         drv.save(D)                                           # the cell store, through the driver
+        _tp = _phase("save", _tp)
         self._sidecar(name, D)
+        _tp = _phase("sidecar", _tp)
         # the RMAP 3NF projection rides with a SQL backend (the GraphDL
         # contract: the relational tables downstream consumers read); an object
         # backend has no relational surface and skips it
         if drv.sql:
             rep["projected"] = drv.project(D)
+            _tp = _phase("sql-project", _tp)
         rep["app"] = name
+        if _tracing:
+            by_rule = {}
+            rounds = 0
+            for r in _rule_stats or []:
+                agg = by_rule.setdefault(r["rule"], [0.0, 0, r["mode"]])
+                agg[0] += r.get("t", 0.0)
+                agg[1] += 1
+                agg[2] = r["mode"]
+                rounds = max(rounds, r.get("round", 0))
+            top_rules = sorted(
+                ({"rule": k, "t": round(v[0], 3), "evals": v[1],
+                  "last_mode": v[2]} for k, v in by_rule.items()),
+                key=lambda x: -x["t"])[:15]
+            top_stmts = sorted(forml.TRACE_STMTS, key=lambda x: -x[0])[:15]
+            trace = {"phases": _phases, "rounds": rounds,
+                     "top_rules": top_rules,
+                     "top_statements": [
+                         {"t": round(t, 3), "stmt": st}
+                         for t, st in top_stmts]}
+            rep["trace"] = trace
+            tpath = os.path.join(self._app_dir(name),
+                                 f"{name}.trace.json")
+            with open(tpath, "w", encoding="utf-8") as f:
+                json.dump(trace, f, ensure_ascii=False, indent=1)
         return rep
 
     def _sidecar(self, name, D):

@@ -1739,6 +1739,13 @@ def compile(stmt, D, known=()):
 # grammar file's own arbitration-rule values. ----
 _GENERIC_CLASSIFICATIONS = {"Fact Type Reading", "Instance Fact"}
 
+# AREST_TRACE: per-statement translate timings (the monkey-wrench
+# detector — a poorly-authored reading shows up as an outlier here).
+# protocol.compile drains this after each compile_model call.
+TRACE_STMTS = []
+import time as _time
+import os
+
 _PRODUCTION_CACHE = {}
 
 
@@ -1942,6 +1949,8 @@ def compile_model_selfhost(text, D=None, context_from=None):
             # deontic carries its operator sign through the modality field
             # (deontic:positive = obligatory, deontic:negative = forbidden);
             # the translator impl splits it back before handlers see it
+            _tr0 = (_time.perf_counter()
+                    if os.environ.get("AREST_TRACE") else None)
             mfield = (mod + ":" + sign) if mod == "deontic" else (mod or "")
             operand = _L.SEQ(                                  # host lacks: skipped, the
                 _L.CONS(_A(inner))(                            # boundary's graceful absence
@@ -1950,6 +1959,9 @@ def compile_model_selfhost(text, D=None, context_from=None):
             with _dm.step(D):
                 try:
                     D = _apply(_A(t), operand)                 # rho: dispatch through DEFS
+                    if _tr0 is not None:
+                        TRACE_STMTS.append(
+                            (_time.perf_counter() - _tr0, stmt[:140]))
                 except ValueError:
                     # a handler REFUSING its statement (unresolved UC
                     # columns) reports loudly — never a silent vanish

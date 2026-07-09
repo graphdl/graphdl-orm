@@ -1070,6 +1070,7 @@ def run_rules(D, changed=None, stats=None):
     from . import ast, defs
     from .reduce import apply as _ap
     from .lam import to_lam, from_lam, atom as _A
+    import time as _time
     reads, atomsof = {}, {}
     for r in _pop_rows(D, "ruleReads"):
         if len(r) >= 2:
@@ -1123,6 +1124,7 @@ def run_rules(D, changed=None, stats=None):
         rnd += 1
         fired, next_delta = False, {}
         for rule_cid, head in rules:
+            _t0 = _time.perf_counter() if stats is not None else 0.0
             if delta is None:                                # round one: full bodies
                 if frontier is not None and not (reads.get(rule_cid, set()) & frontier):
                     continue
@@ -1136,7 +1138,8 @@ def run_rules(D, changed=None, stats=None):
                         continue                             # rule not compiled (M-facts only)
                     new_rows = {tuple(r) for r in outs if isinstance(r, tuple)}
                 if stats is not None:
-                    stats.append({"round": rnd, "rule": rule_cid, "mode": "full"})
+                    stats.append({"round": rnd, "rule": rule_cid, "mode": "full",
+                                  "t": _time.perf_counter() - _t0})
             else:
                 hits = [(p, ft) for (p, ft) in atomsof.get(rule_cid, ()) if ft in delta]
                 if hits:
@@ -1149,6 +1152,7 @@ def run_rules(D, changed=None, stats=None):
                             new_rows |= {tuple(r) for r in o if isinstance(r, tuple)}
                         if stats is not None:
                             stats.append({"round": rnd, "rule": rule_cid, "mode": "delta",
+                                          "t": _time.perf_counter() - _t0,
                                           "pos": p, "in": len(drows),
                                           "base": len(_pop_rows(D, ft))})
                 elif rule_cid not in atomsof and (reads.get(rule_cid, set()) & set(delta)):
@@ -1162,7 +1166,8 @@ def run_rules(D, changed=None, stats=None):
                             continue
                         new_rows = {tuple(r) for r in outs if isinstance(r, tuple)}
                     if stats is not None:
-                        stats.append({"round": rnd, "rule": rule_cid, "mode": "full"})
+                        stats.append({"round": rnd, "rule": rule_cid, "mode": "full",
+                                      "t": _time.perf_counter() - _t0})
                 else:
                     continue
             old = {tuple(r) for r in _pop_rows(D, head)}
