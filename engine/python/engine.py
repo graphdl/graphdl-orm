@@ -1122,7 +1122,17 @@ def run_rules(D, changed=None, stats=None):
         if _mout and not _pop_rows(D, _MIRROR):
             # asserted wins: a model carrying its own membership rows keeps
             # them untouched; the mirror serves only the empty cell (the
-            # post-migration world, where no reflection row ever lands)
+            # post-migration world, where no reflection row ever lands).
+            # NOTE (2026-07-09): the mirror is deliberately OVER-BROAD (an id
+            # is a direct instance of EVERY role-noun it plays, supertypes
+            # included) because SM-seeding and the domain bridge JOIN on it
+            # against supertype-declared machines/domains. Making it most-
+            # specific-only (Samuel's subtype=one-noun ruling) is correct for
+            # `instance of` but breaks those consumers, so the fix is the
+            # coordinated instance-mirror-refactor arc (task): collapse +
+            # a transitive is-a relation for consumers + remove the redundant
+            # Constraint Type noun (NORMA-conformant). Left over-broad here
+            # until that arc lands.
             D = _ap(ast.Store(_MIRROR), _S(to_lam(_rowsort(_mout)), D))
     _FTR = "Fact_Type_has_Role"
     if any(_FTR in rs for rs in reads.values()):
