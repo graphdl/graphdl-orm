@@ -596,9 +596,32 @@ def _role_facts(ft, roles):
 
 
 def _fact_type(reading, known):
-    """A reading → (ftid, assertions) declaring the fact type (template) and its roles in M."""
+    """A reading → (ftid, assertions) declaring the fact type (template) and its roles in M.
+
+    THE PARALLEL-FT UNIFICATION (2026-07-09 — four hits in one day: the
+    us-law assertions, bill-negotiation's granted-by, derivation heads,
+    and the rule twins): a reading naming a SUBTYPE in a role position
+    lands in the DECLARED supertype fact type — ORM's subtype instances
+    play their supertype's roles — instead of minting a parallel ft
+    that splits populations and views. Guarded narrowly: only when the
+    direct id is UNDECLARED and exactly ONE single-position supertype
+    substitution matches a declared ft; ambiguity or a declared direct
+    id keeps today's behavior."""
     template, roles = _reading(reading, known)
     ft = _ftid_from(template, roles)
+    subs = getattr(known, "subs", None)
+    fts = getattr(known, "fts", None)
+    if subs and fts and ft not in fts:
+        hits = []
+        for i, p in enumerate(roles):
+            for anc in subs.get(p, ()):
+                cand_roles = list(roles)
+                cand_roles[i] = anc
+                cand = _ftid_from(template, cand_roles)
+                if cand in fts and cand not in hits:
+                    hits.append(cand)
+        if len(hits) == 1:
+            return hits[0], []
     return ft, [("factType", (ft, template))] + _role_facts(ft, roles)
 
 
