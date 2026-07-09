@@ -1,0 +1,39 @@
+# engine/os — the AREST 0.9.0 operating-system target, FRESH (2026-07-08,
+# Samuel's spec): the 0.9.0 engine hosted on bare UEFI firmware. The
+# pre-0.9.0 kernel (crates/arest-kernel, removed in the serving swap
+# c2902a64) is the reference tree for target quirks — the soft-SIMD
+# build pin (d65bdb43), the OVMF harness mechanics, the profile split —
+# but no code is resurrected wholesale; the engine core this crate
+# hosts is the 0.9.0 one.
+#
+# Three targets, cumulative:
+#   server — no repl, no UI: the store + verb table served over the
+#            wire (the whitepaper's engine surface, headless)
+#   mini   — + text console (no Slint)
+#   full   — + Slint over the UEFI framebuffer realizing the SAME
+#            canon view trees the desktops render (uilayout is already
+#            in-language: engine/rust/src/uilayout.rs)
+#
+# Build:  cargo +nightly build --target x86_64-unknown-uefi
+# Smoke:  ..\..\scripts\boot-os-qemu.ps1 -Smoke
+
+[package]
+name = "arest-os"
+version = "0.1.0"
+edition = "2021"
+description = "AREST 0.9.0 on bare UEFI"
+license = "AGPL-3.0-or-later"
+
+[features]
+default = ["server"]
+server = []
+mini = ["server"]
+full = ["mini"]
+
+[dependencies]
+uefi = { version = "0.33", features = ["alloc", "global_allocator", "panic_handler", "logger"] }
+log = { version = "0.4", default-features = false }
+
+[profile.release]
+lto = true
+opt-level = "z"
