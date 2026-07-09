@@ -191,23 +191,43 @@ async function verifyActor(request, app) {
         // facts (isolate-local, never logged) — the DECLARED
         // subscription link anchors the customer policy rules
         const sub = user?.subscription;
+        const role = user?.role;
+        const entries = [];
         if (sub) {
+          entries.push(
+            { ft: "Subscription_belongs_to_Customer",
+              facts: [[String(sub), actor]] },
+            // THE CUSTOMER ANCHORS at the boundary: authorization.md's
+            // customer rules are the SPEC this projection mirrors —
+            // derivation runs at compile but the subscription link
+            // exists only at runtime, so the triples project here
+            // (isolate-local, never logged) exactly like the REKEY
+            // table, until the native rules path lands.
+            { ft: "User_is_authorized_for_Operation_on_Resource",
+              facts: [[actor, "create", "Support Request"],
+                      [actor, "create", "Message"],
+                      [actor, "create", "Chat Message"]] });
+        }
+        if (role === "ADMIN") {
+          // THE ADMIN ANCHORS: auth.vin's own answer carries the role
+          // (verified 2026-07-09: role ADMIN for the operator);
+          // authorization.md's five admin rules are the spec — their
+          // compile-time derivations mint per-value heads that derive
+          // zero (the quoted-head resolver class), so the boundary
+          // projects them for verified ADMIN callers.
+          entries.push(
+            { ft: "Admin_has_Role", facts: [[actor, "ADMIN"]] },
+            { ft: "User_is_authorized_for_Operation_on_Resource",
+              facts: [[actor, "create", "Support Request"],
+                      [actor, "create", "Message"],
+                      [actor, "create", "Chat Message"],
+                      [actor, "create", "Feature Request"],
+                      [actor, "update", "Support Request"]] });
+        }
+        if (entries.length) {
           try {
             use_(app);
-            arest_ingest(JSON.stringify([
-              { ft: "Subscription_belongs_to_Customer",
-                facts: [[String(sub), actor]] },
-              // THE CUSTOMER ANCHORS at the boundary: authorization.md's
-              // customer rules are the SPEC this projection mirrors —
-              // derivation runs at compile but the subscription link
-              // exists only at runtime, so the triples project here
-              // (isolate-local, never logged) exactly like the REKEY
-              // table, until the native rules path lands.
-              { ft: "User_is_authorized_for_Operation_on_Resource",
-                facts: [[actor, "create", "Support Request"],
-                        [actor, "create", "Message"],
-                        [actor, "create", "Chat Message"]] },
-            ]));
+            arest_ingest(JSON.stringify(entries));
           } catch {}
         }
       }
