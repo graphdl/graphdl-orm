@@ -393,14 +393,10 @@ def deontic_forbidden(values=None):
     from .reduce import apply as _apply
     from .lam import to_lam as _tl
     if not values:
-        return A("id")
-    pred = _S(A("COMP"), A("not"), A("eq"),
-              _S(A("CONS"),
-                 _S(A("COMP"), A("theta:setminus"),
-                    _S(A("CONS"), A("id"),
-                       _S(A("CONST"), _tl(tuple(values))))),
-                 A("id")))
-    return _apply(A("theta:Filter"), pred)
+        return A("id")                                # population form: the id primitive
+    # value form -> constraints:deontic_forbidden (constraints.canon); gated
+    # canon==host on synthetic populations (2026-07-09 canon-completeness port)
+    return _apply(A("constraints:deontic_forbidden"), _tl(tuple(values)))
 
 
 def deontic_obligatory_value(values):
@@ -410,13 +406,9 @@ def deontic_obligatory_value(values):
     the complement of deontic_forbidden's set."""
     from .reduce import apply as _apply
     from .lam import to_lam as _tl
-    pred = _S(A("COMP"), A("eq"),
-              _S(A("CONS"),
-                 _S(A("COMP"), A("theta:setminus"),
-                    _S(A("CONS"), A("id"),
-                       _S(A("CONST"), _tl(tuple(values))))),
-                 A("id")))
-    return _apply(A("theta:Filter"), pred)
+    # -> constraints:deontic_obligatory_value (constraints.canon); gated
+    # canon==host on synthetic populations (2026-07-09 canon-completeness port)
+    return _apply(A("constraints:deontic_obligatory_value"), _tl(tuple(values)))
 
 
 _CC = None
@@ -550,7 +542,14 @@ def scoped_subset_projected_filtered(consequent_cell, proj_p, proj_c,
     """Value-restricted subset: 'It is obligatory that X if that E has Attr
     <lit>' — the condition Y (P) is FILTERED to rows where its value role
     holds <lit> before projecting the bound entity role, then subset
-    against the head X. V = π_p(σ_{filter_pos=lit}(P)) ∖ π_c(↑X)."""
+    against the head X. V = π_p(σ_{filter_pos=lit}(P)) ∖ π_c(↑X). Canon:
+    constraints:scoped_subset_projected_filtered; the host stays as the twin."""
+    if isinstance(consequent_cell, str):
+        from .reduce import apply as _apply
+        from .lam import to_lam as _tl
+        return _apply(A("constraints:scoped_subset_projected_filtered"),
+                      _tl((consequent_cell, tuple(proj_p), tuple(proj_c),
+                           filter_pos, filter_lit)))
     def host():
         pa = _S(_COMP, T.Project(list(proj_p)),
                 _S(_COMP, _value_filter(filter_pos, filter_lit), _P))
@@ -563,7 +562,14 @@ def scoped_exclusion_projected_filtered(other_cell, proj_p, proj_c,
                                         filter_pos, filter_lit):
     """Value-restricted exclusion: 'It is forbidden that X if that E has Attr
     <lit>' — the <lit>-holding entities must be disjoint from the head X.
-    V = π_p(σ_{filter_pos=lit}(P)) ∩ π_c(↑X)."""
+    V = π_p(σ_{filter_pos=lit}(P)) ∩ π_c(↑X). Canon:
+    constraints:scoped_exclusion_projected_filtered; the host stays as the twin."""
+    if isinstance(other_cell, str):
+        from .reduce import apply as _apply
+        from .lam import to_lam as _tl
+        return _apply(A("constraints:scoped_exclusion_projected_filtered"),
+                      _tl((other_cell, tuple(proj_p), tuple(proj_c),
+                           filter_pos, filter_lit)))
     def host():
         pa = _S(_COMP, T.Project(list(proj_p)),
                 _S(_COMP, _value_filter(filter_pos, filter_lit), _P))
@@ -579,7 +585,13 @@ def scoped_exclusion_projected(other_cell, proj_p, proj_c):
     trailing-if: 'It is forbidden that X if Y' means no bound entity may
     play BOTH the head X and the condition Y, so the violators are the
     intersection on the anaphor-bound roles. (Obligatory is the subset
-    below; the deontic sign picks which.)"""
+    below; the deontic sign picks which.) Canon:
+    constraints:scoped_exclusion_projected; the host stays as the twin."""
+    if isinstance(other_cell, str):
+        from .reduce import apply as _apply
+        from .lam import to_lam as _tl
+        return _apply(A("constraints:scoped_exclusion_projected"),
+                      _tl((other_cell, tuple(proj_p), tuple(proj_c))))
     def host():
         pa = _S(_COMP, T.Project(list(proj_p)), _P)
         pb = _S(_COMP, T.Project(list(proj_c)), _pop_of(other_cell))
@@ -596,13 +608,18 @@ def scoped_subset_projected(consequent_cell, proj_p, proj_c):
     V = π_p(P) ∖ π_c(↑B). The anaphors in the trailing-if condition name
     which roles bind; unbound roles project away existentially.
 
-    The HOST composition IS the definition here: no canonical sibling
-    exists in system.canon yet, and _scoped's string branch resolves the
-    NAME through the canon — an undefined name applies to bottom, and a
-    bottom checker object DefineIn'd under the constraint id poisoned
-    the whole store's evaluation (the 2026-07-09 poisoned-cell
-    diagnosis; the base was innocent). A canonical sibling also needs
-    the projections as data, which the one-argument name cannot carry."""
+    Canon: constraints:scoped_subset_projected (constraints.canon), a
+    parameterized builder over ⟨cell, proj_p, proj_c⟩ — the tuple param
+    carries the projections as data (the earlier 'the one-argument name
+    cannot carry projections' objection was wrong; scoped_external_uniqueness
+    already passes cols as data). The 2026-07-09 poison was an UNDEFINED
+    name resolving to bottom; defining the sibling fixes it. The host stays
+    as the differential twin."""
+    if isinstance(consequent_cell, str):
+        from .reduce import apply as _apply
+        from .lam import to_lam as _tl
+        return _apply(A("constraints:scoped_subset_projected"),
+                      _tl((consequent_cell, tuple(proj_p), tuple(proj_c))))
     def host():
         pa = _S(_COMP, T.Project(list(proj_p)), _P)
         pb = _S(_COMP, T.Project(list(proj_c)), _pop_of(consequent_cell))
@@ -896,10 +913,9 @@ def membership_def():
     """The fact type's definition as an operator: metacomposition hands it ⟨f₁, ⟨P, g⟩⟩
     (eq. 1 twice: once on the population, once on the fact), and member:⟨g, P⟩ answers.
     Define this under the fact type's name and the population IS its characteristic
-    function, with no new mechanism."""
-    g = _S(_COMP, _2, _2)
-    P = _S(_COMP, _1, _2)
-    return _S(_COMP, T.member, _S(_CONS, g, P))
+    function, with no new mechanism. Canon: system:membership_def (system.canon) —
+    the closed object member∘[2∘2, 1∘2]; the name resolves through DEFS."""
+    return A("system:membership_def")
 
 
 # --- the book's rule form compiled (Halpin ch.2 ex.4): linear chain join over D ---

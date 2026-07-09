@@ -206,6 +206,24 @@ DEF("constraints:scoped_external_uniqueness",
              S4(A("CONS"), K(A("COMP")),
                 S3(A("COMP"), A("ast:FetchPop"), N(1)), K(N(2))))))),
 
+DEF("constraints:scoped_subset_projected",
+    S4(A("CONS"), K(A("COMP")), K(A("theta:setminus")), S4(A("CONS"), K(A("CONS")), S4(A("CONS"), K(A("COMP")), S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("theta:Project")), N(2))), K(N(1))), S4(A("CONS"), K(A("COMP")), S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("theta:Project")), N(3))), S4(A("CONS"), K(A("COMP")), S3(A("COMP"), A("ast:FetchPop"), N(1)), K(N(2))))))),
+
+DEF("constraints:scoped_exclusion_projected",
+    S4(A("CONS"), K(A("COMP")), K(A("theta:setminus")), S4(A("CONS"), K(A("CONS")), S4(A("CONS"), K(A("COMP")), S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("theta:Project")), N(2))), K(N(1))), S4(A("CONS"), K(A("COMP")), K(A("theta:setminus")), S4(A("CONS"), K(A("CONS")), S4(A("CONS"), K(A("COMP")), S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("theta:Project")), N(2))), K(N(1))), S4(A("CONS"), K(A("COMP")), S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("theta:Project")), N(3))), S4(A("CONS"), K(A("COMP")), S3(A("COMP"), A("ast:FetchPop"), N(1)), K(N(2))))))))),
+
+DEF("constraints:scoped_subset_projected_filtered",
+    S4(A("CONS"), K(A("COMP")), K(A("theta:setminus")), S4(A("CONS"), K(A("CONS")), S5(A("CONS"), K(A("COMP")), S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("theta:Project")), N(2))), S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("theta:Filter")), S4(A("CONS"), K(A("COMP")), K(A("eq")), S4(A("CONS"), K(A("CONS")), N(4), S3(A("CONS"), K(A("CONST")), N(5)))))), K(N(1))), S4(A("CONS"), K(A("COMP")), S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("theta:Project")), N(3))), S4(A("CONS"), K(A("COMP")), S3(A("COMP"), A("ast:FetchPop"), N(1)), K(N(2))))))),
+
+DEF("constraints:scoped_exclusion_projected_filtered",
+    S4(A("CONS"), K(A("COMP")), K(A("theta:setminus")), S4(A("CONS"), K(A("CONS")), S5(A("CONS"), K(A("COMP")), S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("theta:Project")), N(2))), S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("theta:Filter")), S4(A("CONS"), K(A("COMP")), K(A("eq")), S4(A("CONS"), K(A("CONS")), N(4), S3(A("CONS"), K(A("CONST")), N(5)))))), K(N(1))), S4(A("CONS"), K(A("COMP")), K(A("theta:setminus")), S4(A("CONS"), K(A("CONS")), S5(A("CONS"), K(A("COMP")), S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("theta:Project")), N(2))), S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("theta:Filter")), S4(A("CONS"), K(A("COMP")), K(A("eq")), S4(A("CONS"), K(A("CONS")), N(4), S3(A("CONS"), K(A("CONST")), N(5)))))), K(N(1))), S4(A("CONS"), K(A("COMP")), S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("theta:Project")), N(3))), S4(A("CONS"), K(A("COMP")), S3(A("COMP"), A("ast:FetchPop"), N(1)), K(N(2))))))))),
+
+DEF("constraints:deontic_forbidden",
+    S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("theta:Filter")), S5(A("CONS"), K(A("COMP")), K(A("not")), K(A("eq")), S4(A("CONS"), K(A("CONS")), S4(A("CONS"), K(A("COMP")), K(A("theta:setminus")), S4(A("CONS"), K(A("CONS")), K(A("id")), S3(A("CONS"), K(A("CONST")), A("id")))), K(A("id"))))))),
+
+DEF("constraints:deontic_obligatory_value",
+    S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("theta:Filter")), S4(A("CONS"), K(A("COMP")), K(A("eq")), S4(A("CONS"), K(A("CONS")), S4(A("CONS"), K(A("COMP")), K(A("theta:setminus")), S4(A("CONS"), K(A("CONS")), K(A("id")), S3(A("CONS"), K(A("CONST")), A("id")))), K(A("id"))))))),
+
 DEF("constraints:ring_irreflexive",
     S3(A("CONS"), K(A("COMP")),
        S3(A("COMP"), A("apply"),

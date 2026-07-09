@@ -5612,5 +5612,19 @@ DEF("system:render_html",
                                               K(A("</li>")))))),
                                   N(2)))),
                          K(S1(A("</ul>"))))))),
-             S3(A("COMP"), A("tl"), K(A("x")))))))
+             S3(A("COMP"), A("tl"), K(A("x"))))))),
+
+DEF("system:membership_def",
+    S3(A("COMP"), A("theta:member"), S3(A("CONS"), S3(A("COMP"), N(2), N(2)), S3(A("COMP"), N(1), N(2))))),
+
+DEF("monad:unit", S3(A("CONS"), A("id"), S2(A("CONST"), PHI()))),
+
+DEF("monad:bind",
+    S3(A("COMP"),
+       S3(A("CONS"),
+          S3(A("COMP"), N(1), N(2)),
+          S3(A("COMP"), A("cat"), S3(A("CONS"), N(1), S3(A("COMP"), N(2), N(2))))),
+       S3(A("CONS"),
+          S3(A("COMP"), N(2), N(1)),
+          S3(A("COMP"), A("apply"), S3(A("CONS"), N(2), S3(A("COMP"), N(1), N(1)))))))
 )
