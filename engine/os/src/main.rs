@@ -1,3 +1,5 @@
+#![feature(uefi_std)]  // std::os::uefi::env — nightly, same as the target itself
+
 // engine/os — AREST 0.9.0 on bare UEFI, the STD shape: rust ships std
 // for x86_64-unknown-uefi (stdout wired to the firmware's simple-text
 // ConOut, which OVMF mirrors to COM1 — the harness reads the banner
@@ -32,6 +34,7 @@ fn main() {
         "get",
         "{\"noun\":\"Contact Submission\",\"id\":\"ef998c6716463931\"}");
     println!("get: {}", &got[..got.len().min(160)]);
+    net_probe();
     println!("boot: complete");
 
     // mini: the console IS the verb table — one line in (<verb>
@@ -48,6 +51,42 @@ fn main() {
     #[allow(unreachable_code)]
     loop {
         std::hint::spin_loop();
+    }
+}
+
+// The wire's first rung: find the firmware's Simple Network Protocol
+// handles and report link identity — the smoltcp Device rides this
+// handle next. std owns the runtime; the uefi crate only needs the
+// system-table pointer std already holds (std::os::uefi::env).
+fn net_probe() {
+    use uefi::proto::network::snp::SimpleNetwork;
+    let st = std::os::uefi::env::system_table();
+    let ih = std::os::uefi::env::image_handle();
+    unsafe {
+        uefi::table::set_system_table(st.as_ptr().cast());
+        // the open agent for protocol opens — without it the uefi
+        // crate's boot functions panic
+        uefi::boot::set_image_handle(
+            uefi::Handle::from_ptr(ih.as_ptr()).unwrap());
+    }
+    match uefi::boot::find_handles::<SimpleNetwork>() {
+        Ok(handles) => {
+            println!("net: {} SNP handle(s)", handles.len());
+            for h in handles {
+                if let Ok(snp) =
+                    uefi::boot::open_protocol_exclusive::<SimpleNetwork>(h)
+                {
+                    let mode = snp.mode();
+                    let mac = &mode.current_address.0[..6];
+                    println!(
+                        "net: mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} state {:?}",
+                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                        mode.state
+                    );
+                }
+            }
+        }
+        Err(e) => println!("net: no SNP ({e:?})"),
     }
 }
 

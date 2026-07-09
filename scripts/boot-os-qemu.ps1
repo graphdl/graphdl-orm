@@ -91,6 +91,8 @@ $qargs = @(
   # std's UEFI random source needs EFI_RNG_PROTOCOL: virtio-rng feeds
   # OVMF's VirtioRngDxe, and -cpu max adds RDRAND for RngDxe's CPU path
   '-cpu', 'max', '-device', 'virtio-rng-pci',
+  # the wire: OVMF's VirtioNetDxe turns this NIC into an SNP handle
+  '-device', 'virtio-net-pci,netdev=n0', '-netdev', 'user,id=n0',
   '-drive', "if=pflash,format=raw,readonly=on,file=$code",
   '-drive', "if=pflash,format=raw,file=$vars",
   '-drive', ("format=raw,file=fat:rw:" + (Join-Path $work 'esp')),

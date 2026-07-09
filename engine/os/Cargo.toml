@@ -39,6 +39,10 @@ full = ["mini"]
 # default-features = false drops the host half (fs, process spawning,
 # stdio loops — everything bare firmware doesn't have).
 arest = { path = "../rust", package = "arest", default-features = false, features = ["worker"] }
+# firmware protocol access (SNP for the wire) ALONGSIDE std: no
+# panic_handler / global_allocator / logger features — std provides
+# those lang items on this target (their overlap was the E0152)
+uefi = { version = "0.33", default-features = false, features = ["alloc"] }
 
 [profile.release]
 lto = true
