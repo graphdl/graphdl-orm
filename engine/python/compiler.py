@@ -734,11 +734,39 @@ def _h_neg_mandatory(g, k, m):
     mfacts, mobjs = _mandatory_parts(ft, _subject(g[0], k)[0], m)
     return facts + mfacts, mobjs
 
+def _uc_columns(names, rtypes):
+    """Resolve a composite UC's named columns against the reading's role
+    types, or answer the missing names. EVERY name must land: silently
+    narrowing to the resolved subset compiled a TIGHTER constraint than
+    declared (the _components class, 2026-07-09 — 'Property Name' missed
+    the role named 'Property', the UC became uniqueness on Component
+    alone, and every distinct row flagged)."""
+    roles, used, missing = [], {}, []
+    for nm in names:
+        occ = [i for i, t in enumerate(rtypes) if t == nm]
+        if occ:
+            roles.append(occ[min(used.get(nm, 0), len(occ) - 1)] + 1)
+            used[nm] = used.get(nm, 0) + 1
+        else:
+            missing.append(nm)
+    return roles, missing
+
+
 def _h_spanning(g, k, m):
+    """'In each population of <reading>, each A, B combination occurs at
+    most once.' The names RESOLVE against the reading (this spelling
+    hardcoded roles [1, 2] and ignored the names entirely until
+    2026-07-09); unresolvable names raise, and the caller's loud guard
+    keeps such statements out of this handler."""
     ftn = g[0].replace(" ", "_")
+    names = [s.strip() for s in g[1].split(",")]
+    _t, rtypes = _reading(g[0], k)
+    roles, missing = _uc_columns(names, rtypes)
+    if missing or not roles:
+        raise ValueError(f"spanning UC names unresolved roles: {missing}")
     cid = ftn + "_uc"
-    return [("constraint", (cid, "spanning_uniqueness", ftn, m)),
-            ("spans", (cid, 1)), ("spans", (cid, 2))], [(cid, C.uniqueness([1, 2]))]
+    return ([("constraint", (cid, "spanning_uniqueness", ftn, m))]
+            + [("spans", (cid, p)) for p in roles]), [(cid, C.uniqueness(roles))]
 
 
 def _h_spanning_corpus(g, k, m):
@@ -747,13 +775,9 @@ def _h_spanning_corpus(g, k, m):
     names = [s.strip() for s in g[0].split(",")]
     ftn, decl = _fact_type(g[1], k)
     _t, rtypes = _reading(g[1], k)
-    roles, used = [], {}
-    for nm in names:
-        occ = [i for i, t in enumerate(rtypes) if t == nm]
-        if occ:
-            roles.append(occ[min(used.get(nm, 0), len(occ) - 1)] + 1)
-            used[nm] = used.get(nm, 0) + 1
-    roles = roles or [1, 2]
+    roles, missing = _uc_columns(names, rtypes)
+    if missing or not roles:
+        raise ValueError(f"spanning UC names unresolved roles: {missing}")
     cid = ftn + "_uc"
     return (decl + [("constraint", (cid, "spanning_uniqueness", ftn, m))]
             + [("spans", (cid, p)) for p in roles]), [(cid, C.uniqueness(roles))]
@@ -1656,7 +1680,27 @@ def compile(stmt, D, known=()):
         # prose containing ' iff ' claims the rule recognizer, but a real rule
         # HEAD is a reading — commas, colons or parentheses there mean paragraph
         kind, g = "UNPARSED", (stmt,)
-    asserts, cons = _plan(kind, g, known, modality)
+    elif kind in ("spanning_uc", "spanning_uc2"):
+        # a composite UC column that names no role in the reading goes
+        # LOUD (the arrow-glue convention): silently narrowing to the
+        # resolved subset compiled a TIGHTER constraint than declared
+        # (_components, 2026-07-09) — the author fixes the name instead
+        names_i, reading_i = (1, 0) if kind == "spanning_uc" else (0, 1)
+        try:
+            _t, rtypes = _reading(g[reading_i], known)
+            _roles, missing = _uc_columns(
+                [s.strip() for s in g[names_i].split(",")], rtypes)
+        except Exception:
+            missing = ["?"]
+        if missing:
+            kind, g = "UNPARSED", (stmt,)
+    try:
+        asserts, cons = _plan(kind, g, known, modality)
+    except ValueError:
+        # a handler refusing its statement (unresolved UC columns) goes
+        # LOUD as unparsed, never silently narrowed
+        kind, g = "UNPARSED", (stmt,)
+        asserts, cons = _plan(kind, g, known, modality)
     for cell, fact in asserts:
         D = _apply(_A(2), ast.run(to_lam(fact), D, cell_name=cell))
     for name, obj in cons:
@@ -1881,7 +1925,14 @@ def compile_model_selfhost(text, D=None, context_from=None):
                     _L.CONS(_A(mfield))(
                         _L.CONS(ctx)(_L.CONS(D)(_L.NIL)))))
             with _dm.step(D):
-                D = _apply(_A(t), operand)                     # rho: dispatch through DEFS
+                try:
+                    D = _apply(_A(t), operand)                 # rho: dispatch through DEFS
+                except ValueError:
+                    # a handler REFUSING its statement (unresolved UC
+                    # columns) reports loudly — never a silent vanish
+                    # or a silently narrowed constraint
+                    unclassified.append(stmt)
+                    break
     return D, {"unclassified": unclassified, "prose": prose}
 
 
