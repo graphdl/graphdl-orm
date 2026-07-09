@@ -16,6 +16,10 @@ export component Splash inherits Window {
     in property <int> selected: 0;
     in property <string> detail-title: "";
     in property <[FieldRow]> fields: [];
+    // the adaptive form factor (showui's rule, realized on firmware):
+    // split shows both panes; single shows master OR the pushed detail
+    in property <bool> single: false;
+    in property <bool> detail-pushed: false;
     background: #101828;
     VerticalLayout {
         padding: 24px;
@@ -39,8 +43,8 @@ export component Splash inherits Window {
         // render from the same trees (showui's SPLIT layout)
         HorizontalLayout {
             spacing: 18px;
-            Rectangle {
-                width: 34%;
+            if !root.single || !root.detail-pushed: Rectangle {
+                width: root.single ? 100% : 34%;
                 background: #182038;
                 border-radius: 14px;
                 VerticalLayout {
@@ -66,7 +70,7 @@ export component Splash inherits Window {
                     }
                 }
             }
-            Rectangle {
+            if !root.single || root.detail-pushed: Rectangle {
                 background: @linear-gradient(135deg, #c41f3a 0%, #101840 100%);
                 border-radius: 14px;
                 VerticalLayout {

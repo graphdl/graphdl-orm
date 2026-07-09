@@ -379,6 +379,32 @@ mod fb {
                             renoun = true;
                         }
                     }
+                    Key::Special(ScanCode::FUNCTION_2) => {
+                        // the form-factor override (the desktops'
+                        // --single flag, as a key)
+                        let single = !ui.get_single();
+                        ui.set_single(single);
+                        if !single {
+                            ui.set_detail_pushed(false);
+                        }
+                        println!("ui: form factor {}",
+                                 if single { "single" } else { "split" });
+                    }
+                    Key::Special(ScanCode::ESCAPE) => {
+                        // pop the pushed detail (single-pane back)
+                        if ui.get_detail_pushed() {
+                            ui.set_detail_pushed(false);
+                            println!("ui: pop");
+                        }
+                    }
+                    Key::Printable(c) if u16::from(c) == 13 => {
+                        // Enter pushes the detail in single-pane (the
+                        // master->detail navigation of the pane stack)
+                        if ui.get_single() && !ui.get_detail_pushed() {
+                            ui.set_detail_pushed(true);
+                            println!("ui: push detail");
+                        }
+                    }
                     Key::Special(ScanCode::LEFT) => {
                         if !all_nouns.is_empty() {
                             noun_idx =
