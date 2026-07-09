@@ -561,14 +561,25 @@ export default {
       // extra field; provenance is append-only history)
       const actor = await verifyActor(request);
       // AUTHORIZATION IS FACTS: the derived triples (authorization.md)
-      // answer whether THIS actor may 'create' THIS noun. OBSERVING
-      // for now — the verdict rides the receipt while production write
-      // paths are enumerated; enforcement flips per-operation once the
-      // customer anchors land.
+      // answer whether THIS actor may 'create' THIS noun. ENFORCED
+      // for 'create' (2026-07-09, Samuel: no external users) — an
+      // unauthorized create refuses BEFORE apply, verdict on the
+      // receipt. The model-level form (the actor entering P as a
+      // fact, validate_S refusing) is the endgame once the richer
+      // policy rules land; this guard is the per-operation interim.
       const authorized = actor !== null && popRows(
         "User_is_authorized_for_Operation_on_Resource"
       ).some((t) => t.length >= 3 && t[0] === actor
                  && t[1] === "create" && t[2] === noun);
+      if (!authorized) {
+        return json(JSON.stringify({ receipt: {
+          app: "worker", fact_type: body.fact_type, fact: body.fact,
+          committed: false, violations: [],
+          refused: "unauthorized: " + (actor ?? "anonymous") +
+                   " may not 'create' " + noun,
+          actor: actor ?? undefined, authorized: false,
+        } }), 403);
+      }
       const r = JSON.parse(arest_apply(JSON.stringify(
         { fact_type: body.fact_type, fact: body.fact })));
       if (r.receipt?.committed && r.event) {
