@@ -95,6 +95,9 @@ $qargs = @(
   # hostfwd lets the smoke curl the verb table on bare firmware
   '-device', 'virtio-net-pci,netdev=n0',
   '-netdev', 'user,id=n0,hostfwd=tcp:127.0.0.1:18080-:80',
+  # the full target's framebuffer: OVMF's virtio-gpu driver exposes
+  # GOP even headless (-display none just doesn't show it)
+  '-device', 'virtio-gpu-pci',
   '-drive', "if=pflash,format=raw,readonly=on,file=$code",
   '-drive', "if=pflash,format=raw,file=$vars",
   '-drive', ("format=raw,file=fat:rw:" + (Join-Path $work 'esp')),

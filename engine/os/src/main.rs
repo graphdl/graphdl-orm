@@ -35,6 +35,8 @@ fn main() {
         "{\"noun\":\"Contact Submission\",\"id\":\"ef998c6716463931\"}");
     println!("get: {}", &got[..got.len().min(160)]);
     net_probe();
+    #[cfg(feature = "full")]
+    gop_probe();
     println!("boot: complete");
 
     // server: the verb table over the wire — smoltcp rides the SNP
@@ -95,6 +97,28 @@ fn net_probe() {
             }
         }
         Err(e) => println!("net: no SNP ({e:?})"),
+    }
+}
+
+// The full target's first rung: the firmware's Graphics Output
+// Protocol — mode inventory + the current framebuffer's geometry.
+// Slint's software renderer paints into exactly this buffer next
+// (the pre-0.9.0 kernel's slint feature is the blueprint).
+#[cfg(feature = "full")]
+fn gop_probe() {
+    use uefi::proto::console::gop::GraphicsOutput;
+    match uefi::boot::get_handle_for_protocol::<GraphicsOutput>() {
+        Ok(h) => match uefi::boot::open_protocol_exclusive::<GraphicsOutput>(h) {
+            Ok(mut gop) => {
+                let m = gop.current_mode_info();
+                let (w, hgt) = m.resolution();
+                println!("gop: {} mode(s); current {}x{} {:?} stride {}",
+                         gop.modes().count(), w, hgt,
+                         m.pixel_format(), m.stride());
+            }
+            Err(e) => println!("gop: open failed ({e:?})"),
+        },
+        Err(e) => println!("gop: no handle ({e:?})"),
     }
 }
 
