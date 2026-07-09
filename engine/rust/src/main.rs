@@ -6112,13 +6112,23 @@ fn main() {}
 // same way. The verb-table dispatch (init store + get/actions/...)
 // is step 3, the mcp_call_inner hostless refactor.
 #[cfg(feature = "worker")]
-mod worker {
+// pub: wasm-bindgen exports the symbols regardless, but RUST consumers
+// of the rlib (engine/os hosts this same verb surface on bare UEFI —
+// wasm_bindgen compiles to plain attributes off-wasm) need the module
+// reachable as arest_core::worker::*.
+pub mod worker {
     use super::*;
     use wasm_bindgen::prelude::*;
 
     #[wasm_bindgen]
     pub fn arest_version() -> String {
-        "arest 0.9.0 core (wasm)".to_string()
+        // derived, never hard-coded: the crate version from Cargo, the
+        // host from the target (this same verb surface serves wasm
+        // Workers AND bare-UEFI engine/os)
+        let host = if cfg!(target_arch = "wasm32") { "wasm" }
+                   else if cfg!(target_os = "uefi") { "uefi" }
+                   else { "native" };
+        format!("arest {} core ({})", env!("CARGO_PKG_VERSION"), host)
     }
 
     use std::cell::RefCell;

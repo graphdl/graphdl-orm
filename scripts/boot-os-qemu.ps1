@@ -29,6 +29,7 @@
 param(
   [switch]$Smoke,
   [switch]$SkipBuild,
+  [switch]$Release,
   [string]$Features = '',
   [int]$TimeoutSec = 45,
   [switch]$Keep
@@ -37,7 +38,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path "$PSScriptRoot\..").Path
 $osDir = Join-Path $repoRoot 'engine\os'
-$efi = Join-Path $osDir 'target\x86_64-unknown-uefi\debug\arest-os.efi'
+$profileDir = if ($Release) { 'release' } else { 'debug' }
+$efi = Join-Path $osDir ("target\x86_64-unknown-uefi\$profileDir\arest-os.efi")
 
 # --- locate QEMU + OVMF ------------------------------------------------
 $qemu = (Get-Command qemu-system-x86_64 -ErrorAction SilentlyContinue).Source
@@ -58,6 +60,7 @@ if (-not $SkipBuild) {
   Push-Location $osDir
   try {
     $args = @('+nightly', 'build', '--target', 'x86_64-unknown-uefi')
+    if ($Release) { $args += '--release' }
     if ($Features) { $args += @('--features', $Features) }
     & cargo @args
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
@@ -70,6 +73,10 @@ $work = Join-Path $env:TEMP ("arest-os-smoke-" + [IO.Path]::GetRandomFileName().
 $espDir = Join-Path $work 'esp\EFI\BOOT'
 New-Item -ItemType Directory -Force $espDir | Out-Null
 Copy-Item $efi (Join-Path $espDir 'BOOTX64.EFI')
+# BDS sometimes drops to the UEFI shell instead of probing the
+# removable-media default path; startup.nsh makes the shell run the
+# loader itself after its countdown, so both boot paths converge.
+Set-Content -Path (Join-Path $work 'esp\startup.nsh') -Value 'FS0:\EFI\BOOT\BOOTX64.EFI' -Encoding ascii
 $code = Join-Path $work 'code.fd'; Copy-Item $codeSrc $code
 $vars = Join-Path $work 'vars.fd'; Copy-Item $varsSrc $vars
 $serial = Join-Path $work 'serial.log'
@@ -77,6 +84,13 @@ $serial = Join-Path $work 'serial.log'
 # --- boot --------------------------------------------------------------
 $qargs = @(
   '-machine', 'q35', '-m', '256M', '-display', 'none',
+  # TCG on purpose: WHPX + OVMF + -cpu max faults in PlatformPei
+  # (tried 2026-07-08). The boot path must stay cheap enough for pure
+  # emulation — the interpretive verbs are NOT (the engine's own note:
+  # minutes at tasks scale); boot probes ride the native carrier.
+  # std's UEFI random source needs EFI_RNG_PROTOCOL: virtio-rng feeds
+  # OVMF's VirtioRngDxe, and -cpu max adds RDRAND for RngDxe's CPU path
+  '-cpu', 'max', '-device', 'virtio-rng-pci',
   '-drive', "if=pflash,format=raw,readonly=on,file=$code",
   '-drive', "if=pflash,format=raw,file=$vars",
   '-drive', ("format=raw,file=fat:rw:" + (Join-Path $work 'esp')),
@@ -85,7 +99,7 @@ $qargs = @(
 )
 $p = Start-Process -FilePath $qemu -ArgumentList $qargs -PassThru -WindowStyle Hidden
 $deadline = (Get-Date).AddSeconds($TimeoutSec)
-$phrases = @('AREST OS 0.9.0', 'boot: complete')
+$phrases = @('AREST OS', 'boot: complete')   # version-agnostic on purpose
 $pass = $false
 while ((Get-Date) -lt $deadline) {
   Start-Sleep -Seconds 2

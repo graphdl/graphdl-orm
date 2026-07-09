@@ -31,8 +31,14 @@ mini = ["server"]
 full = ["mini"]
 
 [dependencies]
-uefi = { version = "0.33", features = ["alloc", "global_allocator", "panic_handler", "logger"] }
-log = { version = "0.4", default-features = false }
+# the 0.9.0 engine core + the worker verb surface (arest_load /
+# arest_call / arest_view / ...): wasm-bindgen compiles to plain
+# attributes off-wasm, and the engine builds clean for
+# x86_64-unknown-uefi (a STD target — stdout is the firmware ConOut) —
+# the OS hosts the SAME verb table the Worker serves.
+# default-features = false drops the host half (fs, process spawning,
+# stdio loops — everything bare firmware doesn't have).
+arest = { path = "../rust", package = "arest", default-features = false, features = ["worker"] }
 
 [profile.release]
 lto = true
