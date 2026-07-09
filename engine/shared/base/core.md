@@ -420,9 +420,21 @@ push; until then the Rust synthesis continues to cover them.
 Every fact that binds a subtype also binds the supertype: if `Noun1`
 is a subtype of `Noun2` and a Fact uses a Resource whose Noun is
 `Noun1` for some Role, then that same Resource is also an instance of
-`Noun2` in every Fact Type where `Noun2` plays a Role.
+`Noun2`. In ORM this IS `Resource is instance of Noun` — subtyping is
+population inclusion (Halpin, "Subtyping Revisited": all instances of a
+type are instances of its supertype), so instance-of is transitive and
+the runtime mirror is deliberately over-broad to carry it. Inheritance
+proper is PROPERTY reuse (a subtype plays the supertype's roles because
+it IS a supertype instance), not a distinct membership relation.
 
-* Resource is inherited instance of Noun iff Resource is instance of some subtype of that Noun.
+<!-- RETIRED 2026-07-09 (challenged + NORMA-verified): `Resource is
+     inherited instance of Noun` was a non-canonical relation — ORM has
+     no separate "inherited membership", and it only existed to prop up
+     the (also non-canonical, now relaxed) `instance of exactly one
+     Noun`. It had ZERO readers in base or apps (grep: only its own
+     declaration), so retiring it removes dead derived data.
+* Resource is inherited instance of Noun iff Resource is instance of some subtype of that Noun. -->
+
 
 ### Subset Constraint auto-fill (SS)
 

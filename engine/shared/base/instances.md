@@ -99,7 +99,22 @@ Fact Type cites Citation.
 
 ### Resource
 Resource is instance of Noun.
-  Each Resource is instance of exactly one Noun.
+  Each Resource is instance of some Noun.
+<!-- 'exactly one Noun' was NON-CANONICAL (challenged 2026-07-09, verified
+     against Halpin, "Subtyping Revisited", NORMA): in ORM subtyping is
+     population inclusion — "all instances of one type are also instances
+     of a more encompassing type" — so an entity is legitimately an
+     instance of its subtype AND every supertype (Patient 101 is in both
+     the MalePatient and Patient populations). Membership is transitive;
+     there is no single type per entity. The old uniqueness fired alethic
+     on every subtype/multi-typed id on recompile. Mandatory only now
+     (every Resource has some type). 'inherited' in ORM is PROPERTY reuse
+     (a subtype plays the supertype's roles because it IS a supertype
+     instance), not a separate membership relation — so the over-broad
+     mirror (instance of every role-noun, supertypes included) is the
+     CORRECT transitive membership, and 'Resource is inherited instance
+     of Noun' is a non-canonical crutch (retire separately). -->
+
 Resource is of Function. *
   <!-- ns-2 (ns-derive-population-domains): the single-sourcing BRIDGE for a
        Resource's domain. A Noun IS a Function (Noun < Function; same identity,
