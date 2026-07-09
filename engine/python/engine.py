@@ -3069,11 +3069,12 @@ def create_stamped(D, ft, fact, tx):
 def as_of(D, ft, tx):
     """The population as of transaction time `tx`, reconstructed from the τ log —
     Prop. onestep's order_τ audit view: Filter(tx′ ≤ tx), then project the fact."""
-    from . import ast
     from .reduce import apply as _ap
-    from .lam import from_lam
-    keep = T.Filter(_S(_COMP, A("le"), _S(_CONS, _1, _S(_CONST, A(tx)))))
-    expr = _S(_COMP, _S(_ALPHA, A("tl")), keep, ast.FetchPop(ft + "@tx"))
+    from .lam import from_lam, to_lam as _tl
+    # Canon: system:as_of (system.canon) = alpha(tl) . Filter(le(1, CONST(tx))) .
+    # FetchPop(log). The host supplies the log cell name (ft+'@tx'; string concat is
+    # the seed boundary) and set-converts the result.
+    expr = _ap(A("system:as_of"), _tl((ft + "@tx", tx)))
     return {tuple(r) for r in from_lam(_ap(expr, D))}
 
 
