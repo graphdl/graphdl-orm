@@ -103,6 +103,14 @@ async function ensure(env) {
           }
         }
       }
+      if (events === null && env?.DB) {
+        // the D1 stream (Def. iso with ZERO DOs: the single-writer
+        // SQLite serializes appends; n orders the replay)
+        const q = await env.DB.prepare(
+          "SELECT line FROM events WHERE app = ?1 ORDER BY n"
+        ).bind(APP_STREAM).all();
+        events = (q.results ?? []).map((r) => r.line);
+      }
       if (events === null && env?.LOG) {
         const id = env.LOG.idFromName("log");
         const stub = env.LOG.get(id);
@@ -129,6 +137,36 @@ async function ensure(env) {
 // columns to <Noun>_has_<Field> facts, ingest ISOLATE-LOCALLY via
 // arest_apply (no DO appends: federated rows are refetchable cache,
 // not commits). OWA: no credential or unreachable = empty population.
+// the app's stream key in the D1 events table (one worker serves one
+// app today; multi-tenant streams key by app)
+const APP_STREAM = "support.auto.dev";
+
+// ONE serialized append (Def. iso, ZERO DOs): the INSERT mints n
+// atomically in a single statement — D1's SQLite single-writer is the
+// serializer. The KV mirror write-through keeps SSE + boot fast; the
+// DO remains the legacy fallback until it retires.
+async function appendEvent(env, line) {
+  let n = null;
+  if (env?.DB) {
+    const row = await env.DB.prepare(
+      "INSERT INTO events (app, n, line) VALUES (?1, " +
+      "(SELECT COALESCE(MAX(n), 0) + 1 FROM events WHERE app = ?1), ?2) " +
+      "RETURNING n"
+    ).bind(APP_STREAM, line).first();
+    n = row?.n ?? null;
+  } else if (env?.LOG) {
+    const stub = env.LOG.get(env.LOG.idFromName("log"));
+    const r = await stub.fetch("https://log/append", {
+      method: "POST", body: line });
+    n = (await r.json())?.n ?? null;
+  }
+  if (n !== null && env?.AREST_LOG) {
+    await env.AREST_LOG.put("e:" + String(n).padStart(9, "0"), line);
+    await env.AREST_LOG.put("n", String(n));
+  }
+  return n;
+}
+
 const FED_MEMO = new Map();
 const FED_TTL = 60_000;
 
@@ -493,6 +531,35 @@ export default {
       if (!noun) return json('{"error":"unknown noun"}', 404);
       return json(arest_call("schema", JSON.stringify({ noun })));
     }
+    if (request.method === "POST" && url.pathname === "/__migrate-d1") {
+      // one-shot: copy the DO stream into D1 (the zero-DO endgame) —
+      // idempotent: refuses when the D1 stream already has rows
+      if (!env?.DB || !env?.LOG) {
+        return json(JSON.stringify({ error: "needs DB and LOG" }), 501);
+      }
+      try {
+        const have = await env.DB.prepare(
+          "SELECT COUNT(*) AS c FROM events WHERE app = ?1"
+        ).bind(APP_STREAM).first();
+        if ((have?.c ?? 0) > 0) {
+          return json(JSON.stringify({ migrated: 0, existing: have.c }));
+        }
+        const stub = env.LOG.get(env.LOG.idFromName("log"));
+        const r = await stub.fetch("https://log/tail");
+        const events = (await r.json()).events ?? [];
+        let copied = 0;
+        for (const line of events) {
+          await env.DB.prepare(
+            "INSERT INTO events (app, n, line) VALUES (?1, " +
+            "(SELECT COALESCE(MAX(n), 0) + 1 FROM events WHERE app = ?1), ?2)"
+          ).bind(APP_STREAM, line).run();
+          copied++;
+        }
+        return json(JSON.stringify({ migrated: copied }));
+      } catch (e) {
+        return json(JSON.stringify({ error: String(e) }), 500);
+      }
+    }
     if (request.method === "POST" && url.pathname === "/__mirror") {
       // one-shot: backfill the KV mirror from the DO log (do-minimize)
       if (!env?.LOG) return json('{' + String.fromCharCode(34) + 'error' + String.fromCharCode(34) + ':' + String.fromCharCode(34) + 'no log' + String.fromCharCode(34) + '}', 501);
@@ -516,10 +583,8 @@ export default {
         return json('{"error":"body needs fact_type and fact"}', 400);
       const r = JSON.parse(arest_apply(JSON.stringify(
         { fact_type: body.fact_type, fact: body.fact })));
-      if (r.receipt?.committed && r.event && env?.LOG) {
-        const idd = env.LOG.idFromName("log");
-        await env.LOG.get(idd).fetch("https://log/append", {
-          method: "POST", body: JSON.stringify(r.event) });
+      if (r.receipt?.committed && r.event) {
+        await appendEvent(env, JSON.stringify(r.event));
       }
       return json(JSON.stringify(r), r.receipt?.committed ? 201 : 422);
     }

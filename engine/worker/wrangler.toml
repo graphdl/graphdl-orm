@@ -38,3 +38,12 @@ class_name = "ArestLog"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ArestLog"]
+
+# THE D1 ENDGAME (the whitepaper's Def. iso: ONE serialized append per
+# app stream — D1's single-writer SQLite gives it with ZERO DOs; the
+# DO's unique powers were unused): events(app, n, line), n minted by
+# the atomic INSERT-with-subquery. The KV mirror stays the read path.
+[[d1_databases]]
+binding = "DB"
+database_name = "arest-log"
+database_id = "c8b1d12c-391b-49d0-a75c-83b0d738e88e"
