@@ -37,6 +37,8 @@ fn main() {
     net_probe();
     #[cfg(feature = "full")]
     gop_probe();
+    #[cfg(feature = "full")]
+    fb::splash();
     println!("boot: complete");
 
     // server: the verb table over the wire — smoltcp rides the SNP
@@ -128,6 +130,112 @@ fn gop_probe() {
             Err(e) => println!("gop: open failed ({e:?})"),
         },
         Err(e) => println!("gop: no handle ({e:?})"),
+    }
+}
+
+// The full target's renderer: one Slint frame through the software
+// renderer into a CPU line buffer, blt'd region-by-region to the GOP
+// surface. Rung 3 is TEXT-FREE geometry (no font machinery yet); the
+// canon-tree adapter rides once the frame path stands. The platform
+// impl is the MCU recipe: we own the event loop, and time is the same
+// poll-counter fake the wire uses (no clock on bare firmware).
+#[cfg(feature = "full")]
+mod fb {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use slint::platform::software_renderer::{
+        MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel,
+    };
+    use slint::platform::{Platform, WindowAdapter};
+    use uefi::proto::console::gop::{BltOp, BltPixel, GraphicsOutput};
+
+    slint::slint! {
+        export component Splash inherits Window {
+            background: #101828;
+            Rectangle {
+                x: 40px; y: 40px;
+                width: parent.width - 80px;
+                height: parent.height - 80px;
+                background: @linear-gradient(135deg, #c41f3a 0%, #101840 100%);
+                border-radius: 24px;
+            }
+        }
+    }
+
+    struct FirmwarePlatform {
+        window: Rc<MinimalSoftwareWindow>,
+        fake_ms: Cell<u64>,
+    }
+
+    impl Platform for FirmwarePlatform {
+        fn create_window_adapter(
+            &self,
+        ) -> Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
+            Ok(self.window.clone())
+        }
+        fn duration_since_start(&self) -> core::time::Duration {
+            self.fake_ms.set(self.fake_ms.get() + 1);
+            core::time::Duration::from_millis(self.fake_ms.get())
+        }
+    }
+
+    pub fn splash() {
+        let h = match uefi::boot::get_handle_for_protocol::<GraphicsOutput>() {
+            Ok(h) => h,
+            Err(e) => {
+                println!("slint: no GOP ({e:?})");
+                return;
+            }
+        };
+        let mut gop = match
+            uefi::boot::open_protocol_exclusive::<GraphicsOutput>(h)
+        {
+            Ok(g) => g,
+            Err(e) => {
+                println!("slint: GOP open failed ({e:?})");
+                return;
+            }
+        };
+        let (w, hgt) = gop.current_mode_info().resolution();
+
+        let window =
+            MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+        slint::platform::set_platform(Box::new(FirmwarePlatform {
+            window: window.clone(),
+            fake_ms: Cell::new(0),
+        }))
+        .expect("slint platform");
+        let ui = Splash::new().expect("slint component");
+        window.set_size(slint::PhysicalSize::new(w as u32, hgt as u32));
+        ui.show().expect("show");
+
+        let mut pixels =
+            vec![Rgb565Pixel(0); w * hgt];
+        let rendered = window.draw_if_needed(|renderer| {
+            renderer.render(&mut pixels, w);
+        });
+        if !rendered {
+            println!("slint: nothing to draw");
+            return;
+        }
+        // widen 565 -> Blt pixels and push the frame in one blt
+        let blt: Vec<BltPixel> = pixels
+            .iter()
+            .map(|p| {
+                let r = ((p.0 >> 11) & 0x1f) as u8;
+                let g = ((p.0 >> 5) & 0x3f) as u8;
+                let b = (p.0 & 0x1f) as u8;
+                BltPixel::new(r << 3 | r >> 2, g << 2 | g >> 4,
+                              b << 3 | b >> 2)
+            })
+            .collect();
+        let out = gop.blt(BltOp::BufferToVideo {
+            buffer: &blt,
+            src: uefi::proto::console::gop::BltRegion::Full,
+            dest: (0, 0),
+            dims: (w, hgt),
+        });
+        println!("slint: frame {}x{} rendered; blt {:?}", w, hgt, out);
     }
 }
 

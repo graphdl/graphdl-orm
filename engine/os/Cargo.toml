@@ -28,7 +28,7 @@ license = "AGPL-3.0-or-later"
 default = ["server"]
 server = []
 mini = ["server"]
-full = ["mini"]
+full = ["mini", "dep:slint"]
 
 [dependencies]
 # the 0.9.0 engine core + the worker verb surface (arest_load /
@@ -47,6 +47,12 @@ uefi = { version = "0.33", default-features = false, features = ["alloc"] }
 # without an OS network layer — smoltcp IS the network layer
 smoltcp = { version = "0.11", default-features = false, features = [
     "medium-ethernet", "proto-ipv4", "socket-tcp", "alloc",
+] }
+# the full target's renderer: Slint's software renderer paints into a
+# CPU pixel buffer we blt to the GOP surface — the MCU (no_std) recipe
+# even though the target has std (no windowing system exists to bind)
+slint = { version = "1.8", optional = true, default-features = false, features = [
+    "compat-1-2", "renderer-software", "unsafe-single-threaded", "libm",
 ] }
 
 [profile.release]
