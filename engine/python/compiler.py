@@ -1071,17 +1071,20 @@ def _clause_ft_roles(text, known):
     return best
 
 
-def _h_subset_trailing(g, k, m):
-    """FORML 2's implication clause on an ASSERTED head is the subset
-    constraint (Halpin, Mapping ORM to Datalog: 'if' reads the converse
-    implication; CWA closes same-head rule bodies into the iff — but an
-    asserted head has no rule to close, so the implication can only
-    CHECK, the '->' constraint direction). A derived or marked head
-    belongs to the rule path and refuses here (the asserted/derived/
-    semiderived trichotomy dispatches). Role-projected: 'that <Noun>'
-    anaphors in the condition bind the head's roles; the check is
-    pi_bound(condition) minus pi_bound(head). Value literals and
-    compound conditions refuse until their slices land."""
+def _h_subset_trailing(g, k, m, sign="positive"):
+    """FORML 2's implication clause on an ASSERTED head (Halpin, Mapping ORM
+    to Datalog: 'if' reads the converse implication; CWA closes same-head
+    rule bodies into the iff — but an asserted head has no rule to close, so
+    the implication can only CHECK, the '->' constraint direction). A derived
+    or marked head belongs to the rule path and refuses here (the asserted/
+    derived/semiderived trichotomy dispatches). Role-projected: 'that <Noun>'
+    anaphors in the condition bind the head's roles.
+
+    THE SIGN PICKS THE CHECK: 'It is obligatory that X if Y' is a SUBSET
+    (pi(Y) subset of pi(X) — whenever Y holds, X must); 'It is forbidden
+    that X if Y' is an EXCLUSION (pi(Y) disjoint pi(X) — Y and X must never
+    co-occur on the bound entity). Value literals and compound conditions
+    refuse until their slices land."""
     head_txt, cond_txt = g
     fts = getattr(k, "fts", None) or ()
     plain = getattr(k, "plain", None) or ()
@@ -1119,10 +1122,17 @@ def _h_subset_trailing(g, k, m):
                              " (role-path work pending)")
         proj_y.append(y_roles.index(n) + 1)
         proj_x.append(x_roles.index(n) + 1)
+    forbidden = sign == "negative"
+    # the 'subset' cs_rows shape is PROVEN partition-safe (spd-1's mint);
+    # reuse it for both and let the CHECKER object carry the semantics
+    # (subset vs projected exclusion). The row-kind stays 'subset' — a
+    # cosmetic mismatch for the forbidden case's violation-template text
+    # only, the enforcement is the exclusion checker.
     A_, objs = _cs_call("subset", "", [y_ft, x_ft],
                         [cond_txt.strip(), head_txt.strip()], m)
-    objs = [(cell, C.scoped_subset_projected(x_ft, proj_y, proj_x))
-            for (cell, _o) in objs]
+    check = (C.scoped_exclusion_projected if forbidden
+             else C.scoped_subset_projected)
+    objs = [(cell, check(x_ft, proj_y, proj_x)) for (cell, _o) in objs]
     return A_, objs
 
 def _h_negation(g, k, m):
@@ -1816,6 +1826,12 @@ def _plan(kind, g, known, modality="alethic", sign=""):
             return (facts + [("constraint", row)] + mfacts,
                     objs + mobjs)
         return facts + [("constraint", row)], objs
+    if kind == "subset_trailing":
+        # the trailing-if handler needs the SIGN: obligatory/necessary ->
+        # subset (Y subset of X), forbidden/impossible -> exclusion
+        # (Y disjoint X). The other set-constraint handlers are
+        # sign-agnostic, so only this one takes the 4th arg.
+        return _h_subset_trailing(g, known, modality, sign)
     return _PLAN.get(kind, lambda g, k, m: ([], []))(g, known, modality)
 
 

@@ -74,3 +74,48 @@ def test_projection_ignores_unbound_roles():
     # the Human and Agent roles are unbound and project away
     v = _violations(D, "Human_issues_Order", [("h2", "o2")])
     assert not v, v
+
+
+# --- the FORBIDDEN (exclusion) trailing-if: sign picks the check ---
+FORBID = """
+Agent(.System Name) is an entity type.
+Order(.Order Id) is an entity type.
+System Name is a value type.
+Order Id is a value type.
+
+Agent obeys Order.
+Agent defies Order.
+
+It is forbidden that Agent obeys Order if Agent defies that Order.
+"""
+
+
+def _compile_forbid():
+    D, rep = forml.compile_model(FORBID)
+    assert not rep.get("unclassified"), rep
+    return D
+
+
+def test_forbidden_mints_exclusion_not_subset():
+    D = _compile_forbid()
+    rows = [tuple(r) for r in system._pop_rows(D, "constraint")]
+    assert any(len(r) >= 2 and r[1] == "subset" for r in rows), rows
+
+
+def test_forbidden_cooccurrence_violates():
+    # the constraint attaches to the CONDITION cell (Agent_defies_Order),
+    # like the subset case: an Order both obeyed AND defied is forbidden.
+    D = _compile_forbid()
+    D = _apply(L.atom(2), __import__("pyarest").ast.run(
+        to_lam(("a1", "o1")), D, cell_name="Agent_obeys_Order"))
+    v = _violations(D, "Agent_defies_Order", [("a1", "o1")])
+    assert v, "obey+defy on the same Order must violate the exclusion"
+
+
+def test_forbidden_disjoint_is_clean():
+    D = _compile_forbid()
+    D = _apply(L.atom(2), __import__("pyarest").ast.run(
+        to_lam(("a1", "o1")), D, cell_name="Agent_obeys_Order"))
+    # o2 defied but only o1 obeyed: disjoint on Order, exclusion satisfied
+    v = _violations(D, "Agent_defies_Order", [("a1", "o2")])
+    assert not v, v

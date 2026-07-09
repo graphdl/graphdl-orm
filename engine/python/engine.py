@@ -537,6 +537,23 @@ def scoped_subset(consequent_cell):
     return _scoped("constraints:scoped_subset", consequent_cell, host)
 
 
+def scoped_exclusion_projected(other_cell, proj_p, proj_c):
+    """Exclusion on BOUND ROLE POSITIONS: π_p(A) ∩ π_c(B) = ∅, attached to
+    A (P = A) — V = π_p(P) ∩ π_c(↑B). The set-comparison arc's FORBIDDEN
+    trailing-if: 'It is forbidden that X if Y' means no bound entity may
+    play BOTH the head X and the condition Y, so the violators are the
+    intersection on the anaphor-bound roles. (Obligatory is the subset
+    below; the deontic sign picks which.)"""
+    def host():
+        pa = _S(_COMP, T.Project(list(proj_p)), _P)
+        pb = _S(_COMP, T.Project(list(proj_c)), _pop_of(other_cell))
+        # intersection = P ∖ (P ∖ B): the rows of A's projection that are
+        # also in B's projection
+        diff = _S(_COMP, T.setminus, _S(_CONS, pa, pb))
+        return _S(_COMP, T.setminus, _S(_CONS, pa, diff))
+    return host()
+
+
 def scoped_subset_projected(consequent_cell, proj_p, proj_c):
     """Subset on BOUND ROLE POSITIONS (the set-comparison arc's projected
     form): π_p(A) ⊆ π_c(B), attached to the antecedent cell (P = A) —
