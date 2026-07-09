@@ -91,8 +91,10 @@ $qargs = @(
   # std's UEFI random source needs EFI_RNG_PROTOCOL: virtio-rng feeds
   # OVMF's VirtioRngDxe, and -cpu max adds RDRAND for RngDxe's CPU path
   '-cpu', 'max', '-device', 'virtio-rng-pci',
-  # the wire: OVMF's VirtioNetDxe turns this NIC into an SNP handle
-  '-device', 'virtio-net-pci,netdev=n0', '-netdev', 'user,id=n0',
+  # the wire: OVMF's VirtioNetDxe turns this NIC into an SNP handle;
+  # hostfwd lets the smoke curl the verb table on bare firmware
+  '-device', 'virtio-net-pci,netdev=n0',
+  '-netdev', 'user,id=n0,hostfwd=tcp:127.0.0.1:18080-:80',
   '-drive', "if=pflash,format=raw,readonly=on,file=$code",
   '-drive', "if=pflash,format=raw,file=$vars",
   '-drive', ("format=raw,file=fat:rw:" + (Join-Path $work 'esp')),
@@ -103,12 +105,32 @@ $p = Start-Process -FilePath $qemu -ArgumentList $qargs -PassThru -WindowStyle H
 $deadline = (Get-Date).AddSeconds($TimeoutSec)
 $phrases = @('AREST OS', 'boot: complete')   # version-agnostic on purpose
 $pass = $false
+$wirePass = $false
 while ((Get-Date) -lt $deadline) {
   Start-Sleep -Seconds 2
   if (Test-Path $serial) {
     $txt = Get-Content $serial -Raw -ErrorAction SilentlyContinue
     if ($txt -and ($phrases | Where-Object { $txt -notmatch [regex]::Escape($_) }).Count -eq 0) {
-      $pass = $true; break
+      $pass = $true
+      # the wire assertion: once the banner stands, curl the verb
+      # table through the hostfwd — the engine answering HTTP from
+      # bare firmware is the server target's proof
+      if ($txt -match 'wire: listening') {
+        try {
+          $r = Invoke-WebRequest -Uri 'http://127.0.0.1:18080/version' -TimeoutSec 10 -UseBasicParsing
+          if ($r.Content -match 'AREST OS') {
+            Write-Host ("wire answer: " + $r.Content)
+            # a STORE verb over the wire: the native get, same as the
+            # Worker serves — the engine surface, headless
+            $g = Invoke-WebRequest -Uri 'http://127.0.0.1:18080/get?args=%7B%22noun%22%3A%22Contact%20Submission%22%2C%22id%22%3A%22ef998c6716463931%22%7D' -TimeoutSec 10 -UseBasicParsing
+            if ($g.Content -match '"exists"') {
+              $wirePass = $true
+              Write-Host ("wire get: " + $g.Content.Substring(0, [Math]::Min(140, $g.Content.Length)))
+            }
+          }
+        } catch { Write-Host "wire curl failed: $_" }
+      }
+      break
     }
   }
   if ($p.HasExited) { break }
@@ -121,6 +143,7 @@ Write-Host '--- serial tail ---'
 if (-not $Keep) { Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue }
 
 if ($Smoke) {
-  if ($pass) { Write-Host 'SMOKE PASS'; exit 0 }
+  if ($pass -and $wirePass) { Write-Host 'SMOKE PASS (wire)'; exit 0 }
+  if ($pass) { Write-Host 'SMOKE PASS (banner only)'; exit 0 }
   Write-Host 'SMOKE FAIL'; exit 1
 }
