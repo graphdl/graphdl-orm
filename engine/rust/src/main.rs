@@ -6331,11 +6331,20 @@ pub mod worker {
     }
 
     fn with_active<R>(f: impl FnOnce(&mut Srv) -> R) -> R {
+        // TAKE the store out, run f with NO thread-local borrow held,
+        // put it back: a reentrant wasm touch (a registered override,
+        // a host callback) must never observe WSTORES borrowed — the
+        // 2026-07-09 production 1101s were core::cell::
+        // panic_already_borrowed from running the verb body inside
+        // the map borrow. (A panicking f loses the store; a wasm
+        // panic aborts the isolate anyway.)
         let app = WAPP.with(|a| a.borrow().clone());
-        WSTORES.with(|m| {
-            let mut m = m.borrow_mut();
-            f(m.entry(app).or_insert_with(fresh_srv))
-        })
+        let mut srv = WSTORES
+            .with(|m| m.borrow_mut().remove(&app))
+            .unwrap_or_else(fresh_srv);
+        let r = f(&mut srv);
+        WSTORES.with(|m| m.borrow_mut().insert(app, srv));
+        r
     }
 
     #[wasm_bindgen]
