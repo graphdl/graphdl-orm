@@ -6307,17 +6307,54 @@ pub mod worker {
     }
 
     thread_local! {
-        // wasm is single-threaded: ONE retained store per Worker
-        // instance, loaded once and served by the same store_call the
-        // MCP host dispatches through — one verb table, two bindings.
-        static WSRV: RefCell<Srv> = RefCell::new(Srv {
+        // wasm is single-threaded: the retained stores KEY BY APP — a
+        // tenant is a cell whose contents is an entire store (AREST.tex
+        // sec:cells, tenancy one level up), so the map's slots are the
+        // tenant cells and isolation is unaddressability (Prop. tenant:
+        // every verb serves only the ACTIVE slot arest_use selected).
+        // Callers that never select (the MCP host, engine/os, the
+        // pre-tenancy worker) ride the "" slot — the old single store.
+        static WSTORES: RefCell<HashMap<String, Srv>> =
+            RefCell::new(HashMap::new());
+        static WAPP: RefCell<String> = RefCell::new(String::new());
+    }
+
+    fn fresh_srv() -> Srv {
+        Srv {
             d: phi(),
             cells: Vec::new(),
             mu: make_mu(),
             nd: N::Bot,
             ncells: Vec::new(),
             nprocess: Vec::new(),
+        }
+    }
+
+    fn with_active<R>(f: impl FnOnce(&mut Srv) -> R) -> R {
+        let app = WAPP.with(|a| a.borrow().clone());
+        WSTORES.with(|m| {
+            let mut m = m.borrow_mut();
+            f(m.entry(app).or_insert_with(fresh_srv))
+        })
+    }
+
+    #[wasm_bindgen]
+    pub fn arest_use(app: &str) -> String {
+        // select the tenant cell; every later verb serves THIS store.
+        // Cheap and synchronous by design: the JS side re-selects after
+        // every await (isolate single-threadedness makes use+call
+        // atomic within a microtask).
+        ensure_base();
+        WAPP.with(|a| *a.borrow_mut() = app.to_string());
+        let resident = WSTORES.with(|m| {
+            m.borrow().get(app).map(|s| !s.cells.is_empty()).unwrap_or(false)
         });
+        let mut out = String::from("{\"app\":");
+        esc(app, &mut out);
+        out.push_str(",\"resident\":");
+        out.push_str(if resident { "true" } else { "false" });
+        out.push('}');
+        out
     }
 
     #[wasm_bindgen]
@@ -6325,7 +6362,7 @@ pub mod worker {
         ensure_base();
         match parse_json(store_json) {
             Some(payload) if jget(&payload, "d").is_some() => {
-                WSRV.with(|s| handle(&payload, &mut s.borrow_mut(), true))
+                with_active(|srv| handle(&payload, srv, true))
             }
             _ => "{\"error\":\"the payload needs a d\"}".to_string(),
         }
@@ -6338,8 +6375,8 @@ pub mod worker {
             Some(a) => a,
             None => return "{\"error\":\"unparseable args\"}".to_string(),
         };
-        WSRV.with(|s| {
-            match store_call(tool, &args, "worker", &mut s.borrow_mut()) {
+        with_active(|srv| {
+            match store_call(tool, &args, "worker", srv) {
                 Some(Ok(r)) => r,
                 Some(Err((code, msg))) => {
                     let mut out = String::from("{\"error\":");
@@ -6360,7 +6397,7 @@ pub mod worker {
         // (kind dispatch), the menu's buttons POST the event fact
         // types back — the >>= over HTTP
         ensure_base();
-        WSRV.with(|s| match view_trees_json(noun, id, &s.borrow()) {
+        with_active(|srv| match view_trees_json(noun, id, srv) {
             Ok(r) => r,
             Err((code, msg)) => {
                 let mut out = String::from("{\"error\":");
@@ -6377,7 +6414,7 @@ pub mod worker {
     pub fn arest_entry(noun: &str) -> String {
         // the create form's tree; submits POST one fact each
         ensure_base();
-        WSRV.with(|s| match entry_tree_json(noun, &s.borrow()) {
+        with_active(|srv| match entry_tree_json(noun, srv) {
             Ok(r) => r,
             Err((code, msg)) => {
                 let mut out = String::from("{\"error\":");
@@ -6400,8 +6437,7 @@ pub mod worker {
             Some(J::A(es)) => es,
             _ => return "{\"error\":\"entries must be an array\"}".to_string(),
         };
-        WSRV.with(|s| {
-            let mut srv = s.borrow_mut();
+        with_active(|srv| {
             let mut cells: Vec<(String, V)> = cells_of(&srv.d)
                 .into_iter()
                 .filter_map(|(k, v)| leaf_str(&std::rc::Rc::new(k))
@@ -6577,9 +6613,8 @@ pub mod worker {
             Some(a) => a,
             None => return "{\"error\":\"unparseable args\"}".to_string(),
         };
-        WSRV.with(|s| {
-            let mut srv = s.borrow_mut();
-            match apply_core(&args, "worker", &mut srv) {
+        with_active(|srv| {
+            match apply_core(&args, "worker", srv) {
                 Some(Ok((receipt, committed))) => {
                     let mut out = String::from("{\"receipt\":");
                     out.push_str(&receipt);

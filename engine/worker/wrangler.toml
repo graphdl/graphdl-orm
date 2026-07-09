@@ -15,13 +15,13 @@ routes = [
   { pattern = "support.auto.dev/*", zone_name = "auto.dev" }
 ]
 
-# the store: either a KV binding holding the sidecar payload under
-# the key "sidecar", or an inline var for small apps
-# [[kv_namespaces]]
-# binding = "STORE"
-# id = "..."
-# [vars]
-# SIDECAR_JSON = "{...}"
+# the tenant stores (tenancy v1, Samuel 2026-07-09): each app's
+# sidecar lives under sidecar:{app}; the hostname is the app; the
+# bundled sidecar serves the default app only. Onboarding a tenant =
+# one KV put + a route.
+[[kv_namespaces]]
+binding = "STORE"
+id = "cc47da376f974aecb15fedeb1b4faa14"
 
 # the log's KV mirror (worker-do-minimize, Samuel 2026-07-08: DOs are
 # getting expensive — appends WRITE THROUGH here; SSE and boot READ

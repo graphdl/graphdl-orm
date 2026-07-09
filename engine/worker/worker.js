@@ -14,7 +14,7 @@
 //   POST /{noun}/{id}/{event}  -> apply of the transition's trigger
 //                                 fact (the write path: commit appends
 //                                 to the D1 event stream)
-import init, { arest_load, arest_call, arest_apply, arest_view, arest_entry, arest_ingest } from "./arest_core.js";
+import init, { arest_load, arest_call, arest_apply, arest_view, arest_entry, arest_ingest, arest_use } from "./arest_core.js";
 import wasmModule from "./arest_core_bg.wasm";
 import SIDECAR from "./sidecar.js";
 
@@ -30,17 +30,25 @@ const PLURAL = {}; // e.g. { order: "orders" } — inverse applied on route pars
 // commit role until 2026-07-09; retired via migration v2 once a
 // production write proved the D1 append.)
 
-let ready = null;
-async function ensure(env) {
-  if (!ready) {
+const ready = new Map();               // app -> boot promise (tenant cells boot independently)
+const memoKey = (app, j) => "e:" + app + ":" + String(j).padStart(9, "0");
+const LEGACY_BARE = /^e:\d{9}$/;       // the pre-tenancy default-app keys
+async function ensure(env, app) {
+  if (!ready.has(app)) {
     // a failed boot must NOT poison the isolate: a cached REJECTED
     // promise turns every later request into an instant 1101 (the
     // 2026-07-08 flap — 200s and 1101s alternating by isolate).
     // Reset on failure so the next request retries the boot.
-    ready = (async () => {
+    ready.set(app, (async () => {
       await init(wasmModule);
+      // the app's own store payload: the STORE KV namespace serves
+      // tenants (sidecar:{app}); the bundled payload and the inline
+      // var serve the default app only
       const sidecar =
-        env?.SIDECAR_JSON ?? (env?.STORE ? await env.STORE.get("sidecar") : null) ?? SIDECAR;
+        (env?.STORE ? await env.STORE.get("sidecar:" + app) : null)
+        ?? (app === DEFAULT_APP ? (env?.SIDECAR_JSON ?? SIDECAR) : null);
+      if (!sidecar) throw new Error("no sidecar for app " + app);
+      use_(app);
       arest_load(sidecar);
       // replay the log tail over the snapshot (a replayed duplicate
       // reads as refused — D' == D — and changes nothing). The KV
@@ -53,12 +61,11 @@ async function ensure(env) {
       // re-derives from D1.
       let events = null;
       if (env?.AREST_LOG) {
-        const n = Number(await env.AREST_LOG.get("n"));
+        const n = Number(await env.AREST_LOG.get("n:" + app));
         if (Number.isFinite(n) && n > 0) {
           events = [];
           for (let j = 1; j <= n; j++) {
-            const v = await env.AREST_LOG.get(
-              "e:" + String(j).padStart(9, "0"));
+            const v = await env.AREST_LOG.get(memoKey(app, j));
             if (v === null) { events = null; break; }
             events.push(v);
           }
@@ -70,25 +77,37 @@ async function ensure(env) {
         // replay). Re-deriving the memo writes each line at the
         // stream's own n and drops keys the derivation does not yield
         // (compaction that preserves the population rho observes).
+        // The default app's pre-tenancy bare keys sweep here too.
         const q = await env.DB.prepare(
           "SELECT n, line FROM events WHERE app = ?1 ORDER BY n"
-        ).bind(APP_STREAM).all();
+        ).bind(app).all();
         const rows = q.results ?? [];
         events = rows.map((r) => r.line);
         if (env?.AREST_LOG && rows.length) {
-          const want = new Set(["n"]);
+          const want = new Set();
           for (const r of rows) {
-            const k = "e:" + String(r.n).padStart(9, "0");
+            const k = memoKey(app, r.n);
             want.add(k);
             await env.AREST_LOG.put(k, r.line);
           }
-          const listed = await env.AREST_LOG.list({ prefix: "e:" });
+          const listed = await env.AREST_LOG.list(
+            { prefix: "e:" + app + ":" });
           for (const k of listed.keys) {
             if (!want.has(k.name)) await env.AREST_LOG.delete(k.name);
           }
-          await env.AREST_LOG.put("n", String(rows[rows.length - 1].n));
+          if (app === DEFAULT_APP) {
+            const bare = await env.AREST_LOG.list({ prefix: "e:" });
+            for (const k of bare.keys) {
+              if (LEGACY_BARE.test(k.name))
+                await env.AREST_LOG.delete(k.name);
+            }
+            await env.AREST_LOG.delete("n");
+          }
+          await env.AREST_LOG.put("n:" + app,
+                                  String(rows[rows.length - 1].n));
         }
       }
+      use_(app);
       for (const line of events ?? []) {
         try {
           const e = JSON.parse(line);
@@ -96,11 +115,11 @@ async function ensure(env) {
         } catch {}
       }
     })().catch((e) => {
-      ready = null;
+      ready.delete(app);
       throw e;
-    });
+    }));
   }
-  return ready;
+  return ready.get(app);
 }
 
 // ---- the federated connector (contact-federation.md at the edge) ----
@@ -109,9 +128,35 @@ async function ensure(env) {
 // columns to <Noun>_has_<Field> facts, ingest ISOLATE-LOCALLY via
 // arest_apply (no DO appends: federated rows are refetchable cache,
 // not commits). OWA: no credential or unreachable = empty population.
-// the app's stream key in the D1 events table (one worker serves one
-// app today; multi-tenant streams key by app)
-const APP_STREAM = "support.auto.dev";
+// TENANCY (sec:cells: a tenant is a cell whose contents is an entire
+// store). The hostname IS the app: each app is a tenant cell in the
+// wasm core's store map (arest_use selects), its stream keys the D1
+// events table, its memo keys are app-scoped, and its sidecar loads
+// from the STORE KV namespace (sidecar:{app}) — onboarding a tenant
+// is a data operation plus a route, never a deploy. The bundled
+// sidecar serves the default app (the first production consumer).
+// Promotion to Workers-for-Platforms later is a routing change: each
+// dispatch tenant keeps this same multi-store shape (sub-tenancy).
+const DEFAULT_APP = "support.auto.dev";
+function appOf(hostname, request, env) {
+  // wrangler dev presents EVERY local request at the route's host, so
+  // local tenant addressing rides a header — honored ONLY under the
+  // dev-launch var (wrangler dev --var AREST_DEV_HEADER:1). Production
+  // deploys never set it: there the app is the ROUTE'S hostname alone,
+  // never a caller-chosen header (Prop. tenant: isolation is
+  // unaddressability).
+  if (env?.AREST_DEV_HEADER) {
+    const h = request?.headers?.get("x-arest-app");
+    if (h) return h;
+  }
+  if (hostname === "localhost" || hostname.startsWith("127.")
+      || hostname.endsWith(".workers.dev")) return DEFAULT_APP;
+  return hostname;
+}
+// wasm calls are only safe between awaits: re-select the tenant cell
+// after EVERY await before touching the core (isolate
+// single-threadedness makes use+call atomic within a microtask)
+const use_ = (app) => { try { arest_use(app); } catch {} };
 
 // FEDERATED VERIFICATION (the dissolved auth gate, 2026-07-08): the
 // worker PRESENTS the caller's credential to auth.vin — the session
@@ -123,11 +168,11 @@ const APP_STREAM = "support.auto.dev";
 const AUTH_MEMO = new Map();
 const AUTH_TTL = 60_000;
 
-async function verifyActor(request) {
+async function verifyActor(request, app) {
   const auth = request.headers.get("Authorization") ?? "";
   const cookie = request.headers.get("Cookie") ?? "";
   if (!auth && !cookie) return null;
-  const key = auth || ("c:" + cookie);
+  const key = app + "|" + (auth || ("c:" + cookie));
   const hit = AUTH_MEMO.get(key);
   if (hit && Date.now() - hit.t < AUTH_TTL) return hit.actor;
   let actor = null;
@@ -148,6 +193,7 @@ async function verifyActor(request) {
         const sub = user?.subscription;
         if (sub) {
           try {
+            use_(app);
             arest_ingest(JSON.stringify([{
               ft: "Subscription_belongs_to_Customer",
               facts: [[String(sub), actor]],
@@ -168,19 +214,19 @@ async function verifyActor(request) {
 // event id are the same number (the DO era kept a second, 0-indexed
 // numbering for the mirror — the off-by-one class died with it). The
 // KV write-through keeps the memo current for SSE + boot.
-async function appendEvent(env, line) {
+async function appendEvent(env, app, line) {
   let n = null;
   if (env?.DB) {
     const row = await env.DB.prepare(
       "INSERT INTO events (app, n, line) VALUES (?1, " +
       "(SELECT COALESCE(MAX(n), 0) + 1 FROM events WHERE app = ?1), ?2) " +
       "RETURNING n"
-    ).bind(APP_STREAM, line).first();
+    ).bind(app, line).first();
     n = row?.n ?? null;
   }
   if (n !== null && env?.AREST_LOG) {
-    await env.AREST_LOG.put("e:" + String(n).padStart(9, "0"), line);
-    await env.AREST_LOG.put("n", String(n));
+    await env.AREST_LOG.put(memoKey(app, n), line);
+    await env.AREST_LOG.put("n:" + app, String(n));
   }
   return n;
 }
@@ -195,11 +241,12 @@ function popRows(ft) {
   } catch { return []; }
 }
 
-async function ensureFederated(env, noun) {
+async function ensureFederated(env, app, noun) {
+  use_(app);
   const backed = popRows("Noun_is_backed_by_External_System")
     .find((r) => r[0] === noun);
   if (!backed) return;
-  const key = noun;
+  const key = app + "|" + noun;
   const hit = FED_MEMO.get(key);
   if (hit && Date.now() - hit < FED_TTL) return;
   const prop = (ft) => Object.fromEntries(
@@ -218,6 +265,7 @@ async function ensureFederated(env, noun) {
     const r = await fetch(base + uri, { headers });
     if (r.ok) payload = await r.json();
   } catch {}
+  use_(app);                      // the fetch suspended; re-select
   const data = payload?.data ?? [];
   const nid = noun.replace(/[^0-9A-Za-z]+/g, "_").replace(/^_+|_+$/g, "");
   const byFt = new Map();
@@ -423,7 +471,9 @@ export default {
       return new Response(page, {
         headers: { "content-type": "text/html; charset=utf-8" } });
     }
-    await ensure(env);
+    const app = appOf(url0.hostname, request, env);
+    await ensure(env, app);
+    use_(app);                    // ensure suspended; re-select the cell
     const url = new URL(request.url);
     const seg = url.pathname.split("/").filter(Boolean);
     const json = (body, status = 200) =>
@@ -452,11 +502,10 @@ export default {
       // do-minimize: the poll reads the KV MEMO (cheap reads), never
       // the commit store
       const readTail = async (from) => {
-        const n = Number(await env.AREST_LOG.get("n")) || 0;
+        const n = Number(await env.AREST_LOG.get("n:" + app)) || 0;
         const events = [];
         for (let j = from + 1; j <= n; j++) {
-          const v = await env.AREST_LOG.get(
-            "e:" + String(j).padStart(9, "0"));
+          const v = await env.AREST_LOG.get(memoKey(app, j));
           if (v) events.push(v);
         }
         return { n, events };
@@ -559,7 +608,8 @@ export default {
       // OPEN for now (the policy-derivation gate is the next rung) —
       // but every committed event carries WHO (replay ignores the
       // extra field; provenance is append-only history)
-      const actor = await verifyActor(request);
+      const actor = await verifyActor(request, app);
+      use_(app);                  // verifyActor suspended; re-select
       // AUTHORIZATION IS FACTS: the derived triples (authorization.md)
       // answer whether THIS actor may 'create' THIS noun. ENFORCED
       // for 'create' (2026-07-09, Samuel: no external users) — an
@@ -584,7 +634,7 @@ export default {
         { fact_type: body.fact_type, fact: body.fact })));
       if (r.receipt?.committed && r.event) {
         const ev = { ...r.event, actor: actor ?? undefined };
-        await appendEvent(env, JSON.stringify(ev));
+        await appendEvent(env, app, JSON.stringify(ev));
       }
       if (r.receipt) {
         if (actor) r.receipt.actor = actor;
@@ -611,14 +661,17 @@ export default {
       const lnoun = nounOf(seg[0]);
       if (lnoun) {
         try {
-          await ensureFederated(env, lnoun);
+          await ensureFederated(env, app, lnoun);
+          use_(app);
           for (const r of popRows("Noun_is_surfaced_as_Noun")) {
             if (r.length >= 2 && r[1] === lnoun) {
-              await ensureFederated(env, r[0]);
+              await ensureFederated(env, app, r[0]);
+              use_(app);
             }
           }
         } catch {}
         try {
+          use_(app);
           return json(arest_call(
             "list", JSON.stringify({ noun: lnoun })));
         } catch (e) {
@@ -630,14 +683,16 @@ export default {
       const fnoun = nounOf(seg[0]);
       if (fnoun) {
         try {
-          await ensureFederated(env, fnoun);
+          await ensureFederated(env, app, fnoun);
+          use_(app);
           // isolate locality: a noun SURFACED AS the requested one
           // must federate in THIS isolate too — its fetched rows are
           // where the requested noun's facts come from (the SR view
           // was empty in fresh isolates until the CS fetch ran here)
           for (const r of popRows("Noun_is_surfaced_as_Noun")) {
             if (r.length >= 2 && r[1] === fnoun) {
-              await ensureFederated(env, r[0]);
+              await ensureFederated(env, app, r[0]);
+              use_(app);
             }
           }
         }
@@ -648,6 +703,7 @@ export default {
       }
     }
     if (seg.length >= 2) {
+      use_(app);                  // the federation block may have suspended
       const noun = nounOf(seg[0]);
       if (!noun) return json('{"error":"unknown noun"}', 404);
       const id = decodeURIComponent(seg[1]);
@@ -678,12 +734,13 @@ export default {
         // the same commit discipline as create: the proven appendEvent
         // (this path wrote straight to the DO before the retirement —
         // and would have silently dropped the append without it)
-        const actor = await verifyActor(request);
+        const actor = await verifyActor(request, app);
+        use_(app);                // verifyActor suspended; re-select
         const r = JSON.parse(
           arest_apply(JSON.stringify({ fact_type: hit.event, fact })));
         if (r.receipt?.committed && r.event) {
           const ev = { ...r.event, actor: actor ?? undefined };
-          await appendEvent(env, JSON.stringify(ev));
+          await appendEvent(env, app, JSON.stringify(ev));
         }
         if (r.receipt && actor) r.receipt.actor = actor;
         return json(JSON.stringify(r), r.receipt?.committed ? 200 : 422);
