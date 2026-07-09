@@ -1523,6 +1523,56 @@ def _pop_rows(D, name):
     return list(rows) if isinstance(rows, tuple) else []
 
 
+_TXN_SUR = "txn:"
+
+
+def rekey_transitions(D):
+    """Machine-scope each transition's IDENTITY (Core.png/GraphDL: Transition(.id) is a
+    SURROGATE, not the readings' name), so base-vs-app reuse of a transition NAME no
+    longer merges one entity carrying two machines' froms/tos (the base-vs-app collision:
+    18 uniqueness violations on support + sm_triples cross-product). Runs PER COMPILE
+    PASS (base frozen first, apps atop D=base): a bare-named transition gets the surrogate
+    'txn:{SMD}\\x1f{name}' keyed by its defined-in SMD; rows already surrogate-keyed
+    (base's, in the app pass) are SKIPPED, so per-pass the name->SMD map is unambiguous.
+    Rewrites EVERY Transition-typed position — the role metamodel (all declared
+    referencing fact types) + the machinery sm* cells + the non-role-typed
+    Guard_prevents_Transition — so no reference dangles. A bare name that maps to >1 SMD
+    in one pass (a genuinely non-deterministic / cross-machine-name-reused machine) is
+    left as-is (never a partial rekey)."""
+    from .lam import from_lam, to_lam
+    name_smd, ambiguous = {}, set()
+    for r in _pop_rows(D, "Transition_is_defined_in_State_Machine_Definition"):
+        if len(r) >= 2 and not str(r[0]).startswith(_TXN_SUR):
+            nm, smd = r[0], r[1]
+            if nm in name_smd and name_smd[nm] != smd:
+                ambiguous.add(nm)
+            name_smd[nm] = smd
+    for nm in ambiguous:
+        name_smd.pop(nm, None)
+    if not name_smd:
+        return D
+    surro = {nm: f"{_TXN_SUR}{smd}\x1f{nm}" for nm, smd in name_smd.items()}
+    pos_of = {}                                              # cell -> 0-based Transition position
+    for r in _pop_rows(D, "role"):
+        if len(r) >= 4 and r[3] == "Transition":
+            pos_of[r[1]] = int(r[2]) - 1
+    pos_of.update({"smFrom": 0, "smTo": 0, "smTrigger": 0, "smGuard": 0,
+                   "smEmit": 0, "smMoore": 0, "Guard_prevents_Transition": 1})
+    out = []
+    for c in from_lam(D):
+        if isinstance(c, tuple) and len(c) == 3 and c[0] == "CELL" and c[1] in pos_of:
+            p = pos_of[c[1]]
+            rows = []
+            for r in c[2]:
+                if isinstance(r, tuple) and len(r) > p and r[p] in surro:
+                    r = r[:p] + (surro[r[p]],) + r[p + 1:]
+                rows.append(r)
+            out.append(("CELL", c[1], tuple(rows)))
+        else:
+            out.append(c)
+    return to_lam(tuple(out))
+
+
 _PART_MEMO = None
 
 

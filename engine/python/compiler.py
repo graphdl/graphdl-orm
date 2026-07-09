@@ -2176,6 +2176,9 @@ def compile_model(text, D=None, context_from=None):
     PYAREST_SEED=1 as the migration escape hatch until its deletion. The report
     keeps the seed's contract: total, kinds, unparsed, rule_diagnostics."""
     D2, rep = compile_model_selfhost(text, D=D, context_from=context_from)
+    # machine-scope transition identity (Core.png surrogate; base-vs-app name reuse
+    # must not merge one Transition across two machines) — per compile pass
+    D2 = system.rekey_transitions(D2)
     diags = [tuple(r) for r in system._pop_rows(D2, "ruleDiag")]
     return D2, {"total": len(statements(text)), "kinds": {},
                 "unparsed": rep["unclassified"], "prose": rep["prose"],
