@@ -194,10 +194,20 @@ async function verifyActor(request, app) {
         if (sub) {
           try {
             use_(app);
-            arest_ingest(JSON.stringify([{
-              ft: "Subscription_belongs_to_Customer",
-              facts: [[String(sub), actor]],
-            }]));
+            arest_ingest(JSON.stringify([
+              { ft: "Subscription_belongs_to_Customer",
+                facts: [[String(sub), actor]] },
+              // THE CUSTOMER ANCHORS at the boundary: authorization.md's
+              // customer rules are the SPEC this projection mirrors —
+              // derivation runs at compile but the subscription link
+              // exists only at runtime, so the triples project here
+              // (isolate-local, never logged) exactly like the REKEY
+              // table, until the native rules path lands.
+              { ft: "User_is_authorized_for_Operation_on_Resource",
+                facts: [[actor, "create", "Support Request"],
+                        [actor, "create", "Message"],
+                        [actor, "create", "Chat Message"]] },
+            ]));
           } catch {}
         }
       }
