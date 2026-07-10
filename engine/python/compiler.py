@@ -1375,10 +1375,10 @@ def _h_sm_to(g, k, m):
     return _sm_rows("is to Status", "Transition", g[0], g[1])
 
 def _h_sm_trigger(g, k, m):
-    return _sm_rows("is triggered by Fact Type", "Transition", g[0], _clause_ft(g[1], k))
+    return _sm_rows("is triggered by Fact Type", "Transition", g[0], g[1])   # #18: g1 arrives RESOLVED (the _COOK boundary)
 
 def _h_sm_guard(g, k, m):
-    return _sm_rows("is guarded by Fact Type", "Transition", g[0], _clause_ft(g[1], k))
+    return _sm_rows("is guarded by Fact Type", "Transition", g[0], g[1])     # #18: g1 arrives RESOLVED (the _COOK boundary)
 
 def _h_sm_emit(g, k, m):
     return _sm_rows("emits", "Transition", g[0], g[1])
@@ -1807,6 +1807,17 @@ _PLAN = {
 }
 
 
+# #18: the boundary COOKERS — per-kind group resolution that is Stage-1's business
+# (text -> atom through known context), run BEFORE the translator so the translator
+# stays the pure ⟨groups, known, mod⟩ -> ⟨rows, phi⟩ object the canon defines. The SM
+# trigger/guard clause resolves reading -> fact-type id here (the sm_rows doctrine:
+# literals arrive RESOLVED; the resolution is the boundary's step, not the object's).
+_COOK = {
+    "sm_trigger": lambda g, k: (g[0], _clause_ft(g[1], k)),
+    "sm_guard": lambda g, k: (g[0], _clause_ft(g[1], k)),
+}
+
+
 def _plan(kind, g, known, modality="alethic", sign=""):
     """Dispatch the reading kind to its handler (application by key), never an
     if/elif chain. A DEONTIC fact_type_reading transforms (the old engine's
@@ -1815,6 +1826,8 @@ def _plan(kind, g, known, modality="alethic", sign=""):
     instance rows mint) and one constraint row rides with the operator, the
     fact type span, the quoted values if any, and the deontic modality tail.
     Deontic flags, never blocks (Def. Violation)."""
+    if kind in _COOK:
+        g = _COOK[kind](g, known)
     if modality == "deontic" and kind == "fact_type_reading":
         reading = _strip_derivation(g[0])[1]
         # a leading universal quantifier scopes the obligation, never the

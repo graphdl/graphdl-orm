@@ -2,8 +2,9 @@
 to the canonical system:sm_rows over ⟨verb, head, g0, g1⟩; the canon twin system:h_sm_*
 builds that four-tuple from ⟨groups, known, mod⟩ (constant verb/head + the two group
 selectors) and wraps ⟨rows, phi⟩. This certifies host == canon (the #18 doctrine: the host
-stays native for compile speed, the lambda is the meaning). Trigger/guard are excluded —
-their second group needs known-context reading->ft resolution (the Stage-1 boundary)."""
+stays native for compile speed, the lambda is the meaning). Trigger/guard joined 2026-07-10:
+the _COOK boundary resolves their clause group (reading->ft id) BEFORE dispatch, so their
+handlers are the same pure sm_rows shape — the twin test feeds RESOLVED literals."""
 import pyarest.prims  # noqa: F401
 from pyarest import canon, compiler
 from pyarest.lam import from_lam, to_lam, atom as A
@@ -18,6 +19,8 @@ HANDLERS = [
     ("system:h_sm_to", compiler._h_sm_to),
     ("system:h_sm_emit", compiler._h_sm_emit),
     ("system:h_sm_moore", compiler._h_sm_moore),
+    ("system:h_sm_trigger", compiler._h_sm_trigger),
+    ("system:h_sm_guard", compiler._h_sm_guard),
 ]
 
 SAMPLES = [("Placed", "Order Lifecycle"), ("A", "B"),

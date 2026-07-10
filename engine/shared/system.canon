@@ -5506,7 +5506,7 @@ DEF("system:classify_heads",
 DEF("system:h_objectification",
     S3(A("CONS"), S3(A("CONS"), S3(A("CONS"), K(A("instanceOf")), S3(A("CONS"), S3(A("COMP"), N(2), N(1)), K(A("ObjectType")))), S3(A("CONS"), K(A("objectification")), S3(A("CONS"), S3(A("COMP"), N(2), N(1)), S3(A("COMP"), N(1), N(1))))), K(PHI()))),
 
-"THE SM HANDLER TRANSLATORS AS DATA (2026-07-10, #18): six state-machine reading handlers, each a thin delegation to the canonical system:sm_rows row object over the four-tuple ⟨verb, head, group1, group2⟩ — the verb is the grammar's own recognizer token (constant per handler), the head splits the shared 'emits' verb between Transition (Mealy) and Status (Moore). A translator maps ⟨groups, known, mod⟩ -> ⟨rows, phi⟩ (no objs). Hosts _h_sm_def/initial/from/to/emit/moore stay the certified-equal native overrides (test_sm_handler_canon twins them). Trigger and guard are NOT canonized here: their second group resolves reading -> fact-type id through known context, which is the Stage-1 text boundary, not the object's business.",
+"THE SM HANDLER TRANSLATORS AS DATA (2026-07-10, #18): six state-machine reading handlers, each a thin delegation to the canonical system:sm_rows row object over the four-tuple ⟨verb, head, group1, group2⟩ — the verb is the grammar's own recognizer token (constant per handler), the head splits the shared 'emits' verb between Transition (Mealy) and Status (Moore). A translator maps ⟨groups, known, mod⟩ -> ⟨rows, phi⟩ (no objs). Hosts _h_sm_def/initial/from/to/emit/moore stay the certified-equal native overrides (test_sm_handler_canon twins them). Trigger and guard canonize the same way (2026-07-10): the compiler's _COOK boundary resolves their clause group (reading -> fact-type id through known context — Stage-1's step, exactly as this doctrine assigns it) BEFORE dispatch, so system:h_sm_trigger / system:h_sm_guard are the same pure sm_rows shape and the hosts stay the certified-equal overrides (test_sm_handler_canon).",
 
 DEF("system:h_sm_def", S3(A("CONS"), S3(A("COMP"), A("system:sm_rows"), S5(A("CONS"), K(A("is for Noun")), K(A("State Machine Definition")), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(2), N(1)))), K(PHI()))),
 
@@ -5519,6 +5519,10 @@ DEF("system:h_sm_to", S3(A("CONS"), S3(A("COMP"), A("system:sm_rows"), S5(A("CON
 DEF("system:h_sm_emit", S3(A("CONS"), S3(A("COMP"), A("system:sm_rows"), S5(A("CONS"), K(A("emits")), K(A("Transition")), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(2), N(1)))), K(PHI()))),
 
 DEF("system:h_sm_moore", S3(A("CONS"), S3(A("COMP"), A("system:sm_rows"), S5(A("CONS"), K(A("emits")), K(A("Status")), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(2), N(1)))), K(PHI()))),
+
+DEF("system:h_sm_trigger", S3(A("CONS"), S3(A("COMP"), A("system:sm_rows"), S5(A("CONS"), K(A("is triggered by Fact Type")), K(A("Transition")), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(2), N(1)))), K(PHI()))),
+
+DEF("system:h_sm_guard", S3(A("CONS"), S3(A("COMP"), A("system:sm_rows"), S5(A("CONS"), K(A("is guarded by Fact Type")), K(A("Transition")), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(2), N(1)))), K(PHI()))),
 
 "A REFERENCE-SCHEME READING TRANSLATOR AS DATA (2026-07-10, #18): the entity g0 is an ObjectType, its identifying value g1 a ValueType, and refScheme links them — three constant-tag rows from the two groups, the same pure ⟨groups, known, mod⟩ -> ⟨rows, phi⟩ shape as h_objectification. Host _h_ref_scheme stays the certified-equal native override (test_ref_scheme_canon).",
 
