@@ -42,7 +42,7 @@ Reading is a value type.
 Role is an entity type.
 Position is a value type.
 Constraint is an entity type.
-Constraint Kind is a value type.
+Constraint Type is a value type.
 Modality is a value type.
 Object Type is of OT Kind.
 Each Object Type is of exactly one OT Kind.
@@ -51,8 +51,8 @@ Fact Type has Reading.
 Each Fact Type has at most one Reading.
 Role is in Fact Type at Position played by Object Type.
 Each Role is in at most one Fact Type at Position played by Object Type.
-Constraint is of Constraint Kind about Fact Type with Modality.
-Each Constraint is of at most one Constraint Kind about Fact Type with Modality.
+Constraint is of Constraint Type about Fact Type with Modality.
+Each Constraint is of at most one Constraint Type about Fact Type with Modality.
 Object Type specializes Object Type.
 The possible values of Modality are 'alethic', 'deontic'.
 """
@@ -63,7 +63,7 @@ M_MAP = {
     "Object_Type_is_of_OT_Kind": "instanceOf",
     "Fact_Type_has_Reading": "factType",
     "Role_is_in_Fact_Type_at_Position_played_by_Object_Type": "role",
-    "Constraint_is_of_Constraint_Kind_about_Fact_Type_with_Modality": "constraint",
+    "Constraint_is_of_Constraint_Type_about_Fact_Type_with_Modality": "constraint",
     "Object_Type_specializes_Object_Type": "subtype",
 }
 

@@ -23,8 +23,6 @@ Constraint(.id) is an entity type.
 
 Constraint Type(.code) is an entity type.
 
-Constraint Kind(.code) is an entity type.
-
 Derivation Rule(.id) is an entity type.
   Derivation Rule is a subtype of Resource.
 
@@ -99,10 +97,10 @@ Scope is a value type.
 Derivation Mode is a value type.
   The possible values of Derivation Mode are 'fully-derived', 'derived-and-stored', 'semi-derived'.
 
-Constraint Kind Label is a value type.
+Constraint Type Label is a value type.
 
-Constraint Kind Family is a value type.
-  The possible values of Constraint Kind Family are 'ring', 'uniqueness', 'mandatory', 'frequency', 'value', 'set-comparison', 'subset', 'equality', 'deontic'.
+Constraint Type Family is a value type.
+  The possible values of Constraint Type Family are 'ring', 'uniqueness', 'mandatory', 'frequency', 'value', 'set-comparison', 'subset', 'equality', 'deontic'.
 
 Constraint Match Keyword is a value type.
 
@@ -289,7 +287,6 @@ Function belongs to Domain.
 It is obligatory that each Function belongs to some Domain.
 
 ### Constraint
-Constraint is of Constraint Type.
 Constraint has modality of Modality Type.
 Constraint has Text.
   Each Constraint has at most one Text.
@@ -297,15 +294,13 @@ Constraint is semantic.
 Constraint has Constraint Match Keyword.
   It is possible that some Constraint has more than one Constraint Match Keyword.
 
-### Constraint Type
+### Constraint Type (merged #13: NORMA ConstraintType — one classifier carrying code, Name, Label, Family, and Violation Template)
 Constraint Type has Name.
-  Each Constraint Type has exactly one Name.
-
-### Constraint Kind
-Constraint Kind has Constraint Kind Label.
-  Each Constraint Kind has exactly one Constraint Kind Label.
-Constraint Kind has Constraint Kind Family.
-  Each Constraint Kind has exactly one Constraint Kind Family.
+  Each Constraint Type has at most one Name.
+Constraint Type has Constraint Type Label.
+  Each Constraint Type has exactly one Constraint Type Label.
+Constraint Type has Constraint Type Family.
+  Each Constraint Type has exactly one Constraint Type Family.
 
 ### Set Comparison Constraint (subtype of Constraint)
 Set Comparison Constraint has Argument Length.
@@ -329,9 +324,6 @@ API accepts Noun as parameter.
   Each API, Noun combination occurs at most once in the population of API accepts Noun as parameter.
 
 ## Constraints
-
-Each Constraint is of exactly one Constraint Type.
-It is possible that more than one Constraint is of the same Constraint Type.
 
 Each Constraint has modality of exactly one Modality Type.
 It is possible that more than one Constraint has modality of the same Modality Type.
@@ -975,10 +967,10 @@ Conceptual Data Type 'objectId' has Abstract SQL Type 'INTEGER'.
 Conceptual Data Type 'unspecified' has Abstract SQL Type 'CHARACTER VARYING'.
 Conceptual Data Type 'userDefined' has Abstract SQL Type 'CHARACTER VARYING'.
 
-### Constraint Kinds (#747)
+### Constraint Types (#747)
 
 <!--
-Each Constraint Kind code below names one alethic constraint dispatch
+Each Constraint Type code below names one alethic constraint dispatch
 arm in `compile.rs`. The Family groups codes that share an evaluation
 shape (ring, set-comparison, subset/equality, value, frequency,
 uniqueness, mandatory) so tooling — OpenAPI, docs, MCP introspection —
@@ -987,53 +979,53 @@ Rust match. AT and ANS share the antisymmetric ring kernel; ANS is
 preserved as a separate kind so the alias surfaces as a fact.
 -->
 
-Constraint Kind 'IR' has Constraint Kind Label 'Irreflexive Ring'.
-Constraint Kind 'IR' has Constraint Kind Family 'ring'.
-Constraint Kind 'AS' has Constraint Kind Label 'Asymmetric Ring'.
-Constraint Kind 'AS' has Constraint Kind Family 'ring'.
-Constraint Kind 'SY' has Constraint Kind Label 'Symmetric Ring'.
-Constraint Kind 'SY' has Constraint Kind Family 'ring'.
-Constraint Kind 'AT' has Constraint Kind Label 'Antisymmetric Ring'.
-Constraint Kind 'AT' has Constraint Kind Family 'ring'.
-Constraint Kind 'IT' has Constraint Kind Label 'Intransitive Ring'.
-Constraint Kind 'IT' has Constraint Kind Family 'ring'.
-Constraint Kind 'TR' has Constraint Kind Label 'Transitive Ring'.
-Constraint Kind 'TR' has Constraint Kind Family 'ring'.
-Constraint Kind 'AC' has Constraint Kind Label 'Acyclic Ring'.
-Constraint Kind 'AC' has Constraint Kind Family 'ring'.
-Constraint Kind 'RF' has Constraint Kind Label 'Reflexive Ring'.
-Constraint Kind 'RF' has Constraint Kind Family 'ring'.
-Constraint Kind 'UC' has Constraint Kind Label 'Uniqueness'.
-Constraint Kind 'UC' has Constraint Kind Family 'uniqueness'.
-Constraint Kind 'MC' has Constraint Kind Label 'Mandatory'.
-Constraint Kind 'MC' has Constraint Kind Family 'mandatory'.
-Constraint Kind 'FC' has Constraint Kind Label 'Frequency'.
-Constraint Kind 'FC' has Constraint Kind Family 'frequency'.
-Constraint Kind 'VC' has Constraint Kind Label 'Value'.
-Constraint Kind 'VC' has Constraint Kind Family 'value'.
-Constraint Kind 'XO' has Constraint Kind Label 'Exclusive Or'.
-Constraint Kind 'XO' has Constraint Kind Family 'set-comparison'.
-Constraint Kind 'XC' has Constraint Kind Label 'Exclusion'.
-Constraint Kind 'XC' has Constraint Kind Family 'set-comparison'.
-Constraint Kind 'OR' has Constraint Kind Label 'Inclusive Or'.
-Constraint Kind 'OR' has Constraint Kind Family 'set-comparison'.
-Constraint Kind 'SS' has Constraint Kind Label 'Subset'.
-Constraint Kind 'SS' has Constraint Kind Family 'subset'.
-Constraint Kind 'EQ' has Constraint Kind Label 'Equality'.
-Constraint Kind 'EQ' has Constraint Kind Family 'equality'.
+Constraint Type 'IR' has Constraint Type Label 'Irreflexive Ring'.
+Constraint Type 'IR' has Constraint Type Family 'ring'.
+Constraint Type 'AS' has Constraint Type Label 'Asymmetric Ring'.
+Constraint Type 'AS' has Constraint Type Family 'ring'.
+Constraint Type 'SY' has Constraint Type Label 'Symmetric Ring'.
+Constraint Type 'SY' has Constraint Type Family 'ring'.
+Constraint Type 'AT' has Constraint Type Label 'Antisymmetric Ring'.
+Constraint Type 'AT' has Constraint Type Family 'ring'.
+Constraint Type 'IT' has Constraint Type Label 'Intransitive Ring'.
+Constraint Type 'IT' has Constraint Type Family 'ring'.
+Constraint Type 'TR' has Constraint Type Label 'Transitive Ring'.
+Constraint Type 'TR' has Constraint Type Family 'ring'.
+Constraint Type 'AC' has Constraint Type Label 'Acyclic Ring'.
+Constraint Type 'AC' has Constraint Type Family 'ring'.
+Constraint Type 'RF' has Constraint Type Label 'Reflexive Ring'.
+Constraint Type 'RF' has Constraint Type Family 'ring'.
+Constraint Type 'UC' has Constraint Type Label 'Uniqueness'.
+Constraint Type 'UC' has Constraint Type Family 'uniqueness'.
+Constraint Type 'MC' has Constraint Type Label 'Mandatory'.
+Constraint Type 'MC' has Constraint Type Family 'mandatory'.
+Constraint Type 'FC' has Constraint Type Label 'Frequency'.
+Constraint Type 'FC' has Constraint Type Family 'frequency'.
+Constraint Type 'VC' has Constraint Type Label 'Value'.
+Constraint Type 'VC' has Constraint Type Family 'value'.
+Constraint Type 'XO' has Constraint Type Label 'Exclusive Or'.
+Constraint Type 'XO' has Constraint Type Family 'set-comparison'.
+Constraint Type 'XC' has Constraint Type Label 'Exclusion'.
+Constraint Type 'XC' has Constraint Type Family 'set-comparison'.
+Constraint Type 'OR' has Constraint Type Label 'Inclusive Or'.
+Constraint Type 'OR' has Constraint Type Family 'set-comparison'.
+Constraint Type 'SS' has Constraint Type Label 'Subset'.
+Constraint Type 'SS' has Constraint Type Family 'subset'.
+Constraint Type 'EQ' has Constraint Type Label 'Equality'.
+Constraint Type 'EQ' has Constraint Type Family 'equality'.
 
-Constraint Kind 'DF_pop' has Constraint Kind Label 'Deontic Forbidden (population)'.
-Constraint Kind 'DF_pop' has Constraint Kind Family 'deontic'.
-Constraint Kind 'DF_cwa' has Constraint Kind Label 'Deontic Forbidden (closed-world)'.
-Constraint Kind 'DF_cwa' has Constraint Kind Family 'deontic'.
-Constraint Kind 'DF_owa' has Constraint Kind Label 'Deontic Forbidden (open-world)'.
-Constraint Kind 'DF_owa' has Constraint Kind Family 'deontic'.
-Constraint Kind 'DO_pop' has Constraint Kind Label 'Deontic Obligatory (population)'.
-Constraint Kind 'DO_pop' has Constraint Kind Family 'deontic'.
-Constraint Kind 'DO_obl' has Constraint Kind Label 'Deontic Obligatory'.
-Constraint Kind 'DO_obl' has Constraint Kind Family 'deontic'.
-Constraint Kind 'DO_sender' has Constraint Kind Label 'Deontic Obligatory (sender)'.
-Constraint Kind 'DO_sender' has Constraint Kind Family 'deontic'.
+Constraint Type 'DF_pop' has Constraint Type Label 'Deontic Forbidden (population)'.
+Constraint Type 'DF_pop' has Constraint Type Family 'deontic'.
+Constraint Type 'DF_cwa' has Constraint Type Label 'Deontic Forbidden (closed-world)'.
+Constraint Type 'DF_cwa' has Constraint Type Family 'deontic'.
+Constraint Type 'DF_owa' has Constraint Type Label 'Deontic Forbidden (open-world)'.
+Constraint Type 'DF_owa' has Constraint Type Family 'deontic'.
+Constraint Type 'DO_pop' has Constraint Type Label 'Deontic Obligatory (population)'.
+Constraint Type 'DO_pop' has Constraint Type Family 'deontic'.
+Constraint Type 'DO_obl' has Constraint Type Label 'Deontic Obligatory'.
+Constraint Type 'DO_obl' has Constraint Type Family 'deontic'.
+Constraint Type 'DO_sender' has Constraint Type Label 'Deontic Obligatory (sender)'.
+Constraint Type 'DO_sender' has Constraint Type Family 'deontic'.
 
 ### Join Types (NORMA #279)
 

@@ -57,8 +57,8 @@ It is obligatory that each variable in a Derivation Rule consequent appears in a
 
 Violation Template is a value type.
 
-Constraint Kind has Violation Template.
-  Each Constraint Kind has at most one Violation Template.
+Constraint Type has Violation Template.
+  Each Constraint Type has at most one Violation Template.
 
 ### Placeholders
 
@@ -94,32 +94,32 @@ that runtime-evaluates to the atoms inserted at that position:
 
 ### Templates
 
-Constraint Kind 'IR' has Violation Template 'Irreflexive violation: {value} references itself'.
-Constraint Kind 'AS' has Violation Template 'Asymmetric violation: {x} relates to {y} and vice versa'.
-Constraint Kind 'SY' has Violation Template 'Symmetric violation: {x} relates to {y} but not the reverse'.
-Constraint Kind 'AT' has Violation Template 'Antisymmetric violation: {x} and {y} relate to each other but are not the same'.
-Constraint Kind 'IT' has Violation Template 'Intransitive violation: {x} relates to {y} relates to {z} but shortcut also exists'.
-Constraint Kind 'TR' has Violation Template 'Transitive violation: {x} relates to {y} relates to {z} but shortcut is missing'.
-Constraint Kind 'AC' has Violation Template 'Acyclic violation: cycle detected through {value}'.
-Constraint Kind 'RF' has Violation Template 'Reflexive violation: {value} does not reference itself'.
-Constraint Kind 'UC' has Violation Template 'Uniqueness violation: {noun} {value} is not unique in {reading}'.
-Constraint Kind 'MC' has Violation Template 'Mandatory violation: {noun} {value} does not participate in {reading}'.
-Constraint Kind 'FC' has Violation Template 'Frequency violation: {noun} {value} in {reading} expected {range}'.
-Constraint Kind 'VC' has Violation Template 'Value constraint violation: {noun} {value} is not in {valid_set}'.
-Constraint Kind 'XO' has Violation Template 'Set-comparison violation: {entity} {value} expected {requirement} of {clause_count} clause fact types'.
-Constraint Kind 'XC' has Violation Template 'Set-comparison violation: {entity} {value} expected {requirement} of {clause_count} clause fact types'.
-Constraint Kind 'OR' has Violation Template 'Set-comparison violation: {entity} {value} expected {requirement} of {clause_count} clause fact types'.
-Constraint Kind 'SS' has Violation Template 'Subset violation: {pairs} participates in {a_ft} but not in {b_ft}'.
-Constraint Kind 'EQ' has Violation Template 'Equality violation: {pairs} in {a_ft} but not in {b_ft}'.
+Constraint Type 'IR' has Violation Template 'Irreflexive violation: {value} references itself'.
+Constraint Type 'AS' has Violation Template 'Asymmetric violation: {x} relates to {y} and vice versa'.
+Constraint Type 'SY' has Violation Template 'Symmetric violation: {x} relates to {y} but not the reverse'.
+Constraint Type 'AT' has Violation Template 'Antisymmetric violation: {x} and {y} relate to each other but are not the same'.
+Constraint Type 'IT' has Violation Template 'Intransitive violation: {x} relates to {y} relates to {z} but shortcut also exists'.
+Constraint Type 'TR' has Violation Template 'Transitive violation: {x} relates to {y} relates to {z} but shortcut is missing'.
+Constraint Type 'AC' has Violation Template 'Acyclic violation: cycle detected through {value}'.
+Constraint Type 'RF' has Violation Template 'Reflexive violation: {value} does not reference itself'.
+Constraint Type 'UC' has Violation Template 'Uniqueness violation: {noun} {value} is not unique in {reading}'.
+Constraint Type 'MC' has Violation Template 'Mandatory violation: {noun} {value} does not participate in {reading}'.
+Constraint Type 'FC' has Violation Template 'Frequency violation: {noun} {value} in {reading} expected {range}'.
+Constraint Type 'VC' has Violation Template 'Value constraint violation: {noun} {value} is not in {valid_set}'.
+Constraint Type 'XO' has Violation Template 'Set-comparison violation: {entity} {value} expected {requirement} of {clause_count} clause fact types'.
+Constraint Type 'XC' has Violation Template 'Set-comparison violation: {entity} {value} expected {requirement} of {clause_count} clause fact types'.
+Constraint Type 'OR' has Violation Template 'Set-comparison violation: {entity} {value} expected {requirement} of {clause_count} clause fact types'.
+Constraint Type 'SS' has Violation Template 'Subset violation: {pairs} participates in {a_ft} but not in {b_ft}'.
+Constraint Type 'EQ' has Violation Template 'Equality violation: {pairs} in {a_ft} but not in {b_ft}'.
 
 ### Deontic-path templates
 
-Constraint Kind 'DF_pop' has Violation Template 'Forbidden fact present in {primary_ft}'.
-Constraint Kind 'DF_cwa' has Violation Template 'Response contains forbidden {noun} {value}'.
-Constraint Kind 'DF_owa' has Violation Template 'Response may violate: {text}'.
-Constraint Kind 'DO_pop' has Violation Template 'Obligation violated in {primary_ft}'.
-Constraint Kind 'DO_obl' has Violation Template 'Response missing obligatory {noun}'.
-Constraint Kind 'DO_sender' has Violation Template 'Response missing obligatory SenderIdentity'.
+Constraint Type 'DF_pop' has Violation Template 'Forbidden fact present in {primary_ft}'.
+Constraint Type 'DF_cwa' has Violation Template 'Response contains forbidden {noun} {value}'.
+Constraint Type 'DF_owa' has Violation Template 'Response may violate: {text}'.
+Constraint Type 'DO_pop' has Violation Template 'Obligation violated in {primary_ft}'.
+Constraint Type 'DO_obl' has Violation Template 'Response missing obligatory {noun}'.
+Constraint Type 'DO_sender' has Violation Template 'Response missing obligatory SenderIdentity'.
 
 ## Instance Facts
 
