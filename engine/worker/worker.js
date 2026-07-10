@@ -271,6 +271,24 @@ function popRows(ft) {
   } catch { return []; }
 }
 
+// #21 F3: an outbound-target guard for federation fetches. base/uri come from
+// operator-seeded config (write-gated, so not attacker-injectable today), so this is
+// defense-in-depth: never fetch a loopback, private, link-local, or cloud-metadata
+// host, so a future config slip or a widened write policy cannot turn federation into
+// an SSRF pivot onto internal services. Paired with redirect:"error" at the call site.
+function federationTargetOk(u) {
+  let url;
+  try { url = new URL(u); } catch { return false; }
+  if (!/^https?:$/.test(url.protocol)) return false;
+  const h = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (h === "localhost" || h === "0.0.0.0" || h === "::1"
+      || h.endsWith(".local") || h.endsWith(".internal")) return false;
+  if (/^(127\.|10\.|192\.168\.|169\.254\.)/.test(h)) return false;   // loopback / private / link-local (v4)
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(h)) return false;            // 172.16-31 (v4)
+  if (/^(fc|fd)/.test(h) || h.startsWith("fe80:")) return false;     // ULA / link-local (v6)
+  return true;
+}
+
 async function ensureFederated(env, app, noun) {
   use_(app);
   const backed = popRows("Noun_is_backed_by_External_System")
@@ -290,9 +308,10 @@ async function ensureFederated(env, app, noun) {
   const hname = prop("External_System_has_Header")[sys];
   if (hname && secret)
     headers[hname] = ((prop("External_System_has_Prefix")[sys] ?? "") + " " + secret).trim();
+  if (!federationTargetOk(base + uri)) return;   // #21 F3: SSRF guard (defense in depth)
   let payload = null;
   try {
-    const r = await fetch(base + uri, { headers });
+    const r = await fetch(base + uri, { headers, redirect: "error" });
     if (r.ok) payload = await r.json();
   } catch {}
   use_(app);                      // the fetch suspended; re-select
