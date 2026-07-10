@@ -96,14 +96,22 @@ the driver control-flow are the host surface.
 
 Python has 39 `_h_*` translators (compiler.py:739-1768). Canon so far (~10):
 h_objectification (5506), h_sm_def/initial/from/to/emit/moore (5511-5521), h_ref_scheme
-(5525), h_meta_data_type/ref_mode (5529-5531). Remaining frontier includes the constraint
-family (uniqueness, mandatory, frequency, ring, subset/equality, set_comparison), the
-entity/value pair (need `_name_refmode`), the fact/subtype handlers, and the two residual
-SM ones **`_h_sm_trigger`/`_h_sm_guard`** (compiler.py:1377-1381) — identical to the
-canon `h_sm_from` shape except field 2 is wrapped in `system:clause_ft` (already canon) with
-the `known` context threaded in. Each remaining one carries a real dependency (a parse
-helper, a `C.*` constraint builder, or context threading) — careful canon authoring, fleet-
-certified, not mechanical copies.
+(5525), h_meta_data_type/ref_mode (5529-5531).
+
+THE FRONTIER IS NOT "copy the pattern" — a doctrine boundary governs it (system.canon:5504,
+5509): Stage-1 (regex text->groups) stays the host SEED because "text->atom is the informal
+boundary"; only groups->rows is canon. The ~10 canonized are exactly the handlers whose
+groups need NO text-boundary resolution. EVERY remaining handler does a text->X resolution
+INSIDE the handler — `_h_sm_trigger`/`_h_sm_guard` resolve reading->ft-id via `_clause_ft`
+(compiler.py:1377), `_h_entity`/`_h_value` split name/ref-mode via `_name_refmode`, the
+constraint family (`_h_uniqueness`/`_h_mandatory`/...) resolve reading->ft via `_fact_type`,
+`_h_value_constraint` parses the value spec. By the doctrine those resolutions are Stage-1,
+not the translator's business. `_h_sm_trigger`/`_h_sm_guard` are EXPLICITLY doctrine-deferred
+(system.canon:5509 names them). So canonizing each remaining handler is not a DEF copy; it is
+a Stage-1/handler BOUNDARY REFACTOR — move the text->X resolution into Stage-1 so the group
+arrives already resolved, leaving a pure `⟨groups,known,mod⟩ -> ⟨rows,phi⟩` translator to
+canonize, host `_h_*` retained as the certified-equal override. That is the real, careful
+#18 work; there is no tail-of-turn mechanical translator left.
 
 ## The two real #20 levers (measured)
 
