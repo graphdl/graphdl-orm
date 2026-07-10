@@ -5524,6 +5524,12 @@ DEF("system:h_sm_moore", S3(A("CONS"), S3(A("COMP"), A("system:sm_rows"), S5(A("
 
 DEF("system:h_ref_scheme", S3(A("CONS"), S4(A("CONS"), S3(A("CONS"), K(A("instanceOf")), S3(A("CONS"), S3(A("COMP"), N(1), N(1)), K(A("ObjectType")))), S3(A("CONS"), K(A("instanceOf")), S3(A("CONS"), S3(A("COMP"), N(2), N(1)), K(A("ValueType")))), S3(A("CONS"), K(A("refScheme")), S3(A("CONS"), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(2), N(1))))), K(PHI()))),
 
+"THE METADATA READING TRANSLATORS AS DATA (2026-07-10, #18): the data_type and ref_mode readings each emit ONE row into their own cell — the single capture group's value — the pure ⟨groups, known, mod⟩ -> ⟨⟨⟨cell, ⟨g0⟩⟩⟩, phi⟩ shape. Host _h_meta is the certified-equal factory (test_meta_handler_canon twins both instances).",
+
+DEF("system:h_meta_data_type", S3(A("CONS"), S2(A("CONS"), S3(A("CONS"), K(A("data_type")), S2(A("CONS"), S3(A("COMP"), N(1), N(1))))), K(PHI()))),
+
+DEF("system:h_meta_ref_mode", S3(A("CONS"), S2(A("CONS"), S3(A("CONS"), K(A("ref_mode")), S2(A("CONS"), S3(A("COMP"), N(1), N(1))))), K(PHI()))),
+
 "THE PASS ORDER AND ROUND BOUND AS DATA (2026-07-08, scheduler-as-data second face): constants of doctrine, materialized as the passOrder and passBound cells beside passHeads; hosts dispatch their native pass bodies by the cell and fall back to the same literals when a store lacks it. The positive closure stays OUTSIDE the ordered passes: it is the floor the strata stand on.",
 
 DEF("system:pass_order",
