@@ -2802,7 +2802,8 @@ const SESSION_VERBS: [&str; 11] =
 const APP_VERBS: [&str; 13] =
     ["apply", "ask", "cells", "compile", "explain", "get", "induce", "propose",
      "query", "retract", "schema", "sql", "synthesize"];
-const RESIDENT_OPS: [&str; 5] = ["cells", "query", "run_rules", "synthesize_pairs", "verbs"];
+const RESIDENT_OPS: [&str; 6] =
+    ["cells", "compile_model", "query", "run_rules", "synthesize_pairs", "verbs"];
 
 fn reduce_in(mu: &V, cells: &[(Leaf, V)], d: &V, f: V, x: V, fuel: Option<i64>) -> V {
     // one reduction under a given store binding, the case path's frame
@@ -4082,6 +4083,537 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     Ok(r)
 }
 
+// ============================ the compile driver ==============================
+// Phase one of the Rust-native compile (#20, docs/2026-07-10-rust-native-compile.md):
+// op_compile_model is the DRIVER SKELETON of python compiler.compile_model_selfhost
+// (compiler.py:2214) — the thin host g-loop over canon. Shape (the doc's anatomy):
+//   (a) statements(text)      — split the readings text into statements (host string op)
+//   (b) _split_modality       — alethic/deontic + sign + inner (host string op)
+//   (c) BATCH classification  — stage-1 field facts under per-statement ids into a
+//       SCRATCH view of the resident store, ONE op_run_rules derive over the grammar's
+//       recognizer rules (stratum 4: one lfp for every statement, never one each),
+//       Statement_has_Classification read back, the resident store RESTORED whole
+//       (python classify_all_via_M's immutability, done here by save/restore)
+//   (d) the dispatch loop     — Classification_has_Translator rows name the
+//       translators; each dispatches through the reducer (rho): reduce_over over
+//       ⟨inner, mfield, ctx, D⟩, the direct analog of python _apply(_A(t), operand)
+// NOT YET NATIVE (the skeleton's honest gaps, reported in the answer's "missing"):
+//   - the grammar store: python classifies over grammar_D() (the ingested
+//     shared/forml2-grammar.md, frozen-thawed); the skeleton classifies over the
+//     RESIDENT store and so answers real classifications only when the caller
+//     loaded the compiled grammar (classLit + recognizer rules + the dispatch
+//     table resident). Thawing the frozen grammar sidecar into a scratch Srv is
+//     the wiring step this skeleton stops short of.
+//   - the prepass context: _known + _prepass_context (names, subtype closure,
+//     fact-type slugs, plain readings) are not ported; nouns ride empty, so
+//     Statement_has_Role_Reference rows are absent and ctx is four empty seqs.
+//   - the model D: python seeds meta.initial_D() (the process seed); the
+//     skeleton threads an EMPTY store.
+//   - the translator BODIES: host closures in python (_stmt_translator_impl,
+//     compiler.py:2100) until #18 canonizes them; reduce_over answers ⊥ for a
+//     name DEFS does not carry, and the _COOK boundary below explains which
+//     kinds are gated on a host cook. Python's "graceful absence" (unregistered
+//     translator counts accepted) is NOT mirrored: the skeleton reports the
+//     truth — nothing translated is nothing accepted.
+
+// _TRAIL_MARK (compiler.py:165): "<body>. <mark>" with mark in {**, ++, *, +}
+// normalizes to the marker-before-period form "<body> <mark>." — NORMA writes
+// storage markers AFTER the period. Hand-rolled: the host build is zero-dep.
+fn trail_mark(s: &str) -> Option<(String, String)> {
+    for mark in ["**", "++", "*", "+"] {
+        if let Some(pre) = s.strip_suffix(mark) {
+            let pre = pre.trim_end();
+            if let Some(body) = pre.strip_suffix('.') {
+                if body.chars().last().map_or(false, |c| !c.is_whitespace()) {
+                    return Some((body.to_string(), mark.to_string()));
+                }
+            }
+        }
+    }
+    None
+}
+
+// _split_sentences (compiler.py:197): a line carrying SEVERAL sentences splits
+// at quote-aware boundaries ('. ' followed by a capital or a marker); periods
+// inside quoted values never split.
+fn split_sentences(s: &str) -> Vec<String> {
+    let cs: Vec<char> = s.chars().collect();
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur: Vec<char> = Vec::new();
+    let mut q = false;
+    let mut i = 0usize;
+    while i < cs.len() {
+        let c = cs[i];
+        if c == '\'' {
+            q = !q;
+        }
+        cur.push(c);
+        if !q
+            && c == '.'
+            && i + 2 < cs.len()
+            && cs[i + 1] == ' '
+            && (cs[i + 2].is_uppercase() || "'*+".contains(cs[i + 2]))
+        {
+            let part: String = cur.iter().collect();
+            parts.push(part.trim().to_string());
+            cur.clear();
+            i += 1;
+        }
+        i += 1;
+    }
+    let tail: String = cur.iter().collect();
+    let tail = tail.trim();
+    if !tail.is_empty() {
+        parts.push(tail.to_string());
+    }
+    parts
+}
+
+// statements (compiler.py:168): accumulate lines until one ends with '.'
+// (multi-line aware); comment blocks vanish, a heading BREAKS accumulation,
+// trailing NORMA markers normalize before the period.
+fn split_statements(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut buf: Vec<String> = Vec::new();
+    let mut in_comment = false;
+    for line in text.lines() {
+        let mut s = line.trim().to_string();
+        if in_comment {
+            if s.contains("-->") {
+                in_comment = false;
+            }
+            continue;
+        }
+        if s.starts_with("<!--") {
+            in_comment = !s.contains("-->");
+            continue;
+        }
+        if s.starts_with('#') {
+            buf.clear();
+            continue;
+        }
+        if s.is_empty() || s == "Fact Types:" {
+            continue;
+        }
+        if let Some((body, mark)) = trail_mark(&s) {
+            s = format!("{} {}.", body, mark);
+        }
+        let done = s.ends_with('.');
+        buf.push(s);
+        if done {
+            out.extend(split_sentences(&buf.join(" ")));
+            buf.clear();
+        }
+    }
+    if !buf.is_empty() {
+        out.extend(split_sentences(&buf.join(" ")));
+    }
+    out
+}
+
+// _MODAL / _split_modality (compiler.py:224): strip a leading modal operator,
+// yielding (modality, sign, inner). possibility = the ABSENCE of a constraint.
+const MODAL: [(&str, &str, &str); 6] = [
+    ("It is obligatory that ", "deontic", "positive"),
+    ("It is forbidden that ", "deontic", "negative"),
+    ("It is permitted that ", "deontic", "possibility"),
+    ("It is necessary that ", "alethic", "positive"),
+    ("It is impossible that ", "alethic", "negative"),
+    ("It is possible that ", "alethic", "possibility"),
+];
+
+fn split_modality(stmt: &str) -> (&'static str, &'static str, String) {
+    for (op, m, sg) in MODAL {
+        if let Some(rest) = stmt.strip_prefix(op) {
+            return (m, sg, rest.trim().to_string());
+        }
+    }
+    ("alethic", "positive", stmt.to_string())
+}
+
+// _SM_SUSPECT (compiler.py:2244): a statement carrying quoted literals AND
+// machine phrasing that parses as NOTHING is malformed, reported loudly (the
+// arrow-glue-loud class). The regex '[^']+'.*(phrase) hand-rolls as: any
+// adjacent quote pair with content, one of the phrases after its close.
+fn sm_suspect(stmt: &str) -> bool {
+    const PHRASES: [&str; 5] = [
+        "is initial",
+        "is from Status",
+        "is to Status",
+        "is triggered by Fact Type",
+        "is defined in State Machine",
+    ];
+    let qs: Vec<usize> = stmt
+        .char_indices()
+        .filter(|(_, c)| *c == '\'')
+        .map(|(i, _)| i)
+        .collect();
+    for w in qs.windows(2) {
+        if w[1] - w[0] > 1 {
+            let rest = &stmt[w[1] + 1..];
+            if PHRASES.iter().any(|p| rest.contains(p)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// The _COOK boundary (compiler.py:1949, the #18 doctrine at system.canon:5504):
+// Stage-1 text→X resolution the HOST performs before a translator body sees its
+// groups (reading→ft-id via _clause_ft, name/ref-mode splits, constraint
+// reading→ft resolution, value-spec parsing, the subtype/fact/rule cooks).
+// Those cooks are PYTHON today; the native port lands with #18's Stage-1/handler
+// boundary refactor. Mirrors `kind in _COOK` exactly: Err names the gate, Ok
+// means the kind's groups pass through raw (the already-canonized handlers).
+fn native_cook(kind: &str) -> Result<(), String> {
+    match kind {
+        "sm_trigger" | "sm_guard" | "ring" | "frequency" | "value_constraint"
+        | "uniqueness" | "mandatory" | "neg_uniqueness" | "neg_mandatory"
+        | "for_each_mandatory" | "inverse_uc" | "spanning_uc" | "spanning_uc2"
+        | "negation" | "subtype_of" | "fact_type_reading" | "derivation_rule"
+        | "class_rule" => Err(format!("cook not ported: {}", kind)),
+        _ => Ok(()),
+    }
+}
+
+// register_translators' table (compiler.py:2151): the Stage-1 kinds each
+// translator name serves. The dispatch loop consults it to EXPLAIN a native
+// miss through the _COOK boundary — which host cooks gate that translator.
+fn translator_kinds(t: &str) -> &'static [&'static str] {
+    match t {
+        "translate_nouns" => &["entity_type", "value_type", "subtype_of", "brace_subtypes"],
+        "translate_subtypes" => &["subtype_of", "brace_subtypes"],
+        "translate_enum_values" => &["value_constraint"],
+        "translate_data_types" => &["data_type"],
+        "translate_instance_facts" => &["fact_type_reading"],
+        "translate_fact_types" => &["fact_type_reading"],
+        "translate_derivation_mode_facts" => &["fact_type_reading"],
+        "translate_derivation_rules" => {
+            &["class_rule", "rule_if", "rule_iff", "derivation_rule"]
+        }
+        "translate_cardinality_constraints" => &[
+            "uniqueness",
+            "inverse_uc",
+            "spanning_uc",
+            "spanning_uc2",
+            "frequency",
+            "neg_uniqueness",
+            "disjunctive_mandatory",
+            "mandatory",
+            "for_each_mandatory",
+            "neg_mandatory",
+        ],
+        "translate_ring_constraints" => &["ring"],
+        "translate_set_constraints" => &[
+            "set_comparison",
+            "subset",
+            "subset_trailing",
+            "equality",
+            "disjunctive_mandatory",
+        ],
+        "translate_value_constraints" => &["value_constraint"],
+        "translate_state_machines" => &[
+            "sm_def",
+            "sm_initial",
+            "sm_from",
+            "sm_to",
+            "sm_trigger",
+            "sm_guard",
+            "sm_emit",
+            "sm_moore",
+        ],
+        "translate_finality" => &["finality"],
+        "translate_objectifications" => &["objectification"],
+        "translate_negation" => &["neg_pair", "negation"],
+        _ => &[],
+    }
+}
+
+fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    // args parse before anything runs (op_run_rules' discipline: a malformed
+    // request mutates nothing)
+    let text = match jget(j, "text") {
+        Some(J::S(t)) => t.clone(),
+        _ => return Err("compile_model needs a string text".to_string()),
+    };
+    let fuel = match jget(j, "fuel") {
+        Some(J::I(n)) if *n > 0 => Some(*n),
+        _ => None,
+    };
+    let leaf = |s: &str| Leaf::S(s.to_string());
+    let strv = |x: &V| aval(x).and_then(|l| leaf_str(&l));
+
+    // the grammar data, read off the RESIDENT store before any mutation:
+    // the dispatch table (Classification_has_Translator rows, python
+    // compile_model_selfhost's first move) and the stage-1 vocabulary
+    // (classLit rows, python stage1_vocabulary — the tokenizer knows nothing
+    // else). Both empty when the resident store is not the ingested grammar;
+    // the report's "missing" says so instead of silently classifying nothing.
+    let mut dispatch: HashMap<String, Vec<String>> = HashMap::new();
+    for r in pop_rows(&srv.cells, &leaf("Classification_has_Translator")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            if let (Some(c), Some(t)) = (strv(&it[0]), strv(&it[1])) {
+                dispatch.entry(c).or_default().push(t);
+            }
+        }
+    }
+    let mut vocab: Vec<(String, String)> = Vec::new();
+    for r in pop_rows(&srv.cells, &leaf("classLit")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            if let (Some(a), Some(b)) = (strv(&it[0]), strv(&it[1])) {
+                vocab.push((a, b));
+            }
+        }
+    }
+    let mut missing: Vec<String> = Vec::new();
+    if vocab.is_empty() {
+        missing.push(
+            "grammar store not resident: no classLit rows (grammar_D frozen-thaw wiring not ported; load the compiled grammar first)"
+                .to_string(),
+        );
+    }
+    if dispatch.is_empty() {
+        missing.push(
+            "grammar store not resident: no Classification_has_Translator rows".to_string(),
+        );
+    }
+    missing.push(
+        "prepass context not ported (_known/_prepass_context): nouns empty, ctx rides four empty seqs"
+            .to_string(),
+    );
+    missing.push("model D starts EMPTY (meta.initial_D process seed not ported)".to_string());
+    missing.push(
+        "translator bodies are host closures until #18 canonizes them; native dispatch answers only for canon DEFs"
+            .to_string(),
+    );
+
+    // (a) statements + (b) modality split; a possibility statement is the
+    // absence of a constraint (informational) and never enters the g-loop
+    let stmts = split_statements(&text);
+    let total = stmts.len();
+    let mut work: Vec<(String, &'static str, String, &'static str)> = Vec::new();
+    for stmt in &stmts {
+        let (m, sg, inner) = split_modality(stmt);
+        if sg != "possibility" {
+            work.push((stmt.clone(), m, inner, sg));
+        }
+    }
+
+    // (c) BATCH classification (classify_all_via_M, compiler.py:1184): every
+    // statement's field facts land first under s1..sN, ONE derive answers all
+    // classifications. TODO(#20): the nouns prepass — role references classify
+    // weaker without it.
+    let nouns: Vec<String> = Vec::new();
+    let mut by_cell: BTreeMap<String, Vec<V>> = BTreeMap::new();
+    for (i, (_stmt, _m, inner, _sg)) in work.iter().enumerate() {
+        let sid = format!("s{}", i + 1);
+        for (ftb, s, v) in stage1_rows_of(inner, &vocab, &nouns, &sid) {
+            by_cell
+                .entry(ftb)
+                .or_default()
+                .push(seq(from_vec(vec![atom(Leaf::S(s)), atom(Leaf::S(v))])));
+        }
+    }
+    // the SCRATCH discipline: field facts and the derived classifications are
+    // never part of the model — python threads an immutable D and discards it;
+    // the resident kernel saves the store whole and restores it after the read
+    let saved_d = srv.d.clone();
+    let saved_cells = srv.cells.clone();
+    let saved_nd = srv.nd.clone();
+    let saved_ncells = srv.ncells.clone();
+    let mut cls_by_sid: HashMap<String, HashSet<String>> = HashMap::new();
+    if !by_cell.is_empty() {
+        for (ftb, rows) in &by_cell {
+            let name = leaf(ftb);
+            let old = pop_rows(&srv.cells, &name);
+            let mut merged: Vec<V> = Vec::new();
+            let mut keys: HashSet<String> = HashSet::new();
+            for r in old.iter().chain(rows.iter()) {
+                if keys.insert(key_of(r)) {
+                    merged.push(r.clone());
+                }
+            }
+            sort_rows(&mut merged);
+            store_into(
+                &mut srv.d,
+                &mut srv.cells,
+                &mut srv.nd,
+                &mut srv.ncells,
+                &name,
+                seq(from_vec(merged)),
+            );
+        }
+        // ONE run_rules over the grammar's recognizer rules, the frontier the
+        // field cells (python run_rules(D, changed=set(by_cell)))
+        let frontier_req = J::O(vec![(
+            "changed".to_string(),
+            J::A(by_cell.keys().map(|k| J::S(k.clone())).collect()),
+        )]);
+        let derived = op_run_rules(&frontier_req, srv);
+        if derived.is_ok() {
+            for r in pop_rows(&srv.cells, &leaf("Statement_has_Classification")) {
+                let it = items(&list_of(&r));
+                if it.len() >= 2 {
+                    if let (Some(s), Some(c)) = (strv(&it[0]), strv(&it[1])) {
+                        cls_by_sid.entry(s).or_default().insert(c);
+                    }
+                }
+            }
+        }
+        srv.d = saved_d;
+        srv.cells = saved_cells;
+        srv.nd = saved_nd;
+        srv.ncells = saved_ncells;
+        derived?;
+    }
+
+    // (d) the dispatch loop (compile_model_selfhost's per-statement body):
+    // Prose beats the GENERIC fallbacks only; a negative alethic statement no
+    // specific rule claimed is a constraint by definition and goes loud; the
+    // classification set's translators dispatch in sorted order through rho.
+    const GENERIC: [&str; 2] = ["Fact Type Reading", "Instance Fact"];
+    // TODO(#20): meta.initial_D — the skeleton's model store starts EMPTY
+    let mut model_d: V = seq(from_vec(Vec::new()));
+    // the context operand: python to_lam((names, subs, fts, plain)); the
+    // prepass is not ported, so all four ride empty
+    let ctx = seqc(vec![
+        seq(from_vec(Vec::new())),
+        seq(from_vec(Vec::new())),
+        seq(from_vec(Vec::new())),
+        seq(from_vec(Vec::new())),
+    ]);
+    let empty_cls: HashSet<String> = HashSet::new();
+    let mut unclassified: Vec<String> = Vec::new();
+    let mut prose: Vec<String> = Vec::new();
+    let mut blocked: Vec<String> = Vec::new();
+    let mut classified = 0usize;
+    for (i, (stmt, m, inner, sg)) in work.iter().enumerate() {
+        let sid = format!("s{}", i + 1);
+        let cls = cls_by_sid.get(&sid).unwrap_or(&empty_cls);
+        if !cls.is_empty() {
+            classified += 1;
+        }
+        // Prose beats the generics AND the rule claim — except machine-keyword
+        // statements (the arrow-glue-loud class), reported instead of prosed
+        let mut residual = cls.clone();
+        residual.remove("Prose");
+        residual.remove("Derivation Rule");
+        for g in GENERIC {
+            residual.remove(g);
+        }
+        if cls.contains("Prose") && residual.is_empty() {
+            if sm_suspect(stmt) {
+                unclassified.push(stmt.clone());
+            } else {
+                prose.push(stmt.clone());
+            }
+            continue;
+        }
+        let specific: Vec<String> = cls
+            .iter()
+            .filter(|c| !GENERIC.contains(&c.as_str()))
+            .cloned()
+            .collect();
+        if specific.is_empty() && *sg == "negative" && *m == "alethic" {
+            // a NEGATIVE alethic statement is a constraint by definition; the
+            // generic fallbacks must never declare a fact type from it
+            unclassified.push(stmt.clone());
+            continue;
+        }
+        let mut sorted_cls: Vec<String> = if specific.is_empty() {
+            cls.iter().cloned().collect()
+        } else {
+            specific
+        };
+        sorted_cls.sort();
+        let mut translators: Vec<String> = Vec::new();
+        for c in &sorted_cls {
+            if let Some(ts) = dispatch.get(c) {
+                for t in ts {
+                    if !translators.contains(t) {
+                        translators.push(t.clone());
+                    }
+                }
+            }
+        }
+        if translators.is_empty() {
+            unclassified.push(stmt.clone());
+            continue;
+        }
+        // deontic carries its operator sign through the modality field
+        let mfield = if *m == "deontic" {
+            format!("{}:{}", m, sg)
+        } else {
+            (*m).to_string()
+        };
+        let mut accepted = false;
+        for t in &translators {
+            // rho: dispatch through DEFS via the reducer — the direct analog
+            // of python D = _apply(_A(t), operand). When #18 lands a canon
+            // translator DEF this arm runs it for free; today a host-only
+            // name reduces to ⊥ (or stays a stuck app) and the _COOK gate
+            // below explains what blocks the native path.
+            let operand = seqc(vec![
+                atom(Leaf::S(inner.clone())),
+                atom(Leaf::S(mfield.clone())),
+                ctx.clone(),
+                model_d.clone(),
+            ]);
+            let res = reduce_over(srv, atom(Leaf::S(t.clone())), operand, fuel);
+            if matches!(shape(&res), Shape::Seq(_)) && !isapp(&res) {
+                model_d = res;
+                accepted = true;
+            } else {
+                for k in translator_kinds(t) {
+                    if let Err(reason) = native_cook(k) {
+                        if !blocked.contains(&reason) {
+                            blocked.push(reason);
+                        }
+                    }
+                }
+                let miss = format!("translator not native: {}", t);
+                if !blocked.contains(&miss) {
+                    blocked.push(miss);
+                }
+            }
+        }
+        if !accepted {
+            // NO translator accepted: reported loudly — never a silent vanish
+            unclassified.push(stmt.clone());
+        }
+    }
+    // the report: the seed contract's surviving keys (total/unclassified/prose)
+    // plus the skeleton's honest diagnostics (classified/missing/blocked)
+    let mut r = String::from("{\"total\":");
+    r.push_str(&total.to_string());
+    r.push_str(",\"classified\":");
+    r.push_str(&classified.to_string());
+    let arr = |xs: &[String], out: &mut String| {
+        out.push('[');
+        for (i, s) in xs.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            esc(s, out);
+        }
+        out.push(']');
+    };
+    r.push_str(",\"unclassified\":");
+    arr(&unclassified, &mut r);
+    r.push_str(",\"prose\":");
+    arr(&prose, &mut r);
+    r.push_str(",\"missing\":");
+    arr(&missing, &mut r);
+    r.push_str(",\"blocked\":");
+    arr(&blocked, &mut r);
+    r.push('}');
+    Ok(r)
+}
+
 fn op_ok(op: &str, result: &str) -> String {
     let mut s = String::from("{\"op\":");
     esc(op, &mut s);
@@ -4236,6 +4768,17 @@ fn op_answer(op: &str, j: &J, srv: &mut Srv) -> Result<String, String> {
             // the head cells that gained rows, and the retained store is
             // REPLACED by the derived result
             op_run_rules(j, srv)
+        }
+        "compile_model" => {
+            // the Rust-native compile DRIVER (#20 skeleton): split → modality
+            // → batch-classify through op_run_rules over the resident grammar
+            // → dispatch the Classification_has_Translator table through the
+            // reducer. The resident store is used as scratch and restored
+            // whole; the answer reports {total, unclassified, prose} plus the
+            // skeleton's missing/blocked diagnostics. The host "compile" verb
+            // (the python delegation) is untouched — this op is the native
+            // primary being grown beside it (the lex twin pattern).
+            op_compile_model(j, srv)
         }
         "neval" => {
             // DEBUG-ONLY (gated on AREST_NEVAL_TRACE): evaluate f : x over
