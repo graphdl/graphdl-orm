@@ -5530,6 +5530,18 @@ DEF("system:h_meta_data_type", S3(A("CONS"), S2(A("CONS"), S3(A("CONS"), K(A("da
 
 DEF("system:h_meta_ref_mode", S3(A("CONS"), S2(A("CONS"), S3(A("CONS"), K(A("ref_mode")), S2(A("CONS"), S3(A("COMP"), N(1), N(1))))), K(PHI()))),
 
+"THE ENTITY-TYPE READING TRANSLATOR AS DATA (2026-07-10, #18): the FIRST conditional-class handler. Stage-1 now splits 'Name(.RefMode)' into two groups g0=name, g1=refmode (empty when absent); the entity gets its ObjectType instance-of, and refMode(g0,g1) rides ONLY when g1 is non-empty. COND(eq(g1,''), the-single-row, the-two-rows) over the pure ⟨groups, known, mod⟩ -> ⟨rows, phi⟩ shape. Host _h_entity is the certified-equal override (test_entity_canon).",
+
+DEF("system:h_entity",
+    S3(A("CONS"),
+       S4(A("COND"),
+          S3(A("COMP"), A("eq"), S3(A("CONS"), S3(A("COMP"), N(2), N(1)), K(A("")))),
+          S2(A("CONS"), S3(A("CONS"), K(A("instanceOf")), S3(A("CONS"), S3(A("COMP"), N(1), N(1)), K(A("ObjectType"))))),
+          S3(A("CONS"),
+             S3(A("CONS"), K(A("instanceOf")), S3(A("CONS"), S3(A("COMP"), N(1), N(1)), K(A("ObjectType")))),
+             S3(A("CONS"), K(A("refMode")), S3(A("CONS"), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(2), N(1)))))),
+       K(PHI()))),
+
 "THE PASS ORDER AND ROUND BOUND AS DATA (2026-07-08, scheduler-as-data second face): constants of doctrine, materialized as the passOrder and passBound cells beside passHeads; hosts dispatch their native pass bodies by the cell and fall back to the same literals when a store lacks it. The positive closure stays OUTSIDE the ordered passes: it is the floor the strata stand on.",
 
 DEF("system:pass_order",
