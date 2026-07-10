@@ -358,13 +358,41 @@ def consume_fuel():
     return slot["fuel"] > 0
 
 
+_STEP_MISS = object()
+
+
+class _LazyStepNative:
+    """The step's DEFS as native, converted PER KEY on demand (#20). The compile g-loop binds
+    D via defs.step once per statement, but the translator + handlers resolve only GLOBAL canon
+    DEFS, never D's own cell-DEFS, so eagerly converting every cell of a base-sized D each
+    statement was O(N^2) wasted work over the base's thousands of statements. mu only ever calls
+    step_defs.get(f); a global f misses D's cells and returns None with no conversion, so only
+    the cells actually resolved as functions are converted. Semantically identical to the eager
+    dict, so the DEFS are available whenever a step DOES resolve one."""
+    __slots__ = ("_cells", "_conv", "_done")
+
+    def __init__(self, cells, conv):
+        self._cells, self._conv, self._done = cells, conv, {}
+
+    def get(self, f):
+        n = self._done.get(f, _STEP_MISS)
+        if n is not _STEP_MISS:
+            return n
+        c = self._cells.get(f)
+        n = None if c is None else self._conv(c)
+        self._done[f] = n
+        return n
+
+
 def step_native(conv):
-    """The step's DEFS as native objects (converted once per binding via `conv`)."""
+    """The step's DEFS as native objects, converted lazily per key (see _LazyStepNative)."""
     if _step_frame is None:
         return {}
-    if _step_frame[1]["native"] is None:
-        _step_frame[1]["native"] = {k: conv(v) for k, v in _step_frame[0].items()}
-    return _step_frame[1]["native"]
+    lz = _step_frame[1]["native"]
+    if lz is None:
+        lz = _LazyStepNative(_step_frame[0], conv)
+        _step_frame[1]["native"] = lz
+    return lz
 
 
 def boundary_population():
