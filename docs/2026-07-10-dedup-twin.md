@@ -54,10 +54,25 @@ the canon apndl-fold builds, so fixpoint convergence holds).
 
 - PASS: `test_theta` (dedup semantics), `test_csharp_kernel` + `test_java_kernel` (the closure
   fixpoint — byte-parity Python-twin vs C#/Java canon), and all 165 `-k canon` tests.
-- FAIL/HANG: exactly one consumer among `{test_delta, test_entity_view, test_intersection,
-  test_showui, test_skolem_prim}` hangs (infinite loop) — NOT yet isolated (ran out of budget).
-  Likely a row shape my hashing/`==` treats differently than canon `EQOBJ` (nested rows, or an
-  atom whose native `==` diverges from NATEQ), or a dedup applied to a non-population operand.
+- FAIL/HANG: **`test_intersection`** hangs; the other four consumers PASS (isolated by running
+  each file alone). The hang is the CASES row `("theta:dedup", theta.dedup, to_lam(POP))`
+  (test_intersection.py:27), `POP = (("a",1),("b",2),("a",1))` — integer-bearing rows. That test
+  reduces the canon NAME `A("theta:dedup")` (now the twin) and asserts it reduces like the host
+  constructor object `theta.dedup`. Root cause is NOT yet confirmed, and there are two very
+  different possibilities — settle which BEFORE more work:
+  1. A fixable bug — the twin's output type/shape in this specific reduction context (e.g. it
+     returns a native tuple where this path expects a Scott object, or int-row hashing collides
+     under Python `==` where NATEQ separates by type). Add a print in `_theta_dedup`, reduce just
+     CASES[1], see what it's handed and what loops.
+  2. A FUNDAMENTAL tension — the intersection suite is the polyglot purity guarantee that the
+     shared file's ops reduce IDENTICALLY as higher-order builders across canon and each host's
+     constructors. A native override is a Python function, NOT a composable lambda term, so
+     shadowing `theta:dedup` on `defs.fast` may be unable to satisfy builder-equivalence by
+     construction. If so, the twin cannot live on the universal `override` path; options: (a) a
+     narrower hook that only fires for an applied population inside run_rules, (b) exclude
+     performance twins from the intersection differential (they are physical, not logical, per
+     Codd), or (c) accept the O(n²) canon and instead attack dedup call-COUNT (don't re-dedup an
+     already-unique derived population — a run_rules-driver change, host-side).
 
 ## To finish (a focused hour)
 
