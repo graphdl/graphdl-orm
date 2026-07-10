@@ -5501,6 +5501,11 @@ DEF("system:classify_heads",
              S2(A("ALPHA"), S3(A("CONS"), K(A("aggwhole")), A("id"))),
              A("system:cls_aggwhole"))))),
 
+"THE COMPILER'S HANDLER TRANSLATORS AS DATA (2026-07-09, #18 pilot; doctrine: even the compiler is canonized — DEFS override provides performance, lambdas provide the execution lattice). A translator maps ⟨groups, known, mod⟩ -> ⟨asserts, objs⟩: the (cell, fact) rows to store plus the (name, obj) defs to install; Stage-1 (regex text->groups) stays the host SEED because text->atom is the informal boundary. system:h_objectification is the pilot — an objectification reading's two capture groups ⟨association, entity⟩ give the entity its ObjectType instance-of and the objectification link to its association: ⟨⟨⟨instanceOf,⟨entity,ObjectType⟩⟩,⟨objectification,⟨entity,association⟩⟩⟩, phi⟩. Host _h_objectification is the certified-equal native override (test_hobj_canon.py twins them; the host stays native so compiles keep their speed).",
+
+DEF("system:h_objectification",
+    S3(A("CONS"), S3(A("CONS"), S3(A("CONS"), K(A("instanceOf")), S3(A("CONS"), S3(A("COMP"), N(2), N(1)), K(A("ObjectType")))), S3(A("CONS"), K(A("objectification")), S3(A("CONS"), S3(A("COMP"), N(2), N(1)), S3(A("COMP"), N(1), N(1))))), K(PHI()))),
+
 "THE PASS ORDER AND ROUND BOUND AS DATA (2026-07-08, scheduler-as-data second face): constants of doctrine, materialized as the passOrder and passBound cells beside passHeads; hosts dispatch their native pass bodies by the cell and fall back to the same literals when a store lacks it. The positive closure stays OUTSIDE the ordered passes: it is the floor the strata stand on.",
 
 DEF("system:pass_order",
