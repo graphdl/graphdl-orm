@@ -127,8 +127,16 @@ run_rules 12.6s, sql-project 11.9s). So:
    translators (this doc). Removes the process hop; only ~3.7s of raw perf but it is the
    "compile without Python" requirement.
 
-Both are needed to hit "compile in seconds once schema is in memory": the freeze removes the
-40s, canon+native remove the process hop and keep each reduction cheap.
+SUPERSEDED 2026-07-10 by the DEF-resolution profiler (identity compile, 23.1M resolutions):
+lever 1 (the incremental freeze) is REJECTED. Implemented + tested flag-gated, it produced a
+DIFFERENT store (context_from perturbation) AND no speedup (run_rules 11.1->12.0s) — it was
+Python-specific orchestration, the wrong target. The profiler shows the compile is
+COMBINATOR-BOUND: COMP 5.1M, selectors 1/2/3 7.8M, CONS 2.6M, eq/COND/CONST ~7M = ~95%;
+theta:keep_eq (dedup O(n^2)) is only 610k (2.6%). Those primitives are ALREADY native twins
+(kernel _NATIVE), so the 45s is Python-interpreter overhead on 23M native calls. There is no
+big single-canon-op win to chase. The ONLY lever is lever 2: the FAST HOST REDUCER on the
+canon (the Rust-native compile), which is exactly "compile not Python-specific" and is gated
+on #18 canonizing the translators. dedup O(n^2) is a minor secondary interface/override win.
 
 ## Integration + the twin strategy (already proven for `lex`)
 
@@ -145,10 +153,9 @@ as the acceptance gate. No second registry, no semantic fork — a performance t
   (the directive: "compile should not be Python-specific").
 - Compile becomes native reduction over the resident canon + the frozen base, so it lands
   the "compile + validate in seconds once schema is in memory" target natively.
-- Pairs with the two host-independent strategy wins already recorded: the incremental
-  freeze (`docs/2026-07-10-incremental-compile.md`, pay only the app delta) and the canon
-  algorithmic fixes (`ast:Pop` O(n^2)->O(position), 4bcbdbcf). Canon makes each reduction
-  cheap; incrementality makes the reductions few; native removes the process hop.
+- Pairs with the canon algorithmic fixes (`ast:Pop` O(n^2)->O(position), 4bcbdbcf): canon
+  makes each reduction cheap, and native runs the 23M reductions at host speed instead of
+  Python speed. (The incremental freeze is REJECTED — see the profiler note above.)
 
 ## Convergence with #18
 
