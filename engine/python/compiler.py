@@ -872,24 +872,7 @@ def _h_ring(g, k, m):
         [(cid, _apply(_A(builder), to_lam((1, 2))))]
 
 
-def _h_subtype(g, k, m):
-    """A subtype declaration MEANS upward inclusion — subtype instances ARE supertype
-    instances — so it installs the derivation rule super(x) ← sub(x) through the
-    ordinary rule machinery (semi-naive variants included; chains compose round by
-    round). The subset constraint remains the check; the rule is the meaning."""
-    from . import system as _sys
-    sub, sup = g[0].strip(), g[1].strip()
-    cid = _slug(sub) + "_sub_" + _slug(sup)
-    rid = _slug(sub) + "_isa_" + _slug(sup)
-    facts = [("instanceOf", (sub, "ObjectType")), ("instanceOf", (sup, "ObjectType")),
-             ("subtype", (sub, sup)),
-             ("constraint", (cid, "subtype", sub, sup, m)),
-             ("ruleDerives", (rid, sup)), ("ruleReads", (rid, sub)),
-             ("ruleAtom", (rid, 1, sub)), ("ruleCopies", (rid, sub, sup))]
-    objs = [(cid, C.scoped_subset(sup)),
-            (rid, _sys.compile_rule([sub], [1], [1])),
-            (f"{rid}~d1", _sys.compile_rule_delta([sub], [1], 0, [1]))]
-    return facts, objs
+_h_subtype = _h_crows
 
 
 def _h_brace_subtypes(g, k, m):
@@ -900,7 +883,7 @@ def _h_brace_subtypes(g, k, m):
     subs = tuple(s.strip() for s in g[0].split(","))
     A_, objs = [], []
     for s in subs:
-        a, o = _h_subtype((s, g[2]), k, m)
+        a, o = _h_crows(_cook_subtype((s, g[2]), k), k, m)
         A_ += a
         objs += o
     if g[1]:
@@ -1141,9 +1124,7 @@ def _h_subset_trailing(g, k, m, sign="positive"):
     objs = [(cell, check(x_ft, proj_y, proj_x)) for (cell, _o) in objs]
     return A_, objs
 
-def _h_negation(g, k, m):
-    a, pred = _subject(g[0], k)
-    return [("negation", (a, pred + " " + g[1]))], []
+_h_negation = _h_crows
 
 
 def _conj(rest):
@@ -1157,35 +1138,7 @@ def _conj(rest):
 _CLAUSE_RE = re.compile(r"^(\S.*?) has (\S.*?)(?: '(.+?)')?$")
 
 
-def _h_class_rule(g, k, m):
-    """The grammar-as-readings recognizer form (forml2-grammar.md): 'Statement has
-    Classification C iff Statement has Field ⟨lit⟩ [and …]' compiles into an ordinary
-    rule deriving ⟨sid, C⟩ from the field cells — the parser IS the file, run by
-    run_rules. Each literal a body clause tests is recorded as a classLit fact; that
-    population is Stage-1's ENTIRE tokenizer vocabulary."""
-    import zlib
-    from . import system as _sys
-    subjh, fieldh, headlit, body = g
-    head_ft = _slug(f"{subjh} has {fieldh}")
-    clauses = []
-    # split on ' and ' only OUTSIDE quotes ('if and only if' is one literal)
-    for c in re.split(r" and (?=(?:[^']*'[^']*')*[^']*$)", body):
-        mm = _CLAUSE_RE.match(c.strip())
-        if not mm:
-            return [], []
-        s2, f2, lit = mm.groups()
-        clauses.append((_slug(f"{s2} has {f2}"), lit))
-    rid = head_ft + "_cls_" + format(zlib.crc32((headlit + "|" + body).encode()), "x")
-    A_ = [("ruleDerives", (rid, head_ft))]
-    for (ftb, lit) in clauses:
-        A_.append(("ruleReads", (rid, ftb)))
-        # classSpec freezes the twin's contract WITH the store, so the thawed
-        # grammar rebuilds its FAST twins (rebuild_class_twins) — speed as
-        # registration, the canonical object below stays the meaning
-        A_.append(("classSpec", (rid, ftb, lit or "", headlit)))
-        if lit is not None:
-            A_.append(("classLit", (ftb, lit)))
-    return A_, [(rid, _sys.class_rule(clauses, headlit))]
+_h_class_rule = _h_crows
 
 
 def stage1_vocabulary(D):
@@ -1275,7 +1228,7 @@ def _h_neg_pair(g, k, m):
     read-time (docs/2026-07-02-negation-model.md)."""
     subj, mode, rest = g
     if subj not in k:
-        return _h_fact((f"{subj} {mode} {rest}",), k, m)      # unknown subject: plain reading
+        return _h_crows(_cook_fact((f"{subj} {mode} {rest}",), k), k, m)  # unknown subject: plain reading
     pos_read = f"{subj} is {rest}" if mode == "is not" else f"{subj} {_conj(rest)}"
     pos, decl_p = _fact_type(pos_read, k)
     neg, decl_n = _fact_type(f"{subj} {mode} {rest}", k)
@@ -1295,27 +1248,7 @@ _h_inverse_uc = _h_crows
 _QUOTED = re.compile(r"'([^']*)'")
 
 
-def _h_fact(g, k, m):
-    kind, reading = _strip_derivation(g[0])                    # NORMA */**/+/++ derivation-storage marker
-    if "'" in reading:
-        # an INSTANCE fact (the corpus's dominant form): quoted ids fill the declared
-        # roles; the row lands in the fact type's own cell, the population runtime reads
-        ids = tuple(_QUOTED.findall(reading))
-        dequoted = re.sub(r"\s+", " ", _QUOTED.sub("", reading)).strip()
-        ft, _decl = _fact_type(dequoted, k)
-        # the subtype lift, as in _rule_atom: an instance fact authored via a subtype
-        # resolves UP to the supertype-declared fact type when its own is undeclared
-        # (subtype instances ARE supertype instances; the fact lives once)
-        if isinstance(k, _Known) and k.fts and ft not in k.fts:
-            _t, rtypes = _reading(dequoted, k)
-            for anc in sorted(k.subs.get(rtypes[0], ()) if rtypes else ()):
-                lifted, _ = _fact_type(dequoted.replace(rtypes[0], anc, 1), k)
-                if lifted in k.fts:
-                    return [(lifted, ids)], []
-        return [(ft, ids)], []
-    ft, facts = _fact_type(reading, k)                         # mixfix template + ordered roles
-    deriv = [("derivation", (ft, kind))] if kind else []      # link the fact type to its derivation/storage
-    return facts + deriv, []
+_h_fact = _h_crows
 
 
 # ---- the state-machine readings (whitepaper §1): a machine is a SET OF FACTS in M ----
@@ -1736,23 +1669,7 @@ def _h_rule_iff(g, k, m):
                       kind=_MARKER_KIND.get(marker or "*", "fully-derived"))
 
 
-def _h_derivation_rule(g, k, m):
-    from . import system as _sys
-    derived, root, body = g
-    hops = _role_path(body)                                    # the role path from the root
-    rule_cid = _slug(derived) + "_rule"
-    A = [("instanceOf", (derived, "ObjectType")), ("derivation", (_slug(derived), "fully-derived")),
-         ("derivationRule", (_slug(derived), root, len(hops))),
-         ("ruleDerives", (rule_cid, _slug(derived)))]          # frontier: what the rule feeds
-    prev = root
-    for verb, target in hops:                                  # frontier: what the rule reads
-        reading = f"{prev} {verb} {target}" if target else f"{prev} {verb}"
-        A.append(("ruleReads", (rule_cid, _clause_ft(reading, k))))
-        prev = target or prev
-    # a two-hop linear path (root -V1-> T, T -V2-> ...) is a join on the shared type projecting the
-    # root: rule:⟨hop1, hop2⟩ = NatJoin(2) then Project([1]) (infosci ORM->Datalog).
-    cons = [(rule_cid, _sys.join_rule2(2, [1]))] if len(hops) == 2 else []
-    return A, cons
+_h_derivation_rule = _h_crows
 
 
 _PLAN = {
@@ -1896,6 +1813,107 @@ def _cook_inverse_uc(g, k):
     return (tuple(decl), tuple(mid), tuple(ospecs))
 
 
+def _cook_fact(g, k):
+    """fact reading: the marker strip, quote detection, ids extraction, ft resolution,
+    and the subtype lift are ALL the boundary's; the translator is a bare row emitter.
+    An INSTANCE fact's row lands in the ft's OWN cell — the cell name is a VALUE
+    (the first cell-as-value row among the canonized handlers)."""
+    kind, reading = _strip_derivation(g[0])
+    if "'" in reading:
+        ids = tuple(_QUOTED.findall(reading))
+        dequoted = re.sub(r"\s+", " ", _QUOTED.sub("", reading)).strip()
+        ft, _decl = _fact_type(dequoted, k)
+        # the subtype lift, as in _rule_atom: an instance fact authored via a subtype
+        # resolves UP to the supertype-declared fact type when its own is undeclared
+        if isinstance(k, _Known) and k.fts and ft not in k.fts:
+            _t, rtypes = _reading(dequoted, k)
+            for anc in sorted(k.subs.get(rtypes[0], ()) if rtypes else ()):
+                lifted, _ = _fact_type(dequoted.replace(rtypes[0], anc, 1), k)
+                if lifted in k.fts:
+                    return ((), (("w", (lifted, ids)),), ())
+        return ((), (("w", (ft, ids)),), ())
+    ft, decl = _fact_type(reading, k)
+    mid = (("w", ("derivation", (ft, kind))),) if kind else ()
+    return (tuple(decl), mid, ())
+
+
+def _cook_derivation_rule(g, k):
+    """the role-path derivation: the path split, clause_ft resolutions, and the 2-hop
+    join detection are the boundary's; join_rule2 is a canon application. A two-hop
+    linear path (root -V1-> T, T -V2-> ...) is a join on the shared type projecting
+    the root: NatJoin(2) then Project([1]) (infosci ORM->Datalog)."""
+    derived, root, body = g
+    hops = _role_path(body)
+    rule_cid = _slug(derived) + "_rule"
+    rows = [("instanceOf", (derived, "ObjectType")),
+            ("derivation", (_slug(derived), "fully-derived")),
+            ("derivationRule", (_slug(derived), root, len(hops))),
+            ("ruleDerives", (rule_cid, _slug(derived)))]
+    prev = root
+    for verb, target in hops:
+        reading = f"{prev} {verb} {target}" if target else f"{prev} {verb}"
+        rows.append(("ruleReads", (rule_cid, _clause_ft(reading, k))))
+        prev = target or prev
+    ospecs = ((rule_cid, "system:join_rule2", (2, (1,))),) if len(hops) == 2 else ()
+    return (tuple(rows), (), ospecs)
+
+
+def _cook_class_rule(g, k):
+    """The grammar-as-readings recognizer form (forml2-grammar.md): 'Statement has
+    Classification C iff Statement has Field ⟨lit⟩ [and …]' compiles into an ordinary
+    rule deriving ⟨sid, C⟩ from the field cells — the parser IS the file, run by
+    run_rules. Each literal a body clause tests is recorded as a classLit fact; that
+    population is Stage-1's ENTIRE tokenizer vocabulary. system:class_rule is a canon
+    application; its operand carries the eq-predicate DATA trees (the canonical form
+    is the more general one: any predicate over the field row). classSpec freezes the
+    twin's contract WITH the store (rebuild_class_twins) — speed as registration, the
+    canonical object stays the meaning. A non-matching clause -> the empty triple
+    (the host's silent refusal, preserved)."""
+    import zlib
+    subjh, fieldh, headlit, body = g
+    head_ft = _slug(f"{subjh} has {fieldh}")
+    clauses = []
+    # split on ' and ' only OUTSIDE quotes ('if and only if' is one literal)
+    for c in re.split(r" and (?=(?:[^']*'[^']*')*[^']*$)", body):
+        mm = _CLAUSE_RE.match(c.strip())
+        if not mm:
+            return ((), (), ())
+        s2, f2, lit = mm.groups()
+        clauses.append((_slug(f"{s2} has {f2}"), lit))
+    rid = head_ft + "_cls_" + format(zlib.crc32((headlit + "|" + body).encode()), "x")
+    rows = [("ruleDerives", (rid, head_ft))]
+    for (ftb, lit) in clauses:
+        rows.append(("ruleReads", (rid, ftb)))
+        rows.append(("classSpec", (rid, ftb, lit or "", headlit)))
+        if lit is not None:
+            rows.append(("classLit", (ftb, lit)))
+    pred_clauses = tuple((ftb, (() if lit is None else
+                                ("COMP", "eq", ("CONS", 2, ("CONST", lit)))))
+                         for ftb, lit in clauses)
+    return (tuple(rows), (), ((rid, "system:class_rule", (pred_clauses, headlit)),))
+
+
+def _cook_subtype(g, k):
+    """A subtype declaration MEANS upward inclusion — subtype instances ARE supertype
+    instances — so it installs the derivation rule super(x) <- sub(x) through the
+    ordinary rule machinery (semi-naive variants included; chains compose round by
+    round). The subset constraint remains the check; the rule is the meaning.
+    compile_rule/_delta and scoped_subset are canon applications, so the objs are
+    pure apply-specs: atoms ⟨⟨sub,1,()⟩⟩, head ⟨1⟩, filters ⟨⟩ (+ delta seat 1)."""
+    sub, sup = g[0].strip(), g[1].strip()
+    cid = _slug(sub) + "_sub_" + _slug(sup)
+    rid = _slug(sub) + "_isa_" + _slug(sup)
+    decl = (("instanceOf", (sub, "ObjectType")), ("instanceOf", (sup, "ObjectType")),
+            ("subtype", (sub, sup)),
+            ("ruleDerives", (rid, sup)), ("ruleReads", (rid, sub)),
+            ("ruleAtom", (rid, 1, sub)), ("ruleCopies", (rid, sub, sup)))
+    atoms = ((sub, 1, ()),)
+    return (decl, (("c", (cid, "subtype", sub, sup)),),
+            ((cid, "constraints:scoped_subset", sup),
+             (rid, "system:compile_rule", (atoms, (1,), ())),
+             (rid + "~d1", "system:compile_rule_delta", (atoms, (1,), (), 1))))
+
+
 def _cook_spanning(g, k):
     """'In each population of <reading>, each A, B combination occurs at most once.'
     The names RESOLVE against the reading (this spelling hardcoded roles [1, 2] and
@@ -1942,6 +1960,13 @@ _COOK = {
     "inverse_uc": _cook_inverse_uc,
     "spanning_uc": _cook_spanning,
     "spanning_uc2": _cook_spanning_corpus,
+    # negation: one whole row, no objs — pure crows
+    "negation": lambda g, k: ((), (("w", ("negation",
+        (_subject(g[0], k)[0], _subject(g[0], k)[1] + " " + g[1]))),), ()),
+    "subtype_of": _cook_subtype,
+    "fact_type_reading": _cook_fact,
+    "derivation_rule": _cook_derivation_rule,
+    "class_rule": _cook_class_rule,
 }
 
 
@@ -1953,9 +1978,9 @@ def _plan(kind, g, known, modality="alethic", sign=""):
     instance rows mint) and one constraint row rides with the operator, the
     fact type span, the quoted values if any, and the deontic modality tail.
     Deontic flags, never blocks (Def. Violation)."""
-    if kind in _COOK:
-        g = _COOK[kind](g, known)
-    if modality == "deontic" and kind == "fact_type_reading":
+    if kind in _COOK and not (modality == "deontic" and kind == "fact_type_reading"):
+        g = _COOK[kind](g, known)                              # the deontic transform below
+    if modality == "deontic" and kind == "fact_type_reading":  # cooks its own inner reading
         reading = _strip_derivation(g[0])[1]
         # a leading universal quantifier scopes the obligation, never the
         # shape (the old store: 'each Message is natural' declares
@@ -1965,7 +1990,7 @@ def _plan(kind, g, known, modality="alethic", sign=""):
         ids = tuple(_QUOTED.findall(reading))
         dequoted = (re.sub(r"\s+", " ", _QUOTED.sub("", reading)).strip()
                     if ids else reading)
-        facts, objs = _PLAN["fact_type_reading"]((dequoted,), known, modality)
+        facts, objs = _h_crows(_cook_fact((dequoted,), known), known, modality)
         ft, _decl = _fact_type(dequoted, known)
         op = ("deontic_obligatory" if sign == "positive"
               else "deontic_forbidden")

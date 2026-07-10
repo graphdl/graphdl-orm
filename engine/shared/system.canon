@@ -5569,6 +5569,16 @@ DEF("system:h_spanning_uc", A("system:h_crows")),
 
 DEF("system:h_spanning_uc2", A("system:h_crows")),
 
+DEF("system:h_negation", A("system:h_crows")),
+
+DEF("system:h_subtype_of", A("system:h_crows")),
+
+DEF("system:h_fact_type_reading", A("system:h_crows")),
+
+DEF("system:h_derivation_rule", A("system:h_crows")),
+
+DEF("system:h_class_rule", A("system:h_crows")),
+
 "THE VALUE-CONSTRAINT READING TRANSLATOR AS DATA (2026-07-10, #18): cooked groups ⟨name, spec, cid, builder_name, operand⟩ — the spec parse (the VALUE_SPECS pattern table + the enumeration fallback) is the string boundary, and the chosen canonical builder (constraints:value_range / constraints:value_enumeration) rides as a NAME the translator applies through DEFS. Two rows (the valueConstraint reading row keeping the spec text + the constraint row on the value type's own cell) and one obj ⟨cid, (builder : operand)⟩. Host _h_value_constraint is the certified-equal override (test_value_constraint_canon, extensional on the obj).",
 
 DEF("system:h_value_constraint",
