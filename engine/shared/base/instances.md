@@ -3,7 +3,22 @@
 ## Entity Types
 
 Resource(.Reference) is an entity type.
-  Resource is a subtype of Noun.
+  Resource is a subtype of Function.
+<!-- 2026-07-09 (Samuel, NORMA-grounded): Resource was a subtype of Noun, a
+     GraphDL "Graph Schema is a Noun" artifact. In NORMA's own metamodel
+     (ORMCoreMetaModel.orm) ObjectType and FactType are DISJOINT SIBLINGS —
+     both <: ORMNamedElement, and FactType is NEVER a subtype of ObjectType.
+     Halpin: subtyping holds only between object types; a fact type is
+     "predicate + its object types", not an object type. Because Fact Type <
+     Event Type < Resource, the old `Resource < Noun` made every fact type a
+     Noun by population inclusion, tripping the mandatory noun-classification
+     facts (Object Type / World Assumption) on 494 fact types. Reparenting
+     Resource under Function (beside Noun, mirroring ObjectType/FactType both
+     under ORMNamedElement) makes Fact Type a sibling of Noun, not a subtype.
+     Category stays instance-of: `Resource is instance of Noun` below is a
+     genuine instance-of fact between disjoint types, most-specific per
+     NORMA's ObjectTypeHasObjectTypeInstance (Multiplicity One) with
+     WalkSupertypes delegation for supertype-walking consumers. -->
 Event is an entity type.
   Event is a subtype of Resource.
 Fact is an entity type.
