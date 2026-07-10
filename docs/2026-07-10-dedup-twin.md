@@ -50,39 +50,47 @@ Two gotchas already solved: (1) `override`, not `register` (right table / callin
 path, so decode via `from_lam` when it is not a tuple and re-encode via `to_lam` (same cons-list
 the canon apndl-fold builds, so fixpoint convergence holds).
 
-## Test status (this session)
+## Test status — RESOLVED (this session, fully traced)
 
-- PASS: `test_theta` (dedup semantics), `test_csharp_kernel` + `test_java_kernel` (the closure
-  fixpoint — byte-parity Python-twin vs C#/Java canon), and all 165 `-k canon` tests.
-- FAIL/HANG: **`test_intersection`** hangs; the other four consumers PASS (isolated by running
-  each file alone). The hang is the CASES row `("theta:dedup", theta.dedup, to_lam(POP))`
-  (test_intersection.py:27), `POP = (("a",1),("b",2),("a",1))` — integer-bearing rows. That test
-  reduces the canon NAME `A("theta:dedup")` (now the twin) and asserts it reduces like the host
-  constructor object `theta.dedup`. Root cause is NOT yet confirmed, and there are two very
-  different possibilities — settle which BEFORE more work:
-  1. A fixable bug — the twin's output type/shape in this specific reduction context (e.g. it
-     returns a native tuple where this path expects a Scott object, or int-row hashing collides
-     under Python `==` where NATEQ separates by type). Add a print in `_theta_dedup`, reduce just
-     CASES[1], see what it's handed and what loops.
-  2. A FUNDAMENTAL tension — the intersection suite is the polyglot purity guarantee that the
-     shared file's ops reduce IDENTICALLY as higher-order builders across canon and each host's
-     constructors. A native override is a Python function, NOT a composable lambda term, so
-     shadowing `theta:dedup` on `defs.fast` may be unable to satisfy builder-equivalence by
-     construction. If so, the twin cannot live on the universal `override` path; options: (a) a
-     narrower hook that only fires for an applied population inside run_rules, (b) exclude
-     performance twins from the intersection differential (they are physical, not logical, per
-     Codd), or (c) accept the O(n²) canon and instead attack dedup call-COUNT (don't re-dedup an
-     already-unique derived population — a run_rules-driver change, host-side).
+The twin is CORRECT. Nothing about it diverges.
 
-## To finish (a focused hour)
+- PASS: `test_theta`, `test_csharp_kernel` + `test_java_kernel` (the closure fixpoint, byte-parity
+  Python-twin vs C#/Java canon), all 165 `-k canon` tests, and — crucially — `test_intersection`'s
+  own reduction, INCLUDING the Rust differential, once the recursion limit is raised.
+- The "hang" was NOT a bug and NOT builder-equivalence. It is **`FETCH` recursion depth**
+  (kernel.py:247, the Y-recursive Scott-store lookup, one Python frame per `_store` entry). The
+  `override` call bumps `version`, which makes the differential test's repeated `canon.load_all`
+  regrow `_store`, so `FETCH` walks ~4000 deep and blows Python's DEFAULT-1000 limit. Measured:
+  RecursionError at limit 1200/2000, PASS at 4000/8000/200000 (actual depth ~4000, no segfault).
+  Isolated by running each consumer alone: only `test_intersection` (repeated load_all) trips it;
+  `test_delta/entity_view/showui/skolem` pass. It is finite-but-deep, not a loop.
 
-1. Re-apply the twin. Isolate the hanging consumer (`pytest tests/test_<one>.py -x`, one file at a
-   time — pytest-timeout is NOT installed here).
-2. Fix the edge case: most likely normalize the hash key through the same equality the canon uses
-   (compare/hash on the fully-decoded native form; fall back to the O(n²) `==` branch for any row
-   that is not cleanly hashable), or guard the operand shape.
-3. Full gate: `-k "canon or kernel or forml or compile or ported or intersection or delta or
-   entity_view or theta"` plus a real app compile, and re-run def_profile to confirm the 964k
-   `keep_eq` collapses. Then commit signed.
+## The real conclusion — the Python twin is the wrong host
 
-Expected payoff: the derive pipeline's dominant O(n²) becomes O(n) on every reducing host.
+A Python `override` lands only in `defs.fast`, which is Python-process-local. `export_scenario`
+(tools.py:259) ships `defs.latest` (the compiled CANON), NOT `fast`, so the Rust/C#/Java kernels
+still reduce the O(n²) canon dedup. **This twin speeds only the Python reference host.** Per the
+directive (target the Rust CLI and the canon, not the reference), that is not the production win,
+and it is not worth a C-stack-adjacent global recursion bump to land it.
+
+The canon dedup is irreducibly O(n²) in the pure lambda (no hashing). The fix is a per-host native
+twin. This document has already done the hard, portable parts: the exact last-occurrence semantics
+(byte-exact, dedup_probe), the certification (oracle + 165 canon at limit >=4000), and the two
+mechanism gotchas. What remains is per host.
+
+## To finish — build the RUST twin (the production win)
+
+1. In the Rust engine, register a native `theta:dedup` override in its fast/override table (the
+   same table `register_overrides`/`fastreg` use for `apndr` etc.), computing the SAME
+   last-occurrence-in-list-order dedup with a hash set, certified equal to the canon by the
+   existing Rust differential. That gives the compile O(n) dedup where it ships.
+2. OPTIONAL, reference-host only: to also land the Python twin (dev-iteration speed), add
+   `sys.setrecursionlimit(~8000)` at kernel.py import (justified: a Y-recursion interpreter over
+   large stores should not run on the default 1000). Then the full gate `-k "canon or kernel or
+   forml or compile or ported or intersection or delta or entity_view or theta"` is green with the
+   twin, and def_profile shows the 964k `keep_eq` collapse. Off the production critical path.
+3. Independently worth doing: `FETCH` (kernel.py:247) is host machinery, explicitly "not a
+   definition" — making it an iterative Python walk (like `_items`, kernel.py:273) removes the
+   store-size recursion-depth fragility for everyone, twin or no twin.
+
+Expected payoff (Rust twin): the derive pipeline's dominant O(n²) becomes O(n) in production.
