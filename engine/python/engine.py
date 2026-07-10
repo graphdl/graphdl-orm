@@ -1559,12 +1559,39 @@ def machine_for(D, noun):
 
 
 # --- Phase 4 opening: RMAP read off M, driving D's layout (spec §4.4; §Cells) ---
+_POP_MEMO = None
+
+
 def _pop_rows(D, name):
+    """A cell's rows off D — MEMOIZED per D object (weak keys, #20): FetchPop reduces over
+    D and from_lam decodes the population, and the compile pipeline reads the SAME cells off
+    the SAME settled D many times (create_handlers alone runs create_spec per fact type, each
+    re-reading smTrigger/role/smDef; run_rules re-reads factType/role/ruleReads each round).
+    One decode per (D, name) now; a mutation mints a new D object, so a stale hit is impossible
+    by construction. Callers get a fresh list copy every call, so mutating the result never
+    corrupts the cache; a non-weakref-able D just decodes as before."""
+    global _POP_MEMO
+    if _POP_MEMO is None:
+        import weakref
+        _POP_MEMO = weakref.WeakKeyDictionary()
+    per = None
+    try:
+        per = _POP_MEMO.get(D)
+        if per is None:
+            per = {}
+            _POP_MEMO[D] = per
+    except TypeError:
+        per = None
+    if per is not None and name in per:
+        return list(per[name])
     from . import ast
     from .reduce import apply as _ap
     from .lam import from_lam
     rows = from_lam(_ap(ast.FetchPop(name), D))
-    return list(rows) if isinstance(rows, tuple) else []
+    out = list(rows) if isinstance(rows, tuple) else []
+    if per is not None:
+        per[name] = out
+    return list(out)
 
 
 _TXN_SUR = "txn:"
