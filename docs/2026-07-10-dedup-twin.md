@@ -78,19 +78,25 @@ twin. This document has already done the hard, portable parts: the exact last-oc
 (byte-exact, dedup_probe), the certification (oracle + 165 canon at limit >=4000), and the two
 mechanism gotchas. What remains is per host.
 
-## To finish — build the RUST twin (the production win)
+## CLOSED — no Rust twin needed; production already dedups natively
 
-1. In the Rust engine, register a native `theta:dedup` override in its fast/override table (the
-   same table `register_overrides`/`fastreg` use for `apndr` etc.), computing the SAME
-   last-occurrence-in-list-order dedup with a hash set, certified equal to the canon by the
-   existing Rust differential. That gives the compile O(n) dedup where it ships.
-2. OPTIONAL, reference-host only: to also land the Python twin (dev-iteration speed), add
-   `sys.setrecursionlimit(~8000)` at kernel.py import (justified: a Y-recursion interpreter over
-   large stores should not run on the default 1000). Then the full gate `-k "canon or kernel or
-   forml or compile or ported or intersection or delta or entity_view or theta"` is green with the
-   twin, and def_profile shows the 964k `keep_eq` collapse. Off the production critical path.
-3. Independently worth doing: `FETCH` (kernel.py:247) is host machinery, explicitly "not a
-   definition" — making it an iterative Python walk (like `_items`, kernel.py:273) removes the
-   store-size recursion-depth fragility for everyone, twin or no twin.
+Verified in the Rust engine: `op_run_rules` (main.rs:3066) outputs rules "deduplicated by row key
+in FIRST-seen order" — a native `HashSet`/`BTreeSet` dedup, O(n). The Rust runtime does NOT reduce
+the canon `theta:dedup`; it dedups in host code. So there is no Rust twin to build — production is
+already O(n). (Note: Rust keeps first-seen, the canon keeps last-seen; identical as a SET, which is
+all set-semantic dedup needs — the two are different code paths, the canon reduction only exercised
+by the polyglot differential.)
 
-Expected payoff (Rust twin): the derive pipeline's dominant O(n²) becomes O(n) in production.
+The canon `theta:dedup`'s O(n²) is therefore reduced by exactly ONE host: the Python REFERENCE. Per
+the directive (don't optimize the reference), that cost is off-target by design. **Nothing to do for
+production dedup.** The whole thread reduces to: the reference is slow on dedup; the reference is not
+the target; the target (Rust) is already fast.
+
+If the Python reference compile is ever wanted fast for dev-iteration (explicitly off the production
+path), the Python twin above lands with `sys.setrecursionlimit(~8000)` at kernel.py import — but that
+is a reference convenience, not a #20 production item. `FETCH` (kernel.py:247) going iterative would
+similarly harden the reference against store-size recursion depth. Neither is production work.
+
+Lesson for #20: the Rust engine already carries the native optimizations (dedup, store) that make it
+fast; the Python reference's O(n²) costs are reference-specific. The production compile-perf win is
+COMPLETING the Rust-native compile (it delegates to Python today), not optimizing the canon or Python.
