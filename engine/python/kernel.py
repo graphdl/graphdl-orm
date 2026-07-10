@@ -756,24 +756,36 @@ def _d_store():
 
 
 def _make_mu(store, step_defs):
+    # #20: hoist the reducer's per-tree constants out of the inner loop. The step frame is
+    # fixed for this whole mu tree (delta_apply runs inside one defs.step, and pure reduction
+    # never enters a nested step), so the fuel budget is read ONCE here: a trusted/compile
+    # step runs unbounded (fuel None) and skips the per-step consume_fuel() call entirely
+    # (193M calls on a support compile). Hot globals bind to locals so the inner loop is
+    # LOAD_FAST, not LOAD_GLOBAL+LOAD_ATTR.
+    _frame = _step_frame
+    _fuelled = _frame is not None and _frame[3]["fuel"] is not None
+    _consume, _bot, _app, _sget, _dget = (
+        _KERNEL.consume_fuel, BOT_D, APP_D, step_defs.get, store.get)
     def mu(e):
-        # a value is its own meaning; an application node ⟨APP, f, x⟩ reduces (metacomposition)
-        if type(e) is tuple and len(e) == 3 and e[0] is APP_D:
-            if not _KERNEL.consume_fuel():                         # supervision: exhausted
-                return BOT_D                                         # fuel bottoms the step
+        # a value is its own meaning; an application node ⟨APP, f, x⟩ reduces (metacomposition).
+        # APP_D (a unique machinery sentinel) heads ONLY the 3-tuple app node, never a data
+        # sequence, so `e and e[0] is _app` identifies the node without a len() call (#20).
+        if type(e) is tuple and e and e[0] is _app:
+            if _fuelled and not _consume():                         # supervision: exhausted
+                return _bot                                          # fuel bottoms the step
             f = mu(e[1]); x = mu(e[2])                               # reduce operator, then operand (cbv)
-            if f is BOT_D or x is BOT_D:                             # §13.3.1: ρ⊥ = ⊥ and every
-                return BOT_D                                         # function is ⊥-preserving
-            if _isseq(f):                                            # seq operator -> metacomposition
-                return mu((APP_D, f[0], (f, x))) if f else BOT_D     # (φ as operator is ⊥)
-            sd = step_defs.get(f)
+            if f is _bot or x is _bot:                               # §13.3.1: ρ⊥ = ⊥ and every
+                return _bot                                          # function is ⊥-preserving
+            if type(f) is tuple:                                     # seq operator -> metacomposition
+                return mu((_app, f[0], (f, x))) if f else _bot       # (φ as operator is ⊥)
+            sd = _sget(f)
             if sd is not None:                                       # the step's DEFS cell first
-                return mu((APP_D, sd, x))                            # (Def. AREST / Cor. closure)
-            hit = store.get(f)
+                return mu((_app, sd, x))                             # (Def. AREST / Cor. closure)
+            hit = _dget(f)
             if hit is None:
-                return BOT_D
+                return _bot
             kind, impl = hit
-            return mu(impl(mu, x)) if kind == 0 else mu((APP_D, impl, x))
+            return mu(impl(mu, x)) if kind == 0 else mu((_app, impl, x))
         return e
     return mu
 
