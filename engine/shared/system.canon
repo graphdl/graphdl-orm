@@ -5520,6 +5520,10 @@ DEF("system:h_sm_emit", S3(A("CONS"), S3(A("COMP"), A("system:sm_rows"), S5(A("C
 
 DEF("system:h_sm_moore", S3(A("CONS"), S3(A("COMP"), A("system:sm_rows"), S5(A("CONS"), K(A("emits")), K(A("Status")), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(2), N(1)))), K(PHI()))),
 
+"A REFERENCE-SCHEME READING TRANSLATOR AS DATA (2026-07-10, #18): the entity g0 is an ObjectType, its identifying value g1 a ValueType, and refScheme links them — three constant-tag rows from the two groups, the same pure ⟨groups, known, mod⟩ -> ⟨rows, phi⟩ shape as h_objectification. Host _h_ref_scheme stays the certified-equal native override (test_ref_scheme_canon).",
+
+DEF("system:h_ref_scheme", S3(A("CONS"), S4(A("CONS"), S3(A("CONS"), K(A("instanceOf")), S3(A("CONS"), S3(A("COMP"), N(1), N(1)), K(A("ObjectType")))), S3(A("CONS"), K(A("instanceOf")), S3(A("CONS"), S3(A("COMP"), N(2), N(1)), K(A("ValueType")))), S3(A("CONS"), K(A("refScheme")), S3(A("CONS"), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(2), N(1))))), K(PHI()))),
+
 "THE PASS ORDER AND ROUND BOUND AS DATA (2026-07-08, scheduler-as-data second face): constants of doctrine, materialized as the passOrder and passBound cells beside passHeads; hosts dispatch their native pass bodies by the cell and fall back to the same literals when a store lacks it. The positive closure stays OUTSIDE the ordered passes: it is the floor the strata stand on.",
 
 DEF("system:pass_order",
