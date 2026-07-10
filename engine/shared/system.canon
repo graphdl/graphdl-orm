@@ -330,6 +330,13 @@ DEF("system:join_rule2",
        S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("theta:Project")), N(2))),
        S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("theta:NatJoin")), N(1))))),
 
+DEF("system:absorb_core",
+    S3(A("COMP"), A("apply"),
+       S3(A("CONS"),
+          S3(A("CONS"), K(A("INSERT")),
+             S3(A("COMP"), A("apply"), S3(A("CONS"), K(A("theta:NatJoin")), N(1)))),
+          N(2)))),
+
 DEF("system:F_of",
     S4(A("COND"), A("null"),
        K(A("id")),

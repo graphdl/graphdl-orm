@@ -2133,18 +2133,21 @@ def absorb_rows(D, table_key, partition):
     of the fact types absorbed into `table_key` (spec §4.4: functional roles on the same
     object type give one cell keyed on its id). Entities missing a functional fact drop
     from the joined rows; the optional-column (outer join) refinement is a later step."""
-    from . import canon as T
     from .reduce import apply as _ap
-    from .lam import to_lam, from_lam
+    from .lam import to_lam, from_lam, atom as A
     import pyarest.lam as L
     fts = [ft for ft, key in partition.items() if key == table_key and ft != table_key]
     if not fts:
         return []
-    acc = to_lam(tuple(tuple(r) for r in _pop_rows(D, fts[0])))
-    for ft in fts[1:]:
-        nxt = to_lam(tuple(tuple(r) for r in _pop_rows(D, ft)))
-        acc = _ap(T.NatJoin(1), L.SEQ(L.CONS(acc)(L.CONS(nxt)(L.NIL))))
-    return list(from_lam(acc))
+    # read each absorbed population from D (the seed boundary — D-access is host),
+    # then fold on the shared key via the canonical system:absorb_core
+    # (= INSERT[theta:NatJoin:key], shared/system.canon): the variadic NatJoin fold
+    # is the execution lattice, this host reader is only the D-access override.
+    pops = L.NIL
+    for ft in reversed(fts):
+        pops = L.CONS(to_lam(tuple(tuple(r) for r in _pop_rows(D, ft))))(pops)
+    return list(from_lam(_ap(A("system:absorb_core"),
+                             L.SEQ(L.CONS(A(1))(L.CONS(L.SEQ(pops))(L.NIL))))))
 
 
 # The cell-naming boundary op, as the reference TS engine computes it in the worker
