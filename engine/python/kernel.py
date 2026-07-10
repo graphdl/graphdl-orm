@@ -278,10 +278,31 @@ def _items(l):
     return out
 
 
+_CELLS_OF_MEMO = None
+
+
 def _cells_of(D):
     """The {name: contents} view of D's cells, first match winning (Backus §13.3.5: a cell
     ⟨CELL, n, c⟩ is the definition Def n ≡ ρc; §14.3: data and function names share the
-    one namespace, and usage disambiguates)."""
+    one namespace, and usage disambiguates).
+
+    MEMOIZED per D object (weak keys, #20): every `defs.step(D)` builds this view, and the
+    replay/create_handlers/run_rules phases step the SAME settled D many times (388 walks /
+    18.8s of a tasks compile — the whole-spine walk through _items dominates once the g-loop
+    is native). One walk per D now; a mutation mints a NEW D object so a stale hit is
+    impossible by construction. The returned dict is READ-ONLY to every caller (step_get /
+    step_native / the _cells_of(D).get(...) sites), so sharing it is sound; a non-weakref-able
+    D just walks."""
+    global _CELLS_OF_MEMO
+    if _CELLS_OF_MEMO is None:
+        import weakref
+        _CELLS_OF_MEMO = weakref.WeakKeyDictionary()
+    try:
+        hit = _CELLS_OF_MEMO.get(D)
+    except TypeError:
+        hit = None
+    if hit is not None:
+        return hit
     d = {}
     for c in _items(L._list(D)):
         it = _items(L._list(c))
@@ -289,6 +310,10 @@ def _cells_of(D):
             k = _aval(it[1])
             if k is not None and k not in d:                  # first match wins
                 d[k] = it[2]
+    try:
+        _CELLS_OF_MEMO[D] = d
+    except TypeError:
+        pass
     return d
 
 

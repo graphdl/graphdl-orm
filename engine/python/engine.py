@@ -221,48 +221,48 @@ def run(input_fact, D, validate_obj=None, cell_name="FILE", resolve_obj=None, de
         return _transition(apply(handler, _S(input_fact, D)), D)
 
 
-def _native_store_append(Dn, cell, fact):
-    """The plain create's effect on the store, NATIVELY (#20). The self-host compile's
-    g-loop asserts a fact into a cell with no validate/resolve/derive/machine wired, so the
-    create reduces to exactly: D′ = Store(cell):⟨resolve_default(fact, FetchPop(cell, D)),
-    D⟩ — dedup-PREPEND the fact into the named cell's population (apndl; set semantics via
-    theta:member) and replace that cell (Store = apndl ∘ ⟨new cell, Pop(cell)⟩). Dn is
-    native: a tuple of ⟨"CELL", name, contents⟩ cells. Certified equal to the lambda oracle
-    α₂(run(fact, D, cell_name=cell)) by test_native_append_canon; the lambda `run` stays the
-    canonical meaning. Returns None to signal 'not a plain population cell' — the caller then
-    defers to `run` (so this NEVER guesses at a non-plain store shape)."""
-    from .kernel import _eqobj
-    P, found = (), False
-    for c in Dn:
-        if type(c) is tuple and len(c) == 3 and c[0] == "CELL" and _eqobj(c[1], cell):
-            P = c[2]; found = True; break                    # FetchPop: first match's contents
-    if found and type(P) is not tuple:                       # atom/# contents: not the plain path
-        return None
-    if not any(_eqobj(fact, y) for y in P):                  # resolve_default: dedup (set)
-        P = (fact,) + tuple(P)                               # apndl PREPENDS
-    rest, removed = [], False
-    for c in Dn:                                             # Pop: drop the FIRST cell named `cell`
-        if (not removed and type(c) is tuple and len(c) == 3
-                and c[0] == "CELL" and _eqobj(c[1], cell)):
-            removed = True; continue
-        rest.append(c)
-    return (("CELL", cell, P),) + tuple(rest)                # Store: apndl the new cell
-
-
 def run_append(fact, D, cell_name="FILE"):
-    """The g-loop's plain assert as a native fast-path: it returns D′ ONLY (the self-host
-    compile discards the representation o), computing it directly instead of reducing the
+    """The self-host compile g-loop's plain assert as a native fast-path: it returns D′ ONLY
+    (the compile discards the representation o), computing it directly instead of reducing the
     whole build_system pipeline over the base-sized D per assert — the #20 compile hot path
-    (each `run` reduced the Scott base per store). A certified-equal twin of
-    α₂(run(to_lam(fact), D, cell_name=cell)); `run` remains canonical, and any non-plain
-    store shape defers to it, so the fast-path is only ever taken where it is proven equal."""
-    Dn = L.scott_to_native(D)
-    if type(Dn) is tuple:
-        out = _native_store_append(Dn, cell_name, fact)
-        if out is not None:
-            return L.native_to_scott(out)
-    from .lam import to_lam                                  # the canonical fallback (unchanged)
-    return apply(A(2), run(to_lam(fact), D, cell_name=cell_name))
+    (each `run` reduced the Scott base per store). The plain create is exactly
+    D′ = Store(cell):⟨resolve_default(fact, FetchPop(cell, D)), D⟩: dedup-PREPEND the fact into
+    the named cell's population (apndl; theta:member set semantics) and re-top that cell
+    (Store = apndl ∘ ⟨new cell, Pop(cell)⟩). A certified-equal twin of
+    α₂(run(to_lam(fact), D, cell_name=cell)) (test_native_append_canon); `run` stays canonical
+    and any non-plain contents defers to it, so the fast-path is only taken where proven equal.
+
+    It works at the SCOTT level, REUSING unchanged cell objects by identity and SHARING the
+    target population's tail (only the new fact is CONS'd on) — so the g-loop pays no full D
+    conversion per assert. A native-tuple round trip (scott_to_native/native_to_scott) would
+    be O(|D|) deep AND break scott_to_native's id-memo, which is a regression on apps atop the
+    base; keeping the cell objects lets every downstream conversion keep hitting the memo, and
+    the shared population spine is exactly what the lambda apndl/Store produce."""
+    from .kernel import _eqobj, _aval
+    cells = L._items(L._list(D))                             # original Scott cell objects
+    idx, contents = None, None
+    for i, c in enumerate(cells):
+        icl = L._list(c)
+        if _aval(L.HEAD(icl)) == "CELL" and _eqobj(_aval(L.HEAD(L.TAIL(icl))), cell_name):
+            idx, contents = i, L.HEAD(L.TAIL(L.TAIL(icl)))   # FetchPop: role-3 (Scott population)
+            break
+    if contents is None:                                     # absent cell -> fresh singleton
+        newpop = L.SEQ(L.CONS(L.to_lam(fact))(L.NIL))
+    else:
+        P = L.from_lam(contents)                             # decode ONLY the target population
+        if type(P) is not tuple:                             # non-plain contents: canonical fallback
+            from .lam import to_lam
+            return apply(A(2), run(to_lam(fact), D, cell_name=cell_name))
+        if any(_eqobj(fact, y) for y in P):                  # resolve_default: dedup keeps one
+            newpop = contents                                # unchanged -> reuse the Scott pop as-is
+        else:                                                # apndl PREPENDS, sharing the old spine
+            newpop = L.SEQ(L.CONS(L.to_lam(fact))(L._list(contents)))
+    newcell = cell(cell_name, newpop)
+    rest = cells[:idx] + cells[idx + 1:] if idx is not None else cells  # Pop: drop first match
+    lst = L.NIL
+    for c in reversed(rest):                                 # rebuild the spine, cell objects reused
+        lst = L.CONS(c)(lst)
+    return L.SEQ(L.CONS(newcell)(lst))                       # Store: prepend the new cell
 
 
 # ============================ eq. sys — the whole system as one lambda =========
