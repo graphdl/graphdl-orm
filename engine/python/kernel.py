@@ -244,12 +244,21 @@ def reset():
     native.clear()
 
 
-# ↑key : store → ⟨found?, ⟨tag, impl⟩⟩   (first match wins, else ⟨F, _⟩); keys compared by NATEQ
-FETCH = L.Y(lambda rec: lambda key: lambda d:
-    d(L.PAIR(L.FALSE)(L.NIL))(lambda h: lambda t:
-      L.IF(L.NATEQ(L.HEAD(h))(key))
-        (lambda: L.PAIR(L.TRUE)(L.TAIL(h)))
-        (lambda: rec(key)(t))))
+# ↑key : store → ⟨found?, ⟨tag, impl⟩⟩   (first match wins, else ⟨F, _⟩); keys compared by NATEQ.
+# Iterative walk of the store spine (was Y-recursive): a large _store must not blow the host's
+# call stack (Python's default ~1000 frames — a real RecursionError as apps/defs accumulate).
+# FETCH is host machinery (Backus §14.6), not a definition, and its one caller only CALLS it,
+# so a Python loop is observationally identical to the lambda, unbounded in depth.
+def FETCH(key):
+    def go(d):
+        cur = d
+        while not _tobool(L.LNULL(cur)):
+            h = L.HEAD(cur)
+            if _tobool(L.NATEQ(L.HEAD(h))(key)):
+                return L.PAIR(L.TRUE)(L.TAIL(h))
+            cur = L.TAIL(cur)
+        return L.PAIR(L.FALSE)(L.NIL)
+    return go
 
 
 # ============================ the step binding (Def. AREST / Cor. closure) ====
