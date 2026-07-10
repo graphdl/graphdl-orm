@@ -1,0 +1,44 @@
+minimumReleaseAgeExclude:
+  - mdast-util-to-hast@13.2.1
+  - rollup@4.59.0
+  - picomatch@4.0.4
+  - lodash@4.17.23 || 4.17.24
+  - ws@8.20.1 || 8.21.0
+  - uuid@11.1.1 || 13.0.1
+  - react-router@6.30.4 || 7.14.2 || 7.15.0 || 7.15.1
+  - mermaid@11.14.1
+  - js-cookie@3.0.6
+  - esbuild@0.28.1
+  - vite@7.3.5
+  - '@babel/core@7.29.1'
+  - dompurify@3.4.6 || 3.4.7 || 3.4.8 || 3.4.9 || 3.4.11
+  - markdown-it@14.1.2
+  - linkify-it@5.0.1
+overrides:
+  '@babel/core@<=7.29.0': ^7.29.1
+  dompurify@<3.4.7: ^3.4.7
+  dompurify@<3.4.9: ^3.4.9
+  dompurify@<=3.4.10: ^3.4.11
+  dompurify@<=3.4.5: ^3.4.6
+  dompurify@<=3.4.6: ^3.4.7
+  dompurify@>=3.0.0 <=3.4.7: ^3.4.8
+  esbuild@>=0.27.3 <0.28.1: ^0.28.1
+  js-cookie@<=3.0.5: ^3.0.6
+  linkify-it@<=5.0.0: ^5.0.1
+  lodash@<=4.17.23: ^4.17.24
+  lodash@>=4.0.0 <=4.17.22: ^4.17.23
+  lodash@>=4.0.0 <=4.17.23: ^4.17.24
+  markdown-it@<=14.1.1: ^14.1.2
+  mdast-util-to-hast@>=13.0.0 <13.2.1: ^13.2.1
+  mermaid@>=11.0.0-alpha.1 <=11.14.0: ^11.14.1
+  picomatch@>=4.0.0 <4.0.4: ^4.0.4
+  react-router@>=6.7.0 <6.30.4: ^6.30.4
+  react-router@>=7.0.0 <7.15.0: ^7.15.0
+  react-router@>=7.0.0 <=7.14.1: ^7.14.2
+  react-router@>=7.12.0 <7.15.1: ^7.15.1
+  rollup@>=4.0.0 <4.59.0: ^4.59.0
+  uuid@<11.1.1: ^11.1.1
+  uuid@>=13.0.0 <13.0.1: ^13.0.1
+  vite@>=7.0.0 <=7.3.4: ^7.3.5
+  ws@>=8.0.0 <8.20.1: ^8.20.1
+  ws@>=8.0.0 <8.21.0: ^8.21.0
