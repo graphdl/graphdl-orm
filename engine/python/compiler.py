@@ -252,7 +252,7 @@ _BOOTSTRAP_KINDS = {"fact_type_reading", "class_rule", "value_type",
 
 _CLASSIFY = [
     ("entity_type", re.compile(r"^(.+?)(?:\(\.(.+)\))? is an entity type\.$")),
-    ("value_type", re.compile(r"^(.+) is a value type\.$")),
+    ("value_type", re.compile(r"^(.+?)(?:\(\.(.+)\))? is a value type\.$")),
     ("ref_scheme", re.compile(r"^Reference Scheme: (.+) has (.+)\.$")),
     ("ref_mode", re.compile(r"^Reference Mode: (.+)\.$")),
     ("data_type", re.compile(r"^Data Type: (.+)\.$")),
@@ -741,7 +741,7 @@ def _h_entity(g, k, m):
     return [("instanceOf", (name, "ObjectType"))] + ([("refMode", (name, rm))] if rm else []), []
 
 def _h_value(g, k, m):
-    name, rm = _name_refmode(g[0])
+    name, rm = g[0], (g[1] if len(g) > 1 else None)       # #18: Stage-1 splits Name(.RefMode); system:h_value is the canon twin
     return [("instanceOf", (name, "ValueType"))] + ([("refMode", (name, rm))] if rm else []), []
 
 def _h_ref_scheme(g, k, m):
@@ -2367,7 +2367,7 @@ def parse(reading):
 # here, so parse(nf(r)) keeps r's kind. ----
 _RENDER = {
     "entity_type": lambda g: f"{g[0]}{'(.' + g[1] + ')' if len(g) > 1 and g[1] else ''} is an entity type",
-    "value_type": lambda g: f"{g[0]} is a value type",
+    "value_type": lambda g: f"{g[0]}{'(.' + g[1] + ')' if len(g) > 1 and g[1] else ''} is a value type",
     "ref_scheme": lambda g: f"Reference Scheme: {g[0]} has {g[1]}",
     "ref_mode": lambda g: f"Reference Mode: {g[0]}",
     "data_type": lambda g: f"Data Type: {g[0]}",
