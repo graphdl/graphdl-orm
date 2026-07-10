@@ -539,6 +539,34 @@ export default {
       return null;
     };
 
+    // #21 read gate (2026-07-10 security sweep): noun DATA reads — a population,
+    // an entity, its view / repr / actions, and the SSE event stream — require an
+    // authenticated ADMIN, closing the unauthenticated-read exposure. Schema,
+    // openapi, the noun menu, and entry-form templates stay PUBLIC (structure, not
+    // data); writes keep their own per-operation gate below. Customer self-serve
+    // reads (own records, object-scoped by `Support Request is for User`) are the
+    // next rung, once a customer read-portal exists. Fail-safe: deny by default.
+    if (request.method === "GET") {
+      const isEvents = seg[0] === "events";
+      const isPublic = seg[0] === "schema" || seg[0] === "openapi.json" || seg[0] === "nouns";
+      const gNoun = (!isEvents && !isPublic && seg.length >= 1 && seg[1] !== "new")
+        ? nounOf(seg[0]) : null;
+      if (isEvents || gNoun !== null) {
+        const rActor = await verifyActor(request, app);
+        use_(app);                  // verifyActor suspended; re-select the cell
+        const rAdmin = rActor !== null
+          && popRows("Admin_has_Role").some((t) => t.length >= 1 && t[0] === rActor);
+        if (!rAdmin) {
+          return json(JSON.stringify({
+            error: (rActor === null ? "unauthenticated" : "unauthorized")
+                 + ": reading " + (isEvents ? "the event stream" : gNoun)
+                 + " requires an authorized session",
+            actor: rActor ?? undefined,
+          }), rActor === null ? 401 : 403);
+        }
+      }
+    }
+
     if (request.method === "GET" && seg[0] === "events") {
       // SSE over the event stream: the log IS the feed (append =
       // commit = emit; Cor. stream — a subscriber is a rho-application
@@ -651,10 +679,10 @@ export default {
       if (!body?.fact_type || !Array.isArray(body?.fact))
         return json('{"error":"body needs fact_type and fact"}', 400);
       // the actor threads from federated verification: the identity
-      // auth.vin answers for the caller's own credential. Writes stay
-      // OPEN for now (the policy-derivation gate is the next rung) —
-      // but every committed event carries WHO (replay ignores the
-      // extra field; provenance is append-only history)
+      // auth.vin answers for the caller's own credential. Writes are
+      // ENFORCED below (an unauthorized create refuses with 403 before
+      // apply); every committed event also carries WHO (replay ignores
+      // the extra field; provenance is append-only history).
       const actor = await verifyActor(request, app);
       use_(app);                  // verifyActor suspended; re-select
       // AUTHORIZATION IS FACTS: the derived triples (authorization.md)
