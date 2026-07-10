@@ -786,30 +786,27 @@ def _mandatory_parts(ft, subject, m, pos=1):
         [(cid, C.scoped_mandatory_entities(subject)), (cid + "_e", C.scoped_mandatory_facts(ft))]
 
 
-def _h_uniqueness(g, k, m):
-    reading = g[0] + " " + g[2]
-    ft, facts = _fact_type(reading, k)                         # mixfix template + roles
-    _t, rtypes = _reading(reading, k)
-    subject = _subject(g[0], k)[0]
-    pos = rtypes.index(subject) + 1 if subject in rtypes else 1   # computed, not assumed
-    also, aobjs = _mandatory_parts(ft, subject, m, pos) if g[1] == "exactly one" else ([], [])
-    return facts + [("constraint", (ft + "_uc", "uniqueness", ft, m)),
-                    ("spans", (ft + "_uc", pos))] + also, \
-        [(ft + "_uc", C.uniqueness([pos]))] + aobjs            # the quantified role's position
+def _h_crows(g, k, m):
+    # #18: the GENERIC constraint translator (canon system:h_crows). g arrives COOKED as
+    # ⟨decl_rows, mid, obj_specs⟩: decl_rows pass through; mid entries are ⟨"c", tail⟩
+    # (a constraint-row tail the translator completes with the modality) or ⟨"w", row⟩
+    # (a whole row); obj_specs ⟨cid, builder, operand⟩ apply the canonical builder
+    # through DEFS (_scoped's own form). Optionality = the empty sequence — cat and the
+    # map are identity on it, so conditional families need no branches at all.
+    from .reduce import apply as _apply
+    from .lam import atom as _A
+    decl, mid, ospecs = g
+    rows = [(c, tuple(r)) for c, r in decl] + \
+        [("constraint", tuple(p) + (m,)) if t == "c" else (p[0], tuple(p[1]))
+         for t, p in mid]
+    return rows, [(cid, _apply(_A(b), to_lam(op))) for cid, b, op in ospecs]
 
-def _h_mandatory(g, k, m):
-    ft, facts = _fact_type(g[0] + " " + g[1], k)
-    mfacts, mobjs = _mandatory_parts(ft, _subject(g[0], k)[0], m)
-    return facts + mfacts, mobjs
 
-def _h_neg_uniqueness(g, k, m):
-    ft, facts = _fact_type(" ".join(g), k)                     # reconstruct the reading; same constraint
-    return facts + [("constraint", (ft + "_uc", "uniqueness", ft, m))], [(ft + "_uc", C.uniqueness([1]))]
+_h_uniqueness = _h_crows
+_h_mandatory = _h_crows
 
-def _h_neg_mandatory(g, k, m):
-    ft, facts = _fact_type(" ".join(g), k)
-    mfacts, mobjs = _mandatory_parts(ft, _subject(g[0], k)[0], m)
-    return facts + mfacts, mobjs
+_h_neg_uniqueness = _h_crows
+_h_neg_mandatory = _h_crows
 
 def _uc_columns(names, rtypes):
     """Resolve a composite UC's named columns against the reading's role
@@ -829,35 +826,10 @@ def _uc_columns(names, rtypes):
     return roles, missing
 
 
-def _h_spanning(g, k, m):
-    """'In each population of <reading>, each A, B combination occurs at
-    most once.' The names RESOLVE against the reading (this spelling
-    hardcoded roles [1, 2] and ignored the names entirely until
-    2026-07-09); unresolvable names raise, and the caller's loud guard
-    keeps such statements out of this handler."""
-    ftn = g[0].replace(" ", "_")
-    names = [s.strip() for s in g[1].split(",")]
-    _t, rtypes = _reading(g[0], k)
-    roles, missing = _uc_columns(names, rtypes)
-    if missing or not roles:
-        raise ValueError(f"spanning UC names unresolved roles: {missing}")
-    cid = ftn + "_uc"
-    return ([("constraint", (cid, "spanning_uniqueness", ftn, m))]
-            + [("spans", (cid, p)) for p in roles]), [(cid, C.uniqueness(roles))]
-
-
-def _h_spanning_corpus(g, k, m):
-    """'Each A, B combination occurs at most once in the population of <reading>.'
-    — the roles-first spelling; the reading declares implicitly, old-corpus style."""
-    names = [s.strip() for s in g[0].split(",")]
-    ftn, decl = _fact_type(g[1], k)
-    _t, rtypes = _reading(g[1], k)
-    roles, missing = _uc_columns(names, rtypes)
-    if missing or not roles:
-        raise ValueError(f"spanning UC names unresolved roles: {missing}")
-    cid = ftn + "_uc"
-    return (decl + [("constraint", (cid, "spanning_uniqueness", ftn, m))]
-            + [("spans", (cid, p)) for p in roles]), [(cid, C.uniqueness(roles))]
+# the spanning pair, for_each and inverse_uc: crows hosts — their kind-specific
+# resolution lives in the _COOK table (the docstrings ride the cooks)
+_h_spanning = _h_crows
+_h_spanning_corpus = _h_crows
 
 
 def _dequalify(text, known):
@@ -874,15 +846,7 @@ def _dequalify(text, known):
     return " ".join(out)
 
 
-def _h_for_each_mandatory(g, k, m):
-    """'For each S, some <clause over S>.' — the clause declares the fact type
-    (implicitly, old-corpus style) and S's role in it is mandatory."""
-    subject, clause = g[0].strip(), _dequalify(g[1], k)
-    ft, decl = _fact_type(clause, k)
-    _t, rtypes = _reading(clause, k)
-    pos = (rtypes.index(subject) + 1) if subject in rtypes else 1
-    mfacts, mobjs = _mandatory_parts(ft, subject, m, pos)
-    return decl + mfacts, mobjs
+_h_for_each_mandatory = _h_crows
 
 
 def _h_frequency(g, k, m):
@@ -1326,18 +1290,7 @@ def _h_neg_pair(g, k, m):
 def _h_possibility(g, k, m):
     return [("possibility", (g[0][:80], m))], []
 
-def _h_inverse_uc(g, k, m):
-    """The inverse-role UC anchors to the FACT TYPE at the subject's computed position
-    (a real role-2 uniqueness, so doubly-functional 1:1 fact types are detectable);
-    'exactly one' adds the mandatory at the same position, Halpin's fewer-nulls signal."""
-    a, _r = _subject(g[0], k)
-    reading = f"{g[2]} {g[0]}"
-    ft, facts = _fact_type(reading, k)
-    _t, rtypes = _reading(reading, k)
-    pos = rtypes.index(a) + 1 if a in rtypes else 2
-    cid = _slug(a) + "_inv_uc"
-    also, aobjs = _mandatory_parts(ft, a, m, pos) if g[1] == "exactly one" else ([], [])
-    return facts + [("constraint", (cid, "uniqueness", ft, m)), ("spans", (cid, pos))] + also, aobjs
+_h_inverse_uc = _h_crows
 
 _QUOTED = re.compile(r"'([^']*)'")
 
@@ -1858,12 +1811,137 @@ def _cook_value_constraint(g, k):
     return (g[0], g[1], g[0] + "_vc", builder, bop)
 
 
+def _mand_specs(mand, ft, subject):
+    """The mandatory pair's obj specs — _scoped's own application form ⟨cid, name, cell⟩."""
+    return ((mand, "constraints:scoped_mandatory_entities", subject),
+            (mand + "_e", "constraints:scoped_mandatory_facts", ft))
+
+
+def _cook_uniqueness(g, k):
+    """uniqueness (+ its 'exactly one' mandatory rider) -> the generic crows groups
+    ⟨decl_rows, mid, obj_specs⟩; the conditional rider is just MORE ELEMENTS."""
+    reading = g[0] + " " + g[2]
+    ft, decl = _fact_type(reading, k)
+    _t, rtypes = _reading(reading, k)
+    subject = _subject(g[0], k)[0]
+    pos = rtypes.index(subject) + 1 if subject in rtypes else 1
+    uc = ft + "_uc"
+    mid = [("c", (uc, "uniqueness", ft)), ("w", ("spans", (uc, pos)))]
+    ospecs = [(uc, "constraints:uniqueness", (pos,))]
+    if g[1] == "exactly one":
+        mand = ft + "_mand"
+        mid += [("c", (mand, "mandatory", ft, subject)), ("w", ("spans", (mand, pos)))]
+        ospecs += list(_mand_specs(mand, ft, subject))
+    return (tuple(decl), tuple(mid), tuple(ospecs))
+
+
+def _cook_mandatory(g, k):
+    """mandatory -> the generic crows groups (the same shape, no conditional)."""
+    ft, decl = _fact_type(g[0] + " " + g[1], k)
+    subject = _subject(g[0], k)[0]
+    mand = ft + "_mand"
+    mid = [("c", (mand, "mandatory", ft, subject)), ("w", ("spans", (mand, 1)))]
+    return (tuple(decl), tuple(mid), tuple(_mand_specs(mand, ft, subject)))
+
+
+def _cook_neg_uniqueness(g, k):
+    """neg uniqueness: reconstruct the reading; the same uc constraint, NO spans row
+    and NO conditional (the host's historical shape, preserved exactly)."""
+    ft, decl = _fact_type(" ".join(g), k)
+    uc = ft + "_uc"
+    return (tuple(decl), (("c", (uc, "uniqueness", ft)),),
+            ((uc, "constraints:uniqueness", (1,)),))
+
+
+def _cook_neg_mandatory(g, k):
+    """neg mandatory: reconstruct the reading; the standard mandatory pair at pos 1."""
+    ft, decl = _fact_type(" ".join(g), k)
+    subject = _subject(g[0], k)[0]
+    mand = ft + "_mand"
+    return (tuple(decl),
+            (("c", (mand, "mandatory", ft, subject)), ("w", ("spans", (mand, 1)))),
+            tuple(_mand_specs(mand, ft, subject)))
+
+
+def _cook_for_each_mandatory(g, k):
+    """'For each S, some <clause over S>.' — the clause declares the fact type
+    (implicitly, old-corpus style) and S's role in it is mandatory."""
+    subject, clause = g[0].strip(), _dequalify(g[1], k)
+    ft, decl = _fact_type(clause, k)
+    _t, rtypes = _reading(clause, k)
+    pos = (rtypes.index(subject) + 1) if subject in rtypes else 1
+    mand = ft + "_mand"
+    return (tuple(decl),
+            (("c", (mand, "mandatory", ft, subject)), ("w", ("spans", (mand, pos)))),
+            tuple(_mand_specs(mand, ft, subject)))
+
+
+def _cook_inverse_uc(g, k):
+    """The inverse-role UC anchors to the FACT TYPE at the subject's computed position
+    (a real role-2 uniqueness, so doubly-functional 1:1 fact types are detectable);
+    'exactly one' adds the mandatory at the same position, Halpin's fewer-nulls signal.
+    The host emitted NO uniqueness obj here — preserved exactly."""
+    a, _r = _subject(g[0], k)
+    reading = f"{g[2]} {g[0]}"
+    ft, decl = _fact_type(reading, k)
+    _t, rtypes = _reading(reading, k)
+    pos = rtypes.index(a) + 1 if a in rtypes else 2
+    cid = _slug(a) + "_inv_uc"
+    mid = [("c", (cid, "uniqueness", ft)), ("w", ("spans", (cid, pos)))]
+    ospecs = ()
+    if g[1] == "exactly one":
+        mand = ft + "_mand"
+        mid += [("c", (mand, "mandatory", ft, a)), ("w", ("spans", (mand, pos)))]
+        ospecs = _mand_specs(mand, ft, a)
+    return (tuple(decl), tuple(mid), tuple(ospecs))
+
+
+def _cook_spanning(g, k):
+    """'In each population of <reading>, each A, B combination occurs at most once.'
+    The names RESOLVE against the reading (this spelling hardcoded roles [1, 2] and
+    ignored the names until 2026-07-09); unresolvable names raise, and the raise
+    surfaces as the handler's refusal exactly as before (the cook runs inside it)."""
+    ftn = g[0].replace(" ", "_")
+    names = [s.strip() for s in g[1].split(",")]
+    _t, rtypes = _reading(g[0], k)
+    roles, missing = _uc_columns(names, rtypes)
+    if missing or not roles:
+        raise ValueError(f"spanning UC names unresolved roles: {missing}")
+    cid = ftn + "_uc"
+    return ((), (("c", (cid, "spanning_uniqueness", ftn)),)
+            + tuple(("w", ("spans", (cid, p))) for p in roles),
+            ((cid, "constraints:uniqueness", tuple(roles)),))
+
+
+def _cook_spanning_corpus(g, k):
+    """'Each A, B combination occurs at most once in the population of <reading>.'
+    — the roles-first spelling; the reading declares implicitly, old-corpus style."""
+    names = [s.strip() for s in g[0].split(",")]
+    ftn, decl = _fact_type(g[1], k)
+    _t, rtypes = _reading(g[1], k)
+    roles, missing = _uc_columns(names, rtypes)
+    if missing or not roles:
+        raise ValueError(f"spanning UC names unresolved roles: {missing}")
+    cid = ftn + "_uc"
+    return (tuple(decl), (("c", (cid, "spanning_uniqueness", ftn)),)
+            + tuple(("w", ("spans", (cid, p))) for p in roles),
+            ((cid, "constraints:uniqueness", tuple(roles)),))
+
+
 _COOK = {
     "sm_trigger": lambda g, k: (g[0], _clause_ft(g[1], k)),
     "sm_guard": lambda g, k: (g[0], _clause_ft(g[1], k)),
     "ring": _cook_ring,
     "frequency": _cook_frequency,
     "value_constraint": _cook_value_constraint,
+    "uniqueness": _cook_uniqueness,
+    "mandatory": _cook_mandatory,
+    "neg_uniqueness": _cook_neg_uniqueness,
+    "neg_mandatory": _cook_neg_mandatory,
+    "for_each_mandatory": _cook_for_each_mandatory,
+    "inverse_uc": _cook_inverse_uc,
+    "spanning_uc": _cook_spanning,
+    "spanning_uc2": _cook_spanning_corpus,
 }
 
 
