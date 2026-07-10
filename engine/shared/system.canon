@@ -5506,6 +5506,20 @@ DEF("system:classify_heads",
 DEF("system:h_objectification",
     S3(A("CONS"), S3(A("CONS"), S3(A("CONS"), K(A("instanceOf")), S3(A("CONS"), S3(A("COMP"), N(2), N(1)), K(A("ObjectType")))), S3(A("CONS"), K(A("objectification")), S3(A("CONS"), S3(A("COMP"), N(2), N(1)), S3(A("COMP"), N(1), N(1))))), K(PHI()))),
 
+"THE SM HANDLER TRANSLATORS AS DATA (2026-07-10, #18): six state-machine reading handlers, each a thin delegation to the canonical system:sm_rows row object over the four-tuple ⟨verb, head, group1, group2⟩ — the verb is the grammar's own recognizer token (constant per handler), the head splits the shared 'emits' verb between Transition (Mealy) and Status (Moore). A translator maps ⟨groups, known, mod⟩ -> ⟨rows, phi⟩ (no objs). Hosts _h_sm_def/initial/from/to/emit/moore stay the certified-equal native overrides (test_sm_handler_canon twins them). Trigger and guard are NOT canonized here: their second group resolves reading -> fact-type id through known context, which is the Stage-1 text boundary, not the object's business.",
+
+DEF("system:h_sm_def", S3(A("CONS"), S3(A("COMP"), A("system:sm_rows"), S5(A("CONS"), K(A("is for Noun")), K(A("State Machine Definition")), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(2), N(1)))), K(PHI()))),
+
+DEF("system:h_sm_initial", S3(A("CONS"), S3(A("COMP"), A("system:sm_rows"), S5(A("CONS"), K(A("is initial in State Machine Definition")), K(A("Status")), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(2), N(1)))), K(PHI()))),
+
+DEF("system:h_sm_from", S3(A("CONS"), S3(A("COMP"), A("system:sm_rows"), S5(A("CONS"), K(A("is from Status")), K(A("Transition")), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(2), N(1)))), K(PHI()))),
+
+DEF("system:h_sm_to", S3(A("CONS"), S3(A("COMP"), A("system:sm_rows"), S5(A("CONS"), K(A("is to Status")), K(A("Transition")), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(2), N(1)))), K(PHI()))),
+
+DEF("system:h_sm_emit", S3(A("CONS"), S3(A("COMP"), A("system:sm_rows"), S5(A("CONS"), K(A("emits")), K(A("Transition")), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(2), N(1)))), K(PHI()))),
+
+DEF("system:h_sm_moore", S3(A("CONS"), S3(A("COMP"), A("system:sm_rows"), S5(A("CONS"), K(A("emits")), K(A("Status")), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(2), N(1)))), K(PHI()))),
+
 "THE PASS ORDER AND ROUND BOUND AS DATA (2026-07-08, scheduler-as-data second face): constants of doctrine, materialized as the passOrder and passBound cells beside passHeads; hosts dispatch their native pass bodies by the cell and fall back to the same literals when a store lacks it. The positive closure stays OUTSIDE the ordered passes: it is the floor the strata stand on.",
 
 DEF("system:pass_order",
