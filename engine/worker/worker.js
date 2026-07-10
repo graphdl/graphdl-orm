@@ -192,7 +192,11 @@ async function verifyActor(request, app) {
         // subscription link anchors the customer policy rules
         const sub = user?.subscription;
         const role = user?.role;
+        const uid = user?.id != null ? String(user.id) : null;   // #21: for own-record read scoping
         const entries = [];
+        // link the verified email-actor to its auth.vin user id, so the read gate can
+        // scope a customer to their OWN records (Support_Request_is_for_User carries the id)
+        if (uid) entries.push({ ft: "User_is_verified_as_Id", facts: [[actor, uid]] });
         if (sub) {
           entries.push(
             { ft: "Subscription_belongs_to_Customer",
@@ -206,7 +210,10 @@ async function verifyActor(request, app) {
             { ft: "User_is_authorized_for_Operation_on_Resource",
               facts: [[actor, "create", "Support Request"],
                       [actor, "create", "Message"],
-                      [actor, "create", "Chat Message"]] });
+                      [actor, "create", "Chat Message"],
+                      // #21: a Customer READS their OWN Support Requests — this is the
+                      // TYPE grant; the read gate object-scopes the response by ownership
+                      [actor, "read", "Support Request"]] });
         }
         if (role === "ADMIN") {
           // THE ADMIN ANCHORS: auth.vin's own answer carries the role
@@ -558,13 +565,15 @@ export default {
       return null;
     };
 
-    // #21 read gate (2026-07-10 security sweep): noun DATA reads — a population,
-    // an entity, its view / repr / actions, and the SSE event stream — require an
-    // authenticated ADMIN, closing the unauthenticated-read exposure. Schema,
-    // openapi, the noun menu, and entry-form templates stay PUBLIC (structure, not
-    // data); writes keep their own per-operation gate below. Customer self-serve
-    // reads (own records, object-scoped by `Support Request is for User`) are the
-    // next rung, once a customer read-portal exists. Fail-safe: deny by default.
+    // #21 read gate (2026-07-10 security sweep): noun DATA reads — a population, an
+    // entity, its view / repr / actions, and the SSE event stream — require an
+    // authenticated session. An ADMIN reads everything; a CUSTOMER reads only their OWN
+    // Support Requests (object-scoped below by Support_Request_is_for_User); everyone
+    // else is refused. Schema, openapi, the noun menu, and entry-form templates stay
+    // PUBLIC (structure, not data); writes keep their own per-operation gate. Fail-safe:
+    // deny by default, and a caller with no verified id owns nothing.
+    let readScopeUser = null;   // non-null => scope this request's reads to the caller's own records
+    let readScopeNoun = null;
     if (request.method === "GET") {
       const isEvents = seg[0] === "events";
       const isPublic = seg[0] === "schema" || seg[0] === "openapi.json" || seg[0] === "nouns";
@@ -576,12 +585,22 @@ export default {
         const rAdmin = rActor !== null
           && popRows("Admin_has_Role").some((t) => t.length >= 1 && t[0] === rActor);
         if (!rAdmin) {
-          return json(JSON.stringify({
-            error: (rActor === null ? "unauthenticated" : "unauthorized")
-                 + ": reading " + (isEvents ? "the event stream" : gNoun)
-                 + " requires an authorized session",
-            actor: rActor ?? undefined,
-          }), rActor === null ? 401 : 403);
+          // a customer may read a resource they hold a 'read' grant for, scoped to their
+          // own records; the event stream stays admin-only
+          const mayRead = rActor !== null && !isEvents && gNoun !== null
+            && popRows("User_is_authorized_for_Operation_on_Resource").some((t) =>
+                 t.length >= 3 && t[0] === rActor && t[1] === "read" && t[2] === gNoun);
+          if (!mayRead) {
+            return json(JSON.stringify({
+              error: (rActor === null ? "unauthenticated" : "unauthorized")
+                   + ": reading " + (isEvents ? "the event stream" : gNoun)
+                   + " requires an authorized session",
+              actor: rActor ?? undefined,
+            }), rActor === null ? 401 : 403);
+          }
+          const uidRow = popRows("User_is_verified_as_Id").find((t) => t.length >= 2 && t[0] === rActor);
+          readScopeUser = uidRow ? String(uidRow[1]) : " ";   // no verified id => owns nothing
+          readScopeNoun = gNoun;
         }
       }
     }
@@ -766,8 +785,23 @@ export default {
         } catch {}
         try {
           use_(app);
-          return json(arest_call(
-            "list", JSON.stringify({ noun: lnoun })));
+          const raw = arest_call("list", JSON.stringify({ noun: lnoun }));
+          if (readScopeUser !== null && lnoun === readScopeNoun) {
+            // #21: object-scope the population to the caller's OWN records
+            const owned = new Set(popRows("Support_Request_is_for_User")
+              .filter((t) => t.length >= 2 && String(t[1]) === readScopeUser)
+              .map((t) => String(t[0])));
+            try {
+              const b = JSON.parse(raw);
+              if (b && Array.isArray(b.docs)) {
+                b.docs = b.docs.filter((d) => owned.has(String(d?.id)));
+                b.totalDocs = b.docs.length;
+                return json(JSON.stringify(b));
+              }
+            } catch {}
+            return json('{"type":' + JSON.stringify(lnoun) + ',"docs":[],"totalDocs":0}');  // fail closed
+          }
+          return json(raw);
         } catch (e) {
           return json(JSON.stringify({ error: String(e) }), 500);
         }
@@ -802,6 +836,11 @@ export default {
       if (!noun) return json('{"error":"unknown noun"}', 404);
       const id = decodeURIComponent(seg[1]);
       if (request.method === "GET") {
+        if (readScopeUser !== null && noun === readScopeNoun
+            && !popRows("Support_Request_is_for_User").some((t) =>
+                 t.length >= 2 && String(t[0]) === id && String(t[1]) === readScopeUser)) {
+          return json('{"error":"not found"}', 404);   // #21: not the caller's own record
+        }
         if (seg[2] === "actions")
           return json(arest_call("actions", JSON.stringify({ noun, id })));
         if (seg[2] === "repr")
