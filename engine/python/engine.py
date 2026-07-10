@@ -239,13 +239,17 @@ def run_append(fact, D, cell_name="FILE"):
     base; keeping the cell objects lets every downstream conversion keep hitting the memo, and
     the shared population spine is exactly what the lambda apndl/Store produce."""
     from .kernel import _eqobj, _aval
-    cells = L._items(L._list(D))                             # original Scott cell objects
-    idx, contents = None, None
-    for i, c in enumerate(cells):
+    contents, tail, front = None, None, []
+    cur = L._list(D)                                         # the Scott cons-list of cells
+    while not L._is_nil(cur):
+        c = L.HEAD(cur)
         icl = L._list(c)
         if _aval(L.HEAD(icl)) == "CELL" and _eqobj(_aval(L.HEAD(L.TAIL(icl))), cell_name):
-            idx, contents = i, L.HEAD(L.TAIL(L.TAIL(icl)))   # FetchPop: role-3 (Scott population)
+            contents = L.HEAD(L.TAIL(L.TAIL(icl)))           # FetchPop: role-3 (Scott population)
+            tail = L.TAIL(cur)                               # REUSE the Scott sublist AFTER the target
             break
+        front.append(c)                                     # cells BEFORE the target (rebuilt, O(idx))
+        cur = L.TAIL(cur)
     if contents is None:                                     # absent cell -> fresh singleton
         newpop = L.SEQ(L.CONS(L.to_lam(fact))(L.NIL))
     else:
@@ -258,11 +262,13 @@ def run_append(fact, D, cell_name="FILE"):
         else:                                                # apndl PREPENDS, sharing the old spine
             newpop = L.SEQ(L.CONS(L.to_lam(fact))(L._list(contents)))
     newcell = cell(cell_name, newpop)
-    rest = cells[:idx] + cells[idx + 1:] if idx is not None else cells  # Pop: drop first match
-    lst = L.NIL
-    for c in reversed(rest):                                 # rebuild the spine, cell objects reused
-        lst = L.CONS(c)(lst)
-    return L.SEQ(L.CONS(newcell)(lst))                       # Store: prepend the new cell
+    # Store: newcell :: (front ++ Pop's tail). The tail after the target is the ORIGINAL Scott
+    # sublist, reused by identity, so only the O(idx) front is rebuilt, not the whole spine —
+    # and the g-loop's re-topped hot cells sit near the front, so idx is small in practice.
+    rest = tail if tail is not None else L.NIL
+    for c in reversed(front):
+        rest = L.CONS(c)(rest)
+    return L.SEQ(L.CONS(newcell)(rest))                     # Store: prepend the new cell
 
 
 # ============================ eq. sys — the whole system as one lambda =========
