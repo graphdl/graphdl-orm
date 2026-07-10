@@ -1963,7 +1963,12 @@ def _stmt_translator_impl(kinds):
                 asserts, objs = _plan(kind, mm.groups(), known, mod,
                                       sign=msign)
                 for cell, fact in asserts:
-                    D = _apply(_A(2), ast.run(to_lam(fact), D, cell_name=cell))
+                    # #20: the plain assert as a native store-append. run_append is the
+                    # certified-equal twin of α₂(run(to_lam(fact), D, cell_name=cell))
+                    # (test_native_append_canon) — it returns D′ directly instead of
+                    # reducing the build_system pipeline over the base-sized D each assert,
+                    # and defers to the canonical `run` for any non-plain store shape.
+                    D = ast.run_append(fact, D, cell)
                 for name, obj in objs:
                     D = _apply(ast.DefineIn(name, obj), D)
                 break
