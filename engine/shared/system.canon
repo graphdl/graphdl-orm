@@ -5524,6 +5524,48 @@ DEF("system:h_sm_trigger", S3(A("CONS"), S3(A("COMP"), A("system:sm_rows"), S5(A
 
 DEF("system:h_sm_guard", S3(A("CONS"), S3(A("COMP"), A("system:sm_rows"), S5(A("CONS"), K(A("is guarded by Fact Type")), K(A("Transition")), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(2), N(1)))), K(PHI()))),
 
+"THE RING-CONSTRAINT READING TRANSLATOR AS DATA (2026-07-10, #18): the first CONSTRAINT-family handler, and the first with a non-phi objs half. The _COOK boundary resolves the reading (Stage-1's step): groups arrive as ⟨decl_rows, cid, kind_tag, ft, builder_name⟩. The translator appends the constraint row to the declaration rows (apndr) and emits ONE obj ⟨cid, (builder_name : ⟨1,2⟩)⟩ — the constraint OBJECT is the canonical builder applied through DEFS via the apply prim (the C.ring_* hosts are already exactly that application), so even the objs half is canon-valued. Host _h_ring is the certified-equal override (test_ring_canon, extensional on the obj).",
+
+DEF("system:h_ring",
+    S3(A("CONS"),
+       S3(A("COMP"), A("apndr"),
+          S3(A("CONS"), S3(A("COMP"), N(1), N(1)),
+             S3(A("CONS"), K(A("constraint")),
+                S5(A("CONS"), S3(A("COMP"), N(2), N(1)), S3(A("COMP"), N(3), N(1)), S3(A("COMP"), N(4), N(1)), N(3))))),
+       S2(A("CONS"),
+          S3(A("CONS"), S3(A("COMP"), N(2), N(1)),
+             S3(A("COMP"), A("apply"),
+                S3(A("CONS"), S3(A("COMP"), N(5), N(1)), K(S2(N(1), N(2))))))))),
+
+"THE VALUE-CONSTRAINT READING TRANSLATOR AS DATA (2026-07-10, #18): cooked groups ⟨name, spec, cid, builder_name, operand⟩ — the spec parse (the VALUE_SPECS pattern table + the enumeration fallback) is the string boundary, and the chosen canonical builder (constraints:value_range / constraints:value_enumeration) rides as a NAME the translator applies through DEFS. Two rows (the valueConstraint reading row keeping the spec text + the constraint row on the value type's own cell) and one obj ⟨cid, (builder : operand)⟩. Host _h_value_constraint is the certified-equal override (test_value_constraint_canon, extensional on the obj).",
+
+DEF("system:h_value_constraint",
+    S3(A("CONS"),
+       S3(A("CONS"),
+          S3(A("CONS"), K(A("valueConstraint")), S4(A("CONS"), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(2), N(1)), N(3))),
+          S3(A("CONS"), K(A("constraint")), S5(A("CONS"), S3(A("COMP"), N(3), N(1)), K(A("value")), S3(A("COMP"), N(1), N(1)), N(3)))),
+       S2(A("CONS"),
+          S3(A("CONS"), S3(A("COMP"), N(3), N(1)),
+             S3(A("COMP"), A("apply"),
+                S3(A("CONS"), S3(A("COMP"), N(4), N(1)), S3(A("COMP"), N(5), N(1)))))))),
+
+"THE FREQUENCY-CONSTRAINT READING TRANSLATOR AS DATA (2026-07-10, #18): the second constraint-family handler. Cooked groups ⟨cid, ft, roles, builder_operand⟩ — the reading resolution, role-name lookup, and bound encoding (absent bound = the empty sequence, the canonical optionality from constraints:frequency's own contract) are Stage-1's. The translator prepends the constraint row (apndl) to the spans rows — ONE ROW PER ROLE, the mapped family α(⟨spans, id⟩) over distl:⟨cid, roles⟩ — and emits ⟨cid, (constraints:frequency : operand)⟩. Host _h_frequency is the certified-equal override (test_frequency_canon, extensional on the obj).",
+
+DEF("system:h_frequency",
+    S3(A("CONS"),
+       S3(A("COMP"), A("apndl"),
+          S3(A("CONS"),
+             S3(A("CONS"), K(A("constraint")),
+                S5(A("CONS"), S3(A("COMP"), N(1), N(1)), K(A("frequency")), S3(A("COMP"), N(2), N(1)), N(3))),
+             S3(A("COMP"),
+                S2(A("ALPHA"), S3(A("CONS"), K(A("spans")), A("id"))),
+                S3(A("COMP"), A("distl"),
+                   S3(A("CONS"), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(3), N(1))))))),
+       S2(A("CONS"),
+          S3(A("CONS"), S3(A("COMP"), N(1), N(1)),
+             S3(A("COMP"), A("apply"),
+                S3(A("CONS"), K(A("constraints:frequency")), S3(A("COMP"), N(4), N(1)))))))),
+
 "A REFERENCE-SCHEME READING TRANSLATOR AS DATA (2026-07-10, #18): the entity g0 is an ObjectType, its identifying value g1 a ValueType, and refScheme links them — three constant-tag rows from the two groups, the same pure ⟨groups, known, mod⟩ -> ⟨rows, phi⟩ shape as h_objectification. Host _h_ref_scheme stays the certified-equal native override (test_ref_scheme_canon).",
 
 DEF("system:h_ref_scheme", S3(A("CONS"), S4(A("CONS"), S3(A("CONS"), K(A("instanceOf")), S3(A("CONS"), S3(A("COMP"), N(1), N(1)), K(A("ObjectType")))), S3(A("CONS"), K(A("instanceOf")), S3(A("CONS"), S3(A("COMP"), N(2), N(1)), K(A("ValueType")))), S3(A("CONS"), K(A("refScheme")), S3(A("CONS"), S3(A("COMP"), N(1), N(1)), S3(A("COMP"), N(2), N(1))))), K(PHI()))),

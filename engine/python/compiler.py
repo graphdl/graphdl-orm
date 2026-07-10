@@ -692,16 +692,25 @@ def _role_path(body):
 
 # NORMA value specs → a value constraint object over role 1. A pattern table (regex is the string
 # boundary); the first match's builder wins, else an enumeration. No if/elif dispatch.
+def _vc_range(lo=None, hi=None, lo_open=False, hi_open=False):
+    """⟨builder, operand⟩ for a range spec — the same encoding C.value_range applies
+    (absent bound = the empty sequence, the canonical optionality)."""
+    return ("constraints:value_range",
+            (1,
+             (lo, "T" if lo_open else "F") if lo is not None else (),
+             (hi, "T" if hi_open else "F") if hi is not None else ()))
+
+
 _VALUE_SPECS = [
-    (re.compile(r"^\[(.+?)\.\.(.+?)\]$"), lambda gp: C.value_range(1, _num(gp[0]), _num(gp[1]))),
-    (re.compile(r"^at least (.+?) to at most (.+)$"), lambda gp: C.value_range(1, _num(gp[0]), _num(gp[1]))),
-    (re.compile(r"^at least (.+?) (?:to|and) below (.+)$"), lambda gp: C.value_range(1, _num(gp[0]), _num(gp[1]), hi_open=True)),
-    (re.compile(r"^above (.+?) to at most (.+)$"), lambda gp: C.value_range(1, _num(gp[0]), _num(gp[1]), lo_open=True)),
-    (re.compile(r"^above (.+?) (?:to|and) below (.+)$"), lambda gp: C.value_range(1, _num(gp[0]), _num(gp[1]), lo_open=True, hi_open=True)),
-    (re.compile(r"^at least (.+)$"), lambda gp: C.value_range(1, lo=_num(gp[0]))),
-    (re.compile(r"^above (.+)$"), lambda gp: C.value_range(1, lo=_num(gp[0]), lo_open=True)),
-    (re.compile(r"^at most (.+)$"), lambda gp: C.value_range(1, hi=_num(gp[0]))),
-    (re.compile(r"^below (.+)$"), lambda gp: C.value_range(1, hi=_num(gp[0]), hi_open=True)),
+    (re.compile(r"^\[(.+?)\.\.(.+?)\]$"), lambda gp: _vc_range(_num(gp[0]), _num(gp[1]))),
+    (re.compile(r"^at least (.+?) to at most (.+)$"), lambda gp: _vc_range(_num(gp[0]), _num(gp[1]))),
+    (re.compile(r"^at least (.+?) (?:to|and) below (.+)$"), lambda gp: _vc_range(_num(gp[0]), _num(gp[1]), hi_open=True)),
+    (re.compile(r"^above (.+?) to at most (.+)$"), lambda gp: _vc_range(_num(gp[0]), _num(gp[1]), lo_open=True)),
+    (re.compile(r"^above (.+?) (?:to|and) below (.+)$"), lambda gp: _vc_range(_num(gp[0]), _num(gp[1]), lo_open=True, hi_open=True)),
+    (re.compile(r"^at least (.+)$"), lambda gp: _vc_range(lo=_num(gp[0]))),
+    (re.compile(r"^above (.+)$"), lambda gp: _vc_range(lo=_num(gp[0]), lo_open=True)),
+    (re.compile(r"^at most (.+)$"), lambda gp: _vc_range(hi=_num(gp[0]))),
+    (re.compile(r"^below (.+)$"), lambda gp: _vc_range(hi=_num(gp[0]), hi_open=True)),
 ]
 
 
@@ -715,11 +724,15 @@ def _enum_member(v):
     return _num(v)
 
 
-def _value_constraint(spec):
+def _value_spec(spec):
+    """A value spec -> ⟨builder_name, operand⟩ (the string boundary: the pattern table
+    picks the range shape, else the enumeration). The chosen builder applies through
+    DEFS in the handler/canon — one parse, both consumers."""
     spec = spec.strip()
     hit = next(((pat.match(spec), build) for pat, build in _VALUE_SPECS if pat.match(spec)), None)
     return hit[1](hit[0].groups()) if hit else \
-        C.value_enumeration(1, tuple(_enum_member(v) for v in re.split(r",| and ", spec) if v.strip()))
+        ("constraints:value_enumeration",
+         (1, tuple(_enum_member(v) for v in re.split(r",| and ", spec) if v.strip())))
 
 
 # ---- planning: (kind, groups, modality) + known → (assertions, constraints) ----
@@ -755,9 +768,14 @@ def _h_meta(cell):
     return lambda g, k, m: ([(cell, (g[0],))], [])             # data_type / ref_mode metadata
 
 def _h_value_constraint(g, k, m):
-    # enforced BOTH as a named object and on the value type's own cell (validate_for kind 'value')
-    return [("valueConstraint", (g[0], g[1], m)), ("constraint", (g[0] + "_vc", "value", g[0], m))], \
-        [(g[0] + "_vc", _value_constraint(g[1]))]
+    # #18: g arrives COOKED — ⟨name, spec, cid, builder_name, operand⟩ (the spec parse is
+    # the boundary's). Enforced BOTH as a named object and on the value type's own cell
+    # (validate_for kind 'value'); pure assembly + the canonical builder through DEFS.
+    from .reduce import apply as _apply
+    from .lam import atom as _A
+    name, spec, cid, builder, bop = g
+    return [("valueConstraint", (name, spec, m)), ("constraint", (cid, "value", name, m))], \
+        [(cid, _apply(_A(builder), to_lam(bop)))]
 
 
 def _mandatory_parts(ft, subject, m, pos=1):
@@ -868,26 +886,26 @@ def _h_for_each_mandatory(g, k, m):
 
 
 def _h_frequency(g, k, m):
-    template, rtypes = _reading(g[0], k)                       # resolve the population's reading
-    ftn = _ftid_from(template, rtypes)
-    names = [s.strip() for s in g[1].split(",")]
-    roles = [rtypes.index(nm) + 1 for nm in names if nm in rtypes] or [1]
-    n = int(g[3])
-    lo, hi = {"at most": (None, n), "at least": (n, None), "exactly": (n, n)}[g[2]]
-    cid = ftn + "_freq"
+    # #18: g arrives COOKED — ⟨cid, ft, roles, builder_operand⟩; the reading resolution,
+    # role-name lookup, and bound encoding (absent = the empty sequence, the canonical
+    # optionality) all happen at the boundary. The handler is pure assembly + the
+    # canonical builder applied through DEFS — the same reduction system:h_frequency runs.
+    from .reduce import apply as _apply
+    from .lam import atom as _A
+    cid, ftn, roles, bop = g
     return [("constraint", (cid, "frequency", ftn, m))] + [("spans", (cid, p)) for p in roles], \
-        [(cid, C.frequency(roles, lo, hi))]
-
-
-_RING_BUILDERS = {"irreflexive": C.ring_irreflexive, "symmetric": C.ring_symmetric,
-                  "asymmetric": C.ring_asymmetric, "antisymmetric": C.ring_antisymmetric,
-                  "intransitive": C.ring_intransitive, "acyclic": C.ring_acyclic}
+        [(cid, _apply(_A("constraints:frequency"), to_lam(bop)))]
 
 
 def _h_ring(g, k, m):
-    ft, facts = _fact_type(g[0], k)
-    cid = ft + "_ring_" + g[1]
-    return facts + [("constraint", (cid, "ring_" + g[1], ft, m))], [(cid, _RING_BUILDERS[g[1]]())]
+    # #18: g arrives COOKED — ⟨decl_rows, cid, kind_tag, ft, builder_name⟩ (all the
+    # text->X resolution at the boundary); the handler is pure assembly + the canonical
+    # builder applied through DEFS, the same reduction system:h_ring performs.
+    from .reduce import apply as _apply
+    from .lam import atom as _A
+    decl, cid, kind, ft, builder = g
+    return list(decl) + [("constraint", (cid, kind, ft, m))], \
+        [(cid, _apply(_A(builder), to_lam((1, 2))))]
 
 
 def _h_subtype(g, k, m):
@@ -1812,9 +1830,40 @@ _PLAN = {
 # stays the pure ⟨groups, known, mod⟩ -> ⟨rows, phi⟩ object the canon defines. The SM
 # trigger/guard clause resolves reading -> fact-type id here (the sm_rows doctrine:
 # literals arrive RESOLVED; the resolution is the boundary's step, not the object's).
+def _cook_ring(g, k):
+    """ring: resolve the reading -> ⟨decl_rows, cid, kind_tag, ft, builder_name⟩ so the
+    translator is pure assembly + (builder : roles) through DEFS (the constraint objects
+    are already canon applications — C.ring_* = apply(constraints:ring_*, roles))."""
+    ft, decl = _fact_type(g[0], k)
+    return (tuple(decl), ft + "_ring_" + g[1], "ring_" + g[1], ft,
+            "constraints:ring_" + g[1])
+
+
+def _cook_frequency(g, k):
+    """frequency: resolve the reading + role names -> ⟨cid, ft, roles, builder_operand⟩;
+    the operand carries the bounds in the canonical optional encoding (absent = ())."""
+    template, rtypes = _reading(g[0], k)
+    ftn = _ftid_from(template, rtypes)
+    names = [s.strip() for s in g[1].split(",")]
+    roles = tuple(rtypes.index(nm) + 1 for nm in names if nm in rtypes) or (1,)
+    n = int(g[3])
+    lo, hi = {"at most": ((), (n,)), "at least": ((n,), ()),
+              "exactly": ((n,), (n,))}[g[2]]
+    return (ftn + "_freq", ftn, roles, (roles, lo, hi))
+
+
+def _cook_value_constraint(g, k):
+    """value constraint: parse the spec -> ⟨name, spec, cid, builder_name, operand⟩."""
+    builder, bop = _value_spec(g[1])
+    return (g[0], g[1], g[0] + "_vc", builder, bop)
+
+
 _COOK = {
     "sm_trigger": lambda g, k: (g[0], _clause_ft(g[1], k)),
     "sm_guard": lambda g, k: (g[0], _clause_ft(g[1], k)),
+    "ring": _cook_ring,
+    "frequency": _cook_frequency,
+    "value_constraint": _cook_value_constraint,
 }
 
 
