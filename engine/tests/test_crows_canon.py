@@ -73,6 +73,22 @@ def test_crows_uniqueness_obj_extensional():
     assert c_ans, "the duplicated key must be flagged (non-vacuous)"
 
 
+def test_crows_nullary_obj_two_mode():
+    # an EMPTY operand = a nullary builder: the canon emits the NAME ATOM (DEFS-resolved
+    # at use — the universal interface), the host resolves the same table eagerly;
+    # certified extensionally: both flag the entity participating in two clauses
+    g = ((), (("w", ("constraint", ("x1", "exclusion", "N", ("A", "B"), "alethic"))),),
+         (("x1", "constraints:exclusion", ()),))
+    cobjs = _canon("system:h_crows", g)[1]
+    hobjs = _host(g)[1]
+    assert from_lam(R(A(1), R(A(1), cobjs))) == hobjs[0][0] == "x1"
+    pop = (("e1", "A"), ("e1", "B"), ("e2", "A"))
+    c_ans = from_lam(R(R(A(2), R(A(1), cobjs)), to_lam(pop)))
+    h_ans = from_lam(R(hobjs[0][1], to_lam(pop)))
+    assert c_ans == h_ans
+    assert c_ans, "the double-participating entity must be flagged (non-vacuous)"
+
+
 def test_crows_cooks():
     # the cooks produce the crows shape from raw production groups
     class K2(set):

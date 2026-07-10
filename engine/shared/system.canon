@@ -5550,7 +5550,10 @@ DEF("system:h_crows",
                     S3(A("COMP"), N(2), N(1)))),
                 S3(A("COMP"), A("distr"), S3(A("CONS"), S3(A("COMP"), N(2), N(1)), N(3)))))),
        S3(A("COMP"),
-          S2(A("ALPHA"), S3(A("CONS"), N(1), S3(A("COMP"), A("apply"), S3(A("CONS"), N(2), N(3))))),
+          S2(A("ALPHA"), S4(A("COND"),
+              S3(A("COMP"), A("null"), N(3)),
+              S3(A("CONS"), N(1), N(2)),
+              S3(A("CONS"), N(1), S3(A("COMP"), A("apply"), S3(A("CONS"), N(2), N(3)))))),
           S3(A("COMP"), N(3), N(1))))),
 
 DEF("system:h_uniqueness", A("system:h_crows")),
@@ -5578,6 +5581,16 @@ DEF("system:h_fact_type_reading", A("system:h_crows")),
 DEF("system:h_derivation_rule", A("system:h_crows")),
 
 DEF("system:h_class_rule", A("system:h_crows")),
+
+"THE TWO-MODE OBJ MAPPER + THE SET-COMPARISON FAMILY (2026-07-10, #18): h_crows' obj mapper gained the NULLARY mode — an EMPTY operand means the builder takes no arguments, and the emitted object is THE NAME ATOM ITSELF, resolved through DEFS at use (an atom in operator position is rho(name): the universal interface IS the reference; the host override resolves the same table eagerly, certified extensionally). With it the set-comparison family (set_comparison, disjunctive_mandatory, equality, neg_pair) rides h_crows: cs_rows answers the A-row and attach rows as before, and the boundary specs each attach's builder ⟨cid, name, operand⟩ — scoped_* with their operands, the top-level exclusion/exclusive_or/inclusive_or as nullary names.",
+
+DEF("system:h_set_comparison", A("system:h_crows")),
+
+DEF("system:h_disjunctive_mandatory", A("system:h_crows")),
+
+DEF("system:h_equality", A("system:h_crows")),
+
+DEF("system:h_neg_pair", A("system:h_crows")),
 
 "THE VALUE-CONSTRAINT READING TRANSLATOR AS DATA (2026-07-10, #18): cooked groups ⟨name, spec, cid, builder_name, operand⟩ — the spec parse (the VALUE_SPECS pattern table + the enumeration fallback) is the string boundary, and the chosen canonical builder (constraints:value_range / constraints:value_enumeration) rides as a NAME the translator applies through DEFS. Two rows (the valueConstraint reading row keeping the spec text + the constraint row on the value type's own cell) and one obj ⟨cid, (builder : operand)⟩. Host _h_value_constraint is the certified-equal override (test_value_constraint_canon, extensional on the obj).",
 

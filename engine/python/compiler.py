@@ -799,7 +799,11 @@ def _h_crows(g, k, m):
     rows = [(c, tuple(r)) for c, r in decl] + \
         [("constraint", tuple(p) + (m,)) if t == "c" else (p[0], tuple(p[1]))
          for t, p in mid]
-    return rows, [(cid, _apply(_A(b), to_lam(op))) for cid, b, op in ospecs]
+    # TWO-MODE objs: an empty operand means the builder is NULLARY — the NAME is the
+    # object (the canon twin emits the name atom, DEFS-resolved at use: the universal
+    # interface; this host resolves it eagerly via the same table the canon reads).
+    return rows, [(cid, (C._canon_c(b) if op == () else _apply(_A(b), to_lam(op))))
+                  for cid, b, op in ospecs]
 
 
 _h_uniqueness = _h_crows
@@ -933,36 +937,52 @@ _CS_PREFIX = {"disjunctive_mandatory": "ior_", "subset": "subset_",
 
 
 def _cs_call(kind, subj, clause_fts, raws, m):
+    """The set-comparison family through the crows path: cs_rows answers the A-row and
+    the attach rows (canon); the cid minting ([:40] prefix policy, 'no take prim joins
+    the kernel for cosmetics') and the per-attach builder operands are the boundary's.
+    Nullary top-level builders spec operand () — the NAME is the object."""
+    a, o = _h_crows(_cook_cs(kind, subj, clause_fts, raws), None, m)
+    return a, o
+
+
+_CS_SPEC = {
+    "exclusion": lambda arow, clauses, ft: ("constraints:exclusion", ()),
+    "exclusive_or": lambda arow, clauses, ft: ("constraints:exclusive_or", ()),
+    "inclusive_or": lambda arow, clauses, ft: ("constraints:inclusive_or", ()),
+    "scoped_exclusion":
+        lambda arow, clauses, ft: ("constraints:scoped_exclusion", (clauses, ft)),
+    "scoped_exclusive_or":
+        lambda arow, clauses, ft: ("constraints:scoped_exclusive_or",
+                                   (arow[3], clauses, ft)),
+    "scoped_inclusive_or":
+        lambda arow, clauses, ft: ("constraints:scoped_inclusive_or",
+                                   (arow[3], clauses, ft)),
+    "scoped_subset": lambda arow, clauses, ft: ("constraints:scoped_subset", arow[4]),
+    "scoped_equality_side":
+        lambda arow, clauses, ft: ("constraints:scoped_equality_side", ft),
+}
+
+
+def _cook_cs(kind, subj, clause_fts, raws):
     from .reduce import apply as _apply
     from .lam import atom as _A, from_lam as _fl
     rows = _fl(_apply(_A("system:cs_rows"),
-                      to_lam((kind, subj, tuple(clause_fts), tuple(raws), m))))
+                      to_lam((kind, subj, tuple(clause_fts), tuple(raws), ""))))
     arow, attaches = rows[0], rows[1:]
     cid = arow[1]
     pre = _CS_PREFIX.get(kind, "")
     minted = pre + cid[len(pre):][:40] if pre else cid
     clauses = tuple(arow[4]) if isinstance(arow[4], tuple) else arow[4]
-    A_ = [("constraint", (minted, arow[2], arow[3], clauses, arow[5]))]
-    build = {
-        "exclusion": lambda ft: C.exclusion(),
-        "exclusive_or": lambda ft: C.exclusive_or(),
-        "inclusive_or": lambda ft: C.inclusive_or(),
-        "scoped_exclusion": lambda ft: C.scoped_exclusion(clauses, ft),
-        "scoped_exclusive_or":
-            lambda ft: C.scoped_exclusive_or(arow[3], clauses, ft),
-        "scoped_inclusive_or":
-            lambda ft: C.scoped_inclusive_or(arow[3], clauses, ft),
-        "scoped_subset": lambda ft: C.scoped_subset(arow[4]),
-        "scoped_equality_side": lambda ft: C.scoped_equality_side(ft),
-    }
-    objs = []
+    mid = (("c", (minted, arow[2], arow[3], clauses)),)
+    ospecs = []
     for (_tag, cell, builder) in attaches:
         ft = cell.split("@", 1)[1] if "@" in cell else None
         if builder == "scoped_equality_side":
             # the _a side checks against B, the _b side against A
             ft = arow[4] if cell.endswith("_a") else arow[3]
-        objs.append((cell.replace(cid, minted, 1), build[builder](ft)))
-    return A_, objs
+        b, op = _CS_SPEC[builder](arow, clauses, ft)
+        ospecs.append((cell.replace(cid, minted, 1), b, op))
+    return ((), mid, tuple(ospecs))
 
 
 def _h_set_comparison(g, k, m):
@@ -1219,26 +1239,7 @@ def _A2():
     return _A(2)
 
 
-def _h_neg_pair(g, k, m):
-    """NORMA's unary negation pattern (UnaryValuePattern.Negation, FactType.cs): 'X is
-    not R.' / 'X does not R.' creates the PAIRED positive-shaped negation fact type,
-    linked by negOf, with the pair exclusion auto-asserted (nothing is both). Negative
-    information is stored as ordinary monotone facts, so the substrate stays CALM; the
-    closed world is the ordinary disjunctive-mandatory over the pair, and defaults are
-    read-time (docs/2026-07-02-negation-model.md)."""
-    subj, mode, rest = g
-    if subj not in k:
-        return _h_crows(_cook_fact((f"{subj} {mode} {rest}",), k), k, m)  # unknown subject: plain reading
-    pos_read = f"{subj} is {rest}" if mode == "is not" else f"{subj} {_conj(rest)}"
-    pos, decl_p = _fact_type(pos_read, k)
-    neg, decl_n = _fact_type(f"{subj} {mode} {rest}", k)
-    cid = "negx_" + neg[:40]
-    pair = (pos, neg)
-    A_ = decl_p + decl_n + [("negOf", (neg, pos)),
-                            ("constraint", (cid, "exclusion", neg, pair, "alethic"))]
-    objs = [(cid, C.exclusion())] + \
-           [(cid + "@" + ft, C.scoped_exclusion(pair, ft)) for ft in pair]
-    return A_, objs
+_h_neg_pair = _h_crows
 
 def _h_possibility(g, k, m):
     return [("possibility", (g[0][:80], m))], []
@@ -1858,6 +1859,29 @@ def _cook_derivation_rule(g, k):
     return (tuple(rows), (), ospecs)
 
 
+def _cook_neg_pair(g, k):
+    """NORMA's unary negation pattern (UnaryValuePattern.Negation, FactType.cs): 'X is
+    not R.' / 'X does not R.' creates the PAIRED positive-shaped negation fact type,
+    linked by negOf, with the pair exclusion auto-asserted (nothing is both). Negative
+    information is stored as ordinary monotone facts, so the substrate stays CALM; the
+    closed world is the ordinary disjunctive-mandatory over the pair, and defaults are
+    read-time (docs/2026-07-02-negation-model.md). The pair exclusion is the NULLARY
+    top-level builder — operand (), the name is the object."""
+    subj, mode, rest = g
+    if subj not in k:
+        return _cook_fact((f"{subj} {mode} {rest}",), k)      # unknown subject: plain reading
+    pos_read = f"{subj} is {rest}" if mode == "is not" else f"{subj} {_conj(rest)}"
+    pos, decl_p = _fact_type(pos_read, k)
+    neg, decl_n = _fact_type(f"{subj} {mode} {rest}", k)
+    cid = "negx_" + neg[:40]
+    pair = (pos, neg)
+    decl = tuple(decl_p) + tuple(decl_n) + (("negOf", (neg, pos)),)
+    mid = (("w", ("constraint", (cid, "exclusion", neg, pair, "alethic"))),)
+    ospecs = ((cid, "constraints:exclusion", ()),) + tuple(
+        (cid + "@" + ft, "constraints:scoped_exclusion", (pair, ft)) for ft in pair)
+    return (decl, mid, ospecs)
+
+
 def _cook_class_rule(g, k):
     """The grammar-as-readings recognizer form (forml2-grammar.md): 'Statement has
     Classification C iff Statement has Field ⟨lit⟩ [and …]' compiles into an ordinary
@@ -1967,6 +1991,7 @@ _COOK = {
     "fact_type_reading": _cook_fact,
     "derivation_rule": _cook_derivation_rule,
     "class_rule": _cook_class_rule,
+    "neg_pair": _cook_neg_pair,
 }
 
 
