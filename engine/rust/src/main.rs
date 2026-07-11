@@ -4097,16 +4097,17 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
 //   (d) the dispatch loop     — Classification_has_Translator rows name the
 //       translators; each dispatches through the reducer (rho): reduce_over over
 //       ⟨inner, mfield, ctx, D⟩, the direct analog of python _apply(_A(t), operand)
-// NOT YET NATIVE (the skeleton's honest gaps, reported in the answer's "missing"):
-//   - the grammar store: python classifies over grammar_D() (the ingested
-//     shared/forml2-grammar.md, frozen-thawed); the skeleton classifies over the
-//     RESIDENT store and so answers real classifications only when the caller
-//     loaded the compiled grammar (classLit + recognizer rules + the dispatch
-//     table resident). Thawing the frozen grammar sidecar into a scratch Srv is
-//     the wiring step this skeleton stops short of.
-//   - the prepass context: _known + _prepass_context (names, subtype closure,
-//     fact-type slugs, plain readings) are not ported; nouns ride empty, so
-//     Statement_has_Role_Reference rows are absent and ctx is four empty seqs.
+// NATIVE SINCE THE SKELETON (driver slice 2):
+//   - the grammar store (gap 1): grammar_D()'s resident equivalent — when the
+//     resident store lacks the grammar cells (the classLit probe), the compiled
+//     grammar THAWS from a serve-protocol sidecar (grammar_sidecar op arg, else
+//     <root>/shared/forml2-grammar.store.json walking up from the exe) into the
+//     classification SCRATCH; the resident store never becomes the grammar.
+//   - the prepass context (gap 2): _known + _prepass_context + _context_of
+//     ported whole (the seed classifier's pattern table hand-rolled below), so
+//     nouns carry the known names into Stage-1 (Statement_has_Role_Reference)
+//     and ctx carries ⟨names, subtype closure, fact-type slugs, plain⟩.
+// NOT YET NATIVE (the honest gaps, reported in the answer's "missing"):
 //   - the model D: python seeds meta.initial_D() (the process seed); the
 //     skeleton threads an EMPTY store.
 //   - the translator BODIES: host closures in python (_stmt_translator_impl,
@@ -4330,6 +4331,1120 @@ fn translator_kinds(t: &str) -> &'static [&'static str] {
     }
 }
 
+// ======================= the prepass context (gap 2) ==========================
+// _known + _prepass_context + _context_of (compiler.py:529/416/404) ported
+// whole, with their dependency chain: the SEED classifier's ordered pattern
+// table (_CLASSIFY, compiler.py:253 — every regex hand-rolled, zero-dep),
+// _implicit_nouns, _prose_suspect, _strip_derivation, and the reading
+// machinery _reading/_ftid_from/_atomic_run_guard (the certified-equal host
+// override of system:reading_parse/ftid, test_reading_canon). The prepass
+// feeds classification (nouns → Statement_has_Role_Reference field facts)
+// and the translator operand's ctx (names, subtype closure, fact-type slugs,
+// plain readings).
+
+// split at the FIRST separator occurrence leaving both sides nonempty — the
+// lazy-group split (.+?)SEP(.+): regex backtracking skips an occurrence whose
+// left side is empty, so the scan continues instead of failing
+fn split_first<'a>(s: &'a str, sep: &str) -> Option<(&'a str, &'a str)> {
+    for (p, _) in s.match_indices(sep) {
+        let (a, b) = (&s[..p], &s[p + sep.len()..]);
+        if !a.is_empty() && !b.is_empty() {
+            return Some((a, b));
+        }
+    }
+    None
+}
+
+// split at the LAST such occurrence — the greedy-group split (.+)SEP(.+)
+fn split_last<'a>(s: &'a str, sep: &str) -> Option<(&'a str, &'a str)> {
+    let hits: Vec<usize> = s.match_indices(sep).map(|(p, _)| p).collect();
+    for p in hits.into_iter().rev() {
+        let (a, b) = (&s[..p], &s[p + sep.len()..]);
+        if !a.is_empty() && !b.is_empty() {
+            return Some((a, b));
+        }
+    }
+    None
+}
+
+// analyze()'s annotation strip (compiler.py:353): a TRAILING parenthetical is
+// an annotation, not sentence content — re.sub(r"\s*\([^()]*\)\.$", ".", s)
+fn strip_annotation(stmt: &str) -> String {
+    let body = match stmt.strip_suffix('.') {
+        Some(b) => b,
+        None => return stmt.to_string(),
+    };
+    if !body.ends_with(')') {
+        return stmt.to_string();
+    }
+    // the nearest paren before the closer must be the opener (no nesting)
+    match body[..body.len() - 1].rfind(|c| c == '(' || c == ')') {
+        Some(i) if body.as_bytes()[i] == b'(' => {
+            format!("{}.", body[..i].trim_end())
+        }
+        _ => stmt.to_string(),
+    }
+}
+
+// quote parity: '[^']*' pairs quotes sequentially, so a position is OUTSIDE
+// literals exactly when an even number of quotes precede it
+fn quote_positions(s: &str) -> Vec<usize> {
+    s.match_indices('\'').map(|(p, _)| p).collect()
+}
+
+fn even_before(qs: &[usize], p: usize) -> bool {
+    qs.iter().filter(|&&q| q < p).count() % 2 == 0
+}
+
+// _QUOTED_SPAN.sub(repl, s): every 'span' replaces with repl, quotes pairing
+// sequentially, an unpaired trailing quote left verbatim
+fn blank_spans(s: &str, repl: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    loop {
+        match rest.find('\'') {
+            None => {
+                out.push_str(rest);
+                break;
+            }
+            Some(a) => match rest[a + 1..].find('\'') {
+                None => {
+                    out.push_str(rest);
+                    break;
+                }
+                Some(b) => {
+                    out.push_str(&rest[..a]);
+                    out.push_str(repl);
+                    rest = &rest[a + 1 + b + 1..];
+                }
+            },
+        }
+    }
+    out
+}
+
+// entity_type / value_type: ^(.+?)(?:\(\.(.+)\))? SUFFIX$ — lazy head, an
+// optional (.RefMode) parenthetical peeled when it directly abuts the suffix
+fn cls_entity_like(s: &str, suffix: &str) -> Option<Vec<String>> {
+    let head = s.strip_suffix(suffix)?;
+    if head.is_empty() {
+        return None;
+    }
+    if head.ends_with(')') {
+        for (p, _) in head.match_indices("(.") {
+            if p >= 1 && p + 2 < head.len() - 1 {
+                return Some(vec![
+                    head[..p].to_string(),
+                    head[p + 2..head.len() - 1].to_string(),
+                ]);
+            }
+        }
+    }
+    Some(vec![head.to_string()])
+}
+
+// the sm_* family: ^PFX'(.+)'MID'(.+)'\.$ — existence only (no prepass groups)
+fn sm_two(s: &str, pfx: &str, mid: &str) -> bool {
+    match s.strip_prefix(pfx).and_then(|b| b.strip_suffix("'.")) {
+        Some(body) => split_first(body, mid).is_some(),
+        None => false,
+    }
+}
+
+// ^[Ff]or each (.+?), it is impossible that that .+? (.+)MID(.+)\.$ —
+// the negative-form recognizers (existence only)
+fn impossible_that_that(s: &str, mid: &str) -> bool {
+    for pfx in ["For each ", "for each "] {
+        let body = match s.strip_prefix(pfx).and_then(|b| b.strip_suffix('.')) {
+            Some(b) => b,
+            None => continue,
+        };
+        for (p, _) in body.match_indices(", it is impossible that that ") {
+            if p == 0 {
+                continue;
+            }
+            let r = &body[p + 29..];
+            for (m, _) in r.match_indices(mid) {
+                if r[m + mid.len()..].is_empty() {
+                    continue;
+                }
+                // ^.+? (.+)MID: a space with ≥1 char before it and ≥1 after
+                if r[..m].match_indices(' ').any(|(a, _)| a >= 1 && a + 1 < m) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+// class_rule: ^(?![*+])(\S[^']*?) has (\S[^']*?) '(.+?)' iff (.+)\.$ —
+// existence only, with the lazy groups' full backtracking order
+fn cls_class_rule(s: &str) -> bool {
+    if s.starts_with('*') || s.starts_with('+') {
+        return false;
+    }
+    let body = match s.strip_suffix('.') {
+        Some(b) => b,
+        None => return false,
+    };
+    for (p, _) in body.match_indices(" has ") {
+        let g0 = &body[..p];
+        if g0.is_empty()
+            || g0.chars().next().map_or(true, |c| c.is_whitespace())
+            || g0.chars().skip(1).any(|c| c == '\'')
+        {
+            continue;
+        }
+        let right = &body[p + 5..];
+        for (q, _) in right.match_indices(" '") {
+            let g1 = &right[..q];
+            if g1.is_empty()
+                || g1.chars().next().map_or(true, |c| c.is_whitespace())
+                || g1.chars().skip(1).any(|c| c == '\'')
+            {
+                continue;
+            }
+            let rest = &right[q + 2..];
+            for (r, _) in rest.match_indices("' iff ") {
+                if r >= 1 && !rest[r + 6..].is_empty() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+// rule_if: ^(?![*+])(quote-aware*?\d\S*quote-aware*?) iff? (.+)\.$ — the head
+// carries a digit OUTSIDE literals; the keyword boundary sits at/after the
+// digit token's end, outside literals, earliest first. (The corner where the
+// digit's own token carries quotes — \S* eating a lone quote — is accepted as
+// a delta; no corpus rule head does.) Answers the head group.
+fn cls_rule_if(s: &str) -> Option<Vec<String>> {
+    if s.starts_with('*') || s.starts_with('+') || !s.ends_with('.') {
+        return None;
+    }
+    let qs = quote_positions(s);
+    let mut d: Option<usize> = None;
+    for (i, b) in s.bytes().enumerate() {
+        if b.is_ascii_digit() && even_before(&qs, i) {
+            d = Some(i);
+            break;
+        }
+    }
+    let d = d?;
+    let mut e = s.len();
+    for (i, c) in s.char_indices() {
+        if i > d && c.is_whitespace() {
+            e = i;
+            break;
+        }
+    }
+    let mut cands: Vec<(usize, usize)> = Vec::new();
+    for (p, _) in s.match_indices(" iff ") {
+        if p >= e && even_before(&qs, p) {
+            cands.push((p, 5));
+        }
+    }
+    for (p, _) in s.match_indices(" if ") {
+        if p >= e && even_before(&qs, p) {
+            cands.push((p, 4));
+        }
+    }
+    cands.sort();
+    for (p, kw) in cands {
+        let tail = &s[p + kw..];
+        if tail.len() >= 2 && tail.ends_with('.') {
+            return Some(vec![s[..p].to_string()]);
+        }
+    }
+    None
+}
+
+// rule_iff: ^(?:([*+]{1,2}) )?(quote-aware*?) iff (.+)\.$ — optional NORMA
+// storage marker (greedy: two chars, then one, then none), quote-aware head
+// (possibly empty), earliest outside-literals " iff ". Answers ⟨marker, head⟩.
+fn cls_rule_iff(s: &str) -> Option<Vec<String>> {
+    if !s.ends_with('.') {
+        return None;
+    }
+    let b = s.as_bytes();
+    let marker_at = |n: usize| -> bool {
+        s.len() > n
+            && b[..n].iter().all(|c| *c == b'*' || *c == b'+')
+            && b[n] == b' '
+    };
+    let mut starts: Vec<usize> = Vec::new();
+    if s.len() > 2 && marker_at(2) {
+        starts.push(3);
+    }
+    if s.len() > 1 && marker_at(1) {
+        starts.push(2);
+    }
+    starts.push(0);
+    for off in starts {
+        let body = &s[off..];
+        let qs = quote_positions(body);
+        for (p, _) in body.match_indices(" iff ") {
+            if !even_before(&qs, p) {
+                continue;
+            }
+            let tail = &body[p + 5..];
+            if tail.len() >= 2 && tail.ends_with('.') {
+                let marker = if off > 0 { &s[..off - 1] } else { "" };
+                return Some(vec![marker.to_string(), body[..p].to_string()]);
+            }
+        }
+    }
+    None
+}
+
+// subset_trailing: ^(?![*+])(quote-aware+?) if (quote-aware+)\.$ — existence
+fn cls_subset_trailing(s: &str) -> bool {
+    if s.starts_with('*') || s.starts_with('+') || !s.ends_with('.') {
+        return false;
+    }
+    let qs = quote_positions(s);
+    for (p, _) in s.match_indices(" if ") {
+        if p >= 1 && even_before(&qs, p) {
+            let tail = &s[p + 4..s.len() - 1];
+            if !tail.is_empty() && quote_positions(tail).len() % 2 == 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// frequency: ^[Ii]n each population of (.+), each (.+) combination occurs
+// (at most|at least|exactly) (\d+) times?\.$ — existence, parsed off the tail
+fn cls_frequency(s: &str) -> bool {
+    for pfx in ["In each population of ", "in each population of "] {
+        let body = match s.strip_prefix(pfx).and_then(|t| t.strip_suffix('.')) {
+            Some(t) => t,
+            None => continue,
+        };
+        let body = match body.strip_suffix("times").or_else(|| body.strip_suffix("time")) {
+            Some(t) => t,
+            None => continue,
+        };
+        let body = match body.strip_suffix(' ') {
+            Some(t) => t,
+            None => continue,
+        };
+        let trimmed = body.trim_end_matches(|c: char| c.is_ascii_digit());
+        if trimmed.len() == body.len() {
+            continue; // (\d+) needs at least one digit
+        }
+        let body = match trimmed.strip_suffix(' ') {
+            Some(t) => t,
+            None => continue,
+        };
+        let body = match ["at most", "at least", "exactly"]
+            .iter()
+            .find_map(|kw| body.strip_suffix(kw))
+        {
+            Some(t) => t,
+            None => continue,
+        };
+        let body = match body.strip_suffix(" combination occurs ") {
+            Some(t) => t,
+            None => continue,
+        };
+        if split_first(body, ", each ").is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+// brace_subtypes: ^\{(.+)\} are (mutually exclusive )?subtypes of (.+)\.$
+fn cls_brace_subtypes(s: &str) -> Option<Vec<String>> {
+    let t = s.strip_prefix('{')?.strip_suffix('.')?;
+    let hits: Vec<usize> = t.match_indices("} are ").map(|(p, _)| p).collect();
+    for p in hits.into_iter().rev() {
+        let g0 = &t[..p];
+        if g0.is_empty() {
+            continue;
+        }
+        let mut rest = &t[p + 6..];
+        let mut g1 = "";
+        if let Some(r2) = rest.strip_prefix("mutually exclusive ") {
+            g1 = "mutually exclusive ";
+            rest = r2;
+        }
+        if let Some(g2) = rest.strip_prefix("subtypes of ") {
+            if !g2.is_empty() {
+                return Some(vec![g0.to_string(), g1.to_string(), g2.to_string()]);
+            }
+        }
+    }
+    None
+}
+
+// The seed classifier over the modality-stripped inner statement: the FULL
+// _CLASSIFY table (compiler.py:253) in its exact arbitration order — an
+// earlier pattern's claim never reaches a later one. Groups are extracted
+// only for the kinds the prepass consumes; recognition-only kinds answer
+// empty groups (the prepass has no branch for them).
+fn classify_inner(s: &str) -> (&'static str, Vec<String>) {
+    if let Some(g) = cls_entity_like(s, " is an entity type.") {
+        return ("entity_type", g);
+    }
+    if let Some(g) = cls_entity_like(s, " is a value type.") {
+        return ("value_type", g);
+    }
+    if let Some(body) = s.strip_prefix("Reference Scheme: ").and_then(|b| b.strip_suffix('.')) {
+        if let Some((a, b)) = split_last(body, " has ") {
+            return ("ref_scheme", vec![a.to_string(), b.to_string()]);
+        }
+    }
+    if let Some(body) = s.strip_prefix("Reference Mode: ").and_then(|b| b.strip_suffix('.')) {
+        if !body.is_empty() {
+            return ("ref_mode", Vec::new());
+        }
+    }
+    if let Some(body) = s.strip_prefix("Data Type: ").and_then(|b| b.strip_suffix('.')) {
+        if !body.is_empty() {
+            return ("data_type", Vec::new());
+        }
+    }
+    for (kind, pfx, mid) in [
+        ("sm_def", "State Machine Definition '", "' is for Noun '"),
+        ("sm_initial", "Status '", "' is initial in State Machine Definition '"),
+        ("sm_from", "Transition '", "' is from Status '"),
+        ("sm_to", "Transition '", "' is to Status '"),
+        ("sm_trigger", "Transition '", "' is triggered by Fact Type '"),
+        ("sm_guard", "Transition '", "' is guarded by Fact Type '"),
+        ("sm_emit", "Transition '", "' emits '"),
+        ("sm_moore", "Status '", "' emits '"),
+    ] {
+        if sm_two(s, pfx, mid) {
+            return (kind, Vec::new());
+        }
+    }
+    for pfx in [
+        "The possible values of ",
+        "the possible values of ",
+        "The possible value of ",
+        "the possible value of ",
+    ] {
+        if let Some(body) = s.strip_prefix(pfx).and_then(|b| b.strip_suffix('.')) {
+            if split_first(body, " are ").is_some() || split_first(body, " is ").is_some() {
+                return ("value_constraint", Vec::new());
+            }
+        }
+    }
+    for pfx in ["In each population of ", "in each population of "] {
+        if let Some(body) = s
+            .strip_prefix(pfx)
+            .and_then(|b| b.strip_suffix(" combination occurs at most once."))
+        {
+            if split_first(body, ", each ").is_some() {
+                return ("spanning_uc", Vec::new());
+            }
+        }
+    }
+    for pfx in ["Each ", "each "] {
+        if let Some(body) = s.strip_prefix(pfx).and_then(|b| b.strip_suffix('.')) {
+            if split_first(body, " combination occurs at most once in the population of ")
+                .is_some()
+            {
+                return ("spanning_uc2", Vec::new());
+            }
+        }
+    }
+    if let Some(body) = s.strip_prefix("For each ").and_then(|b| b.strip_suffix('.')) {
+        if split_first(body, ", some ").is_some() {
+            return ("for_each_mandatory", Vec::new());
+        }
+    }
+    if cls_frequency(s) {
+        return ("frequency", Vec::new());
+    }
+    for w in [
+        "acyclic", "asymmetric", "antisymmetric", "intransitive", "irreflexive", "symmetric",
+    ] {
+        if let Some(head) = s.strip_suffix(&format!(" is {}.", w)) {
+            if !head.is_empty() {
+                return ("ring", Vec::new());
+            }
+        }
+    }
+    if let Some(body) = s.strip_suffix('.') {
+        if let Some((a, b)) = split_last(body, " is a subtype of ") {
+            return ("subtype_of", vec![a.to_string(), b.to_string()]);
+        }
+    }
+    if let Some(g) = cls_brace_subtypes(s) {
+        return ("brace_subtypes", g);
+    }
+    for pfx in ["This association with ", "this association with "] {
+        if let Some(body) = s.strip_prefix(pfx).and_then(|b| b.strip_suffix('.')) {
+            if let Some((a, b)) =
+                split_last(body, " provides the preferred identification scheme for ")
+            {
+                return ("objectification", vec![a.to_string(), b.to_string()]);
+            }
+        }
+    }
+    for pfx in ["For each ", "for each "] {
+        if let Some(body) = s.strip_prefix(pfx).and_then(|b| b.strip_suffix('.')) {
+            if split_first(body, ", exactly one of the following holds: ").is_some()
+                || split_first(body, ", at most one of the following holds: ").is_some()
+            {
+                return ("set_comparison", Vec::new());
+            }
+        }
+    }
+    if impossible_that_that(s, " more than one ") {
+        return ("neg_uniqueness", Vec::new());
+    }
+    if impossible_that_that(s, " no ") {
+        return ("neg_mandatory", Vec::new());
+    }
+    for pfx in ["For each ", "for each "] {
+        if let Some(body) = s.strip_prefix(pfx).and_then(|b| b.strip_suffix('.')) {
+            for (p, _) in body.match_indices(", ") {
+                if p >= 1 && split_first(&body[p + 2..], " or ").is_some() {
+                    return ("disjunctive_mandatory", Vec::new());
+                }
+            }
+        }
+    }
+    for pfx in ["For each ", "for each "] {
+        if let Some(body) = s.strip_prefix(pfx).and_then(|b| b.strip_suffix('.')) {
+            for sep in [", at most one ", ", exactly one "] {
+                for (p, _) in body.match_indices(sep) {
+                    if p >= 1 {
+                        let t = &body[p + sep.len()..];
+                        if split_first(t, " that ").is_some()
+                            || split_first(t, " those ").is_some()
+                        {
+                            return ("inverse_uc", Vec::new());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for pfx in ["If ", "if "] {
+        if let Some(body) = s.strip_prefix(pfx).and_then(|b| b.strip_suffix('.')) {
+            if split_first(body, " then ").is_some() {
+                return ("subset", Vec::new());
+            }
+        }
+    }
+    if cls_class_rule(s) {
+        return ("class_rule", Vec::new());
+    }
+    if let Some(body) = s.strip_suffix('.') {
+        if split_first(body, " if and only if ").is_some() {
+            return ("equality", Vec::new());
+        }
+    }
+    if let Some(g) = cls_rule_if(s) {
+        return ("rule_if", g);
+    }
+    if let Some(g) = cls_rule_iff(s) {
+        return ("rule_iff", g);
+    }
+    if let Some(body) = s.strip_prefix("*Each ").and_then(|b| b.strip_suffix('.')) {
+        for (p, _) in body.match_indices(" is some ") {
+            if p >= 1 && split_first(&body[p + 9..], " who ").is_some() {
+                return ("derivation_rule", Vec::new());
+            }
+        }
+    }
+    if let Some(body) = s.strip_prefix("any ").and_then(|b| b.strip_suffix('.')) {
+        if split_first(body, " more than one ").is_some() {
+            return ("neg_uniqueness", Vec::new());
+        }
+    }
+    if let Some(body) = s.strip_prefix("any ").and_then(|b| b.strip_suffix('.')) {
+        if split_first(body, " no ").is_some() {
+            return ("neg_mandatory", Vec::new());
+        }
+    }
+    for pfx in ["Each ", "each "] {
+        if let Some(body) = s.strip_prefix(pfx).and_then(|b| b.strip_suffix('.')) {
+            if split_first(body, " or ").is_some() {
+                return ("disjunctive_mandatory", Vec::new());
+            }
+        }
+    }
+    for pfx in ["Each ", "each "] {
+        if let Some(body) = s.strip_prefix(pfx).and_then(|b| b.strip_suffix('.')) {
+            let mut cands: Vec<(usize, &str)> = Vec::new();
+            for (p, _) in body.match_indices(" at most one ") {
+                cands.push((p, "at most one"));
+            }
+            for (p, _) in body.match_indices(" exactly one ") {
+                cands.push((p, "exactly one"));
+            }
+            cands.sort();
+            for (p, q) in cands {
+                let right = &body[p + 13..];
+                if p >= 1 && !right.is_empty() {
+                    return (
+                        "uniqueness",
+                        vec![body[..p].to_string(), q.to_string(), right.to_string()],
+                    );
+                }
+            }
+        }
+    }
+    for pfx in ["Each ", "each "] {
+        if let Some(body) = s.strip_prefix(pfx).and_then(|b| b.strip_suffix('.')) {
+            if let Some((a, b)) = split_first(body, " some ") {
+                return ("mandatory", vec![a.to_string(), b.to_string()]);
+            }
+        }
+    }
+    if let Some(body) = s.strip_suffix('.') {
+        if let Some(sp) = body.find(' ') {
+            let (tok0, rest) = (&body[..sp], &body[sp + 1..]);
+            if !tok0.is_empty() && !tok0.contains(char::is_whitespace) {
+                if let Some(dg) = rest.strip_prefix("becomes final at depth ") {
+                    if !dg.is_empty() && dg.bytes().all(|b| b.is_ascii_digit()) {
+                        return ("finality", Vec::new());
+                    }
+                }
+                for neg in ["does not ", "is not "] {
+                    if let Some(t) = rest.strip_prefix(neg) {
+                        if t.chars().next().map_or(false, |c| !c.is_whitespace()) {
+                            return ("neg_pair", Vec::new());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(body) = s.strip_suffix('.') {
+        if split_last(body, " ~").is_some() {
+            return ("negation", Vec::new());
+        }
+    }
+    if cls_subset_trailing(s) {
+        return ("subset_trailing", Vec::new());
+    }
+    if let Some(body) = s.strip_suffix('.') {
+        if !body.is_empty() {
+            return ("fact_type_reading", vec![body.to_string()]);
+        }
+    }
+    ("UNPARSED", vec![s.to_string()])
+}
+
+// classify (compiler.py:364) = analyze minus the modality tag: annotation
+// strip, modality split, possibility short-circuit, then the pattern table
+fn classify_kind(stmt: &str) -> (&'static str, Vec<String>) {
+    let stripped = strip_annotation(stmt);
+    let (_m, sg, inner) = split_modality(&stripped);
+    if sg == "possibility" {
+        return ("possibility", vec![inner.trim_end_matches('.').to_string()]);
+    }
+    classify_inner(&inner)
+}
+
+// the sentence vocabulary that never OPENS a type name (compiler.py:468)
+const IMPLICIT_STOP: [&str; 27] = [
+    "If", "When", "Then", "That", "This", "An", "A", "The", "Each", "Some", "No", "Every",
+    "Not", "It", "There", "Once", "For", "In", "Of", "To", "On", "At", "By", "With", "And",
+    "Or", "Only",
+];
+
+fn strip_pnc(t: &str) -> &str {
+    t.trim_matches(|c| c == '.' || c == ';' || c == ':')
+}
+
+// _implicit_nouns (compiler.py:474): a maximal Title-case run is a noun
+// CANDIDATE; it becomes a noun only when CORROBORATED — followed somewhere by
+// a quoted literal (instance evidence) or opened by a quantifier
+fn implicit_nouns(stmts: &[String]) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    let quantifiers = ["each", "some", "every", "no", "any"];
+    let mut candidates: HashSet<String> = HashSet::new();
+    let mut corroborated: HashSet<String> = HashSet::new();
+    for s in stmts {
+        let s = strip_annotation(s);
+        let bare = blank_spans(&s, " '' ");
+        if bare.contains(',') || bare.contains('(') || bare.contains(')') {
+            continue;
+        }
+        let mut run: Vec<String> = Vec::new();
+        let mut after_quant = false;
+        let mut prev = String::new();
+        for tok in bare.split_whitespace() {
+            if tok == "''" || tok == "''." {
+                if !run.is_empty() {
+                    let name = run.join(" ");
+                    candidates.insert(name.clone());
+                    corroborated.insert(name); // instance evidence
+                }
+                run.clear();
+                after_quant = false;
+                prev = tok.to_string();
+                continue;
+            }
+            let base = strip_pnc(tok).trim_end_matches(|c: char| c.is_ascii_digit());
+            let title = base.chars().next().map_or(false, |c| c.is_uppercase());
+            if title && !IMPLICIT_STOP.contains(&base) {
+                if run.is_empty() {
+                    after_quant =
+                        quantifiers.contains(&strip_pnc(&prev).to_lowercase().as_str());
+                }
+                run.push(base.to_string());
+                prev = tok.to_string();
+                continue;
+            }
+            if !run.is_empty() {
+                let name = run.join(" ");
+                candidates.insert(name.clone());
+                if after_quant {
+                    corroborated.insert(name); // a quantifier names a TYPE
+                }
+            }
+            run.clear();
+            after_quant = false;
+            prev = tok.to_string();
+        }
+        if !run.is_empty() {
+            let name = run.join(" ");
+            candidates.insert(name.clone());
+            if after_quant {
+                corroborated.insert(name);
+            }
+        }
+    }
+    candidates.intersection(&corroborated).cloned().collect()
+}
+
+// _name_refmode (compiler.py:747): strip a (.RefMode) parenthetical
+fn name_refmode(text: &str) -> String {
+    let t = text.trim();
+    if t.ends_with(')') {
+        for (p, _) in t.match_indices("(.") {
+            if p >= 1 && p + 2 < t.len() - 1 {
+                return t[..p].to_string();
+            }
+        }
+    }
+    t.to_string()
+}
+
+// _known (compiler.py:529): the declared type names, plus the implicit nouns
+fn known_names(stmts: &[String]) -> std::collections::HashSet<String> {
+    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for s in stmts {
+        let (k, g) = classify_kind(s);
+        match k {
+            "entity_type" | "value_type" => {
+                names.insert(name_refmode(&g[0]));
+            }
+            "ref_scheme" => {
+                names.insert(g[0].clone());
+                names.insert(g[1].clone());
+            }
+            "objectification" => {
+                names.insert(g[1].clone());
+            }
+            "subtype_of" => {
+                // a subtype clause DECLARES both names
+                names.insert(g[0].clone());
+                names.insert(g[1].clone());
+            }
+            "brace_subtypes" => {
+                for x in g[0].split(',') {
+                    names.insert(x.trim().to_string());
+                }
+                names.insert(g[2].clone());
+            }
+            _ => {}
+        }
+    }
+    for n in implicit_nouns(stmts) {
+        names.insert(n);
+    }
+    names
+}
+
+// _prose_suspect (compiler.py:372): structural punctuation outside quoted
+// spans is the paragraph tell
+fn prose_suspect(text: &str) -> bool {
+    let bare = blank_spans(text, " ");
+    bare.contains(',') || bare.contains('(') || bare.contains(')') || bare.contains(": ")
+}
+
+// _strip_derivation (compiler.py:674), the name half: peel a trailing NORMA
+// derivation-storage marker
+fn strip_derivation_name(text: &str) -> String {
+    for mark in [" **", " ++", " *", " +"] {
+        if let Some(pre) = text.strip_suffix(mark) {
+            return pre.trim().to_string();
+        }
+    }
+    text.to_string()
+}
+
+// _atomic_run_guard (compiler.py:577): a noun match whose Title-case
+// continuation is not covered by a longer known name is predicate text
+fn atomic_run_guard(
+    toks: &[&str],
+    i: usize,
+    kw: &[String],
+    known: &std::collections::HashSet<String>,
+) -> bool {
+    let j = i + kw.len();
+    if j >= toks.len() {
+        return true;
+    }
+    let nxt = strip_pnc(toks[j]).trim_end_matches(|c: char| c.is_ascii_digit());
+    let title = nxt.chars().next().map_or(false, |c| c.is_uppercase());
+    if !(title && !IMPLICIT_STOP.contains(&nxt)) {
+        return true; // no Title-case continuation
+    }
+    let ext = format!("{} {}", kw.join(" "), nxt);
+    let pfx = format!("{} ", ext);
+    known.iter().any(|k| *k == ext || k.starts_with(&pfx))
+}
+
+// the known names pre-split for _reading's longest-first scan (word count
+// descending; the lexicographic tiebreak is deterministic where Python's set
+// order was arbitrary — equal-length matches at one position are impossible)
+fn sort_known(names: &std::collections::HashSet<String>) -> Vec<Vec<String>> {
+    let mut ks: Vec<Vec<String>> = names
+        .iter()
+        .map(|k| k.split_whitespace().map(|w| w.to_string()).collect())
+        .collect();
+    ks.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    ks
+}
+
+// _reading (compiler.py:593): a fact-type reading → (template, roles) — the
+// certified-equal host override of system:reading_parse
+fn reading_split(
+    text: &str,
+    known_sorted: &[Vec<String>],
+    known: &std::collections::HashSet<String>,
+) -> (String, Vec<String>) {
+    let toks: Vec<&str> = text.split_whitespace().collect();
+    let mut roles: Vec<String> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < toks.len() {
+        let tok = toks[i];
+        if tok.contains('-') && !tok.ends_with('-') {
+            // forward hyphen binding: adj-Type -> role Type
+            let post = &tok[tok.find('-').unwrap() + 1..];
+            if known.contains(post) {
+                roles.push(post.to_string());
+                out.push(format!("{{{}}}", roles.len() - 1));
+                i += 1;
+                continue;
+            }
+        }
+        let mut matched: Option<&Vec<String>> = None;
+        for kw in known_sorted {
+            let n = kw.len();
+            if n >= 1
+                && i + n <= toks.len()
+                && toks[i..i + n].iter().zip(kw.iter()).all(|(a, b)| *a == b.as_str())
+                && atomic_run_guard(&toks, i, kw, known)
+            {
+                matched = Some(kw);
+                break;
+            }
+        }
+        match matched {
+            Some(kw) => {
+                roles.push(kw.join(" "));
+                out.push(format!("{{{}}}", roles.len() - 1));
+                i += kw.len();
+            }
+            None => {
+                out.push(tok.to_string());
+                i += 1;
+            }
+        }
+    }
+    (out.join(" "), roles)
+}
+
+// _ftid_from (compiler.py:621): substitute the roles back in and slugify
+fn ftid_from(template: &str, roles: &[String]) -> String {
+    let mut s = template.to_string();
+    for (i, r) in roles.iter().enumerate() {
+        s = s.replace(&format!("{{{}}}", i), r);
+    }
+    slug_str(&s)
+}
+
+// _fact_type (compiler.py:634) reduced to the prepass's use: the ftid alone.
+// The parallel-ft unification branch is OFF here by construction — the
+// prepass passes a plain name set (no subs/fts attrs), exactly as Python does.
+fn fact_type_slug(
+    reading: &str,
+    known_sorted: &[Vec<String>],
+    known: &std::collections::HashSet<String>,
+) -> String {
+    let (template, roles) = reading_split(reading, known_sorted, known);
+    ftid_from(&template, &roles)
+}
+
+// _prepass_context (compiler.py:416): subtype edges (closed transitively),
+// declared fact-type slugs, and the PLAIN reading declarations
+#[allow(clippy::type_complexity)]
+fn prepass_context(
+    stmts: &[String],
+    names: &std::collections::HashSet<String>,
+    extra_edges: &[(String, String)],
+    extra_fts: &[String],
+) -> (
+    std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+) {
+    use std::collections::{BTreeMap, BTreeSet};
+    let known_sorted = sort_known(names);
+    let mut edges: Vec<(String, String)> = extra_edges.to_vec();
+    let mut fts: BTreeSet<String> = extra_fts.iter().cloned().collect();
+    let mut plain: BTreeSet<String> = extra_fts.iter().cloned().collect();
+    for s in stmts {
+        let (k, g) = classify_kind(s);
+        match k {
+            "subtype_of" => {
+                edges.push((g[0].trim().to_string(), g[1].trim().to_string()));
+            }
+            "brace_subtypes" => {
+                for sub in g[0].split(',') {
+                    edges.push((sub.trim().to_string(), g[2].trim().to_string()));
+                }
+            }
+            "fact_type_reading" => {
+                if !g[0].contains('\'') && !prose_suspect(&g[0]) {
+                    let ft = fact_type_slug(
+                        &strip_derivation_name(&g[0]),
+                        &known_sorted,
+                        names,
+                    );
+                    fts.insert(ft.clone());
+                    plain.insert(ft);
+                }
+            }
+            "rule_if" | "rule_iff" => {
+                // a rule HEAD is a declaration (NORMA's starred reading)
+                let head = if k == "rule_if" { &g[0] } else { &g[1] };
+                let cleaned: String =
+                    head.chars().filter(|c| !c.is_ascii_digit()).collect();
+                let ft = fact_type_slug(cleaned.trim(), &known_sorted, names);
+                fts.insert(ft);
+            }
+            "uniqueness" => {
+                let ft = fact_type_slug(
+                    &format!("{} {}", g[0], g[2]),
+                    &known_sorted,
+                    names,
+                );
+                fts.insert(ft.clone());
+                plain.insert(ft);
+            }
+            "mandatory" => {
+                let ft = fact_type_slug(
+                    &format!("{} {}", g[0], g[1]),
+                    &known_sorted,
+                    names,
+                );
+                fts.insert(ft.clone());
+                plain.insert(ft);
+            }
+            _ => {}
+        }
+    }
+    let mut parents: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (a, b) in &edges {
+        parents.entry(a.clone()).or_default().insert(b.clone());
+    }
+    let mut closure: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for start in parents.keys() {
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut todo: Vec<String> = vec![start.clone()];
+        while let Some(cur) = todo.pop() {
+            if let Some(ps) = parents.get(&cur) {
+                for p in ps {
+                    if seen.insert(p.clone()) {
+                        todo.push(p.clone());
+                    }
+                }
+            }
+        }
+        closure.insert(start.clone(), seen);
+    }
+    (closure, fts, plain)
+}
+
+// _context_of (compiler.py:404): the known context READ OFF a compiled store —
+// declared type names, subtype edges, fact-type slugs — so a model compiles
+// ATOP a preloaded base. The resident op's base is the RESIDENT store, asked
+// for via {"context_from": "resident"}.
+#[allow(clippy::type_complexity)]
+fn context_of(
+    cells: &[(Leaf, V)],
+) -> (
+    std::collections::HashSet<String>,
+    Vec<(String, String)>,
+    std::collections::HashSet<String>,
+) {
+    let leaf = |s: &str| Leaf::S(s.to_string());
+    let strv = |x: &V| aval(x).and_then(|l| leaf_str(&l));
+    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in pop_rows(cells, &leaf("instanceOf")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            if let (Some(a), Some(b)) = (strv(&it[0]), strv(&it[1])) {
+                if b == "ObjectType" || b == "ValueType" {
+                    names.insert(a);
+                }
+            }
+        }
+    }
+    let mut fts: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in pop_rows(cells, &leaf("factType")) {
+        let it = items(&list_of(&r));
+        if let Some(f) = it.first().and_then(|x| strv(x)) {
+            fts.insert(f);
+        }
+    }
+    let mut edges: Vec<(String, String)> = Vec::new();
+    for r in pop_rows(cells, &leaf("subtype")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            if let (Some(a), Some(b)) = (strv(&it[0]), strv(&it[1])) {
+                edges.push((a, b));
+            }
+        }
+    }
+    (names, edges, fts)
+}
+
+// ======================= the grammar thaw (gap 1) =============================
+// Python classifies over grammar_D() — shared/forml2-grammar.md ingested once
+// and frozen-thawed per process (compiler.grammar_D → persist.ingest_frozen,
+// a content-keyed sqlite snapshot). The resident's equivalent snapshot is a
+// SERVE-PROTOCOL SIDECAR: the exact payload Registry._sidecar writes beside
+// every app db ({"d": …, "process": …, "overrides": 1, "cases": []}), holding
+// the compiled grammar store. CONVENTION: <root>/shared/forml2-grammar.store.json
+// beside the grammar source itself, <root> found by walking up from the
+// executable exactly as find_cli walks to cli.py (the exe lives under
+// <root>/rust/target/<profile>/). An explicit "grammar_sidecar" op arg
+// overrides the walk. When the file is absent, generate it via the Python
+// engine (the same bootstrap cli.py performs):
+//   python -c "import importlib.util,sys,os,json; root=r'<repo>/engine'; \
+//     spec=importlib.util.spec_from_file_location('pyarest', \
+//       os.path.join(root,'python','__init__.py'), \
+//       submodule_search_locations=[os.path.join(root,'python')]); \
+//     m=importlib.util.module_from_spec(spec); sys.modules['pyarest']=m; \
+//     spec.loader.exec_module(m); import pyarest.prims; \
+//     from pyarest import forml, defs, polyglot; from pyarest.lam import from_lam; \
+//     D=forml.grammar_D(); \
+//     proc=[[n,polyglot._conv(from_lam(o))] for n,(k,o) in defs.latest.items() if k=='compiled']; \
+//     p=os.path.join(root,'shared','forml2-grammar.store.json'); \
+//     json.dump({'d':polyglot._conv(from_lam(D)),'process':proc,'overrides':1,'cases':[]}, \
+//       open(p,'w',encoding='utf-8'), ensure_ascii=False)"
+// The thawed store lives ONLY in the classification scratch: op_compile_model
+// swaps it in for the batch derive and restores the resident store whole.
+type GrammarScratch = (V, Vec<(Leaf, V)>, N, Vec<(Leaf, N)>, Vec<(String, N)>);
+
+fn load_grammar_scratch(j: &J) -> Result<(GrammarScratch, String), String> {
+    let path: std::path::PathBuf = match jget(j, "grammar_sidecar") {
+        Some(J::S(p)) => std::path::PathBuf::from(p),
+        Some(_) => return Err("grammar_sidecar must be a string path".to_string()),
+        None => {
+            let exe = std::env::current_exe().map_err(|e| {
+                format!("no executable path to walk for the grammar sidecar: {}", e)
+            })?;
+            let mut found: Option<std::path::PathBuf> = None;
+            for dir in exe.ancestors().skip(1) {
+                let cand = dir.join("shared").join("forml2-grammar.store.json");
+                if cand.is_file() {
+                    found = Some(cand);
+                    break;
+                }
+            }
+            match found {
+                Some(p) => p,
+                None => {
+                    return Err(
+                        "grammar store not resident and no grammar sidecar found: pass \
+                         grammar_sidecar or generate <root>/shared/forml2-grammar.store.json \
+                         from the Python engine (forml.grammar_D() serialized as \
+                         Registry._sidecar does — see the comment above load_grammar_scratch)"
+                            .to_string(),
+                    )
+                }
+            }
+        }
+    };
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("unreadable grammar sidecar {}: {}", path.display(), e))?;
+    let payload = match parse_json(&text) {
+        Some(p) if jget(&p, "d").is_some() => p,
+        _ => return Err(format!("unparseable grammar sidecar {}", path.display())),
+    };
+    let dj = jget(&payload, "d").unwrap();
+    let gd = to_v(dj);
+    let gcells = cells_of(&gd);
+    let gnd = j_to_n(dj);
+    let gncells = n_cells_of(&gnd);
+    let mut gproc: Vec<(String, N)> = Vec::new();
+    if let Some(J::A(procs)) = jget(&payload, "process") {
+        for entry in procs {
+            if let J::A(pair) = entry {
+                if pair.len() >= 2 {
+                    if let J::S(name) = &pair[0] {
+                        gproc.push((name.clone(), j_to_n(&pair[1])));
+                    }
+                }
+            }
+        }
+    }
+    Ok(((gd, gcells, gnd, gncells, gproc), path.display().to_string()))
+}
+
+// the grammar data read off a store's cells: the dispatch table
+// (Classification_has_Translator) and the stage-1 vocabulary (classLit)
+#[allow(clippy::type_complexity)]
+fn grammar_tables(
+    cells: &[(Leaf, V)],
+) -> (
+    std::collections::HashMap<String, Vec<String>>,
+    Vec<(String, String)>,
+) {
+    let leaf = |s: &str| Leaf::S(s.to_string());
+    let strv = |x: &V| aval(x).and_then(|l| leaf_str(&l));
+    let mut dispatch: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for r in pop_rows(cells, &leaf("Classification_has_Translator")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            if let (Some(c), Some(t)) = (strv(&it[0]), strv(&it[1])) {
+                dispatch.entry(c).or_default().push(t);
+            }
+        }
+    }
+    let mut vocab: Vec<(String, String)> = Vec::new();
+    for r in pop_rows(cells, &leaf("classLit")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            if let (Some(a), Some(b)) = (strv(&it[0]), strv(&it[1])) {
+                vocab.push((a, b));
+            }
+        }
+    }
+    (dispatch, vocab)
+}
+
 fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
     use std::collections::{BTreeMap, HashMap, HashSet};
     // args parse before anything runs (op_run_rules' discipline: a malformed
@@ -4345,46 +5460,42 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
     let leaf = |s: &str| Leaf::S(s.to_string());
     let strv = |x: &V| aval(x).and_then(|l| leaf_str(&l));
 
-    // the grammar data, read off the RESIDENT store before any mutation:
-    // the dispatch table (Classification_has_Translator rows, python
-    // compile_model_selfhost's first move) and the stage-1 vocabulary
-    // (classLit rows, python stage1_vocabulary — the tokenizer knows nothing
-    // else). Both empty when the resident store is not the ingested grammar;
-    // the report's "missing" says so instead of silently classifying nothing.
-    let mut dispatch: HashMap<String, Vec<String>> = HashMap::new();
-    for r in pop_rows(&srv.cells, &leaf("Classification_has_Translator")) {
-        let it = items(&list_of(&r));
-        if it.len() >= 2 {
-            if let (Some(c), Some(t)) = (strv(&it[0]), strv(&it[1])) {
-                dispatch.entry(c).or_default().push(t);
-            }
-        }
-    }
-    let mut vocab: Vec<(String, String)> = Vec::new();
-    for r in pop_rows(&srv.cells, &leaf("classLit")) {
-        let it = items(&list_of(&r));
-        if it.len() >= 2 {
-            if let (Some(a), Some(b)) = (strv(&it[0]), strv(&it[1])) {
-                vocab.push((a, b));
-            }
-        }
-    }
+    // the grammar data: the dispatch table (Classification_has_Translator,
+    // python compile_model_selfhost's first move) and the stage-1 vocabulary
+    // (classLit, python stage1_vocabulary — the tokenizer knows nothing else).
+    // Read off the RESIDENT store first (an ingested-grammar resident serves
+    // itself); when the resident lacks the grammar cells (the classLit probe),
+    // THAW the compiled grammar sidecar into a classification SCRATCH — the
+    // resident-kernel grammar_D(). The scratch swaps in only around the batch
+    // derive below; the resident store is restored whole.
+    let (mut dispatch, mut vocab) = grammar_tables(&srv.cells);
+    let mut grammar_src = String::from("resident");
+    let mut scratch: Option<GrammarScratch> = None;
     let mut missing: Vec<String> = Vec::new();
     if vocab.is_empty() {
-        missing.push(
-            "grammar store not resident: no classLit rows (grammar_D frozen-thaw wiring not ported; load the compiled grammar first)"
-                .to_string(),
-        );
+        match load_grammar_scratch(j) {
+            Ok((g, path)) => {
+                let (d2, v2) = grammar_tables(&g.1);
+                dispatch = d2;
+                vocab = v2;
+                grammar_src = path;
+                scratch = Some(g);
+                if vocab.is_empty() {
+                    missing.push(format!(
+                        "grammar sidecar {} carries no classLit rows (not a compiled grammar store?)",
+                        grammar_src
+                    ));
+                }
+            }
+            Err(e) => missing.push(e),
+        }
     }
     if dispatch.is_empty() {
         missing.push(
-            "grammar store not resident: no Classification_has_Translator rows".to_string(),
+            "no Classification_has_Translator rows (grammar store absent or partial)"
+                .to_string(),
         );
     }
-    missing.push(
-        "prepass context not ported (_known/_prepass_context): nouns empty, ctx rides four empty seqs"
-            .to_string(),
-    );
     missing.push("model D starts EMPTY (meta.initial_D process seed not ported)".to_string());
     missing.push(
         "translator bodies are host closures until #18 canonizes them; native dispatch answers only for canon DEFs"
@@ -4403,11 +5514,29 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
         }
     }
 
-    // (c) BATCH classification (classify_all_via_M, compiler.py:1184): every
+    // the PREPASS (python: _known + _prepass_context, the context seam):
+    // declared names (plus the base's, read off the RESIDENT store when the
+    // caller passes context_from:"resident" — python's context_from store),
+    // the subtype closure, fact-type slugs, and the plain reading set
+    let (b_names, b_edges, b_fts) = match jget(j, "context_from") {
+        Some(J::S(s)) if s == "resident" => context_of(&srv.cells),
+        _ => (HashSet::new(), Vec::new(), HashSet::new()),
+    };
+    let mut names = known_names(&stmts);
+    for n in b_names {
+        names.insert(n);
+    }
+    let b_fts_vec: Vec<String> = b_fts.into_iter().collect();
+    let (subs, fts, plain) = prepass_context(&stmts, &names, &b_edges, &b_fts_vec);
+    // the nouns Stage-1 scans for Role References: the known names, ordered
+    // longest-first like _known's return (rows dedup + sort below, so order
+    // never reaches the store)
+    let mut nouns: Vec<String> = names.iter().cloned().collect();
+    nouns.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+
+    // (c) BATCH classification (classify_all_via_M, compiler.py:1204): every
     // statement's field facts land first under s1..sN, ONE derive answers all
-    // classifications. TODO(#20): the nouns prepass — role references classify
-    // weaker without it.
-    let nouns: Vec<String> = Vec::new();
+    // classifications.
     let mut by_cell: BTreeMap<String, Vec<V>> = BTreeMap::new();
     for (i, (_stmt, _m, inner, _sg)) in work.iter().enumerate() {
         let sid = format!("s{}", i + 1);
@@ -4420,13 +5549,24 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
     }
     // the SCRATCH discipline: field facts and the derived classifications are
     // never part of the model — python threads an immutable D and discards it;
-    // the resident kernel saves the store whole and restores it after the read
+    // the resident kernel saves the store whole, swaps in the thawed grammar
+    // when one was loaded (python's gD), and restores the resident after the
+    // read. nprocess joins the save because the grammar sidecar carries its
+    // own compiled process defs for the derive's native carrier.
     let saved_d = srv.d.clone();
     let saved_cells = srv.cells.clone();
     let saved_nd = srv.nd.clone();
     let saved_ncells = srv.ncells.clone();
+    let saved_nprocess = srv.nprocess.clone();
     let mut cls_by_sid: HashMap<String, HashSet<String>> = HashMap::new();
     if !by_cell.is_empty() {
+        if let Some((gd, gcells, gnd, gncells, gproc)) = scratch {
+            srv.d = gd;
+            srv.cells = gcells;
+            srv.nd = gnd;
+            srv.ncells = gncells;
+            srv.nprocess = gproc;
+        }
         for (ftb, rows) in &by_cell {
             let name = leaf(ftb);
             let old = pop_rows(&srv.cells, &name);
@@ -4468,6 +5608,7 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
         srv.cells = saved_cells;
         srv.nd = saved_nd;
         srv.ncells = saved_ncells;
+        srv.nprocess = saved_nprocess;
         derived?;
     }
 
@@ -4478,13 +5619,27 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
     const GENERIC: [&str; 2] = ["Fact Type Reading", "Instance Fact"];
     // TODO(#20): meta.initial_D — the skeleton's model store starts EMPTY
     let mut model_d: V = seq(from_vec(Vec::new()));
-    // the context operand: python to_lam((names, subs, fts, plain)); the
-    // prepass is not ported, so all four ride empty
+    // the context operand, python's to_lam((tuple(sorted(names)),
+    // tuple(sorted((s, tuple(sorted(a))) for s, a in subs.items())),
+    // tuple(sorted(fts)), tuple(sorted(plain)))) — all four sorted, the
+    // subtype closure as ⟨name, ancestors⟩ pairs
+    let atom_s = |s: &str| atom(Leaf::S(s.to_string()));
+    let mut names_sorted: Vec<String> = names.iter().cloned().collect();
+    names_sorted.sort();
+    let subs_pairs: Vec<V> = subs
+        .iter()
+        .map(|(s, anc)| {
+            seqc(vec![
+                atom_s(s),
+                seq(from_vec(anc.iter().map(|a| atom_s(a)).collect())),
+            ])
+        })
+        .collect();
     let ctx = seqc(vec![
-        seq(from_vec(Vec::new())),
-        seq(from_vec(Vec::new())),
-        seq(from_vec(Vec::new())),
-        seq(from_vec(Vec::new())),
+        seq(from_vec(names_sorted.iter().map(|n| atom_s(n)).collect())),
+        seq(from_vec(subs_pairs)),
+        seq(from_vec(fts.iter().map(|f| atom_s(f)).collect())),
+        seq(from_vec(plain.iter().map(|f| atom_s(f)).collect())),
     ]);
     let empty_cls: HashSet<String> = HashSet::new();
     let mut unclassified: Vec<String> = Vec::new();
@@ -4587,11 +5742,13 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
         }
     }
     // the report: the seed contract's surviving keys (total/unclassified/prose)
-    // plus the skeleton's honest diagnostics (classified/missing/blocked)
+    // plus the honest diagnostics (classified/grammar/missing/blocked)
     let mut r = String::from("{\"total\":");
     r.push_str(&total.to_string());
     r.push_str(",\"classified\":");
     r.push_str(&classified.to_string());
+    r.push_str(",\"grammar\":");
+    esc(&grammar_src, &mut r);
     let arr = |xs: &[String], out: &mut String| {
         out.push('[');
         for (i, s) in xs.iter().enumerate() {
