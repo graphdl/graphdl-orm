@@ -258,20 +258,39 @@ def replay_entries(D, entries):
     through the gated create = 71.6s of a support compile for ~15
     entries): consecutive applies buffer by fact type and flush through
     the SAME bulk paths the migrate op rides — the log is history,
-    already validated at commit time, and the post-replay machine_fold
-    re-derives transitions either way. Retract/migrate ops flush first,
-    so ordering across op boundaries is preserved."""
+    already validated at commit time. Retract/migrate ops flush first,
+    so ordering across op boundaries is preserved.
+
+    MACHINE EVENTS are the exception (found 2026-07-10: replay answered
+    the initial status where sequential application answered the
+    transitioned one): an entry of a TRIGGER fact type is not a mere
+    fact install — the gated create carries the transition onto the
+    status column, the Mealy emissions, and the links, and none of that
+    rides the bulk paths (the compile-time machine_fold re-derives
+    status alone, and only where a caller folds). So a trigger entry
+    flushes the buffer (log order: an entity's initial status lands
+    before its events) and re-fires through the SAME create — the
+    schema-stable recipe and the one replay partition are reused, so
+    the batch win keeps to the plain installs that dominate the logs."""
     buf = {}
     # ONE partition for the whole replay: the schema never changes here,
     # but every bulk install mints a new D and the per-D memo misses —
     # the traced compile showed ~12s PER MIGRATE ENTRY going to
     # recomputes (the 71-83s replay phase, 2026-07-09)
     part_box = []
+    trig_box = []                       # trigger fact types, read once
+    spec_box = {}                       # per-ft create recipes, schema-stable
 
     def _part(D):
         if not part_box:
             part_box.append(system.rmap_partition(D))
         return part_box[0]
+
+    def _triggers(D):
+        if not trig_box:
+            trig_box.append({r[1] for r in system._pop_rows(D, "smTrigger")
+                             if len(r) >= 2})
+        return trig_box[0]
 
     def _flush(D):
         if not buf:
@@ -320,7 +339,16 @@ def replay_entries(D, entries):
             rows |= {_untuple(f) for f in entry["facts"]}
             D = _ap(ast.Store(ft), _S(to_lam(system._rowsort(rows)), D))
             continue
-        buf.setdefault(entry["ft"], []).append(_untuple(entry["fact"]))
+        ft = entry["ft"]
+        if ft in _triggers(D):
+            D = _flush(D)
+            spec = spec_box.get(ft)
+            if spec is None:
+                spec = spec_box[ft] = system.create_spec(D, ft, _part(D))
+            D = _ap(_A(2), system._create_from_spec(
+                D, ft, to_lam(_untuple(entry["fact"])), spec))
+            continue
+        buf.setdefault(ft, []).append(_untuple(entry["fact"]))
     return _flush(D)
 
 
@@ -2425,7 +2453,8 @@ class Registry:
             if violations(existing + (cand,)) - baseline:
                 continue                                       # candidate-INTRODUCED only
             hyp_id = f"hyp-{ft_id}-{idx}"
-            D2 = _bulk_absorbed_install(D, part, part[ft_id], ft_id, [list(cand)]) \
+            D2 = system.bulk_absorbed_install(D, part, part[ft_id], ft_id,
+                                              [list(cand)]) \
                 if part.get(ft_id, ft_id) != ft_id else \
                 _apx(ast.Store(ft_id),
                      _S(to_lam(system._rowsort(set(existing) | {cand})), D))
