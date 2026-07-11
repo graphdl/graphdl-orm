@@ -390,14 +390,18 @@ class _Known(set):
     included, for antecedent resolution), and the PLAIN reading declarations
     (rule heads excluded — a rule against a plainly-declared fact type must not
     re-mark its storage kind; the reading's own trailing marker owns that)."""
-    def __new__(cls, names, subs=None, fts=None, plain=None):
+    def __new__(cls, names, subs=None, fts=None, plain=None, vals=None):
         self = super().__new__(cls, names)
         self.subs = subs or {}
         self.fts = fts or set()
         self.plain = plain or set()
+        # #31: the VALUE-TYPE names — a quoted literal filling a value-typed role
+        # coerces to its native number at the boundary (quotes are the reading's,
+        # not the value's); an entity-typed (reference) role keeps its id verbatim.
+        self.vals = vals or set()
         return self
 
-    def __init__(self, names, subs=None, fts=None, plain=None):
+    def __init__(self, names, subs=None, fts=None, plain=None, vals=None):
         super().__init__(names)
 
 
@@ -408,9 +412,11 @@ def _context_of(D):
     base thawed from frozen ingestion instead of recompiled)."""
     names = {r[0] for r in system._pop_rows(D, "instanceOf")
              if len(r) >= 2 and r[1] in ("ObjectType", "ValueType")}
+    vals = {r[0] for r in system._pop_rows(D, "instanceOf")
+            if len(r) >= 2 and r[1] == "ValueType"}
     fts = {f[0] for f in system._pop_rows(D, "factType") if f}
     edges = [(r[0], r[1]) for r in system._pop_rows(D, "subtype") if len(r) >= 2]
-    return names, edges, fts
+    return names, edges, fts, vals
 
 
 def _prepass_context(stmts, names, extra_edges=(), extra_fts=()):
@@ -524,6 +530,19 @@ def _implicit_nouns(stmts):
             if after_quant:
                 corroborated.add(name)
     return candidates & corroborated
+
+
+def _known_vals(stmts):
+    """The VALUE-TYPE names declared in-text (#31): explicit value-type readings
+    plus each reference scheme's identifying value."""
+    vals = set()
+    for s in stmts:
+        k, g = classify(s)
+        if k == "value_type":
+            vals.add(_name_refmode(g[0])[0])
+        elif k == "ref_scheme":
+            vals.add(g[1])
+    return vals
 
 
 def _known(stmts):
@@ -1608,10 +1627,17 @@ def _cook_fact(g, k):
         ids = tuple(_QUOTED.findall(reading))
         dequoted = re.sub(r"\s+", " ", _QUOTED.sub("", reading)).strip()
         ft, _decl = _fact_type(dequoted, k)
+        _t, rtypes = _reading(dequoted, k)
+        # #31: a quoted literal filling a VALUE-typed role coerces to its native
+        # number (quotes are the reading's, not the value's); an entity-typed
+        # (reference) role keeps its id verbatim — '42' as a Task id stays a
+        # string key, '40' as Budget Hours becomes 40.
+        vset = getattr(k, "vals", ()) or ()
+        ids = tuple(_num(v) if (i < len(rtypes) and rtypes[i] in vset) else v
+                    for i, v in enumerate(ids))
         # the subtype lift, as in _rule_atom: an instance fact authored via a subtype
         # resolves UP to the supertype-declared fact type when its own is undeclared
         if isinstance(k, _Known) and k.fts and ft not in k.fts:
-            _t, rtypes = _reading(dequoted, k)
             for anc in sorted(k.subs.get(rtypes[0], ()) if rtypes else ()):
                 lifted, _ = _fact_type(dequoted.replace(rtypes[0], anc, 1), k)
                 if lifted in k.fts:
@@ -2224,9 +2250,10 @@ def _stmt_translator_impl(kinds):
             # plainly must not earn the rule's derivation kind (the storage
             # kind belongs to the reading; over-marking feeds the sweep)
             plain = unpacked[3] if len(unpacked) > 3 else ()
+            vals = unpacked[4] if len(unpacked) > 4 else ()
             D = _apply(_A(4), operand)
             known = _Known(names, {s: tuple(a) for (s, a) in subs}, set(fts),
-                           set(plain))
+                           set(plain), set(vals))
             for kind in kinds:
                 mm = next((p.match(stmt) for p in _productions().get(kind, ())
                            if p.match(stmt)), None)
@@ -2337,15 +2364,18 @@ def compile_model_selfhost(text, D=None, context_from=None):
     stmts = statements(text)
     # the context seam, mirroring compile_model: base-declared names, subtype
     # edges and fact types resolve exactly like in-text declarations
-    b_names, b_edges, b_fts = ((set(), (), ()) if context_from is None
-                               else _context_of(context_from))
+    b_names, b_edges, b_fts, b_vals = ((set(), (), (), set())
+                                       if context_from is None
+                                       else _context_of(context_from))
     names = set(_known(stmts)) | b_names
+    vals = _known_vals(stmts) | set(b_vals)
     subs, fts, plain = _prepass_context(stmts, names, b_edges, b_fts)
-    known = _Known(names, subs, fts, plain)
+    known = _Known(names, subs, fts, plain, vals)
     ctx = to_lam((tuple(sorted(names)),
                   tuple(sorted((s, tuple(sorted(a))) for s, a in subs.items())),
                   tuple(sorted(fts)),
-                  tuple(sorted(plain))))
+                  tuple(sorted(plain)),
+                  tuple(sorted(vals))))
     if D is None:
         D = meta.initial_D()
     _SM_SUSPECT = re.compile(
@@ -2471,12 +2501,14 @@ def _compile_model_seed(text, D=None, context_from=None):
     from collections import Counter
     if D is None:
         D = meta.initial_D()
-    b_names, b_edges, b_fts = ((set(), (), ()) if context_from is None
-                               else _context_of(context_from))
+    b_names, b_edges, b_fts, b_vals = ((set(), (), (), set())
+                                       if context_from is None
+                                       else _context_of(context_from))
     stmts = statements(text)
     names = set(_known(stmts)) | b_names
+    vals = _known_vals(stmts) | set(b_vals)
     subs, fts, plain = _prepass_context(stmts, names, b_edges, b_fts)
-    known = _Known(names, subs, fts, plain)
+    known = _Known(names, subs, fts, plain, vals)
     report, unparsed = Counter(), []
     for s in stmts:
         D, kind = compile(s, D, known)

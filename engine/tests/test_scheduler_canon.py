@@ -127,9 +127,11 @@ def test_derived_and_stored_heads_rederive_at_run_rules():
     D, _rep = forml.compile_model(MODEL + INSTANCES)
     D = system.run_rules(D)
     cost = {tuple(r) for r in _pop_rows(D, "Task_has_Cost")}
-    assert ("t1", "5") in cost and ("t2", "7") in cost
+    # #31: Cost is a VALUE-typed role, so its quoted literals coerce to native
+    # numbers at the boundary (quotes are the reading's, not the value's)
+    assert ("t1", 5) in cost and ("t2", 7) in cost
     reach = {tuple(r) for r in _pop_rows(D, "Task_is_reachable")}
     assert ("t1",) in reach          # t1 blocks t2, and t2 has a Cost
     assert ("t2",) not in reach      # t2 blocks nothing
     rank = {tuple(r) for r in _pop_rows(D, "Task_has_Rank")}
-    assert ("t1", "1") in rank       # the keyed pass, unchanged by the slice
+    assert ("t1", 1) in rank         # the keyed pass, unchanged by the slice (#31 coerced)
