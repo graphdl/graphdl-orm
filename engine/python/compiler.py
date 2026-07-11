@@ -1130,19 +1130,21 @@ def _h_subset_trailing(g, k, m, sign="positive"):
     # reuse it for both signs and both the plain and value-filtered forms,
     # letting the CHECKER object carry the semantics. The row-kind stays
     # 'subset' (a cosmetic violation-template mismatch for the forbidden
-    # case only); enforcement is the checker.
-    A_, objs = _cs_call("subset", "", [y_ft, x_ft],
-                        [cond_txt.strip(), head_txt.strip()], m)
+    # case only); enforcement is the checker. #18: the checker rides as an
+    # apply-SPEC — the projected builders are parameterized canon
+    # applications over ⟨cell, proj_p, proj_c[, filter_pos, filter_lit]⟩ —
+    # and the whole handler is the generic crows body over the cooked groups.
+    decl, mid, ospecs = _cook_cs("subset", "", [y_ft, x_ft],
+                                 [cond_txt.strip(), head_txt.strip()])
+    builder = ("constraints:scoped_exclusion_projected" if forbidden
+               else "constraints:scoped_subset_projected")
+    op = (x_ft, tuple(proj_y), tuple(proj_x))
     if filter_lit is not None:
-        check = ((lambda xf, py, px: C.scoped_exclusion_projected_filtered(
-                    xf, py, px, filter_pos, filter_lit)) if forbidden
-                 else (lambda xf, py, px: C.scoped_subset_projected_filtered(
-                    xf, py, px, filter_pos, filter_lit)))
-    else:
-        check = (C.scoped_exclusion_projected if forbidden
-                 else C.scoped_subset_projected)
-    objs = [(cell, check(x_ft, proj_y, proj_x)) for (cell, _o) in objs]
-    return A_, objs
+        builder += "_filtered"
+        op = op + (filter_pos, filter_lit)
+    return _h_crows((decl, mid,
+                     tuple((cell, builder, op) for (cell, _b, _o) in ospecs)),
+                    k, m)
 
 _h_negation = _h_crows
 
@@ -1404,256 +1406,9 @@ _CMP_OPS = {"exceeds": "gt", "is greater than": "gt", "is less than": "lt",
             "is at least": "ge", "is at most": "le", "equals": "eq"}
 
 
-def _h_rule_if(g, k, m, kind="fully-derived"):
-    """The book's rule form: Head if Clause [and Clause…]. Fact-type clauses join
-    linearly on shared variables; COMPARATOR clauses (the corpus's word comparators, a
-    bound variable against a literal or another bound variable) do not join — they
-    RESTRICT the running tuple as filters; COERCION clauses ('Task is Resource', two
-    known types, no declared fact type) alias their variables to one column; the head
-    projects its variables; the compiled object consumes D (cross-cell) and run_rules
-    derives to the lfp."""
-    import zlib
-    from . import system as _sys
-    head_txt, body = g[0], g[1]
-    # ' and ' splits at TOP level; a fragment's ' where '-chain then scopes to
-    # the fragment's own quantifier: inside a 'no'-group it stays the negated
-    # existential's conjunction (it must never escape as a top-level clause),
-    # after an aggregate it hoists to top-level conjunction (the corpus's
-    # bag-scoping spelling, the behavior existing models compiled against)
-    clauses, neg_groups = [], []
-    for frag in (c.strip() for c in body.split(" and ")):
-        mm0 = re.search(r"\bat most 0 (.+)$", frag)
-        if frag.startswith("no "):
-            # (parts, subject-override): 'no X' introduces X fresh by position
-            neg_groups.append(([p.strip() for p in frag[3:].split(" where ")],
-                               None))
-        elif mm0:
-            # 'X is Yed by at most 0 Z' — negation spelled as frequency (the
-            # corpus's zero-supplying idiom): the clause minus the quantifier is
-            # the declared reading, and the COUNTED type Z is the fresh subject
-            neg_groups.append(([frag.replace("at most 0 ", "", 1)],
-                               mm0.group(1).strip()))
-        elif " where " in frag:
-            clauses.extend(p.strip() for p in frag.split(" where "))
-        else:
-            clauses.append(frag)
-    hft, hvars, _hlits = _rule_atom(head_txt, k)
-    rule_cid = hft + "_rule_" + format(zlib.crc32(body.encode()), "x")
-    _hf, decl = _fact_type(re.sub(r"\d+", "", head_txt).strip(), k)
-    # the rule's leading marker marks the RULE; the fact type's storage kind
-    # belongs to its READING declaration (trailing marker there, or none). Only
-    # a head the rule itself declares defaults to the rule's kind — the old
-    # base's SM current-status is plainly declared with imperative writers
-    # beside its seed rule, and must not become fully-derived here.
-    head_is_new = not (isinstance(k, _Known) and hft in k.plain)
-    A_ = decl + ([("derivation", (hft, kind))] if head_is_new else []) \
-        + [("ruleDerives", (rule_cid, hft))]
-    # one pass, clauses in order: joins extend the column map, comparators filter
-    # it. The AGGREGATE clause is extracted first and processed LAST: the corpus
-    # places it at the head of the body with its bag scoped by the where-clauses
-    # after it, so its source binds only once the joins have run.
-    cols, atoms, filters, joins = {}, [], [], []
-    ok, diag, agg = True, None, None
-    agg_clause = next((c for c in clauses if _AGG_CLAUSE.match(c)), None)
-    if agg_clause is not None:
-        clauses = [c for c in clauses if c != agg_clause]
-    for c in clauses:
-        mm = _CMP_CLAUSE.match(c)
-        if mm and mm.group(1) in cols:
-            subj, opw, objtxt = mm.groups()
-            if objtxt in cols:
-                filters.append(_sys.cmp_filter(_CMP_OPS[opw], cols[subj],
-                                               col2=cols[objtxt]))
-            else:
-                lit = _num(objtxt)
-                if isinstance(lit, str):
-                    ok = False
-                    diag = (f"comparator operand {objtxt!r} is neither a bound "
-                            f"variable nor a literal")
-                    break
-                filters.append(_sys.cmp_filter(_CMP_OPS[opw], cols[subj], lit=lit))
-            continue
-        coer = _coercion(c, k)
-        if coer is not None:
-            a, b = coer
-            if a in cols and b in cols:
-                filters.append(_sys.cmp_filter("eq", cols[a], col2=cols[b]))
-            elif a in cols:
-                cols[b] = cols[a]                          # alias: one instance, two names
-            elif b in cols:
-                cols[a] = cols[b]
-            else:
-                ok = False
-                diag = f"coercion clause {c!r} has no bound side"
-                break
-            continue
-        aft, avars, alits = _rule_atom(c, k)
-        A_.append(("ruleReads", (rule_cid, aft)))
-        if not atoms:
-            for v in avars:
-                cols.setdefault(v, len(cols) + 1)
-        elif (avars and cols.get(avars[0]) == len(cols)
-              and len(set(avars)) == len(avars)
-              and all(v not in cols for v in avars[1:])):
-            # the linear chain the fragment always compiled: NatJoin on the running
-            # tuple's last column — existing models keep bit-identical plans. Valid
-            # ONLY when the trailing variables are fresh: a rebound trailing variable
-            # (considers x actionable x has_rank, rank bound at atom one) needs the
-            # general pairs join, or its equality silently drops to a cross product
-            joins.append(None)
-            for v in avars[1:]:
-                cols.setdefault(v, len(cols) + 1)
-        else:
-            # the general conjunctive shape (Codd's join is not restricted to the
-            # last column): join on EVERY bound variable at its position, keep each
-            # fresh one ONCE at its first occurrence (a repeat's equality is the
-            # fragment boundary, as on the linear path); no bound variable at all is
-            # the degenerate cross product
-            pairs = tuple((cols[v], i + 1) for i, v in enumerate(avars) if v in cols)
-            fresh, seen = [], set()
-            for i, v in enumerate(avars):
-                if v not in cols and v not in seen:
-                    fresh.append(i + 1)
-                    seen.add(v)
-            joins.append((pairs, tuple(fresh)))
-            for v in avars:
-                cols.setdefault(v, len(cols) + 1)
-        for (vi, lit) in alits:                            # 'Task Status ⟨lit⟩': the role's column
-            filters.append(_sys.cmp_filter("eq", cols[avars[vi]], lit=_num(lit)))
-        atoms.append((aft, avars))
-    # negation groups compile AFTER the positive body binds its columns: the
-    # group is its own little conjunctive body (fresh namespace — the 'no X'
-    # subject SHADOWS any outer X; other group variables shared-if-bound), and
-    # the anti-join keys on the shared columns
-    negs = []
-    if ok and neg_groups and atoms:
-        for (parts, subject_override) in neg_groups:
-            gatoms, gcols, gfilters, gjoins = [], {}, [], []
-            subject = subject_override
-            for ci, c in enumerate(parts):
-                aft, avars, alits = _rule_atom(c, k)
-                A_.append(("ruleReads", (rule_cid, aft)))
-                if ci == 0 and subject is None:
-                    subject = avars[0] if avars else None
-                if not gatoms:
-                    for v in avars:
-                        gcols.setdefault(v, len(gcols) + 1)
-                else:
-                    pairs = tuple((gcols[v], i + 1)
-                                  for i, v in enumerate(avars) if v in gcols)
-                    fresh, seen = [], set()
-                    for i, v in enumerate(avars):
-                        if v not in gcols and v not in seen:
-                            fresh.append(i + 1)
-                            seen.add(v)
-                    gjoins.append((pairs, tuple(fresh)))
-                    for v in avars:
-                        gcols.setdefault(v, len(gcols) + 1)
-                for (vi, lit) in alits:
-                    gfilters.append(_sys.cmp_filter("eq", gcols[avars[vi]],
-                                                    lit=_num(lit)))
-                gatoms.append((aft, avars))
-            shared = [v for v in gcols if v in cols and v != subject]
-            if not shared:
-                ok = False
-                diag = "negation group shares no bound variable with the body"
-                break
-            gwidths = [max(len(av), 1) for (_aft, av) in gatoms]
-            negs.append(([a[0] for a in gatoms],
-                         [gcols[v] for v in shared], gwidths, gfilters,
-                         gjoins, [cols[v] for v in shared]))
-    if ok and agg_clause is not None:
-        out_v, op, over_v = _AGG_CLAUSE.match(agg_clause).groups()
-        if neg_groups:
-            ok = False
-            diag = "an aggregate with a negation group is not supported"
-        elif over_v in cols and out_v not in cols:
-            agg = (op, cols[over_v], out_v)
-        else:
-            ok = False
-            diag = (f"aggregate clause needs a bound source and an unbound "
-                    f"output ({agg_clause!r})")
-    obj = None
-    widths = [max(len(av), 1) for (_aft, av) in atoms]
-    if ok and atoms and agg is not None:
-        op, over_col, out_v = agg
-        # a NUMBERED output variable sits in hvars and is excluded from the group;
-        # the corpus's UNNUMBERED spelling names the head's aggregated role (last in
-        # the head reading), so every numbered head variable is a group key
-        rest = [v for v in hvars if v != out_v]
-        if all(v in cols for v in rest):
-            A_.append(("derivationRule", (hft, atoms[0][0], len(atoms))))
-            A_.append(("ruleAgg", (rule_cid,)))
-            obj = _sys.compile_agg_rule([a[0] for a in atoms],
-                                        [cols[v] for v in rest], over_col, op,
-                                        widths, filters, joins)
-            # stratified above the closure, full recompute: no ~d variants
-            return A_, [(rule_cid, obj)]
-        diag = f"aggregate head variables unbound or output {out_v!r} not in head"
-    elif ok and atoms and all(v in cols for i, v in enumerate(hvars)
-                              if i not in {vi for vi, _l in _hlits}):
-        A_.append(("derivationRule", (hft, atoms[0][0], len(atoms))))
-        # a head literal fixes its role to a constant: rho applies the spec entry
-        # ⟨CONST, lit⟩ as the constant function, so the projection stays one form
-        litmap = {vi: lit for vi, lit in _hlits}
-        proj = [("CONST", _num(litmap[i])) if i in litmap else cols[v]
-                for i, v in enumerate(hvars)]
-        if negs:
-            # stratified above the closure, full recompute — like aggregates
-            A_.append(("ruleNeg", (rule_cid,)))
-            obj = _sys.compile_rule_neg([a[0] for a in atoms], proj, len(cols),
-                                        widths, filters, joins, negs)
-            return A_, [(rule_cid, obj)]
-        if len(atoms) == 1 and not filters and proj == list(range(1, widths[0] + 1)):
-            # a COPY rule (one positive atom, no filters, identity head): it proves
-            # atom ⊆ head at every fixed point, so a matching subset/subtype check
-            # is statically discharged (validate_for reads this fact)
-            A_.append(("ruleCopies", (rule_cid, atoms[0][0], hft)))
-        obj = _sys.compile_rule([a[0] for a in atoms], proj, widths, filters,
-                                joins)
-    elif ok and atoms and not negs and agg is None:
-        # EXISTENTIAL (TGD) heads, task-970's surface under 0.9.0: a head
-        # variable never bound in the body is a SKOLEM role. Its projection
-        # entry is the combinator ⟨COMP, skolem, ⟨CONS, CONST(varname),
-        # frontier selectors…⟩⟩ over the joined row — the variable IS the
-        # skolem function symbol (two fresh variables in one head mint
-        # distinct ids; the same variable over the same body SHARES its id
-        # across rules, the multi-consequent E), and the frontier is every
-        # body-bound column in appearance order. theta:selrow consumes the
-        # entry as a function directly, so no new machinery evaluates it;
-        # deterministic ids make the OWNED sweep idempotent — eager
-        # delete-and-rederive IS the semi-oblivious chase step.
-        fixed_idx = {vi for vi, _l in _hlits}
-        litmap = {vi: lit for vi, lit in _hlits}
-        frontier = tuple(sorted(cols.values()))
-
-        def _sk(v):
-            return ("COMP", "skolem", ("CONS", ("CONST", v)) + frontier)
-        A_.append(("derivationRule", (hft, atoms[0][0], len(atoms))))
-        A_.append(("ruleSkolem", (rule_cid, hft)))
-        proj = [("CONST", _num(litmap[i])) if i in fixed_idx
-                else (cols[v] if v in cols else _sk(v))
-                for i, v in enumerate(hvars)]
-        obj = _sys.compile_rule([a[0] for a in atoms], proj, widths, filters,
-                                joins)
-    elif ok:
-        fixed = {hvars[vi] for vi, _l in _hlits if vi < len(hvars)}
-        unbound = sorted(set(hvars) - set(cols) - fixed) if atoms else []
-        diag = (f"head variable(s) {unbound} unbound in the body" if unbound
-                else "no fact-type clause in the body")
-    if obj is None:
-        # the rule stays M-facts only, but it SAYS WHY (the diagnostics class)
-        if diag:
-            A_.append(("ruleDiag", (rule_cid, diag)))
-        return A_, []
-    # semi-naive: the atom list as M-facts, and one ~d delta variant per atom position
-    out = [(rule_cid, obj)]
-    for i, (aft, _av) in enumerate(atoms):
-        A_.append(("ruleAtom", (rule_cid, i + 1, aft)))
-        out.append((f"{rule_cid}~d{i + 1}",
-                    _sys.compile_rule_delta([a[0] for a in atoms], proj,
-                                            i, widths, filters, joins)))
-    return A_, out
+# #18: rule_if arrives COOKED (_cook_rule_if — the whole body parse is the
+# boundary's); the translator is the generic crows body, canon system:h_rule_if
+_h_rule_if = _h_crows
 
 
 # NORMA's derivation-storage markers in LEADING position (the corpus's spelling;
@@ -1662,12 +1417,7 @@ _MARKER_KIND = {"*": "fully-derived", "**": "derived-and-stored",
                 "+": "semi-derived", "++": "partially-derived-and-stored"}
 
 
-def _h_rule_iff(g, k, m):
-    """The unnumbered anaphoric rule: strip the storage marker, then the one rule
-    handler — numbered and unnumbered spellings are the same mechanism."""
-    marker, head, body = g
-    return _h_rule_if((head, body), k, m,
-                      kind=_MARKER_KIND.get(marker or "*", "fully-derived"))
+_h_rule_iff = _h_crows
 
 
 _h_derivation_rule = _h_crows
@@ -1721,6 +1471,16 @@ def _cook_frequency(g, k):
     lo, hi = {"at most": ((), (n,)), "at least": ((n,), ()),
               "exactly": ((n,), (n,))}[g[2]]
     return (ftn + "_freq", ftn, roles, (roles, lo, hi))
+
+
+def _value_constraint(spec):
+    """The value spec as its checker OBJECT — the historical surface, kept as the
+    spec parse's semantic checkpoint (test_modality pins it): the chosen canonical
+    builder applied to its operand."""
+    from .reduce import apply as _apply
+    from .lam import atom as _A
+    b, op = _value_spec(spec)
+    return _apply(_A(b), to_lam(op))
 
 
 def _cook_value_constraint(g, k):
@@ -1970,6 +1730,302 @@ def _cook_spanning_corpus(g, k):
             ((cid, "constraints:uniqueness", tuple(roles)),))
 
 
+def _fspec(op, col, lit=None, col2=None):
+    """The comparator predicate as canonical DATA — the very tree the
+    system:cmp_filter_lit / system:cmp_filter_col builders construct (in FFP a
+    function's representation IS a sequence, so to_lam(tree) is the identical
+    Scott object host cmp_filter builds and the operand stays pure data — the
+    class_rule eq-pred-tree precedent). theta:Filter consumes it unchanged."""
+    if col2 is not None:
+        return ("COMP", op, ("CONS", col, col2))
+    return ("COMP", op, ("CONS", col, ("CONST", lit)))
+
+
+def _atom_specs(atom_fts, widths, joins):
+    """⟨⟨ft, width, join?⟩…⟩ as plain data — engine._rule_atoms' exact optional
+    encoding (join? = () for the first atom and the linear chain, ⟨key_pairs,
+    fresh_proj⟩ for the general Codd join), so to_lam of the spec IS the sequence
+    the host builder passes to system:compile_rule."""
+    js = [None] + (list(joins) if joins else [None] * (len(atom_fts) - 1))
+    return tuple((ft, w, () if j is None
+                  else (tuple(tuple(p) for p in j[0]), tuple(j[1])))
+                 for ft, w, j in zip(atom_fts, widths, js))
+
+
+def _cook_rule_if(g, k, sign="", kind="fully-derived"):
+    """The book's rule form: Head if Clause [and Clause…] — the WHOLE resolution
+    (clause split, column map, comparators-as-filters, coercion aliases, negation
+    groups, the aggregate, the head shape incl. skolem existentials) is boundary
+    work, cooked to the generic crows groups ⟨rows, ⟨⟩, obj_specs⟩. Fact-type
+    clauses join linearly on shared variables; COMPARATOR clauses (the corpus's
+    word comparators, a bound variable against a literal or another bound
+    variable) do not join — they RESTRICT the running tuple as filter trees;
+    COERCION clauses ('Task is Resource', two known types, no declared fact type)
+    alias their variables to one column; the head projects its variables; the
+    spec-built objects consume D (cross-cell) and run_rules derives to the lfp.
+    `sign` rides for uniformity with _plan's seam (a rule is never modal)."""
+    import zlib
+    head_txt, body = g[0], g[1]
+    # ' and ' splits at TOP level; a fragment's ' where '-chain then scopes to
+    # the fragment's own quantifier: inside a 'no'-group it stays the negated
+    # existential's conjunction (it must never escape as a top-level clause),
+    # after an aggregate it hoists to top-level conjunction (the corpus's
+    # bag-scoping spelling, the behavior existing models compiled against)
+    clauses, neg_groups = [], []
+    for frag in (c.strip() for c in body.split(" and ")):
+        mm0 = re.search(r"\bat most 0 (.+)$", frag)
+        if frag.startswith("no "):
+            # (parts, subject-override): 'no X' introduces X fresh by position
+            neg_groups.append(([p.strip() for p in frag[3:].split(" where ")],
+                               None))
+        elif mm0:
+            # 'X is Yed by at most 0 Z' — negation spelled as frequency (the
+            # corpus's zero-supplying idiom): the clause minus the quantifier is
+            # the declared reading, and the COUNTED type Z is the fresh subject
+            neg_groups.append(([frag.replace("at most 0 ", "", 1)],
+                               mm0.group(1).strip()))
+        elif " where " in frag:
+            clauses.extend(p.strip() for p in frag.split(" where "))
+        else:
+            clauses.append(frag)
+    hft, hvars, _hlits = _rule_atom(head_txt, k)
+    rule_cid = hft + "_rule_" + format(zlib.crc32(body.encode()), "x")
+    _hf, decl = _fact_type(re.sub(r"\d+", "", head_txt).strip(), k)
+    # the rule's leading marker marks the RULE; the fact type's storage kind
+    # belongs to its READING declaration (trailing marker there, or none). Only
+    # a head the rule itself declares defaults to the rule's kind — the old
+    # base's SM current-status is plainly declared with imperative writers
+    # beside its seed rule, and must not become fully-derived here.
+    head_is_new = not (isinstance(k, _Known) and hft in k.plain)
+    A_ = decl + ([("derivation", (hft, kind))] if head_is_new else []) \
+        + [("ruleDerives", (rule_cid, hft))]
+    # one pass, clauses in order: joins extend the column map, comparators filter
+    # it. The AGGREGATE clause is extracted first and processed LAST: the corpus
+    # places it at the head of the body with its bag scoped by the where-clauses
+    # after it, so its source binds only once the joins have run.
+    cols, atoms, filters, joins = {}, [], [], []
+    ok, diag, agg = True, None, None
+    agg_clause = next((c for c in clauses if _AGG_CLAUSE.match(c)), None)
+    if agg_clause is not None:
+        clauses = [c for c in clauses if c != agg_clause]
+    for c in clauses:
+        mm = _CMP_CLAUSE.match(c)
+        if mm and mm.group(1) in cols:
+            subj, opw, objtxt = mm.groups()
+            if objtxt in cols:
+                filters.append(_fspec(_CMP_OPS[opw], cols[subj],
+                                      col2=cols[objtxt]))
+            else:
+                lit = _num(objtxt)
+                if isinstance(lit, str):
+                    ok = False
+                    diag = (f"comparator operand {objtxt!r} is neither a bound "
+                            f"variable nor a literal")
+                    break
+                filters.append(_fspec(_CMP_OPS[opw], cols[subj], lit=lit))
+            continue
+        coer = _coercion(c, k)
+        if coer is not None:
+            a, b = coer
+            if a in cols and b in cols:
+                filters.append(_fspec("eq", cols[a], col2=cols[b]))
+            elif a in cols:
+                cols[b] = cols[a]                          # alias: one instance, two names
+            elif b in cols:
+                cols[a] = cols[b]
+            else:
+                ok = False
+                diag = f"coercion clause {c!r} has no bound side"
+                break
+            continue
+        aft, avars, alits = _rule_atom(c, k)
+        A_.append(("ruleReads", (rule_cid, aft)))
+        if not atoms:
+            for v in avars:
+                cols.setdefault(v, len(cols) + 1)
+        elif (avars and cols.get(avars[0]) == len(cols)
+              and len(set(avars)) == len(avars)
+              and all(v not in cols for v in avars[1:])):
+            # the linear chain the fragment always compiled: NatJoin on the running
+            # tuple's last column — existing models keep bit-identical plans. Valid
+            # ONLY when the trailing variables are fresh: a rebound trailing variable
+            # (considers x actionable x has_rank, rank bound at atom one) needs the
+            # general pairs join, or its equality silently drops to a cross product
+            joins.append(None)
+            for v in avars[1:]:
+                cols.setdefault(v, len(cols) + 1)
+        else:
+            # the general conjunctive shape (Codd's join is not restricted to the
+            # last column): join on EVERY bound variable at its position, keep each
+            # fresh one ONCE at its first occurrence (a repeat's equality is the
+            # fragment boundary, as on the linear path); no bound variable at all is
+            # the degenerate cross product
+            pairs = tuple((cols[v], i + 1) for i, v in enumerate(avars) if v in cols)
+            fresh, seen = [], set()
+            for i, v in enumerate(avars):
+                if v not in cols and v not in seen:
+                    fresh.append(i + 1)
+                    seen.add(v)
+            joins.append((pairs, tuple(fresh)))
+            for v in avars:
+                cols.setdefault(v, len(cols) + 1)
+        for (vi, lit) in alits:                            # 'Task Status ⟨lit⟩': the role's column
+            filters.append(_fspec("eq", cols[avars[vi]], lit=_num(lit)))
+        atoms.append((aft, avars))
+    # negation groups compile AFTER the positive body binds its columns: the
+    # group is its own little conjunctive body (fresh namespace — the 'no X'
+    # subject SHADOWS any outer X; other group variables shared-if-bound), and
+    # the anti-join keys on the shared columns
+    negs = []
+    if ok and neg_groups and atoms:
+        for (parts, subject_override) in neg_groups:
+            gatoms, gcols, gfilters, gjoins = [], {}, [], []
+            subject = subject_override
+            for ci, c in enumerate(parts):
+                aft, avars, alits = _rule_atom(c, k)
+                A_.append(("ruleReads", (rule_cid, aft)))
+                if ci == 0 and subject is None:
+                    subject = avars[0] if avars else None
+                if not gatoms:
+                    for v in avars:
+                        gcols.setdefault(v, len(gcols) + 1)
+                else:
+                    pairs = tuple((gcols[v], i + 1)
+                                  for i, v in enumerate(avars) if v in gcols)
+                    fresh, seen = [], set()
+                    for i, v in enumerate(avars):
+                        if v not in gcols and v not in seen:
+                            fresh.append(i + 1)
+                            seen.add(v)
+                    gjoins.append((pairs, tuple(fresh)))
+                    for v in avars:
+                        gcols.setdefault(v, len(gcols) + 1)
+                for (vi, lit) in alits:
+                    gfilters.append(_fspec("eq", gcols[avars[vi]],
+                                           lit=_num(lit)))
+                gatoms.append((aft, avars))
+            shared = [v for v in gcols if v in cols and v != subject]
+            if not shared:
+                ok = False
+                diag = "negation group shares no bound variable with the body"
+                break
+            gwidths = [max(len(av), 1) for (_aft, av) in gatoms]
+            negs.append(([a[0] for a in gatoms],
+                         [gcols[v] for v in shared], gwidths, gfilters,
+                         gjoins, [cols[v] for v in shared]))
+    if ok and agg_clause is not None:
+        out_v, op, over_v = _AGG_CLAUSE.match(agg_clause).groups()
+        if neg_groups:
+            ok = False
+            diag = "an aggregate with a negation group is not supported"
+        elif over_v in cols and out_v not in cols:
+            agg = (op, cols[over_v], out_v)
+        else:
+            ok = False
+            diag = (f"aggregate clause needs a bound source and an unbound "
+                    f"output ({agg_clause!r})")
+    obj = None
+    widths = [max(len(av), 1) for (_aft, av) in atoms]
+    # the atom specs in the shared ⟨ft, width, join?⟩ encoding — widths and joins
+    # fold INTO the spec exactly as engine._rule_atoms folds them at build time
+    aspecs = _atom_specs([a[0] for a in atoms], widths, joins)
+    if ok and atoms and agg is not None:
+        op, over_col, out_v = agg
+        # a NUMBERED output variable sits in hvars and is excluded from the group;
+        # the corpus's UNNUMBERED spelling names the head's aggregated role (last in
+        # the head reading), so every numbered head variable is a group key
+        rest = [v for v in hvars if v != out_v]
+        if all(v in cols for v in rest):
+            A_.append(("derivationRule", (hft, atoms[0][0], len(atoms))))
+            A_.append(("ruleAgg", (rule_cid,)))
+            # stratified above the closure, full recompute: no ~d variants
+            return (tuple(A_), (),
+                    ((rule_cid, "system:compile_agg_rule",
+                      (aspecs, tuple(cols[v] for v in rest), over_col, op,
+                       tuple(filters))),))
+        diag = f"aggregate head variables unbound or output {out_v!r} not in head"
+    elif ok and atoms and all(v in cols for i, v in enumerate(hvars)
+                              if i not in {vi for vi, _l in _hlits}):
+        A_.append(("derivationRule", (hft, atoms[0][0], len(atoms))))
+        # a head literal fixes its role to a constant: rho applies the spec entry
+        # ⟨CONST, lit⟩ as the constant function, so the projection stays one form
+        litmap = {vi: lit for vi, lit in _hlits}
+        proj = [("CONST", _num(litmap[i])) if i in litmap else cols[v]
+                for i, v in enumerate(hvars)]
+        if negs:
+            # stratified above the closure, full recompute — like aggregates.
+            # The whole group spec is data: per group ⟨natoms, nproj, nfilters,
+            # ⟨anti_key, 1..|nproj|⟩⟩ (the anti-join spec precomputed — Stage-1
+            # resolves everything static; the base has no iota)
+            A_.append(("ruleNeg", (rule_cid,)))
+            negspecs = tuple(
+                (_atom_specs(nfts, nwidths, njoins), tuple(nproj),
+                 tuple(nfilters),
+                 (tuple(anti_key), tuple(range(1, len(nproj) + 1))))
+                for (nfts, nproj, nwidths, nfilters, njoins, anti_key) in negs)
+            return (tuple(A_), (),
+                    ((rule_cid, "system:compile_rule_neg",
+                      (aspecs, tuple(proj), tuple(range(1, len(cols) + 1)),
+                       tuple(filters), negspecs)),))
+        if len(atoms) == 1 and not filters and proj == list(range(1, widths[0] + 1)):
+            # a COPY rule (one positive atom, no filters, identity head): it proves
+            # atom ⊆ head at every fixed point, so a matching subset/subtype check
+            # is statically discharged (validate_for reads this fact)
+            A_.append(("ruleCopies", (rule_cid, atoms[0][0], hft)))
+        obj = ("system:compile_rule", (aspecs, tuple(proj), tuple(filters)))
+    elif ok and atoms and not negs and agg is None:
+        # EXISTENTIAL (TGD) heads, task-970's surface under 0.9.0: a head
+        # variable never bound in the body is a SKOLEM role. Its projection
+        # entry is the combinator ⟨COMP, skolem, ⟨CONS, CONST(varname),
+        # frontier selectors…⟩⟩ over the joined row — the variable IS the
+        # skolem function symbol (two fresh variables in one head mint
+        # distinct ids; the same variable over the same body SHARES its id
+        # across rules, the multi-consequent E), and the frontier is every
+        # body-bound column in appearance order. theta:selrow consumes the
+        # entry as a function directly, so no new machinery evaluates it;
+        # deterministic ids make the OWNED sweep idempotent — eager
+        # delete-and-rederive IS the semi-oblivious chase step.
+        fixed_idx = {vi for vi, _l in _hlits}
+        litmap = {vi: lit for vi, lit in _hlits}
+        frontier = tuple(sorted(cols.values()))
+
+        def _sk(v):
+            return ("COMP", "skolem", ("CONS", ("CONST", v)) + frontier)
+        A_.append(("derivationRule", (hft, atoms[0][0], len(atoms))))
+        A_.append(("ruleSkolem", (rule_cid, hft)))
+        proj = [("CONST", _num(litmap[i])) if i in fixed_idx
+                else (cols[v] if v in cols else _sk(v))
+                for i, v in enumerate(hvars)]
+        obj = ("system:compile_rule", (aspecs, tuple(proj), tuple(filters)))
+    elif ok:
+        fixed = {hvars[vi] for vi, _l in _hlits if vi < len(hvars)}
+        unbound = sorted(set(hvars) - set(cols) - fixed) if atoms else []
+        diag = (f"head variable(s) {unbound} unbound in the body" if unbound
+                else "no fact-type clause in the body")
+    if obj is None:
+        # the rule stays M-facts only, but it SAYS WHY (the diagnostics class)
+        if diag:
+            A_.append(("ruleDiag", (rule_cid, diag)))
+        return (tuple(A_), (), ())
+    # semi-naive: the atom list as M-facts, and one ~d delta variant per atom
+    # position — the delta operand is the rule operand plus the 1-based seat
+    ospecs = [(rule_cid,) + obj]
+    for i, (aft, _av) in enumerate(atoms):
+        A_.append(("ruleAtom", (rule_cid, i + 1, aft)))
+        ospecs.append((f"{rule_cid}~d{i + 1}", "system:compile_rule_delta",
+                       obj[1] + (i + 1,)))
+    return (tuple(A_), (), tuple(ospecs))
+
+
+def _cook_rule_iff(g, k):
+    """The unnumbered anaphoric rule: strip the storage marker, then the one rule
+    cook — numbered and unnumbered spellings are the same mechanism (the old
+    _h_rule_iff delegation, moved whole to the boundary)."""
+    marker, head, body = g
+    return _cook_rule_if((head, body), k,
+                         kind=_MARKER_KIND.get(marker or "*", "fully-derived"))
+
+
 _COOK = {
     "sm_trigger": lambda g, k: (g[0], _clause_ft(g[1], k)),
     "sm_guard": lambda g, k: (g[0], _clause_ft(g[1], k)),
@@ -1992,6 +2048,8 @@ _COOK = {
     "derivation_rule": _cook_derivation_rule,
     "class_rule": _cook_class_rule,
     "neg_pair": _cook_neg_pair,
+    "rule_if": _cook_rule_if,
+    "rule_iff": _cook_rule_iff,
 }
 
 

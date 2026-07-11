@@ -942,8 +942,10 @@ def links_of(key_pos, sm=None, status_pos=None):
     if sm is None:
         return nav_of(key_pos)                        # nav only (dispatches to system:nav_of)
     from .reduce import apply as _apply
-    from .lam import to_lam as _tl
-    return _apply(A("system:links_of"), _tl((key_pos, sm, status_pos)))
+    # sm is ALREADY a Scott value — ride it raw in a built SEQ exactly like
+    # transitions_of does (to_lam would wrap the function as an atom and the
+    # transitions branch would mis-evaluate: the test_hateoas unpack regression)
+    return _apply(A("system:links_of"), _S(A(key_pos), sm, A(status_pos)))
 
 
 # --- S1: membership is application, as a construction (Def. pop / eq. (1)) ---

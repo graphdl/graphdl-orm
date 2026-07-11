@@ -2462,6 +2462,34 @@ DEF("system:anti_wrap",
        S3(A("COMP"), A("theta:AntiRestrict"), N(3)),
        S4(A("CONS"), K(A("CONS")), N(1), N(2)))),
 
+"THE STRATIFIED-NEGATION RULE BUILDER (2026-07-10, #18 rule_if): system:compile_rule_neg — the positive body wrapped in anti-joins, the canonical form of engine.compile_rule_neg (the host stays the certified-equal twin). Operand ⟨atoms, head, bodyhead, filters, negs⟩: atoms in the shared ⟨ft, width, join?⟩ encoding (widths and joins fold into the spec, exactly _rule_atoms); head the projection over the surviving tuple (may carry ⟨CONST, lit⟩ entries); bodyhead the IDENTITY projection 1..ncols precomputed by the cook (Stage-1 resolves everything static; the base has no iota); filters the comparator data trees (theta:Filter consumes a sequence-form predicate directly — a function's representation IS a sequence); negs the group specs ⟨natoms, nproj, nfilters, ⟨anti_key, 1..|nproj|⟩⟩ — each group its own compile_rule over its own spec, anti-joined onto the running object through system:anti_wrap (theta:AntiRestrict — Restrict's mirror with the membership negated). The WHILE fold carries ⟨obj, remaining groups⟩ — group order preserved, the LAST group wraps outermost, exactly the host's loop; the head Project composes last. Full recompute above the closure, like aggregates: semi-naive deltas are unsound under negation-as-failure, so no ~d variant exists for this builder.",
+
+DEF("system:compile_rule_neg",
+    S4(A("CONS"), K(A("COMP")),
+       S3(A("COMP"), A("apply"),
+          S3(A("CONS"), K(A("theta:Project")), N(2))),
+       S4(A("COMP"), N(1),
+          S3(A("WHILE"),
+             S4(A("COMP"), A("not"), A("null"), N(2)),
+             S3(A("CONS"),
+                S3(A("COMP"), A("apply"),
+                   S3(A("CONS"), K(A("system:anti_wrap")),
+                      S4(A("CONS"),
+                         N(1),
+                         S3(A("COMP"), A("apply"),
+                            S3(A("CONS"), K(A("system:compile_rule")),
+                               S4(A("CONS"),
+                                  S4(A("COMP"), N(1), N(1), N(2)),
+                                  S4(A("COMP"), N(2), N(1), N(2)),
+                                  S4(A("COMP"), N(3), N(1), N(2))))),
+                         S4(A("COMP"), N(4), N(1), N(2))))),
+                S3(A("COMP"), A("tl"), N(2)))),
+          S3(A("CONS"),
+             S3(A("COMP"), A("apply"),
+                S3(A("CONS"), K(A("system:compile_rule")),
+                   S4(A("CONS"), N(1), N(3), N(4)))),
+             N(5))))),
+
 DEF("system:class_subj",
     S5(A("CONS"), K(A("COMP")),
        K(S2(A("ALPHA"), N(1))),
@@ -5591,6 +5619,14 @@ DEF("system:h_disjunctive_mandatory", A("system:h_crows")),
 DEF("system:h_equality", A("system:h_crows")),
 
 DEF("system:h_neg_pair", A("system:h_crows")),
+
+DEF("system:h_subset_trailing", A("system:h_crows")),
+
+"THE RULE-FORM READING TRANSLATORS (2026-07-10, #18): rule_if and rule_iff ride h_crows — the WHOLE body parse (clause split, column map, comparators-as-filter-trees, coercion aliases, negation groups, the aggregate extraction, the head shape incl. skolem existentials) is _cook_rule_if at the Stage-1 boundary, and every compiled object is an obj spec through DEFS: ⟨cid, system:compile_rule, ⟨atoms, head, filters⟩⟩ plus one system:compile_rule_delta spec per atom seat (the semi-naive variants), system:compile_agg_rule for the aggregate form, system:compile_rule_neg for the stratified negation form. Filters are the cmp_filter DATA TREES (⟨COMP, op, ⟨CONS, col, ⟨CONST, lit⟩⟩⟩ / ⟨COMP, op, ⟨CONS, col, col2⟩⟩ — what the builders construct anyway), so the specs stay pure data and the apply prim rebuilds the identical objects. rule_iff's storage marker resolves to the derivation kind in its cook (_MARKER_KIND — the old delegation, moved whole to the boundary). Hosts _h_rule_if/_h_rule_iff are the certified-equal crows overrides (test_rule_if_canon twins rows and objects, structurally and extensionally).",
+
+DEF("system:h_rule_if", A("system:h_crows")),
+
+DEF("system:h_rule_iff", A("system:h_crows")),
 
 "THE VALUE-CONSTRAINT READING TRANSLATOR AS DATA (2026-07-10, #18): cooked groups ⟨name, spec, cid, builder_name, operand⟩ — the spec parse (the VALUE_SPECS pattern table + the enumeration fallback) is the string boundary, and the chosen canonical builder (constraints:value_range / constraints:value_enumeration) rides as a NAME the translator applies through DEFS. Two rows (the valueConstraint reading row keeping the spec text + the constraint row on the value type's own cell) and one obj ⟨cid, (builder : operand)⟩. Host _h_value_constraint is the certified-equal override (test_value_constraint_canon, extensional on the obj).",
 
