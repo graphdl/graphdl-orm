@@ -2823,8 +2823,9 @@ const SESSION_VERBS: [&str; 11] =
 const APP_VERBS: [&str; 13] =
     ["apply", "ask", "cells", "compile", "explain", "get", "induce", "propose",
      "query", "retract", "schema", "sql", "synthesize"];
-const RESIDENT_OPS: [&str; 7] =
-    ["cells", "compile_model", "query", "run_rules", "sql_project", "synthesize_pairs", "verbs"];
+const RESIDENT_OPS: [&str; 8] =
+    ["base_seed", "cells", "compile_model", "query", "run_rules", "sql_project",
+     "synthesize_pairs", "verbs"];
 
 fn reduce_in(mu: &V, cells: &[(Leaf, V)], d: &V, f: V, x: V, fuel: Option<i64>) -> V {
     // one reduction under a given store binding, the case path's frame
@@ -6963,6 +6964,375 @@ fn status_facts_native(
     Ok(out)
 }
 
+// ======================= the model-D seed (#20, native-compile mission) ======
+// docs/2026-07-11-native-pipeline-tail-spec.md §3. Python's every app compile
+// seeds from Registry._base_D() (protocol.py:1782), which is JUST
+// persist.ingest_frozen(base_text, cache_dir=self.cache_dir) with no
+// `compiler` override -- and ingest_frozen's cache-miss body (protocol.py:200)
+// is `(compiler or forml.compile_model)(text)[0]`, i.e. bare
+// `forml.compile_model(text)` with D=None, context_from=None. `forml` IS
+// `compiler` (engine/python/__init__.py's alias table), and compile_model
+// (compiler.py:2478) is `compile_model_selfhost(...) + system.rekey_
+// transitions(D2)` -- nothing else. So _base_D() is fold+rekey ONLY: no
+// run_rules, no status_facts, no machine_fold, no layout_cells -- those are
+// the PIPELINE's own later calls, made in Registry.compile() on the
+// base-seeded APP store, never on the base alone. (This narrower boundary
+// supersedes the task brief's literal "classify -> cooks -> fold -> rekey ->
+// rules -> status_facts -> machine_fold -> rules-iff-changed -> layout_cells"
+// list, which was that brief's hypothesis pending exactly this check.)
+//
+// That boundary already has a native twin: compile_lines_native (above,
+// #20 machine_fold slice) IS compile_model_selfhost + rekey_transitions_
+// native, byte-parity-certified as status_facts_native's own nested compile.
+// Calling it with seed_cells = initial_d_cells() reproduces D=None/context_
+// from=None exactly: context_of(&initial_d_cells()) reads instanceOf/
+// factType/subtype off a store holding only the FILE:phi cell, finding none
+// of those three names and returning the same empty (HashSet::new(),
+// Vec::new(), HashSet::new(), HashSet::new()) python's own `context_from is
+// None` shortcut returns. So base_seed below is a THIN wrapper: assemble the
+// base text, then hand it to the already-certified compile_lines_native --
+// zero new fold/rekey logic, per the constraint against touching those
+// functions.
+
+// read_base_text mirrors Registry._base_D's own text assembly EXACTLY
+// (protocol.py:1787-1789): every *.md file directly under base_dir,
+// filename-sorted (plain string sort; all filenames here are lowercase
+// ASCII, so byte order and codepoint order agree), joined by a blank line.
+//
+// The one native ADDITION, load-bearing: Python's open(path,
+// encoding="utf-8").read() is TEXT MODE, which performs universal-newline
+// translation on every read ("\r\n" and a lone "\r" both fold to "\n").
+// Rust's std::fs::read_to_string does not. This repo checks out with
+// core.autocrlf=true and engine/shared/base/*.md carry real CRLF on disk
+// (verified empirically: core.md alone holds 1,053 "\r\n" pairs, zero lone
+// "\r"). Every EXISTING native pipeline entry point (op_compile_model,
+// compile_lines_native) takes "text" as a pre-supplied JSON string -- every
+// caller reads the file in Python first, so this normalization has always
+// happened upstream, invisibly. base_seed is the FIRST native code path that
+// reads readings files itself, so it is the first that must do this
+// normalization on purpose; skipped, every base statement would carry a
+// trailing '\r' baked into its stored text -- a silent divergence from
+// python's D, not a crash.
+fn normalize_newlines(s: &str) -> String {
+    if !s.contains('\r') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn read_base_text(base_dir: &std::path::Path) -> Result<String, String> {
+    let rd = std::fs::read_dir(base_dir)
+        .map_err(|e| format!("unreadable base dir {}: {}", base_dir.display(), e))?;
+    let mut names: Vec<String> = Vec::new();
+    for entry in rd {
+        let entry = entry.map_err(|e| format!("base dir walk {}: {}", base_dir.display(), e))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".md") && entry.path().is_file() {
+            names.push(name);
+        }
+    }
+    names.sort();
+    let mut parts: Vec<String> = Vec::with_capacity(names.len());
+    for name in &names {
+        let raw = std::fs::read_to_string(base_dir.join(name))
+            .map_err(|e| format!("unreadable base reading {}: {}", name, e))?;
+        parts.push(normalize_newlines(&raw));
+    }
+    Ok(parts.join("\n\n"))
+}
+
+// ============================ sha256 (zero-dep base-seed fingerprint) ========
+// A minimal from-scratch SHA-256 (FIPS 180-4), standard constants and
+// algorithm -- Cargo.toml is explicit that the HOST build stays zero-dep
+// ("the crate's first dependency, deliberate and OPTIONAL" is wasm-bindgen,
+// worker-only), so the base-seed key hashes with this instead of pulling a
+// sha2 crate. Verified against the two standard test vectors (sha256("") and
+// sha256("abc")) in a standalone scratch build before landing here
+// (seed-sha256-check.rs, both matched byte for byte); not re-checked by a
+// #[test] because this crate carries none (differential scripts against the
+// python engine are its existing acceptance discipline, kept consistent
+// rather than introducing a new one for one helper).
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+fn sha256_hex(data: &[u8]) -> String {
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+    let bitlen: u64 = (data.len() as u64) * 8;
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bitlen.to_be_bytes());
+
+    for chunk in msg.chunks(64) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([chunk[4 * i], chunk[4 * i + 1], chunk[4 * i + 2], chunk[4 * i + 3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(SHA256_K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+    let mut out = String::with_capacity(64);
+    for x in h {
+        out.push_str(&format!("{:08x}", x));
+    }
+    out
+}
+
+// exe_fingerprint_hex is the base-seed key's "did the engine change" half:
+// the running executable's own bytes, sha256'd -- "the exe's own hash", the
+// cheaper of the spec's two named options (the other, a compile-time env,
+// needs a build.rs: a build-system change this crate's dependency policy
+// steers away from, ditto Cargo.toml's zero-dep comment). It is, if
+// anything, MORE honest than python's _engine_fingerprint (hashes only
+// engine/python/*.py + engine/shared/*.py): a binary hash also invalidates
+// on a toolchain bump or a Cargo.lock change, any input that changes the
+// compiled output, not just main.rs's own text. Memoized per process
+// (OnceLock, stable std, no new dependency) -- the exe cannot change under a
+// running process, and base_seed may be called more than once per --serve
+// session.
+fn exe_fingerprint_hex() -> Result<String, String> {
+    static FP: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+    FP.get_or_init(|| {
+        let exe = std::env::current_exe()
+            .map_err(|e| format!("no executable path to fingerprint: {}", e))?;
+        let bytes = std::fs::read(&exe)
+            .map_err(|e| format!("unreadable executable {}: {}", exe.display(), e))?;
+        Ok(sha256_hex(&bytes))
+    })
+    .clone()
+}
+
+// base_seed_key: sha256(exe_fingerprint || 0x00 || base_text) -- the same
+// "fingerprint + NUL + text" shape ingest_frozen hashes on the python side
+// (_engine_fingerprint() + "\x00" + text), unrelated in VALUE (this key
+// never needs to equal python's own; each host invalidates only its own
+// cache) but matched in FORM since it is the same idea for the same reason.
+fn base_seed_key(base_text: &str) -> Result<String, String> {
+    let fp = exe_fingerprint_hex()?;
+    let mut buf = fp.into_bytes();
+    buf.push(0);
+    buf.extend_from_slice(base_text.as_bytes());
+    Ok(sha256_hex(&buf))
+}
+
+// base_seed_paths resolves the base readings directory and the base store
+// sidecar path. CONVENTION, matching load_grammar_scratch's own exactly:
+// walk up from the executable for a "shared" directory carrying
+// forml2-grammar.store.json (the grammar sidecar's own landmark file), then
+// base_dir = <that>/base and store_path = <that>/base.store.json -- "beside
+// the grammar sidecar" per the spec, literally the same directory. Explicit
+// "base_dir"/"base_store" op args override either half independently (the
+// differential scripts use this to point at a worktree's own engine/shared
+// without relying on exe ancestry, exactly as grammar_sidecar does).
+fn base_seed_paths(j: &J) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+    let explicit_dir = match jget(j, "base_dir") {
+        Some(J::S(p)) => Some(std::path::PathBuf::from(p)),
+        Some(_) => return Err("base_dir must be a string path".to_string()),
+        None => None,
+    };
+    let explicit_store = match jget(j, "base_store") {
+        Some(J::S(p)) => Some(std::path::PathBuf::from(p)),
+        Some(_) => return Err("base_store must be a string path".to_string()),
+        None => None,
+    };
+    let shared: Option<std::path::PathBuf> = if explicit_dir.is_none() || explicit_store.is_none() {
+        let exe = std::env::current_exe()
+            .map_err(|e| format!("no executable path to walk for the base seed: {}", e))?;
+        exe.ancestors()
+            .skip(1)
+            .map(|dir| dir.join("shared"))
+            .find(|cand| cand.join("forml2-grammar.store.json").is_file())
+    } else {
+        None
+    };
+    let base_dir = match explicit_dir {
+        Some(d) => d,
+        None => shared
+            .clone()
+            .ok_or_else(|| {
+                "base readings dir not found by walking the executable's ancestors for \
+                 shared/forml2-grammar.store.json; pass base_dir"
+                    .to_string()
+            })?
+            .join("base"),
+    };
+    let store_path = match explicit_store {
+        Some(s) => s,
+        None => shared
+            .ok_or_else(|| {
+                "base store path not found by walking the executable's ancestors for \
+                 shared/forml2-grammar.store.json; pass base_store"
+                    .to_string()
+            })?
+            .join("base.store.json"),
+    };
+    Ok((base_dir, store_path))
+}
+
+// op_base_seed: the native model-D seed (task #20). Ensures the resident
+// store holds the CURRENT base (thawing base.store.json when its embedded
+// key matches a fresh recompute-would-produce-this key, else recomputing
+// through compile_lines_native and persisting tmp-then-rename) and answers
+// which path was taken. "Current" is exactly the regen rule the spec names
+// (the sidecar lesson, 310404b4): the key is sha256(exe bytes, NUL, base
+// text), so a changed reading OR a rebuilt engine changes the key and a
+// stale thaw is impossible by construction, never a silent hit.
+//
+// The persisted shape is the SAME {"d": ...} the serve loop's generic
+// preamble already accepts (handle()'s `if let Some(dj) = jget(j, "d")`
+// arm) -- base.store.json can be fed as an ordinary preamble line by any
+// caller that does not want the key-check convenience this op adds; this op
+// is that convenience plus the write path. A "key" field rides alongside
+// "d" (the spec's "sibling key ... or embedded field" alternative); generic
+// preamble consumers ignore the extra field, so the two consumption paths
+// coexist over one file.
+fn op_base_seed(j: &J, srv: &mut Srv) -> Result<String, String> {
+    let fuel = match jget(j, "fuel") {
+        Some(J::I(n)) if *n > 0 => Some(*n),
+        _ => None,
+    };
+    let dump_store_on = matches!(jget(j, "dump_store"), Some(J::I(1)));
+
+    let (base_dir, store_path) = base_seed_paths(j)?;
+    let base_text = read_base_text(&base_dir)?;
+    let key = base_seed_key(&base_text)?;
+
+    // ---- the thaw attempt: a key match proves THIS binary already wrote
+    // this exact base text's store, so trusting the file is exactly as
+    // correct as recomputing (never a stale shortcut). Any failure along
+    // this path (missing file, bad JSON, no "d", mismatched key) falls
+    // through to the recompute below instead of erroring.
+    if let Ok(text) = std::fs::read_to_string(&store_path) {
+        if let Some(payload) = parse_json(&text) {
+            let existing_key = match jget(&payload, "key") {
+                Some(J::S(k)) => Some(k.as_str()),
+                _ => None,
+            };
+            if existing_key == Some(key.as_str()) {
+                if let Some(dj) = jget(&payload, "d") {
+                    srv.d = to_v(dj);
+                    srv.cells = cells_of(&srv.d);
+                    srv.nd = j_to_n(dj);
+                    srv.ncells = n_cells_of(&srv.nd);
+                    let mut r = String::from("{\"source\":\"thawed\",\"cells\":");
+                    r.push_str(&srv.cells.len().to_string());
+                    r.push_str(",\"key\":");
+                    esc(&key, &mut r);
+                    r.push_str(",\"path\":");
+                    esc(&store_path.display().to_string(), &mut r);
+                    if dump_store_on {
+                        r.push_str(",\"store\":");
+                        write_v(&srv.d, &mut r);
+                    }
+                    r.push('}');
+                    return Ok(r);
+                }
+            }
+        }
+    }
+
+    // ---- recompute: ingest_frozen's exact boundary (compile_model_selfhost
+    // + rekey_transitions, D=None/context_from=None), via the ALREADY
+    // byte-parity-certified compile_lines_native -- no new fold/rekey logic
+    // (the constraint against touching those functions is honored by
+    // reusing this one wholesale, not by re-deriving it).
+    let (model_cells, folded_any) =
+        compile_lines_native(j, &base_text, &initial_d_cells(), srv, fuel)
+            .map_err(|e| format!("base_seed compile: {}", e))?;
+    srv.d = cells_to_d(&model_cells);
+    srv.cells = model_cells;
+    srv.nd = v_to_n(&srv.d);
+    srv.ncells = n_cells_of(&srv.nd);
+
+    let mut payload = String::from("{\"d\":");
+    write_v(&srv.d, &mut payload);
+    payload.push_str(",\"key\":");
+    esc(&key, &mut payload);
+    payload.push('}');
+    let mut tmp = store_path.clone().into_os_string();
+    // the tmp name carries the pid, matching write_sidecar/_sidecar: two
+    // writers racing to reseed the SAME base.store.json must never share one
+    // tmp path and tear the file
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = std::path::PathBuf::from(tmp);
+    std::fs::write(&tmp, payload.as_bytes())
+        .map_err(|e| format!("base_seed write {}: {}", tmp.display(), e))?;
+    std::fs::rename(&tmp, &store_path)
+        .map_err(|e| format!("base_seed rename to {}: {}", store_path.display(), e))?;
+
+    let mut r = String::from("{\"source\":\"recomputed\",\"cells\":");
+    r.push_str(&srv.cells.len().to_string());
+    r.push_str(",\"key\":");
+    esc(&key, &mut r);
+    r.push_str(",\"path\":");
+    esc(&store_path.display().to_string(), &mut r);
+    r.push_str(",\"folded\":");
+    r.push_str(if folded_any { "true" } else { "false" });
+    if dump_store_on {
+        r.push_str(",\"store\":");
+        write_v(&srv.d, &mut r);
+    }
+    r.push('}');
+    Ok(r)
+}
+
 fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
     use std::collections::{BTreeMap, HashMap, HashSet};
     // args parse before anything runs (op_run_rules' discipline: a malformed
@@ -8196,6 +8566,15 @@ fn op_answer(op: &str, j: &J, srv: &mut Srv) -> Result<String, String> {
             // (the python delegation) is untouched — this op is the native
             // primary being grown beside it (the lex twin pattern).
             op_compile_model(j, srv)
+        }
+        "base_seed" => {
+            // the native model-D seed (#20 seed slice): thaw base.store.json
+            // when its embedded key matches, else recompute through the
+            // already-certified compile_lines_native and persist
+            // tmp-then-rename. Either way the resident ends up holding the
+            // current base, ready for an app compile's own
+            // context_from:"resident" (the identity/tasks --based flow).
+            op_base_seed(j, srv)
         }
         "sql_project" => {
             // the RMAP 3NF projection over the resident store (transplant #2):
