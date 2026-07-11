@@ -5803,7 +5803,22 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
                 accepted = true;
                 continue;
             }
-            match native_cook(t, inner, &mfield, &kn, srv) {
+            // the panic fence (#32): a cook tripping a guarded-by-construction
+            // unwrap on an adversarial reading must degrade to python's
+            // per-statement semantics (raise -> unclassified, compile
+            // continues), never kill the resident. Payload -> the Err lane.
+            let cooked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || native_cook(t, inner, &mfield, &kn, srv),
+            ))
+            .unwrap_or_else(|p| {
+                let msg = p
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| p.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".into());
+                Err(format!("cook panicked: {}", msg))
+            });
+            match cooked {
                 Ok(Some(fire)) => {
                     // the translator fired: python's _plan answered its
                     // ⟨asserts, objs⟩ (the acceptance surface of the
