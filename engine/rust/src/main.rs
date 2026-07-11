@@ -3084,6 +3084,59 @@ fn store_into(
     }
 }
 
+// setcell_into is engine.py _reconcile_absorbed_heads' setcell (:1165): the
+// reassembly's write REPLACES IN PLACE when the cell exists and APPENDS AT
+// THE END when it doesn't — Store's remove+prepend would re-top the written
+// cells and reorder the dump against python (order forensics, 2026-07-11).
+fn setcell_into(
+    d: &mut V,
+    cells: &mut Vec<(Leaf, V)>,
+    nd: &mut N,
+    ncells: &mut Vec<(Leaf, N)>,
+    name: &Leaf,
+    contents: V,
+) {
+    let ncontents = v_to_n(&contents);
+    let cellv = seq(from_vec(vec![
+        atom(Leaf::S("CELL".into())),
+        atom(name.clone()),
+        contents.clone(),
+    ]));
+    let mut entries = items(&list_of(d));
+    match entries.iter().position(|c| {
+        let it = items(&list_of(c));
+        it.len() >= 2 && matches!(aval(&it[1]), Some(k) if k.nateq(name))
+    }) {
+        Some(p) => entries[p] = cellv,
+        None => entries.push(cellv),
+    }
+    *d = seq(from_vec(entries));
+    match cells.iter_mut().find(|(k, _)| k.nateq(name)) {
+        Some(slot) => slot.1 = contents,
+        None => cells.push((name.clone(), contents)),
+    }
+    let ncellv = N::S(Rc::new(vec![
+        N::A(Rc::new(Leaf::S("CELL".into()))),
+        N::A(Rc::new(name.clone())),
+        ncontents.clone(),
+    ]));
+    let mut nentries: Vec<N> = match nd {
+        N::S(v) => v.to_vec(),
+        _ => Vec::new(),
+    };
+    match nentries.iter().position(|c| {
+        matches!(c, N::S(it) if it.len() >= 2 && matches!(&it[1], N::A(k) if k.nateq(name)))
+    }) {
+        Some(p) => nentries[p] = ncellv,
+        None => nentries.push(ncellv),
+    }
+    *nd = N::S(Rc::new(nentries));
+    match ncells.iter_mut().find(|(k, _)| k.nateq(name)) {
+        Some(slot) => slot.1 = ncontents,
+        None => ncells.push((name.clone(), ncontents)),
+    }
+}
+
 // eval_rules is engine.py's _eval_rules (line 1188): the UNION of the given
 // rules' outputs over the store, deduplicated by row key in first-seen order
 // and keeping only sequence rows (Python keeps only tuples). It is the shared
@@ -4044,7 +4097,21 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 _ => None,
             };
             let hole = || atom(Leaf::S("#".to_string()));
+            // python's reconcile filter (engine.py:1523): touched ∩
+            // DERIVED_HEADS ∩ absorbed — a base-populated absorbed ft that
+            // changed in the round must NOT have its column reassembled
+            // from its pop here (its storage is the routed write's, not the
+            // derive cache's; visible on pre-layout stores where the extra
+            // write fills columns python leaves holed)
+            let derived: HashSet<String> = rules
+                .iter()
+                .chain(agg_rules.iter())
+                .map(|rr| leaf_text(&rr.head))
+                .collect();
             for ftname in changed.iter() {
+                if !derived.contains(ftname) {
+                    continue;
+                }
                 let (table, col) = match layout.get(ftname) {
                     Some((t, c)) => (t.clone(), *c),
                     None => continue,
@@ -4100,7 +4167,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                     }
                     if !eqobj(&row[col - 1], &v) {
                         row[col - 1] = v;
-                        store_into(&mut d, &mut cells, &mut nd, &mut ncells, &rc,
+                        setcell_into(&mut d, &mut cells, &mut nd, &mut ncells, &rc,
                                    seq(from_vec(row)));
                     }
                 }
@@ -4130,12 +4197,12 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                         row.push(hole());
                     }
                     row[col - 1] = v;
-                    store_into(&mut d, &mut cells, &mut nd, &mut ncells, &rc,
+                    setcell_into(&mut d, &mut cells, &mut nd, &mut ncells, &rc,
                                seq(from_vec(row)));
                     tbl.push(seq(from_vec(vec![ka])));
                 }
                 if grew {
-                    store_into(&mut d, &mut cells, &mut nd, &mut ncells, &tleaf,
+                    setcell_into(&mut d, &mut cells, &mut nd, &mut ncells, &tleaf,
                                seq(from_vec(tbl)));
                 }
             }
@@ -5690,6 +5757,131 @@ fn fold_fire(fire: &cooks::Fire, cells: &mut Vec<(Leaf, V)>) -> Result<(), Strin
     Ok(())
 }
 
+// ======================= rekey_transitions (#20, native pipeline tail slice 1) ===
+// engine.py:1608 rekey_transitions, ported whole (NOT canon-backed: its body is
+// pure host list/dict manipulation over from_lam(D), no _apply/reduce call
+// anywhere in it — confirmed against every DEF in shared/*.canon; none is named
+// or shaped for this). Machine-scope each Transition's IDENTITY: Core.png/
+// GraphDL model Transition(.id) as a SURROGATE, not the readings' name, so a
+// base-vs-app reuse of a transition NAME must not merge one entity carrying
+// two machines' froms/tos. Runs PER COMPILE PASS (the base is rekeyed first,
+// frozen; an app compiling atop it via context_from:"resident" sees the
+// base's transitions ALREADY surrogate-keyed and skips them, so the name->SMD
+// map stays unambiguous per pass): a bare-named transition gets the surrogate
+// "txn:{SMD}\x1f{name}" keyed by its defined-in SMD; rows already
+// surrogate-keyed are skipped. Rewrites EVERY Transition-typed position — the
+// role metamodel's declared referencing fact types PLUS the hardcoded
+// machinery cells (smFrom/smTo/smTrigger/smGuard/smEmit/smMoore) and
+// Guard_prevents_Transition — so no reference dangles. A bare name mapping to
+// more than one SMD in one pass (genuinely ambiguous) is left as-is, never a
+// partial rekey.
+const TXN_SUR: &str = "txn:";
+
+fn rekey_transitions_native(cells: &mut Vec<(Leaf, V)>) {
+    use std::collections::HashSet;
+    let leaf = |s: &str| Leaf::S(s.to_string());
+    // name_smd: bare transition-name key -> (name V, smd V), built from
+    // Transition_is_defined_in_State_Machine_Definition rows; a name seen
+    // with two DIFFERENT smd values anywhere in the population is ambiguous
+    // and excluded whole (python's unconditional overwrite-then-pop)
+    let mut name_smd: HashMap<String, (V, V)> = HashMap::new();
+    let mut ambiguous: HashSet<String> = HashSet::new();
+    for r in pop_rows(cells, &leaf("Transition_is_defined_in_State_Machine_Definition")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            let already_sur = match aval(&it[0]) {
+                Some(l) => leaf_text(&l).starts_with(TXN_SUR),
+                None => false,
+            };
+            if !already_sur {
+                let k = key_of(&it[0]);
+                if let Some((_, existing_smd)) = name_smd.get(&k) {
+                    if !eqobj(existing_smd, &it[1]) {
+                        ambiguous.insert(k.clone());
+                    }
+                }
+                name_smd.insert(k, (it[0].clone(), it[1].clone()));
+            }
+        }
+    }
+    for k in &ambiguous {
+        name_smd.remove(k);
+    }
+    if name_smd.is_empty() {
+        return;
+    }
+    // surro: bare-name key -> the surrogate atom, ready to substitute in place
+    let mut surro: HashMap<String, V> = HashMap::new();
+    for (k, (nm, smd)) in &name_smd {
+        if let (Some(nl), Some(sl)) = (aval(nm), aval(smd)) {
+            let sur = format!("{}{}\x1f{}", TXN_SUR, leaf_text(&sl), leaf_text(&nl));
+            surro.insert(k.clone(), atom(Leaf::S(sur)));
+        }
+    }
+    // pos_of: fact-type-name key -> 0-based Transition column position, from
+    // the role metamodel's Transition-typed declarations plus the hardcoded
+    // machinery cells (python's pos_of.update literal, unconditional so it
+    // overrides any role-derived entry for the same name)
+    let mut pos_of: HashMap<String, i64> = HashMap::new();
+    for r in pop_rows(cells, &leaf("role")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 4 {
+            let is_transition =
+                matches!(aval(&it[3]).as_deref(), Some(Leaf::S(s)) if s == "Transition");
+            if is_transition {
+                if let Some(Leaf::I(p)) = aval(&it[2]).as_deref() {
+                    pos_of.insert(key_of(&it[1]), *p - 1);
+                }
+            }
+        }
+    }
+    for (name, pos) in [
+        ("smFrom", 0i64),
+        ("smTo", 0),
+        ("smTrigger", 0),
+        ("smGuard", 0),
+        ("smEmit", 0),
+        ("smMoore", 0),
+        ("Guard_prevents_Transition", 1),
+    ] {
+        pos_of.insert(key_of(&atom(leaf(name))), pos);
+    }
+    // the walk: every cell in D, in place; only a cell named in pos_of has
+    // its rows visited, and only the row's value AT that column, when it is
+    // a bare name in surro, is replaced — everything else copies through
+    for i in 0..cells.len() {
+        let nk = key_of(&atom(cells[i].0.clone()));
+        let p = match pos_of.get(&nk) {
+            Some(&pp) if pp >= 0 => pp as usize,
+            _ => continue,
+        };
+        let rows = items(&list_of(&cells[i].1));
+        if rows.is_empty() {
+            continue;
+        }
+        let mut changed = false;
+        let mut new_rows: Vec<V> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut out_row = row.clone();
+            if let Shape::Seq(rl) = shape(&row) {
+                let mut cols = items(&rl);
+                if cols.len() > p {
+                    let ck = key_of(&cols[p]);
+                    if let Some(sur) = surro.get(&ck) {
+                        cols[p] = sur.clone();
+                        out_row = seq(from_vec(cols));
+                        changed = true;
+                    }
+                }
+            }
+            new_rows.push(out_row);
+        }
+        if changed {
+            cells[i].1 = seq(from_vec(new_rows));
+        }
+    }
+}
+
 fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
     use std::collections::{BTreeMap, HashMap, HashSet};
     // args parse before anything runs (op_run_rules' discipline: a malformed
@@ -5903,6 +6095,10 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
     let mut prose: Vec<String> = Vec::new();
     let mut blocked: Vec<String> = Vec::new();
     let mut classified = 0usize;
+    // slice 1's identity-skip witness: true the instant ANY fold_fire or
+    // canon-DEF adoption actually mutates model_cells — "the fold produced
+    // no cells beyond the seed" (the probe-app case) is exactly !folded_any
+    let mut folded_any = false;
     // the native cook context (#20): the SAME names/subs/fts/plain/vals the
     // ctx operand carries, in cooks form, built once per compile
     let kn = cooks::Known::new(&names, &subs, &fts, &plain, &vals);
@@ -6019,6 +6215,7 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
                 // future seam, kept correct even though dormant today)
                 model_cells = raw_cells_of(&res);
                 accepted = true;
+                folded_any = true;
                 continue;
             }
             // the panic fence (#32): a cook tripping a guarded-by-construction
@@ -6051,6 +6248,7 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
                             e, stmt
                         ));
                     }
+                    folded_any = true;
                     if trace_on {
                         let mut f = String::new();
                         cooks::fire_json(t, &fire, &mut f);
@@ -6095,6 +6293,62 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
             translated.push(e);
         }
     }
+    // slice 1 tail (native pipeline tail, #20): rekey_transitions
+    // (machine-scope transition identity — compiler.py's compile_model
+    // wrapper applies it right after the fold: D2 = system.rekey_transitions(D2))
+    rekey_transitions_native(&mut model_cells);
+    // then the post-model rules fixpoint (protocol.py:1815's separate
+    // system.run_rules(D, ...) call, made after compile_model returns) through
+    // the EXISTING native op_run_rules machinery — the SAME save/swap/restore
+    // discipline the batch-classification derive above already uses, so this
+    // op stays pure: the resident's own store is read for dispatch throughout
+    // and left exactly as found, never overwritten with the compiled model.
+    // Identity-skip: a fold that never fired (no cell mutation, no canon-DEF
+    // adoption — the probe-app case) leaves model_cells identical to the seed,
+    // and running the fixpoint over an unchanged, already-derived seed is a
+    // proven no-op (round one finds nothing new and breaks immediately) — so
+    // it is skipped here to save the setup cost, never to change the answer.
+    if folded_any {
+        let saved_d2 = srv.d.clone();
+        let saved_cells2 = srv.cells.clone();
+        let saved_nd2 = srv.nd.clone();
+        let saved_ncells2 = srv.ncells.clone();
+        srv.d = cells_to_d(&model_cells);
+        srv.cells = model_cells.clone();
+        srv.nd = v_to_n(&srv.d);
+        srv.ncells = n_cells_of(&srv.nd);
+        let rules_req = J::O(Vec::new());
+        let derived2 = op_run_rules(&rules_req, srv);
+        if derived2.is_ok() {
+            // harvest from the TRUE store (srv.d), not the index Vec: python's
+            // Store re-tops every write, so a head cell NEW in the rules phase
+            // sits at the FRONT of D — the index Vec appends it at the end,
+            // which is a different (wrong) dump order (core.md's two
+            // new-in-rules heads, found by the order forensics 2026-07-11)
+            model_cells = raw_cells_of(&srv.d);
+        }
+        srv.d = saved_d2;
+        srv.cells = saved_cells2;
+        srv.nd = saved_nd2;
+        srv.ncells = saved_ncells2;
+        derived2?;
+    }
+    // rule_diagnostics: the ruleDiag population AFTER rules (python's own
+    // compiler.py:2489 reads it right after rekey, BEFORE the pipeline's
+    // separate run_rules call — but ruleDiag is a STAGE-1 COMPILE diagnostic,
+    // written only by the rule_if/rule_iff cook when a rule body fails to
+    // compile, never a derivation rule's HEAD in any known corpus, so
+    // run_rules never adds to it; reading it here, after everything, equals
+    // python's snapshot by construction)
+    let rulediag_rows: Vec<V> = pop_rows(&model_cells, &leaf("ruleDiag"));
+    let mut rulediag_json = String::from("[");
+    for (i, row) in rulediag_rows.iter().enumerate() {
+        if i > 0 {
+            rulediag_json.push(',');
+        }
+        write_v(row, &mut rulediag_json);
+    }
+    rulediag_json.push(']');
     // the report: the seed contract's surviving keys (total/unclassified/prose)
     // plus the honest diagnostics (classified/grammar/missing/blocked)
     let mut r = String::from("{\"total\":");
@@ -6121,6 +6375,17 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
     arr(&missing, &mut r);
     r.push_str(",\"blocked\":");
     arr(&blocked, &mut r);
+    // slice 2 (native pipeline tail, #20): the Python rep contract's exact
+    // field names (compiler.py:2490), alongside the skeleton's own honest
+    // diagnostics above — total/prose already match; kinds is always the
+    // selfhost path's empty dict (a seed leftover, emitted verbatim, never
+    // innovated on); unparsed mirrors unclassified under python's external
+    // name; rule_diagnostics is the ruleDiag rows built above
+    r.push_str(",\"kinds\":{}");
+    r.push_str(",\"unparsed\":");
+    arr(&unclassified, &mut r);
+    r.push_str(",\"rule_diagnostics\":");
+    r.push_str(&rulediag_json);
     if trace_on {
         // the differential dump: per statement, the fires' ⟨asserts, objs⟩
         r.push_str(",\"translated\":[");
@@ -6128,8 +6393,13 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
         r.push(']');
     }
     if dump_store_on {
-        // the folded store itself: python compile_model_selfhost's returned
-        // D, full from_lam — the fold's own differential surface
+        // the store as of THIS slice's own boundary: fold -> rekey_transitions
+        // -> the post-model run_rules fixpoint (when it ran) — python's
+        // compile_model (WITH rekey) + the pipeline's separate run_rules call,
+        // full from_lam. (The fold slice's own narrower boundary,
+        // compile_model_selfhost's bare return, is no longer what dump_store
+        // answers — that comparison now lives in fold_pydump.py calling
+        // compile_model_selfhost directly, pre-rekey, pre-rules.)
         r.push_str(",\"store\":");
         write_v(&cells_to_d(&model_cells), &mut r);
     }
