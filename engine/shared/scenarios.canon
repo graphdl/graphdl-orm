@@ -52,7 +52,7 @@ DEF("case:ftpop-pairsel-mini", S2(S3(A("COMP"), A("apply"), S3(A("CONS"), S3(A("
 
 DEF("case:lex-words", S2(A("lex"), A("Each Task1 occurs."))),
 DEF("case:lex-quoted", S2(A("lex"), A("Status 'In Cart' is to Status 'Placed'."))),
-DEF("case:lex-hyphen", S2(A("lex"), A("Layer has valence-Coord and adj- Type"))),
+DEF("case:lex-hyphen", S2(A("lex"), A("Layer has valence- Coord and Type -adj and FORE-- WORD and from-Status"))),
 DEF("case:implode-tpl", S2(A("implode"), S2(A(" "), S3(A("{0}"), A("was"), A("{1}"))))),
 DEF("case:implode-us", S2(A("implode"), S2(A("_"), S2(A("a"), A("b"))))),
 DEF("case:slug-reading", S2(A("slug"), A("Order was placed by Customer"))),
@@ -60,6 +60,7 @@ DEF("case:slug-hyphen", S2(A("slug"), A("place-receipt"))),
 
 DEF("case:reading-parse", S2(A("system:reading_parse"), S3(A("Order was placed by Customer"), S2(A("Order"), A("Customer")), S2(A("The"), A("Each"))))),
 DEF("case:reading-parse-munch", S2(A("system:reading_parse"), S3(A("Event Type has Name"), S3(A("Event"), A("Event Type"), A("Name")), S2(A("The"), A("Each"))))),
+DEF("case:reading-parse-hyphen", S2(A("system:reading_parse"), S3(A("Layer has valence- Coord -local and FORE-- WORD and from-Status"), S2(A("Layer"), A("Coord")), S2(A("The"), A("Each"))))),
 DEF("case:reading-ftid", S2(A("system:ftid"), S2(A("{0} was placed by {1}"), S2(A("Order"), A("Customer"))))),
 
 DEF("case:skolem-mints-frontier-id", S2(A("skolem"), S2(A("menu"), A("t1")))),

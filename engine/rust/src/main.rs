@@ -947,6 +947,29 @@ fn leaf_str(l: &Leaf) -> Option<String> {
     }
 }
 
+// a token's TEMPLATE form under NORMA hyphen binding (#24, lex field 8 —
+// mirrors compiler.py _hyphen_tpl / engine.py _lex_impl): a one-sided
+// touching hyphen is the bind marker and is consumed ('adj-'/'-adj' -> the
+// word), the doubled hyphen escapes to one literal hyphen ('FORE--'->'FORE-',
+// '--W'->'-W'), anything else (incl. the retired touching bind 'from-Status')
+// is as written.
+fn hyphen_tpl(tok: &str) -> String {
+    let n = tok.chars().count();
+    if n > 2 && tok.ends_with("--") {
+        return tok[..tok.len() - 1].to_string();
+    }
+    if n > 2 && tok.starts_with("--") {
+        return tok[1..].to_string();
+    }
+    if n > 1 && tok.ends_with('-') && !tok.ends_with("--") {
+        return tok[..tok.len() - 1].to_string();
+    }
+    if n > 1 && tok.starts_with('-') && !tok.starts_with("--") {
+        return tok[1..].to_string();
+    }
+    tok.to_string()
+}
+
 #[allow(clippy::type_complexity)]
 fn lex_rows(text: &str) -> Vec<(String, String, String, String, String, String, bool, String, bool, i64)> {
     let cs: Vec<char> = text.chars().collect();
@@ -993,11 +1016,8 @@ fn lex_rows(text: &str) -> Vec<(String, String, String, String, String, String, 
         let subscript = nopunct[base.len()..].to_string();
         let lower = tok.to_lowercase();
         let title = base.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
-        let post = match tok.find('-') {
-            Some(p) => tok[p + 1..].to_string(),
-            None => String::new(),
-        };
-        rows.push((tok, nopunct, base, subscript, lower, qtext, title, post, k > 0, k as i64));
+        let tpl = hyphen_tpl(&tok);
+        rows.push((tok, nopunct, base, subscript, lower, qtext, title, tpl, k > 0, k as i64));
     }
     rows
 }
@@ -5122,8 +5142,12 @@ fn sort_known(names: &std::collections::HashSet<String>) -> Vec<Vec<String>> {
     ks
 }
 
-// _reading (compiler.py:593): a fact-type reading → (template, roles) — the
-// certified-equal host override of system:reading_parse
+// _reading (compiler.py): a fact-type reading → (template, roles) — the
+// certified-equal host override of system:reading_parse. Hyphen binding is
+// NORMA's (#24): the bound word stays in the template with its one-sided
+// touching hyphen consumed (hyphen_tpl), the '--' escape keeps a literal
+// hyphen, and the old touching bind ('from-Status' claiming role Status) is
+// retired — a touching hyphen is just a word.
 fn reading_split(
     text: &str,
     known_sorted: &[Vec<String>],
@@ -5135,16 +5159,6 @@ fn reading_split(
     let mut i = 0usize;
     while i < toks.len() {
         let tok = toks[i];
-        if tok.contains('-') && !tok.ends_with('-') {
-            // forward hyphen binding: adj-Type -> role Type
-            let post = &tok[tok.find('-').unwrap() + 1..];
-            if known.contains(post) {
-                roles.push(post.to_string());
-                out.push(format!("{{{}}}", roles.len() - 1));
-                i += 1;
-                continue;
-            }
-        }
         let mut matched: Option<&Vec<String>> = None;
         for kw in known_sorted {
             let n = kw.len();
@@ -5164,7 +5178,7 @@ fn reading_split(
                 i += kw.len();
             }
             None => {
-                out.push(tok.to_string());
+                out.push(hyphen_tpl(tok));
                 i += 1;
             }
         }

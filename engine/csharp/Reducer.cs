@@ -652,15 +652,30 @@ static class Reducer
             while (bl > 0 && nopunct[bl - 1] >= '0' && nopunct[bl - 1] <= '9') bl--;
             var basew = nopunct.Substring(0, bl);
             var title = basew.Length > 0 && char.IsUpper(basew[0]) ? "T" : "F";
-            var hp = tok.IndexOf('-');
             rows.Add(new object[]
             {
                 tok, nopunct, basew, nopunct.Substring(bl), tok.ToLowerInvariant(),
-                qtext, title, hp >= 0 ? tok.Substring(hp + 1) : "",
+                qtext, title, HyphenTpl(tok),
                 k > 0 ? "T" : "F", (long)k,
             });
         }
         return rows.ToArray();
+    }
+
+    // a token's TEMPLATE form under NORMA hyphen binding (#24, lex field 8 —
+    // mirrors python engine.py _lex_impl / rust hyphen_tpl): a one-sided
+    // touching hyphen is the bind marker and is consumed ('adj-'/'-adj' ->
+    // the word), the doubled hyphen escapes to one literal hyphen
+    // ('FORE--'->'FORE-', '--W'->'-W'), anything else (incl. the retired
+    // touching bind 'from-Status') is as written.
+    static string HyphenTpl(string tok)
+    {
+        var n = tok.Length;
+        if (n > 2 && tok.EndsWith("--")) return tok.Substring(0, n - 1);
+        if (n > 2 && tok.StartsWith("--")) return tok.Substring(1);
+        if (n > 1 && tok.EndsWith("-") && !tok.EndsWith("--")) return tok.Substring(0, n - 1);
+        if (n > 1 && tok.StartsWith("-") && !tok.StartsWith("--")) return tok.Substring(1);
+        return tok;
     }
 
     static string Slug(string t)

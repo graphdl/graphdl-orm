@@ -2478,9 +2478,24 @@ def _lex_impl(mu):
                 qtext = text[max(s, a + 1):min(e, b - 1)]
             nopunct = tok.strip(".;:,")
             base = nopunct.rstrip("0123456789")
+            # field 8 is the token's TEMPLATE form under NORMA hyphen binding
+            # (#24, retiring the touching bind): a one-sided touching hyphen is
+            # the bind marker and is consumed ('adj-'/'-adj' -> the word), the
+            # doubled hyphen escapes to one literal hyphen ('FORE--'->'FORE-',
+            # '--W'->'-W'), anything else (incl. 'from-Status') is as written.
+            # The compiler's _hyphen_tpl is the certified host twin.
+            tpl = tok
+            if len(tpl) > 2 and tpl.endswith("--"):
+                tpl = tpl[:-1]
+            elif len(tpl) > 2 and tpl.startswith("--"):
+                tpl = tpl[1:]
+            elif len(tpl) > 1 and tpl.endswith("-") and not tpl.endswith("--"):
+                tpl = tpl[:-1]
+            elif len(tpl) > 1 and tpl.startswith("-") and not tpl.startswith("--"):
+                tpl = tpl[1:]
             rows.append((tok, nopunct, base, nopunct[len(base):], tok.lower(),
                          qtext, "T" if base and base[0].isupper() else "F",
-                         tok.partition("-")[2], "T" if k else "F", k))
+                         tpl, "T" if k else "F", k))
         return to_lam(tuple(rows))
     return g
 

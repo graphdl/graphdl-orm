@@ -3,16 +3,19 @@ ops on names are registered boundary ops, like cellkey). Three primitives carry
 text into the object world; everything above them — the mixfix scan, the type
 spans, Stage-1's vocabulary matcher — is sequence algebra, canonical territory.
 
-  lex:     text → ⟨⟨raw, nopunct, base, subscript, lower, qtext, title, post,
+  lex:     text → ⟨⟨raw, nopunct, base, subscript, lower, qtext, title, tpl,
            quoted, qidx⟩…⟩ per whitespace word. nopunct strips '.;:,' at both
            ends (the _atomic_run_guard strip); base further strips trailing
            digits and subscript keeps them (Halpin's Task1 twins); lower is the
            case-fold (Stage-1 matches case-insensitively); qtext is the word's
            text INSIDE its quoted span, quotes excluded (the _QUOTED span is
            character-level, so a trailing period outside the closing quote
-           stays out of the literal); title is T iff base opens uppercase; post
-           is the after-hyphen tail (forward hyphen binding adj-Type); quoted/
-           qidx mark span membership, spans numbered from 1.
+           stays out of the literal); title is T iff base opens uppercase; tpl
+           is the word's TEMPLATE form under NORMA hyphen binding (#24 — a
+           one-sided touching hyphen is the bind marker, consumed: 'adj-'/
+           '-adj' -> the word; the doubled hyphen escapes to one literal
+           hyphen: 'FORE--' -> 'FORE-'; a hyphen touching both sides is just a
+           word); quoted/qidx mark span membership, spans numbered from 1.
   implode: ⟨sep, ⟨w…⟩⟩ → one atom (templates are STRINGS in factType rows).
   slug:    text → id atom (the [^0-9A-Za-z]+ → '_' collapse, ends stripped —
            id MINTING is a boundary act; names are data)."""
@@ -30,7 +33,7 @@ def test_lex_plain_words_carry_their_case():
     assert [r[0] for r in got] == ["Order", "was", "placed", "by", "Customer"]
     assert [r[6] for r in got] == ["T", "F", "F", "F", "T"]   # title?
     r = got[0]
-    assert r == ("Order", "Order", "Order", "", "order", "", "T", "", "F", 0)
+    assert r == ("Order", "Order", "Order", "", "order", "", "T", "Order", "F", 0)
 
 
 def test_lex_strips_punctuation_and_splits_subscripts():
@@ -52,12 +55,14 @@ def test_lex_marks_quoted_spans_character_wise():
             by_raw["'Placed'."][5]) == ("T", 2, "Placed")
 
 
-def test_lex_hyphen_binding_exposes_the_type_tail():
-    got = _lex("Layer has valence-Coord and adj- Type")
+def test_lex_hyphen_carries_the_norma_template_form():
+    got = _lex("Layer has valence- Coord and Type -adj and FORE-- WORD and from-Status")
     by_raw = {r[0]: r for r in got}
-    assert by_raw["valence-Coord"][7] == "Coord"              # adj-Type → role Type
-    assert by_raw["adj-"][7] == ""                            # trailing hyphen: no tail
-    assert by_raw["Layer"][7] == ""
+    assert by_raw["valence-"][7] == "valence"                 # leading bind: marker consumed
+    assert by_raw["-adj"][7] == "adj"                         # trailing bind: marker consumed
+    assert by_raw["FORE--"][7] == "FORE-"                     # -- escape: one literal hyphen
+    assert by_raw["from-Status"][7] == "from-Status"          # touching: just a word (retired bind)
+    assert by_raw["Layer"][7] == "Layer"                      # plain words pass through
 
 
 def test_implode_joins_template_tokens():
@@ -76,12 +81,15 @@ def test_slug_mints_the_id():
 def test_lex_agrees_with_the_host_split_over_the_corpus():
     """Twin sanity over real model text: raws are exactly text.split(), and the
     per-word attributes match the host expressions they replace."""
+    from pyarest import forml
     MODEL = """Order(.OrderId) is an entity type.
 Customer(.Name) is an entity type.
 Customer places Order.
 Status 'In Cart' is initial in State Machine Definition 'Order'.
 Each Order is placed by at most one Customer2.
-Layer has valence-Coord.
+Layer has valence- Coord.
+Transition is from- Status.
+Layer has Coord -local and FORE-- WORD and from-Status.
 """
     for line in MODEL.strip().split("\n"):
         got = _lex(line)
@@ -94,4 +102,4 @@ Layer has valence-Coord.
             assert r[3] == tok.strip(".;:,")[len(base):]
             assert r[4] == tok.lower()
             assert r[6] == ("T" if base and base[0].isupper() else "F")
-            assert r[7] == (tok.partition("-")[2] if not tok.endswith("-") else "")
+            assert r[7] == forml._hyphen_tpl(tok)             # field 8 twins the host collapse

@@ -653,15 +653,29 @@ public class Reducer {
             while (bl > 0 && nopunct.charAt(bl - 1) >= '0' && nopunct.charAt(bl - 1) <= '9') bl--;
             String base = nopunct.substring(0, bl);
             String title = base.length() > 0 && Character.isUpperCase(base.charAt(0)) ? "T" : "F";
-            int hp = tok.indexOf('-');
             rows.add(new Object[]{
                 tok, nopunct, base, nopunct.substring(bl),
                 tok.toLowerCase(java.util.Locale.ROOT), qtext, title,
-                hp >= 0 ? tok.substring(hp + 1) : "",
+                hyphenTpl(tok),
                 k > 0 ? "T" : "F", Long.valueOf(k),
             });
         }
         return rows.toArray();
+    }
+
+    // a token's TEMPLATE form under NORMA hyphen binding (#24, lex field 8 —
+    // mirrors python engine.py _lex_impl / rust hyphen_tpl): a one-sided
+    // touching hyphen is the bind marker and is consumed ('adj-'/'-adj' ->
+    // the word), the doubled hyphen escapes to one literal hyphen
+    // ('FORE--'->'FORE-', '--W'->'-W'), anything else (incl. the retired
+    // touching bind 'from-Status') is as written.
+    static String hyphenTpl(String tok) {
+        int n = tok.length();
+        if (n > 2 && tok.endsWith("--")) return tok.substring(0, n - 1);
+        if (n > 2 && tok.startsWith("--")) return tok.substring(1);
+        if (n > 1 && tok.endsWith("-") && !tok.endsWith("--")) return tok.substring(0, n - 1);
+        if (n > 1 && tok.startsWith("-") && !tok.startsWith("--")) return tok.substring(1);
+        return tok;
     }
 
     static String slug(String t) {
