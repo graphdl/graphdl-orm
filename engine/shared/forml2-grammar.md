@@ -328,13 +328,13 @@ Classification 'State Machine Reading' has Translator 'translate_state_machines'
 Classification 'Finality Declaration' has Translator 'translate_finality'.
 Classification 'Negation Reading' has Translator 'translate_negation'.
 
-Statement has Classification 'State Machine Reading' iff Statement has Verb 'is for Noun'.
-Statement has Classification 'State Machine Reading' iff Statement has Verb 'is initial in State Machine Definition'.
-Statement has Classification 'State Machine Reading' iff Statement has Verb 'is from Status'.
-Statement has Classification 'State Machine Reading' iff Statement has Verb 'is to Status'.
-Statement has Classification 'State Machine Reading' iff Statement has Verb 'is triggered by Fact Type'.
-Statement has Classification 'State Machine Reading' iff Statement has Verb 'is guarded by Fact Type'.
-Statement has Classification 'State Machine Reading' iff Statement has Verb 'emits'.
+Statement has Classification 'State Machine Reading' iff Statement has Verb 'is for Noun' and Statement has Literal Role.
+Statement has Classification 'State Machine Reading' iff Statement has Verb 'is initial in State Machine Definition' and Statement has Literal Role.
+Statement has Classification 'State Machine Reading' iff Statement has Verb 'is from Status' and Statement has Literal Role.
+Statement has Classification 'State Machine Reading' iff Statement has Verb 'is to Status' and Statement has Literal Role.
+Statement has Classification 'State Machine Reading' iff Statement has Verb 'is triggered by Fact Type' and Statement has Literal Role.
+Statement has Classification 'State Machine Reading' iff Statement has Verb 'is guarded by Fact Type' and Statement has Literal Role.
+Statement has Classification 'State Machine Reading' iff Statement has Verb 'emits' and Statement has Literal Role.
 Statement has Classification 'Finality Declaration' iff Statement has Verb 'becomes final at depth'.
 Statement has Classification 'Negation Reading' iff Statement has Verb 'does not'.
 Statement has Classification 'Negation Reading' iff Statement has Verb 'is not'.
