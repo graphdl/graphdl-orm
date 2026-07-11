@@ -5882,6 +5882,1087 @@ fn rekey_transitions_native(cells: &mut Vec<(Leaf, V)>) {
     }
 }
 
+// ======================= status_facts / machine_fold / layout_cells ==========
+// (#20, the machine_fold port slice: docs/2026-07-11-machine-fold-port-spec.md)
+// The protocol tail after the landed post-model fixpoint (protocol.py:1760-
+// 1801): status_facts (engine.py:3516) -> machine_fold (engine.py:2780) ->
+// run_rules IFF machine_fold changed anything -> layout_cells (engine.py:1693).
+// replay (log-carried events) is explicitly NOT in this slice; these corpora's
+// machine events arrive as READINGS (instance facts of trigger fact types),
+// which status_facts/machine_fold read directly off the fact populations.
+//
+// The judgment-bearing pieces are ALREADY CANON (the spec's table): sm_triples
+// via system:sm_join, the RMAP partition via system:partition, table columns
+// via system:table_columns, the governed player via system:governed_player,
+// and an absorbed fact type's reassembled population via system:ftpop_absorbed
+// -- every helper below evaluates these through the resident NEval, the SAME
+// pattern the view_menu/actions sites (main.rs, "actions" op) and op_run_rules's
+// own canon-first partition fallback already use. These are NEW, STANDALONE
+// helpers (not a refactor of that fallback block or of op_run_rules) -- the
+// CONSTRAINT is to leave cooks.rs, the model_d fold functions, rekey, and the
+// landed reassembly semantics untouched; duplicating the small amount of
+// canon-eval plumbing costs nothing and keeps zero risk to those proven paths.
+
+fn mf_na(s: &str) -> N {
+    N::A(Rc::new(Leaf::S(s.to_string())))
+}
+
+// mf_lkey renders a leaf as a type-strict SET/MAP key (python's native
+// hash/eq: an int and a float of equal value coalesce, a numeric-looking
+// string never does) -- the existing set_key/key_of encoding, reused as-is
+// for entity keys that may be int- or string-reference-moded per noun.
+fn mf_lkey(l: &Leaf) -> String {
+    key_of(&atom(l.clone()))
+}
+
+// mf_leaf_cmp orders two leaves the way Python's native `<` would for a
+// per-noun-homogeneous entity key column (int-vs-int numeric, str-vs-str
+// lexical, int-vs-float numeric like Python allows); a genuinely mixed
+// str/num pair (which would raise TypeError in Python's own sorted() and so
+// never arises on a corpus this differential accepts) falls back to a
+// deterministic text compare rather than panicking.
+fn mf_leaf_cmp(a: &Leaf, b: &Leaf) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Leaf::I(x), Leaf::I(y)) => x.cmp(y),
+        (Leaf::F(x), Leaf::F(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Leaf::I(x), Leaf::F(y)) => (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Leaf::F(x), Leaf::I(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal),
+        (Leaf::S(x), Leaf::S(y)) => x.cmp(y),
+        _ => leaf_text(a).cmp(&leaf_text(b)),
+    }
+}
+
+// system:partition applied to D whole (rmap_partition, engine.py:1658): the
+// ⟨table, ft⟩ canon pairs inverted to ft->table (python's `part`), plus the
+// SAME pairs re-paired as ⟨ft, table⟩ (python's `partition.items()`, the
+// operand table_columns' second argument expects) -- built ONCE per fold and
+// threaded everywhere, mirroring rmap_partition's own per-D memoization intent
+// without needing a weak-key cache here (one machine_fold/layout_cells call
+// each, per compile).
+fn mf_partition(ev: &NEval, nd: &N) -> (std::collections::HashMap<String, String>, V) {
+    let pairs_v = n_to_v(&ev.mu(napp(mf_na("system:partition"), nd.clone())));
+    let mut part: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut ft_table_pairs: Vec<V> = Vec::new();
+    if let Shape::Seq(l) = shape(&pairs_v) {
+        for p in items(&l) {
+            let it = items(&list_of(&p));
+            if it.len() >= 2 {
+                if let (Some(t), Some(f)) = (aval(&it[0]), aval(&it[1])) {
+                    part.insert(leaf_text(&f), leaf_text(&t));
+                    ft_table_pairs.push(seqc(vec![atom((*f).clone()), atom((*t).clone())]));
+                }
+            }
+        }
+    }
+    (part, seq(from_vec(ft_table_pairs)))
+}
+
+// table_columns(partition, table) (engine.py:2621): system:table_columns
+// applied to ⟨table, ft-table pairs⟩, the absorbed fact types in column
+// order (column j+2 == cols[j]).
+fn mf_table_columns(ev: &NEval, table: &str, pairs_v: &V) -> Vec<String> {
+    let cols_v = n_to_v(&ev.mu(napp(
+        napp(mf_na("system:table_columns"), mf_na(table)),
+        v_to_n(pairs_v),
+    )));
+    let mut out = Vec::new();
+    if let Shape::Seq(l) = shape(&cols_v) {
+        for c in items(&l) {
+            if let Some(f) = aval(&c) {
+                out.push(leaf_text(&f));
+            }
+        }
+    }
+    out
+}
+
+// the unary check every RMAP-absorbed read/write threads (engine.py's
+// `max((r[2] for r in _pop_rows(D,"role") if len(r)>=3 and r[1]==ft),
+// default=2) == 1`) -- note len(r)>=3, NOT >=4: only r[1]/r[2] are read here.
+fn mf_role_max_pos(cells: &[(Leaf, V)], ft: &str) -> i64 {
+    let leaf_role = Leaf::S("role".to_string());
+    let mut mx: Option<i64> = None;
+    for r in pop_rows(cells, &leaf_role) {
+        let it = items(&list_of(&r));
+        if it.len() >= 3 {
+            if aval(&it[1]).map(|l| leaf_text(&l)).as_deref() == Some(ft) {
+                if let Some(Leaf::I(p)) = aval(&it[2]).as_deref() {
+                    mx = Some(mx.map_or(*p, |m| m.max(*p)));
+                }
+            }
+        }
+    }
+    mx.unwrap_or(2)
+}
+
+// ft_view (engine.py:2671): an own-table fact type short-circuits to its
+// pop (host-side, no canon eval needed -- FetchPop applied to D IS the pop);
+// an absorbed one reassembles via system:ftpop_absorbed⟨table,col⟩ applied
+// to D, then a unary fact type's boolean column reshapes (k,"T") -> (k,)
+// host-side, filtering v != "T" out entirely -- the spec's exact contract.
+fn mf_ft_view(
+    cells: &[(Leaf, V)],
+    ev: &NEval,
+    nd: &N,
+    ft: &str,
+    part: &std::collections::HashMap<String, String>,
+    pairs_v: &V,
+) -> Vec<V> {
+    let table = part.get(ft).cloned().unwrap_or_else(|| ft.to_string());
+    if table == ft {
+        return pop_rows(cells, &Leaf::S(ft.to_string()));
+    }
+    let cols = mf_table_columns(ev, &table, pairs_v);
+    let col = 2 + cols.iter().position(|c| c == ft).unwrap_or(0);
+    let unary = mf_role_max_pos(cells, ft) == 1;
+    let pairs = n_to_v(&ev.mu(napp(
+        napp(
+            mf_na("system:ftpop_absorbed"),
+            nseq(vec![mf_na(&table), N::A(Rc::new(Leaf::I(col as i64)))]),
+        ),
+        nd.clone(),
+    )));
+    let mut out = Vec::new();
+    if let Shape::Seq(l) = shape(&pairs) {
+        for r in items(&l) {
+            let it = items(&list_of(&r));
+            if unary {
+                if it.len() >= 2 && matches!(aval(&it[1]).as_deref(), Some(Leaf::S(s)) if s == "T")
+                {
+                    out.push(seqc(vec![it[0].clone()]));
+                }
+            } else {
+                out.push(r);
+            }
+        }
+    }
+    out
+}
+
+// _governed_player (engine.py:3024): system:governed_player applied to the
+// PAIR ⟨ft, D⟩ (one application, not curried) -- the empty tuple means no
+// governed player; otherwise the result is the player's name atom.
+fn mf_governed_player(ev: &NEval, nd: &N, ft: &str) -> Option<String> {
+    let r = ev.mu(napp(mf_na("system:governed_player"), nseq(vec![mf_na(ft), nd.clone()])));
+    match r {
+        N::A(l) => Some(leaf_text(&l)),
+        _ => None,
+    }
+}
+
+// sm_triples (engine.py:1536): system:sm_join applied to the 3-tuple of
+// smFrom/smTrigger/smTo POPULATIONS (already-fetched pops, not cell names) --
+// the exact resident-evaluator pattern the view_menu/actions sites use.
+fn mf_sm_triples(cells: &[(Leaf, V)], ev: &NEval) -> Vec<(String, String, String)> {
+    let pops: Vec<N> = ["smFrom", "smTrigger", "smTo"]
+        .iter()
+        .map(|c| v_to_n(&seq(from_vec(pop_rows(cells, &Leaf::S(c.to_string()))))))
+        .collect();
+    let triples_v = n_to_v(&ev.mu(napp(mf_na("system:sm_join"), nseq(pops))));
+    let mut out = Vec::new();
+    if let Shape::Seq(l) = shape(&triples_v) {
+        for t in items(&l) {
+            let it = items(&list_of(&t));
+            if it.len() >= 3 {
+                if let (Some(f), Some(g), Some(to)) = (aval(&it[0]), aval(&it[1]), aval(&it[2])) {
+                    out.push((leaf_text(&f), leaf_text(&g), leaf_text(&to)));
+                }
+            }
+        }
+    }
+    out
+}
+
+// mf_setcell_bare is bulk_absorbed_install's OWN `setcell` local (engine.py
+// :2744), over the fold's bare Vec<(Leaf,V)> shape (not the srv d/nd/ncells
+// quad setcell_into threads): replace IN PLACE when the name is already a
+// cell, APPEND AT THE END when it is not -- deliberately NOT Store's
+// remove-then-prepend (the fold's own driver writes use Store; the
+// bulk-absorbed writes do not, mirroring each site's actual python primitive
+// per the spec).
+fn mf_setcell_bare(cells: &mut Vec<(Leaf, V)>, name: &str, contents: V) {
+    match cells.iter_mut().find(|(k, _)| matches!(k, Leaf::S(s) if s == name)) {
+        Some(slot) => slot.1 = contents,
+        None => cells.push((Leaf::S(name.to_string()), contents)),
+    }
+}
+
+// bulk_absorbed_install (engine.py:2725): the batch install of an absorbed
+// fact type's ⟨key,value⟩ rows onto the entity's 3NF row (fresh rows
+// hole-padded), the table index joined, and the ft's view-cache cell
+// unioned -- replace_keys=true ALWAYS here (the machine fold's own mode:
+// one status per entity), so the installed keys' stale view rows are pruned
+// before the union. `rows` carries machine_fold's own (entity, new-status)
+// pairs in ITS processing order (walk-phase then SM-init-phase, each
+// internally sorted) -- that order drives the table index's APPEND order
+// for freshly-seen keys, matching python's `tbl.append((k,))` inside the
+// per-row loop exactly.
+fn mf_bulk_absorbed_install(
+    cells: &[(Leaf, V)],
+    ev: &NEval,
+    table: &str,
+    ft: &str,
+    rows: &[(Leaf, String)],
+    pairs_v: &V,
+) -> Vec<(Leaf, V)> {
+    use std::collections::HashSet;
+    let leaf = |s: &str| Leaf::S(s.to_string());
+
+    let cols = mf_table_columns(ev, table, pairs_v);
+    let col = 2 + cols.iter().position(|c| c == ft).unwrap_or(0);
+    let width = 1 + cols.len();
+    let unary = mf_role_max_pos(cells, ft) == 1;
+
+    let mut out: Vec<(Leaf, V)> = cells.to_vec();
+    let hole = || atom(Leaf::S("#".to_string()));
+
+    let mut tbl: Vec<V> = pop_rows(&out, &leaf(table));
+    let mut keys: HashSet<String> = tbl
+        .iter()
+        .filter_map(|r| {
+            let it = items(&list_of(r));
+            if !it.is_empty() {
+                aval(&it[0]).map(|l| mf_lkey(&l))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for (e, cur) in rows {
+        let v = if unary {
+            atom(Leaf::S("T".to_string()))
+        } else {
+            atom(Leaf::S(cur.clone()))
+        };
+        let rc = format!("{}:{}", table, leaf_text(e));
+        let mut row: Vec<V> = pop_rows(&out, &leaf(&rc));
+        if row.is_empty() {
+            row = vec![atom(e.clone())];
+        }
+        while row.len() < width {
+            row.push(hole());
+        }
+        row[col - 1] = v;
+        mf_setcell_bare(&mut out, &rc, seq(from_vec(row)));
+        if keys.insert(mf_lkey(e)) {
+            tbl.push(seqc(vec![atom(e.clone())]));
+        }
+    }
+    mf_setcell_bare(&mut out, table, seq(from_vec(tbl)));
+
+    // the view-cache cell: replace_keys prunes the installed keys' stale
+    // rows, unions the fresh (RAW, un-reshaped -- python never applies the
+    // unary reshape to the view cache, only to the ROW COLUMN value) pairs,
+    // dedups as a set, then _rowsort (the mixed-type key contract).
+    let installed: HashSet<String> = rows.iter().map(|(e, _)| mf_lkey(e)).collect();
+    let mut view: Vec<V> = pop_rows(&out, &leaf(ft))
+        .into_iter()
+        .filter(|r| {
+            let it = items(&list_of(r));
+            match it.first().and_then(|x| aval(x)) {
+                Some(k) => !installed.contains(&mf_lkey(&k)),
+                None => true,
+            }
+        })
+        .collect();
+    for (e, cur) in rows {
+        view.push(seqc(vec![atom(e.clone()), atom(Leaf::S(cur.clone()))]));
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut view_dedup: Vec<V> = Vec::new();
+    for r in view {
+        if seen.insert(key_of(&r)) {
+            view_dedup.push(r);
+        }
+    }
+    sort_rows(&mut view_dedup);
+    mf_setcell_bare(&mut out, ft, seq(from_vec(view_dedup)));
+
+    out
+}
+
+// machine_fold (engine.py:2780): readings-carried machine events, folded at
+// compile. Returns (folded cells, changed) -- changed mirrors protocol.py
+// :1842's `D2 is not D` (python's OBJECT IDENTITY: machine_fold returns the
+// SAME D untouched when there are no machines at all, or when the walk +
+// SM-init produce no writes) so the caller can gate the post-fold run_rules
+// the same way.
+fn machine_fold_native(cells: &[(Leaf, V)], srv: &Srv) -> (Vec<(Leaf, V)>, bool) {
+    use std::collections::{HashMap, HashSet};
+    let leaf = |s: &str| Leaf::S(s.to_string());
+
+    let d0 = cells_to_d(cells);
+    let nd = v_to_n(&d0);
+    let ncells = n_cells_of(&nd);
+    let ev = NEval {
+        cells: ncells,
+        process: srv.nprocess.clone(),
+        defs_n: nd.clone(),
+        fuel: std::cell::Cell::new(-1),
+    };
+
+    let triples = mf_sm_triples(cells, &ev);
+    if triples.is_empty() {
+        return (cells.to_vec(), false);
+    }
+
+    let mut trig_fts: Vec<String> = {
+        let mut s: HashSet<String> = HashSet::new();
+        for r in pop_rows(cells, &leaf("smTrigger")) {
+            let it = items(&list_of(&r));
+            if it.len() >= 2 {
+                if let Some(f) = aval(&it[1]) {
+                    s.insert(leaf_text(&f));
+                }
+            }
+        }
+        s.into_iter().collect()
+    };
+    trig_fts.sort();
+
+    // initials: SMD -> initial status (rows are ⟨status, SMD⟩: r[1]->r[0])
+    let mut initials: HashMap<String, String> = HashMap::new();
+    for r in pop_rows(cells, &leaf("Status_is_initial_in_State_Machine_Definition")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            if let (Some(status), Some(smd)) = (aval(&it[0]), aval(&it[1])) {
+                initials.insert(leaf_text(&smd), leaf_text(&status));
+            }
+        }
+    }
+    // status_fts: noun -> status fact type (rows ⟨noun, ft⟩)
+    let mut status_fts: HashMap<String, String> = HashMap::new();
+    for r in pop_rows(cells, &leaf("smStatusFt")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            if let (Some(n), Some(f)) = (aval(&it[0]), aval(&it[1])) {
+                status_fts.insert(leaf_text(&n), leaf_text(&f));
+            }
+        }
+    }
+    // machines: noun -> SMD (rows ⟨SMD, noun⟩: r[1]->r[0])
+    let mut machines: HashMap<String, String> = HashMap::new();
+    for r in pop_rows(cells, &leaf("smDef")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            if let (Some(smd), Some(n)) = (aval(&it[0]), aval(&it[1])) {
+                machines.insert(leaf_text(&n), leaf_text(&smd));
+            }
+        }
+    }
+    // gov: noun -> governing noun (rows ⟨noun, governor⟩)
+    let mut gov: HashMap<String, String> = HashMap::new();
+    for r in pop_rows(cells, &leaf("governedBy")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            if let (Some(a), Some(b)) = (aval(&it[0]), aval(&it[1])) {
+                gov.insert(leaf_text(&a), leaf_text(&b));
+            }
+        }
+    }
+
+    // ---- event collection (engine.py:2807-2818): BARE pop reads (never
+    // ft_view -- the trigger ft's own cell, not the RMAP-reassembled view),
+    // keyed by (noun, entity); duplicates matter (two rows of the same
+    // trigger ft = two events, appended, never deduped) ----
+    let mut events: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let mut event_entity: HashMap<(String, String), Leaf> = HashMap::new();
+    for ft in &trig_fts {
+        let noun = match mf_governed_player(&ev, &nd, ft) {
+            Some(n) => n,
+            None => continue,
+        };
+        let pos = pop_rows(cells, &leaf("role")).iter().find_map(|r| {
+            let it = items(&list_of(r));
+            if it.len() >= 4
+                && aval(&it[1]).map(|l| leaf_text(&l)).as_deref() == Some(ft.as_str())
+                && aval(&it[3]).map(|l| leaf_text(&l)).as_deref() == Some(noun.as_str())
+            {
+                if let Some(Leaf::I(p)) = aval(&it[2]).as_deref() {
+                    return Some(*p);
+                }
+            }
+            None
+        });
+        let pos = match pos {
+            Some(p) if p >= 1 => p,
+            _ => continue,
+        };
+        let idx = (pos - 1) as usize;
+        for row in pop_rows(cells, &leaf(ft)) {
+            let it = items(&list_of(&row));
+            if it.len() >= pos as usize {
+                if let Some(ekey) = aval(&it[idx]) {
+                    let et = leaf_text(&ekey);
+                    if et.is_empty() || et == "\u{3c6}" {
+                        continue;
+                    }
+                    let k = (noun.clone(), mf_lkey(&ekey));
+                    events.entry(k.clone()).or_default().push(ft.clone());
+                    event_entity.entry(k).or_insert_with(|| (*ekey).clone());
+                }
+            }
+        }
+    }
+
+    let (part, pairs_v) = mf_partition(&ev, &nd);
+
+    // ---- current status, read through ft_view (RMAP-aware: the status ft
+    // is usually absorbed by fold time) ----
+    let mut current: HashMap<(String, String), String> = HashMap::new();
+    let mut current_nouns: Vec<String> =
+        events.keys().map(|(n, _)| n.clone()).collect::<HashSet<_>>().into_iter().collect();
+    current_nouns.sort();
+    for noun in &current_nouns {
+        let sft = match status_fts.get(gov.get(noun).unwrap_or(noun)) {
+            Some(s) => s.clone(),
+            None => continue,
+        };
+        for row in mf_ft_view(cells, &ev, &nd, &sft, &part, &pairs_v) {
+            let it = items(&list_of(&row));
+            if it.len() >= 2 {
+                if let (Some(k), Some(v)) = (aval(&it[0]), aval(&it[1])) {
+                    current.insert((noun.clone(), mf_lkey(&k)), leaf_text(&v));
+                }
+            }
+        }
+    }
+
+    // ---- the greedy walk: per (noun, entity) in SORTED order (python's
+    // native tuple sort -- numeric for a homogeneous int-keyed noun, lexical
+    // for a string-keyed one), fire the FIRST fireable event, remove it,
+    // restart the scan; stop when a full scan fires nothing ----
+    struct ChangedRow {
+        sft: String,
+        ekey: String,
+        entity: Leaf,
+        status: String,
+    }
+    let mut changed: Vec<ChangedRow> = Vec::new();
+
+    let mut event_keys: Vec<(String, String)> = events.keys().cloned().collect();
+    event_keys.sort_by(|a, b| {
+        a.0.cmp(&b.0).then_with(|| mf_leaf_cmp(&event_entity[a], &event_entity[b]))
+    });
+
+    for k in &event_keys {
+        let (noun, ekey) = k;
+        let sft = match status_fts.get(gov.get(noun).unwrap_or(noun)) {
+            Some(s) => s.clone(),
+            None => continue,
+        };
+        let m: Option<String> = machines
+            .get(gov.get(noun).unwrap_or(noun))
+            .or_else(|| machines.get(noun))
+            .cloned();
+        let start: Option<String> = current.get(k).cloned().or_else(|| {
+            m.as_ref().and_then(|mm| initials.get(mm)).cloned()
+        });
+        let mut cur = start;
+        let mut evs: Vec<String> = events[k].clone();
+        evs.sort();
+        let mut fired_any = false;
+        loop {
+            if evs.is_empty() {
+                break;
+            }
+            let mut fired_idx: Option<(usize, String)> = None;
+            for (i, ev_ft) in evs.iter().enumerate() {
+                if let Some(c) = &cur {
+                    if let Some((_, _, to)) =
+                        triples.iter().find(|(f, g, _)| g == ev_ft && f == c)
+                    {
+                        fired_idx = Some((i, to.clone()));
+                        break;
+                    }
+                }
+            }
+            match fired_idx {
+                Some((i, to)) => {
+                    cur = Some(to);
+                    fired_any = true;
+                    evs.remove(i);
+                }
+                None => break,
+            }
+        }
+        // write iff the machine RAN for this entity -- a round-trip back to
+        // the RECORDED current does not write; an entity with no recorded
+        // status that walks back to the initial DOES write (current.get is
+        // None, never equal to a real status string)
+        if fired_any {
+            let existing = current.get(k).cloned();
+            if cur != existing {
+                if let Some(cv) = cur {
+                    changed.push(ChangedRow {
+                        sft,
+                        ekey: ekey.clone(),
+                        entity: event_entity[k].clone(),
+                        status: cv,
+                    });
+                }
+            }
+        }
+    }
+
+    // ---- SM init: every governed entity with no status row materializes
+    // the machine's initial. Entity source = the noun's own table UNIONED
+    // with role-1 keys of every OTHER fact type the noun heads. Keys sorted
+    // BY STR (python's `key=str`, unlike the walk's native-type sort) ----
+    let mut written: HashSet<(String, String)> =
+        changed.iter().map(|c| (c.sft.clone(), c.ekey.clone())).collect();
+
+    let mut machine_pairs: Vec<(String, String)> =
+        machines.iter().map(|(n, m)| (n.clone(), m.clone())).collect();
+    machine_pairs.sort();
+
+    for (noun, m) in &machine_pairs {
+        let sft = match status_fts.get(noun) {
+            Some(s) => s.clone(),
+            None => continue,
+        };
+        let init = match initials.get(m) {
+            Some(i) => i.clone(),
+            None => continue,
+        };
+
+        let have: HashSet<String> = mf_ft_view(cells, &ev, &nd, &sft, &part, &pairs_v)
+            .iter()
+            .filter_map(|r| {
+                let it = items(&list_of(r));
+                if !it.is_empty() {
+                    aval(&it[0]).map(|l| mf_lkey(&l))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut keys: HashMap<String, Leaf> = HashMap::new();
+        for r in pop_rows(cells, &leaf(noun)) {
+            let it = items(&list_of(&r));
+            if !it.is_empty() {
+                if let Some(k) = aval(&it[0]) {
+                    keys.entry(mf_lkey(&k)).or_insert_with(|| (*k).clone());
+                }
+            }
+        }
+        for r in pop_rows(cells, &leaf("role")) {
+            let it = items(&list_of(&r));
+            if it.len() >= 4
+                && matches!(aval(&it[2]).as_deref(), Some(Leaf::I(1)))
+                && aval(&it[3]).map(|l| leaf_text(&l)).as_deref() == Some(noun.as_str())
+            {
+                if let Some(oft) = aval(&it[1]).map(|l| leaf_text(&l)) {
+                    if oft != *sft {
+                        for x in pop_rows(cells, &leaf(&oft)) {
+                            let xit = items(&list_of(&x));
+                            if !xit.is_empty() {
+                                if let Some(k) = aval(&xit[0]) {
+                                    keys.entry(mf_lkey(&k)).or_insert_with(|| (*k).clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut keys_vec: Vec<(String, Leaf)> = keys.into_iter().collect();
+        keys_vec.sort_by(|a, b| leaf_text(&a.1).cmp(&leaf_text(&b.1)));
+
+        for (lk, kleaf) in keys_vec {
+            let kt = leaf_text(&kleaf);
+            // python's `if k and k not in ("", "φ")`: a TRUTHINESS check,
+            // not membership alone -- an integer 0 key is falsy too
+            let falsy = match &kleaf {
+                Leaf::I(i) => *i == 0,
+                Leaf::F(f) => *f == 0.0,
+                Leaf::S(s) => s.is_empty(),
+                Leaf::AppTag => false,
+            };
+            if falsy || kt == "\u{3c6}" {
+                continue;
+            }
+            if have.contains(&lk) {
+                continue;
+            }
+            if written.contains(&(sft.clone(), lk.clone())) {
+                continue;
+            }
+            written.insert((sft.clone(), lk.clone()));
+            changed.push(ChangedRow {
+                sft: sft.clone(),
+                ekey: lk,
+                entity: kleaf,
+                status: init.clone(),
+            });
+        }
+    }
+
+    if changed.is_empty() {
+        return (cells.to_vec(), false);
+    }
+
+    // ---- the commit: group by status ft (preserving each group's relative
+    // order), sorted by ft name. Absorbed -> mf_bulk_absorbed_install
+    // (replace_keys=true). Own-table -> union-overwrite the pop directly
+    // through STORE semantics (python's ast.Store) ----
+    let mut by_sft: Vec<(String, Vec<(Leaf, String)>)> = Vec::new();
+    {
+        let mut idx: HashMap<String, usize> = HashMap::new();
+        for c in &changed {
+            let i = *idx.entry(c.sft.clone()).or_insert_with(|| {
+                by_sft.push((c.sft.clone(), Vec::new()));
+                by_sft.len() - 1
+            });
+            by_sft[i].1.push((c.entity.clone(), c.status.clone()));
+        }
+    }
+    by_sft.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out_cells: Vec<(Leaf, V)> = cells.to_vec();
+    for (sft, rows) in &by_sft {
+        let table = part.get(sft).cloned().unwrap_or_else(|| sft.clone());
+        if &table == sft {
+            let new_keys: HashSet<String> = rows.iter().map(|(e, _)| mf_lkey(e)).collect();
+            let mut keep: Vec<V> = Vec::new();
+            for r in pop_rows(&out_cells, &leaf(sft)) {
+                let it = items(&list_of(&r));
+                if !it.is_empty() {
+                    if let Some(k) = aval(&it[0]) {
+                        if !new_keys.contains(&mf_lkey(&k)) {
+                            keep.push(r.clone());
+                        }
+                    }
+                }
+            }
+            let new_rows: Vec<V> = rows
+                .iter()
+                .map(|(e, cur)| seqc(vec![atom(e.clone()), atom(Leaf::S(cur.clone()))]))
+                .collect();
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut union_rows: Vec<V> = Vec::new();
+            for r in keep.into_iter().chain(new_rows.into_iter()) {
+                if seen.insert(key_of(&r)) {
+                    union_rows.push(r);
+                }
+            }
+            sort_rows(&mut union_rows);
+            store_move(&mut out_cells, sft, seq(from_vec(union_rows)));
+        } else {
+            out_cells = mf_bulk_absorbed_install(&out_cells, &ev, &table, sft, rows, &pairs_v);
+        }
+    }
+
+    (out_cells, true)
+}
+
+// layout_cells (engine.py:1693): materializes the RMAP layout as data --
+// rows ⟨table, 2+j, ft⟩ for every absorbed fact type. Unconditional (no
+// machine gating): a no-machine corpus still gets its ORDINARY RMAP
+// absorptions laid out. REPLACES any existing rmapColumns cell WHOLESALE --
+// python filters the old cell out then appends the fresh one at the END
+// (`cells + (new,)`), never Store's re-top-to-front.
+fn layout_cells_native(cells: &[(Leaf, V)], srv: &Srv) -> Vec<(Leaf, V)> {
+    use std::collections::HashSet;
+    let d0 = cells_to_d(cells);
+    let nd = v_to_n(&d0);
+    let ncells = n_cells_of(&nd);
+    let ev = NEval {
+        cells: ncells,
+        process: srv.nprocess.clone(),
+        defs_n: nd.clone(),
+        fuel: std::cell::Cell::new(-1),
+    };
+
+    let (part, pairs_v) = mf_partition(&ev, &nd);
+    let mut tables: Vec<String> = part
+        .iter()
+        .filter(|(f, t)| f != t)
+        .map(|(_, t)| t.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    tables.sort();
+
+    let mut rows: Vec<V> = Vec::new();
+    for table in &tables {
+        let cols = mf_table_columns(&ev, table, &pairs_v);
+        for (j, ft) in cols.iter().enumerate() {
+            rows.push(seqc(vec![
+                atom(Leaf::S(table.clone())),
+                atom(Leaf::I((2 + j) as i64)),
+                atom(Leaf::S(ft.clone())),
+            ]));
+        }
+    }
+
+    let mut out: Vec<(Leaf, V)> = cells
+        .iter()
+        .filter(|(k, _)| !matches!(k, Leaf::S(s) if s == "rmapColumns"))
+        .cloned()
+        .collect();
+    out.push((Leaf::S("rmapColumns".to_string()), seq(from_vec(rows))));
+    out
+}
+
+// compile_lines_native is a SELF-CONTAINED twin of op_compile_model's own
+// dispatch loop (grammar load through rekey_transitions_native), used ONLY
+// by status_facts_native's nested "compile these synthesized lines atop the
+// in-progress model" call -- the exact recursive shape python's status_facts
+// takes (`forml.compile_model(text, D=D, context_from=D)`, engine.py:3541,
+// itself compile_model_selfhost + rekey_transitions, NEVER run_rules --
+// run_rules is the pipeline's own separate call, not part of compile_model).
+// Deliberately a SEPARATE function, not a refactor of op_compile_model's own
+// (already byte-parity-certified across ten corpora + identity, by two
+// earlier slices) loop -- duplicating this logic costs a couple hundred
+// lines but keeps zero risk to that proven path. Every helper it calls
+// (split_statements/split_modality/context_of/known_names/known_vals/
+// prepass_context/stage1_rows_of/op_run_rules/store_into/pop_rows/
+// reduce_over/native_cook/fold_fire/rekey_transitions_native) is REUSED
+// verbatim, never modified. Diagnostics (classified/unclassified/prose/
+// missing/blocked/trace) are dropped -- only model_cells and folded_any are
+// this boundary's contract.
+fn compile_lines_native(
+    j: &J,
+    text: &str,
+    seed_cells: &[(Leaf, V)],
+    srv: &mut Srv,
+    fuel: Option<i64>,
+) -> Result<(Vec<(Leaf, V)>, bool), String> {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    let leaf = |s: &str| Leaf::S(s.to_string());
+
+    // ---- grammar (mirrors op_compile_model's own load verbatim) ----
+    let (mut dispatch, mut vocab) = grammar_tables(&srv.cells);
+    let mut scratch: Option<GrammarScratch> = None;
+    if vocab.is_empty() {
+        match load_grammar_scratch(j) {
+            Ok((g, _path)) => {
+                let (d2, v2) = grammar_tables(&g.1);
+                dispatch = d2;
+                vocab = v2;
+                scratch = Some(g);
+            }
+            Err(e) => return Err(format!("status_facts sub-compile: {}", e)),
+        }
+    }
+    if dispatch.is_empty() {
+        return Err(
+            "status_facts sub-compile: no Classification_has_Translator rows".to_string(),
+        );
+    }
+
+    let stmts = split_statements(text);
+    let mut work: Vec<(String, &'static str, String, &'static str)> = Vec::new();
+    for stmt in &stmts {
+        let (m, sg, inner) = split_modality(stmt);
+        if sg != "possibility" {
+            work.push((stmt.clone(), m, inner, sg));
+        }
+    }
+
+    // context_from = seed_cells (status_facts' own D, NOT the resident base)
+    let (b_names, b_edges, b_fts, b_vals) = context_of(seed_cells);
+    let mut names = known_names(&stmts);
+    for n in b_names {
+        names.insert(n);
+    }
+    let mut vals = known_vals(&stmts);
+    for v in b_vals {
+        vals.insert(v);
+    }
+    let b_fts_vec: Vec<String> = b_fts.into_iter().collect();
+    let (subs, fts, plain) = prepass_context(&stmts, &names, &b_edges, &b_fts_vec);
+    let mut nouns: Vec<String> = names.iter().cloned().collect();
+    nouns.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+
+    // ---- batch classification (the SAME save/swap/restore discipline
+    // op_compile_model's own classify step uses) ----
+    let mut by_cell: BTreeMap<String, Vec<V>> = BTreeMap::new();
+    for (i, (_stmt, _m, inner, _sg)) in work.iter().enumerate() {
+        let sid = format!("s{}", i + 1);
+        for (ftb, s, v) in stage1_rows_of(inner, &vocab, &nouns, &sid) {
+            by_cell
+                .entry(ftb)
+                .or_default()
+                .push(seq(from_vec(vec![atom(Leaf::S(s)), atom(Leaf::S(v))])));
+        }
+    }
+    let saved_d = srv.d.clone();
+    let saved_cells = srv.cells.clone();
+    let saved_nd = srv.nd.clone();
+    let saved_ncells = srv.ncells.clone();
+    let saved_nprocess = srv.nprocess.clone();
+    let mut cls_by_sid: HashMap<String, HashSet<String>> = HashMap::new();
+    if !by_cell.is_empty() {
+        if let Some((gd, gcells, gnd, gncells, gproc)) = scratch {
+            srv.d = gd;
+            srv.cells = gcells;
+            srv.nd = gnd;
+            srv.ncells = gncells;
+            srv.nprocess = gproc;
+        }
+        for (ftb, rows) in &by_cell {
+            let name = leaf(ftb);
+            let old = pop_rows(&srv.cells, &name);
+            let mut merged: Vec<V> = Vec::new();
+            let mut keys: HashSet<String> = HashSet::new();
+            for r in old.iter().chain(rows.iter()) {
+                if keys.insert(key_of(r)) {
+                    merged.push(r.clone());
+                }
+            }
+            sort_rows(&mut merged);
+            store_into(
+                &mut srv.d,
+                &mut srv.cells,
+                &mut srv.nd,
+                &mut srv.ncells,
+                &name,
+                seq(from_vec(merged)),
+            );
+        }
+        let frontier_req = J::O(vec![(
+            "changed".to_string(),
+            J::A(by_cell.keys().map(|k| J::S(k.clone())).collect()),
+        )]);
+        let derived = op_run_rules(&frontier_req, srv);
+        if derived.is_ok() {
+            for r in pop_rows(&srv.cells, &leaf("Statement_has_Classification")) {
+                let it = items(&list_of(&r));
+                if it.len() >= 2 {
+                    if let (Some(s), Some(c)) = (
+                        aval(&it[0]).and_then(|l| leaf_str(&l)),
+                        aval(&it[1]).and_then(|l| leaf_str(&l)),
+                    ) {
+                        cls_by_sid.entry(s).or_default().insert(c);
+                    }
+                }
+            }
+        }
+        srv.d = saved_d;
+        srv.cells = saved_cells;
+        srv.nd = saved_nd;
+        srv.ncells = saved_ncells;
+        srv.nprocess = saved_nprocess;
+        derived?;
+    }
+
+    // ---- the dispatch loop (op_compile_model's own, diagnostics dropped) ----
+    const GENERIC: [&str; 2] = ["Fact Type Reading", "Instance Fact"];
+    let mut model_cells: Vec<(Leaf, V)> = seed_cells.to_vec();
+    let atom_s = |s: &str| atom(Leaf::S(s.to_string()));
+    let mut names_sorted: Vec<String> = names.iter().cloned().collect();
+    names_sorted.sort();
+    let subs_pairs: Vec<V> = subs
+        .iter()
+        .map(|(s, anc)| {
+            seqc(vec![
+                atom_s(s),
+                seq(from_vec(anc.iter().map(|a| atom_s(a)).collect())),
+            ])
+        })
+        .collect();
+    let mut vals_sorted: Vec<String> = vals.iter().cloned().collect();
+    vals_sorted.sort();
+    let ctx = seqc(vec![
+        seq(from_vec(names_sorted.iter().map(|n| atom_s(n)).collect())),
+        seq(from_vec(subs_pairs)),
+        seq(from_vec(fts.iter().map(|f| atom_s(f)).collect())),
+        seq(from_vec(plain.iter().map(|f| atom_s(f)).collect())),
+        seq(from_vec(vals_sorted.iter().map(|v| atom_s(v)).collect())),
+    ]);
+    let empty_cls: HashSet<String> = HashSet::new();
+    let mut folded_any = false;
+    let kn = cooks::Known::new(&names, &subs, &fts, &plain, &vals);
+
+    for (i, (stmt, m, inner, sg)) in work.iter().enumerate() {
+        let sid = format!("s{}", i + 1);
+        let cls = cls_by_sid.get(&sid).unwrap_or(&empty_cls);
+        let mut residual = cls.clone();
+        residual.remove("Prose");
+        residual.remove("Derivation Rule");
+        for g in GENERIC {
+            residual.remove(g);
+        }
+        if cls.contains("Prose") && residual.is_empty() {
+            continue;
+        }
+        let specific: Vec<String> = cls
+            .iter()
+            .filter(|c| !GENERIC.contains(&c.as_str()))
+            .cloned()
+            .collect();
+        if specific.is_empty() && *sg == "negative" && *m == "alethic" {
+            continue;
+        }
+        let mut sorted_cls: Vec<String> = if specific.is_empty() {
+            cls.iter().cloned().collect()
+        } else {
+            specific
+        };
+        sorted_cls.sort();
+        let mut translators: Vec<String> = Vec::new();
+        for c in &sorted_cls {
+            if let Some(ts) = dispatch.get(c) {
+                for t in ts {
+                    if !translators.contains(t) {
+                        translators.push(t.clone());
+                    }
+                }
+            }
+        }
+        if translators.is_empty() {
+            continue;
+        }
+        let mfield = if *m == "deontic" {
+            format!("{}:{}", m, sg)
+        } else {
+            (*m).to_string()
+        };
+        for t in &translators {
+            if translator_kinds(t).is_empty() {
+                continue;
+            }
+            let operand = seqc(vec![
+                atom(Leaf::S(inner.clone())),
+                atom(Leaf::S(mfield.clone())),
+                ctx.clone(),
+                cells_to_d(&model_cells),
+            ]);
+            let res = reduce_over(srv, atom(Leaf::S(t.clone())), operand, fuel);
+            if matches!(shape(&res), Shape::Seq(_)) && !isapp(&res) {
+                model_cells = raw_cells_of(&res);
+                folded_any = true;
+                continue;
+            }
+            let cooked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                native_cook(t, inner, &mfield, &kn, srv)
+            }))
+            .unwrap_or_else(|p| {
+                let msg = p
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| p.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".into());
+                Err(format!("cook panicked: {}", msg))
+            });
+            if let Ok(Some(fire)) = cooked {
+                fold_fire(&fire, &mut model_cells).map_err(|e| {
+                    format!("status_facts fold: {} (statement: {})", e, stmt)
+                })?;
+                folded_any = true;
+            }
+        }
+    }
+    rekey_transitions_native(&mut model_cells);
+    Ok((model_cells, folded_any))
+}
+
+// status_facts (engine.py:3516): each governed Object Type gets its "is
+// currently in Status" fact type, generated through the ordinary reading
+// path (compile_lines_native above) so the name is compiled, never
+// hand-built. Runs BEFORE machine_fold so the status column is laid out
+// (RMAP absorbs it, since "Each Noun is currently in at most one Status" is
+// a role-1 UC) before the fold writes.
+fn status_facts_native(
+    j: &J,
+    cells: &[(Leaf, V)],
+    srv: &mut Srv,
+) -> Result<Vec<(Leaf, V)>, String> {
+    use std::collections::HashMap;
+    let leaf = |s: &str| Leaf::S(s.to_string());
+
+    // nouns: smDef rows' r[1] (governed noun), IN POP ORDER, duplicates
+    // preserved (engine.py:3529's plain list comprehension -- no dedup)
+    let nouns: Vec<String> = pop_rows(cells, &leaf("smDef"))
+        .iter()
+        .filter_map(|r| {
+            let it = items(&list_of(r));
+            if it.len() >= 2 {
+                aval(&it[1]).map(|l| leaf_text(&l))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if nouns.is_empty() {
+        return Ok(cells.to_vec());
+    }
+
+    let has_status_value = pop_rows(cells, &leaf("instanceOf")).iter().any(|r| {
+        let it = items(&list_of(r));
+        it.len() >= 2
+            && aval(&it[0]).map(|l| leaf_text(&l)).as_deref() == Some("Status")
+            && aval(&it[1]).map(|l| leaf_text(&l)).as_deref() == Some("ValueType")
+    });
+
+    let mut lines: Vec<String> = Vec::new();
+    if !has_status_value {
+        lines.push("Status is a value type.".to_string());
+    }
+    for noun in &nouns {
+        lines.push(format!("{} is currently in Status.", noun));
+        lines.push(format!("Each {} is currently in at most one Status.", noun));
+    }
+    let text = format!("{}\n", lines.join("\n"));
+
+    // engine.py's nested `forml.compile_model(text, D=D, context_from=D)`
+    // never inherits the caller's own fuel budget (compile_model takes none
+    // from status_facts) -- unbounded here regardless of the outer op's fuel
+    let (cells2, _folded) = compile_lines_native(j, &text, cells, srv, None)?;
+
+    let mut role1: HashMap<String, String> = HashMap::new();
+    for r in pop_rows(&cells2, &leaf("role")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 4 && matches!(aval(&it[2]).as_deref(), Some(Leaf::I(1))) {
+            if let (Some(f), Some(pl)) = (aval(&it[1]), aval(&it[3])) {
+                role1.insert(leaf_text(&f), leaf_text(&pl));
+            }
+        }
+    }
+    let mut templ: HashMap<String, String> = HashMap::new();
+    for r in pop_rows(&cells2, &leaf("factType")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            if let (Some(f), Some(rd)) = (aval(&it[0]), aval(&it[1])) {
+                templ.insert(leaf_text(&f), leaf_text(&rd));
+            }
+        }
+    }
+    let existing_smstatusft = pop_rows(&cells2, &leaf("smStatusFt"));
+    let mut have: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for r in &existing_smstatusft {
+        let it = items(&list_of(r));
+        if it.len() >= 2 {
+            if let (Some(n), Some(f)) = (aval(&it[0]), aval(&it[1])) {
+                have.insert((leaf_text(&n), leaf_text(&f)));
+            }
+        }
+    }
+    let mut templ_keys: Vec<String> = templ.keys().cloned().collect();
+    templ_keys.sort();
+
+    let mut rows: Vec<V> = existing_smstatusft;
+    for noun in &nouns {
+        for ft in &templ_keys {
+            if role1.get(ft).map(|s| s.as_str()) == Some(noun.as_str())
+                && templ.get(ft).map(|t| t.contains("is currently in")).unwrap_or(false)
+                && !have.contains(&(noun.clone(), ft.clone()))
+            {
+                rows.push(seqc(vec![atom(Leaf::S(noun.clone())), atom(Leaf::S(ft.clone()))]));
+            }
+        }
+    }
+    let mut out = cells2;
+    store_move(&mut out, "smStatusFt", seq(from_vec(rows)));
+    Ok(out)
+}
+
 fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
     use std::collections::{BTreeMap, HashMap, HashSet};
     // args parse before anything runs (op_run_rules' discipline: a malformed
@@ -6333,6 +7414,46 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
         srv.ncells = saved_ncells2;
         derived2?;
     }
+    // ======================= status_facts -> machine_fold -> (rules iff
+    // changed) -> layout_cells (#20, the machine_fold port slice) =========
+    // protocol.py:1760-1801's phase order, continued from the post-model
+    // fixpoint above: status_facts (engine.py:3516) mints each governed
+    // Object Type's "is currently in Status" fact type via a NESTED compile
+    // (status_facts_native's own compile_lines_native sub-call) so RMAP
+    // absorbs it as a column before the fold writes; machine_fold
+    // (engine.py:2780) then folds every readings-carried machine event to
+    // its final status, greedy per entity; the conditional run_rules
+    // mirrors protocol.py:1842's `if D2 is not D`; layout_cells
+    // (engine.py:1693) materializes the rmapColumns cell unconditionally.
+    // replay (log-carried events) is explicitly NOT in this slice — these
+    // corpora's machine events arrive as readings, which status_facts /
+    // machine_fold read directly off the fact populations, no event log
+    // needed.
+    model_cells = status_facts_native(j, &model_cells, srv)
+        .map_err(|e| format!("status_facts: {}", e))?;
+    let (mf_cells, mf_changed) = machine_fold_native(&model_cells, srv);
+    model_cells = mf_cells;
+    if mf_changed {
+        let saved_d3 = srv.d.clone();
+        let saved_cells3 = srv.cells.clone();
+        let saved_nd3 = srv.nd.clone();
+        let saved_ncells3 = srv.ncells.clone();
+        srv.d = cells_to_d(&model_cells);
+        srv.cells = model_cells.clone();
+        srv.nd = v_to_n(&srv.d);
+        srv.ncells = n_cells_of(&srv.nd);
+        let rules_req3 = J::O(Vec::new());
+        let derived3 = op_run_rules(&rules_req3, srv);
+        if derived3.is_ok() {
+            model_cells = raw_cells_of(&srv.d);
+        }
+        srv.d = saved_d3;
+        srv.cells = saved_cells3;
+        srv.nd = saved_nd3;
+        srv.ncells = saved_ncells3;
+        derived3?;
+    }
+    model_cells = layout_cells_native(&model_cells, srv);
     // rule_diagnostics: the ruleDiag population AFTER rules (python's own
     // compiler.py:2489 reads it right after rekey, BEFORE the pipeline's
     // separate run_rules call — but ruleDiag is a STAGE-1 COMPILE diagnostic,
@@ -6393,13 +7514,19 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
         r.push(']');
     }
     if dump_store_on {
-        // the store as of THIS slice's own boundary: fold -> rekey_transitions
-        // -> the post-model run_rules fixpoint (when it ran) — python's
-        // compile_model (WITH rekey) + the pipeline's separate run_rules call,
-        // full from_lam. (The fold slice's own narrower boundary,
-        // compile_model_selfhost's bare return, is no longer what dump_store
-        // answers — that comparison now lives in fold_pydump.py calling
-        // compile_model_selfhost directly, pre-rekey, pre-rules.)
+        // the store as of THIS slice's own boundary (#20, machine_fold):
+        // fold -> rekey_transitions -> post-model run_rules -> status_facts
+        // -> machine_fold -> run_rules IFF machine_fold changed anything ->
+        // layout_cells, full from_lam — python's compile_model (WITH rekey)
+        // + protocol.py's own run_rules/status_facts/machine_fold/
+        // (run_rules)/layout_cells calls, EXCLUDING replay (log-carried
+        // events; explicitly not in this slice) and everything after
+        // layout_cells (scheduler/generator/create_handlers/save). (Earlier
+        // slices' narrower boundaries — compile_model_selfhost's bare
+        // return, and the post-rules-pre-status_facts point — are no longer
+        // what dump_store answers; those comparisons live in
+        // fold_pydump.py/rules-pydump.py calling the narrower python
+        // boundary directly.)
         r.push_str(",\"store\":");
         write_v(&cells_to_d(&model_cells), &mut r);
     }
