@@ -31,12 +31,38 @@ using System.Windows.Media;
 
 namespace ArestShow;
 
-// ---- the compiler-host delegation: every verb is one cli.py call ----
-sealed class Cli(string appsDir, string app)
+// ---- the data seam: six verbs, two hosts (board task #36, 2026-07-11:
+// swap the python subprocess for the native Rust resident) -- the SAME
+// Register/Resolve discipline the control registry below uses, one
+// level up: an interface for the six verbs, PyCli the original
+// subprocess-per-call implementation (unchanged behavior), NativeServe
+// a persistent `arest.exe --mcp` child. Program.Main resolves
+// NativeServe by default; --py-host falls back to PyCli. ----
+interface IHost
 {
-    static readonly string Root = FindRoot();
+    JsonElement Schema();
+    string[] Entities(string noun);
+    (string id, string text, string value)[] Items(string noun);
+    JsonElement Get(string noun, string id);
+    JsonElement Actions(string noun, string id);
+    JsonElement Apply(string ft, params string[] row);
 
-    static string FindRoot()
+    // Nouns is a PROJECTION of Schema (object_types filtered to entity
+    // kinds), not a separate verb -- one shared reading, not forked
+    // across both hosts.
+    string[] Nouns() =>
+        [.. Schema().GetProperty("object_types").EnumerateArray()
+            .Where(n => n.GetProperty("kind").GetString() == "ObjectType")
+            .Select(n => n.GetProperty("name").GetString()!)];
+}
+
+// the ONE landmark walk both hosts need: PyCli spawns cli.py directly;
+// NativeServe finds rust/target/{release,debug}/arest.exe beside it.
+static class EngineRoot
+{
+    public static readonly string Dir = Find();
+
+    static string Find()
     {
         var d = AppContext.BaseDirectory;
         while (d != null && !File.Exists(Path.Combine(d, "cli.py")))
@@ -44,8 +70,13 @@ sealed class Cli(string appsDir, string app)
         return d ?? throw new FileNotFoundException(
             "cli.py not found above " + AppContext.BaseDirectory);
     }
+}
 
-    public JsonElement Call(params string[] args)
+// ---- PyCli: the original seam, unchanged behavior -- one
+// `python cli.py <verb>` subprocess per call ----
+sealed class PyCli(string appsDir, string app) : IHost
+{
+    JsonElement Call(params string[] args)
     {
         var psi = new ProcessStartInfo("python")
         {
@@ -53,7 +84,7 @@ sealed class Cli(string appsDir, string app)
             RedirectStandardError = true,
             UseShellExecute = false,
         };
-        foreach (var a in new[] { "-X", "utf8", Path.Combine(Root, "cli.py"),
+        foreach (var a in new[] { "-X", "utf8", Path.Combine(EngineRoot.Dir, "cli.py"),
                                   args[0], "--apps-dir", appsDir, app })
             psi.ArgumentList.Add(a);
         foreach (var a in args.Skip(1))
@@ -65,10 +96,7 @@ sealed class Cli(string appsDir, string app)
         return JsonDocument.Parse(line.Length > 0 ? line : "{}").RootElement;
     }
 
-    public string[] Nouns() =>
-        [.. Call("schema").GetProperty("object_types").EnumerateArray()
-            .Where(n => n.GetProperty("kind").GetString() == "ObjectType")
-            .Select(n => n.GetProperty("name").GetString()!)];
+    public JsonElement Schema() => Call("schema");
 
     public string[] Entities(string noun) =>
         [.. Call("entities", noun).EnumerateArray()
@@ -86,6 +114,248 @@ sealed class Cli(string appsDir, string app)
 
     public JsonElement Apply(string ft, params string[] row) =>
         Call("apply", ft, JsonSerializer.Serialize(row));
+}
+
+// ---- NativeServe: the native Rust resident, ONE persistent
+// `arest.exe --mcp --apps-dir <dir>` child speaking newline-delimited
+// JSON-RPC 2.0 (main.rs's --mcp binding). TRANSPORT CHOICE: the --serve
+// op table (base_seed/cells/compile_model/query/run_rules/sql_project/
+// synthesize_pairs/verbs) has no schema/get/apply/actions op at all --
+// only --mcp's tool table covers all six verbs, so --mcp is the one
+// transport that reaches every verb with zero main.rs edits.
+// apps_use preloads the app's store sidecar once (the {"d":...}
+// preamble under the hood, main.rs's load_sidecar); schema/get/actions
+// ride the native store_call arms directly and apply rides native_apply
+// (falling back to the python delegate INSIDE arest.exe for an
+// absorbed fact type -- transparent to this class, and to retract,
+// which always delegates). Every write already reloads the resident's
+// OWN in-memory store on the far side (apply_core / delegate_verb both
+// refresh srv before answering), so this class never re-preambles
+// after a write -- the next call simply reads the same child's already
+// -current state.
+// entities/items have NO mcp tool of their own (verified against
+// main.rs's MCP_TOOLS/mcp_call_inner/store_call, 2026-07-11), so they
+// compose shell-side from "query" (+ "actions" for the machine-tracked
+// status column: a bare query on an ABSORBED status fact type would
+// read the raw row_overwrite cell rather than the RMAP-resolved current
+// value -- protocol.py's ft_view distinction, Registry.query's
+// smStatusFt special case -- so status rides the same per-id "actions"
+// read Registry.actions itself uses, paid only when the noun is
+// actually machine-governed).
+sealed class NativeServe : IHost, IDisposable
+{
+    // reads (query/get/actions/schema) answer in well under a second even
+    // at the tasks app's ~1000-entity scale; apply's bounded derive is the
+    // one call that can run long on a large, richly-derived corpus (a
+    // 90s and a 600s attempt on the tasks app's own Task noun BOTH ran out
+    // the clock still computing, board task #36's report has the detail),
+    // so the timeout carries generous margin above the read path's actual
+    // (sub-second) latency.
+    static readonly TimeSpan Timeout = TimeSpan.FromSeconds(1800);
+
+    readonly Process proc;
+    readonly string app;
+    int nextId;
+
+    public NativeServe(string appsDir, string app)
+    {
+        this.app = app;
+        var psi = new ProcessStartInfo(FindArestExe())
+        {
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        psi.ArgumentList.Add("--mcp");
+        psi.ArgumentList.Add("--apps-dir");
+        psi.ArgumentList.Add(appsDir);
+        proc = Process.Start(psi)!;
+        // drain stderr in the background so a full OS pipe buffer never
+        // blocks the child on a diagnostic line this seam never reads
+        var stderr = proc.StandardError;
+        _ = Task.Run(() => { try { stderr.ReadToEnd(); } catch { } });
+
+        // a throw anywhere below must still reap the child: a failed
+        // constructor never returns an IHost/IDisposable for the caller
+        // to clean up, so a leak here is a leak for the process's life
+        try
+        {
+            RpcCall("initialize", new { protocolVersion = "2024-11-05" });
+            var used = ToolCall("apps_use", new { name = app });
+            if (!(used.TryGetProperty("ok", out var ok) && ok.ValueKind == JsonValueKind.True))
+                throw new InvalidOperationException($"apps_use {app} failed: {used}");
+        }
+        catch
+        {
+            try { proc.Kill(entireProcessTree: true); } catch { }
+            throw;
+        }
+    }
+
+    static string FindArestExe()
+    {
+        var release = Path.Combine(EngineRoot.Dir, "rust", "target", "release", "arest.exe");
+        if (File.Exists(release)) return release;
+        var debug = Path.Combine(EngineRoot.Dir, "rust", "target", "debug", "arest.exe");
+        if (File.Exists(debug)) return debug;
+        throw new FileNotFoundException(
+            $"arest.exe not found under {EngineRoot.Dir}/rust/target/{{release,debug}}; " +
+            "run `cargo build` (or --release) in engine/rust, or pass --py-host");
+    }
+
+    JsonElement RpcCall(string method, object? paramsObj)
+    {
+        int id = ++nextId;
+        object req = paramsObj is null
+            ? new { jsonrpc = "2.0", id, method }
+            : new { jsonrpc = "2.0", id, method, @params = paramsObj };
+        var stdin = proc.StandardInput;
+        stdin.Write(JsonSerializer.Serialize(req));
+        stdin.Write('\n');
+        stdin.Flush();
+        while (true)
+        {
+            var readTask = proc.StandardOutput.ReadLineAsync();
+            if (!readTask.Wait(Timeout))
+                throw new TimeoutException(
+                    $"arest --mcp did not answer {method} within {Timeout}");
+            var line = readTask.Result
+                ?? throw new EndOfStreamException("arest --mcp closed its output");
+            if (line.Length == 0) continue;
+            var root = JsonDocument.Parse(line).RootElement;
+            if (!root.TryGetProperty("id", out var ridEl)
+                || ridEl.ValueKind != JsonValueKind.Number
+                || ridEl.GetInt32() != id)
+                continue;                     // a stray line; keep reading for ours
+            if (root.TryGetProperty("error", out var err))
+                throw new InvalidOperationException($"arest --mcp {method}: {err}");
+            return root.GetProperty("result").Clone();
+        }
+    }
+
+    JsonElement ToolCall(string tool, object args)
+    {
+        var result = RpcCall("tools/call", new { name = tool, arguments = args });
+        var text = result.GetProperty("content")[0].GetProperty("text").GetString()!;
+        return JsonDocument.Parse(text).RootElement.Clone();
+    }
+
+    JsonElement[] Query(string factType) =>
+        [.. ToolCall("query", new { fact_type = factType })
+            .GetProperty("rows").EnumerateArray()];
+
+    static string Scalar(JsonElement e) => e.ValueKind switch
+    {
+        JsonValueKind.String => e.GetString()!,
+        JsonValueKind.Number => e.GetRawText(),
+        _ => e.ToString(),
+    };
+
+    public JsonElement Schema() => ToolCall("schema", new { });
+
+    public JsonElement Get(string noun, string id) => ToolCall("get", new { noun, id });
+
+    public JsonElement Actions(string noun, string id) => ToolCall("actions", new { noun, id });
+
+    public JsonElement Apply(string ft, params string[] row) =>
+        ToolCall("apply", new { app, fact_type = ft, fact = row });
+
+    // the test harness' cleanup path only (--task-roundtrip below) --
+    // NOT one of the shell's six verbs, so it rides here rather than on
+    // IHost; retract always delegates on the far side regardless.
+    public JsonElement Retract(string ft, params string[] row) =>
+        ToolCall("retract", new { app, fact_type = ft, fact = row });
+
+    (string ft, int pos, string player)[] RoleRows() =>
+        [.. Query("role")
+            .Where(r => r.GetArrayLength() >= 4)
+            .Select(r => (Scalar(r[1]), r[2].GetInt32(), Scalar(r[3])))];
+
+    public string[] Entities(string noun)
+    {
+        // Registry.entities' exact union (protocol.py): the noun's own
+        // population's keys, unioned with the role-1 population of
+        // every fact type it heads -- an entity is an entity by
+        // playing a fact.
+        var keys = new SortedSet<string>(StringComparer.Ordinal);
+        foreach (var row in Query(noun))
+            if (row.GetArrayLength() > 0) keys.Add(Scalar(row[0]));
+        foreach (var r in RoleRows())
+            if (r.pos == 1 && r.player == noun)
+                foreach (var row in Query(r.ft))
+                    if (row.GetArrayLength() > 0) keys.Add(Scalar(row[0]));
+        keys.Remove("");
+        keys.Remove("φ");
+        return [.. keys];
+    }
+
+    public (string id, string text, string value)[] Items(string noun)
+    {
+        var ids = Entities(noun);
+        var roles = RoleRows();
+        // the text column: the ALPHABETICALLY-FIRST (by fact type id)
+        // binary fact type headed by noun. Role rows key as
+        // "<ft>.<position>" (compiler.py's _role_facts), so
+        // Registry.items' sort-over-role-tuples tie-break reduces
+        // exactly to a plain ordinal string sort of the fact type id
+        // among role-1 rows (the shared ".1" suffix never changes two
+        // strings' relative order) -- proved 2026-07-11 rather than
+        // assumed, since a wrong tie-break would silently pick the
+        // wrong column.
+        string? textFt = roles
+            .Where(r => r.pos == 1 && r.player == noun)
+            .Select(r => r.ft)
+            .OrderBy(ft => ft, StringComparer.Ordinal)
+            .FirstOrDefault(ft => roles.Any(q => q.ft == ft && q.pos == 2));
+        var texts = new Dictionary<string, string>();
+        if (textFt != null)
+            foreach (var row in Query(textFt))
+                if (row.GetArrayLength() >= 2)
+                    texts.TryAdd(Scalar(row[0]), Scalar(row[1]));
+        // the status column: machine_for's own walk (smDef + subtype),
+        // paying the per-id "actions" call -- the only correct native
+        // read of a row_overwrite-managed status column -- only when
+        // the noun is actually governed by some machine.
+        bool governed = Governed(noun);
+        var outp = new (string, string, string)[ids.Length];
+        for (int i = 0; i < ids.Length; i++)
+        {
+            var id = ids[i];
+            string value = "";
+            if (governed)
+            {
+                var acts = Actions(noun, id);
+                if (acts.TryGetProperty("status", out var st)
+                    && st.ValueKind == JsonValueKind.String)
+                    value = st.GetString()!;
+            }
+            outp[i] = (id, texts.TryGetValue(id, out var t) ? t : id, value);
+        }
+        return outp;
+    }
+
+    bool Governed(string noun)
+    {
+        var bound = new HashSet<string>();
+        foreach (var r in Query("smDef"))
+            if (r.GetArrayLength() >= 2) bound.Add(Scalar(r[1]));
+        var subs = new Dictionary<string, string>();
+        foreach (var r in Query("subtype"))
+            if (r.GetArrayLength() >= 2) subs[Scalar(r[0])] = Scalar(r[1]);
+        var n = noun;
+        var seen = new HashSet<string>();
+        while (!bound.Contains(n) && subs.TryGetValue(n, out var sup) && seen.Add(n))
+            n = sup;
+        return bound.Contains(n);
+    }
+
+    public void Dispose()
+    {
+        try { proc.StandardInput.Close(); } catch { }
+        try { if (!proc.WaitForExit(2000)) proc.Kill(entireProcessTree: true); } catch { }
+        try { proc.Dispose(); } catch { }
+    }
 }
 
 // ---- the pane: a ContentControl over a manual view stack ----
@@ -124,7 +394,7 @@ static class Defaults   // iFactr-WPF PlatformDefaults, copied as literals
 
 sealed class Shell
 {
-    readonly Cli cli;
+    readonly IHost cli;
     readonly string app;
     string noun;
     readonly bool single;
@@ -140,7 +410,7 @@ sealed class Shell
     // Register/Resolve seam as kernel.register_form("control:<role>")
     readonly Dictionary<string, Func<JsonElement, UIElement>> controls;
 
-    public Shell(Cli cli, string app, string noun, bool single = false)
+    public Shell(IHost cli, string app, string noun, bool single = false)
     {
         this.cli = cli;
         this.app = app;
@@ -462,7 +732,7 @@ sealed class Shell
         // tree is canon-derived host-side; HERE the cli's schema
         // answers fact types and the container filters the noun's
         // functional ones (role-1 = noun, binary or unary).
-        var schema = cli.Call("schema");
+        var schema = cli.Schema();
         var canvas = new Canvas();
         var grid = new LayoutGrid
         {
@@ -554,32 +824,218 @@ static class Program
             // tests/test_uilayout.py
             return LayoutSelfTest.Run();
         }
+        // --host-diff and --task-roundtrip are the board task #36
+        // acceptance harnesses: no WPF window, just the IHost seam
+        // itself, so they run headless (see the task's report for why:
+        // this sandbox has no interactive window station to pump).
+        if (args.Length >= 1 && args[0] == "--host-diff")
+            return args.Length >= 3
+                ? HostDiff.Run(args[1], args[2], args.Length > 3 ? args[3..] : null)
+                : Usage();
+        if (args.Length >= 1 && args[0] == "--task-roundtrip")
+            return args.Length >= 7
+                ? TaskRoundtrip.Run(args[1], args[2], args[3], args[4], args[5], args[6])
+                : Usage();
         if (args.Length < 2)
+            return Usage();
+        // NativeServe by default (the seam this task swaps in); --py-host
+        // falls back to the original subprocess-per-call PyCli.
+        IHost cli = args.Contains("--py-host")
+            ? new PyCli(args[0], args[1])
+            : new NativeServe(args[0], args[1]);
+        try
         {
-            Console.Error.WriteLine("usage: arest-show <apps-dir> <app> [noun] [--probe | --layout-selftest]");
-            return 2;
+            var nouns = cli.Nouns();
+            if (nouns.Length == 0)
+            {
+                Console.Error.WriteLine($"app {args[1]} has no entity nouns");
+                return 1;
+            }
+            var noun = args.Length > 2 && !args[2].StartsWith("--")
+                ? args[2] : nouns[0];
+            var app = new Application();
+            var shell = new Shell(cli, args[1], noun,
+                                  single: args.Contains("--single"));
+            var window = shell.Build(nouns);
+            if (args.Contains("--probe"))
+            {
+                // construct + measure once, no pump: the build smoke
+                window.Show();
+                window.Close();
+                Console.WriteLine("probe ok: " + string.Join(",", nouns));
+                return 0;
+            }
+            return app.Run(window);
         }
-        var cli = new Cli(args[0], args[1]);
-        var nouns = cli.Nouns();
-        if (nouns.Length == 0)
+        finally
         {
-            Console.Error.WriteLine($"app {args[1]} has no entity nouns");
-            return 1;
+            (cli as IDisposable)?.Dispose();
         }
-        var noun = args.Length > 2 && !args[2].StartsWith("--")
-            ? args[2] : nouns[0];
-        var app = new Application();
-        var shell = new Shell(cli, args[1], noun,
-                              single: args.Contains("--single"));
-        var window = shell.Build(nouns);
-        if (args.Contains("--probe"))
+    }
+
+    static int Usage()
+    {
+        Console.Error.WriteLine(
+            "usage: arest-show <apps-dir> <app> [noun] [--probe | --single | --py-host]\n" +
+            "       arest-show --layout-selftest\n" +
+            "       arest-show --host-diff <apps-dir> <app> [noun...]\n" +
+            "       arest-show --task-roundtrip <apps-dir> <app> <noun> <id> <forward-ft> <backward-ft>");
+        return 2;
+    }
+}
+
+// ---- --host-diff: the transport differential (board task #36,
+// acceptance a) -- drives PyCli and NativeServe through the SAME verb
+// sequence (nouns, entities, items, get, actions) and asserts JSON-equal
+// answers: object keys compared order-blind, arrays compared
+// order-sensitive (this domain's lists -- entities, items, actions --
+// are all meaningfully ordered). ----
+static class HostDiff
+{
+    // nouns: when given, scopes the entities/items/get/actions sweep to
+    // just these (the "nouns" comparison itself always covers the FULL
+    // list either way) -- an app built on the shared base canon reflects
+    // upward of a hundred metamodel nouns alongside its own domain ones,
+    // and PyCli's subprocess-per-call cost makes an exhaustive sweep
+    // impractical for what the board task calls "a small script".
+    public static int Run(string appsDir, string app, string[]? nouns = null)
+    {
+        IHost py = new PyCli(appsDir, app);
+        IHost native = new NativeServe(appsDir, app);
+        try
         {
-            // construct + measure once, no pump: the build smoke
-            window.Show();
-            window.Close();
-            Console.WriteLine("probe ok: " + string.Join(",", nouns));
-            return 0;
+            bool ok = true;
+            var pyNouns = py.Nouns();
+            ok &= Check("nouns",
+                JsonSerializer.SerializeToElement(pyNouns),
+                JsonSerializer.SerializeToElement(native.Nouns()));
+            foreach (var noun in nouns ?? pyNouns)
+            {
+                ok &= Check($"entities({noun})",
+                    JsonSerializer.SerializeToElement(py.Entities(noun)),
+                    JsonSerializer.SerializeToElement(native.Entities(noun)));
+                var pyItems = py.Items(noun).Select(t => new[] { t.id, t.text, t.value }).ToArray();
+                var nativeItems = native.Items(noun).Select(t => new[] { t.id, t.text, t.value }).ToArray();
+                ok &= Check($"items({noun})",
+                    JsonSerializer.SerializeToElement(pyItems),
+                    JsonSerializer.SerializeToElement(nativeItems));
+                var ids = py.Entities(noun);
+                if (ids.Length > 0)
+                {
+                    var id = ids[0];
+                    ok &= Check($"get({noun},{id})", py.Get(noun, id), native.Get(noun, id));
+                    ok &= Check($"actions({noun},{id})", py.Actions(noun, id), native.Actions(noun, id));
+                }
+            }
+            Console.WriteLine(ok ? "HOST-DIFF: PASS" : "HOST-DIFF: FAIL");
+            return ok ? 0 : 1;
         }
-        return app.Run(window);
+        finally
+        {
+            (py as IDisposable)?.Dispose();
+            (native as IDisposable)?.Dispose();
+        }
+    }
+
+    static bool Check(string label, JsonElement a, JsonElement b)
+    {
+        bool eq = JsonEquals(a, b);
+        Console.WriteLine((eq ? "  ok   " : "  FAIL ") + label);
+        if (!eq)
+        {
+            Console.WriteLine("    py:     " + a.GetRawText());
+            Console.WriteLine("    native: " + b.GetRawText());
+        }
+        return eq;
+    }
+
+    public static bool JsonEquals(JsonElement a, JsonElement b)
+    {
+        if (a.ValueKind != b.ValueKind)
+            return a.ToString() == b.ToString();
+        switch (a.ValueKind)
+        {
+            case JsonValueKind.Object:
+                var ap = a.EnumerateObject().ToDictionary(p => p.Name, p => p.Value);
+                var bp = b.EnumerateObject().ToDictionary(p => p.Name, p => p.Value);
+                if (ap.Count != bp.Count) return false;
+                foreach (var (k, av) in ap)
+                    if (!bp.TryGetValue(k, out var bv) || !JsonEquals(av, bv)) return false;
+                return true;
+            case JsonValueKind.Array:
+                var al = a.EnumerateArray().ToArray();
+                var bl = b.EnumerateArray().ToArray();
+                if (al.Length != bl.Length) return false;
+                for (int i = 0; i < al.Length; i++)
+                    if (!JsonEquals(al[i], bl[i])) return false;
+                return true;
+            default:
+                return a.ToString() == b.ToString();
+        }
+    }
+}
+
+// ---- --task-roundtrip: the tasks-app apply/verify/retract evidence
+// (board task #36, acceptance b) -- drives one forward transition and
+// its retraction through NativeServe ONLY (the native path), printing
+// each receipt so the caller can confirm the pane would re-render the
+// new status and the event log grew by exactly one line. Byte-restoring
+// the app's files on disk is the CALLER's job (snapshot/hash outside
+// this process, since a retract recompiles rather than reverting the
+// log in place); this tool proves the seam's read-your-write behavior
+// over the real store. ----
+static class TaskRoundtrip
+{
+    public static int Run(string appsDir, string app, string noun, string id,
+                          string forwardFt, string backwardFt)
+    {
+        var eventsPath = Path.Combine(appsDir, app, $"{app}.events.jsonl");
+        long LineCount() => File.Exists(eventsPath) ? File.ReadLines(eventsPath).LongCount() : 0;
+
+        var native = new NativeServe(appsDir, app);
+        try
+        {
+            long before = LineCount();
+            var actionsBefore = native.Actions(noun, id);
+            Console.WriteLine("before:   " + actionsBefore.GetRawText());
+
+            var applied = native.Apply(forwardFt, id);
+            Console.WriteLine("apply:    " + applied.GetRawText());
+            bool committed = applied.TryGetProperty("committed", out var c1)
+                && c1.ValueKind == JsonValueKind.True;
+            long afterApply = LineCount();
+
+            var actionsAfter = native.Actions(noun, id);
+            Console.WriteLine("after:    " + actionsAfter.GetRawText());
+
+            var retracted = native.Retract(forwardFt, id);
+            Console.WriteLine("retract:  " + retracted.GetRawText());
+            bool retractCommitted = retracted.TryGetProperty("committed", out var c2)
+                && c2.ValueKind == JsonValueKind.True;
+
+            var actionsRestored = native.Actions(noun, id);
+            Console.WriteLine("restored: " + actionsRestored.GetRawText());
+
+            string? statusBefore = actionsBefore.GetProperty("status").GetString();
+            string? statusAfter = actionsAfter.GetProperty("status").GetString();
+            string? statusRestored = actionsRestored.GetProperty("status").GetString();
+
+            bool logGrewByOne = (afterApply - before) == 1;
+            bool statusChanged = statusBefore != statusAfter;
+            bool statusReverted = statusBefore == statusRestored;
+
+            Console.WriteLine(
+                $"committed={committed} logGrewByOne={logGrewByOne} " +
+                $"({before}->{afterApply}) statusChanged={statusBefore}->{statusAfter} " +
+                $"retractCommitted={retractCommitted} statusReverted={statusReverted}");
+            bool ok = committed && logGrewByOne && statusChanged
+                     && retractCommitted && statusReverted;
+            Console.WriteLine(ok ? "TASK-ROUNDTRIP: PASS" : "TASK-ROUNDTRIP: FAIL");
+            return ok ? 0 : 1;
+        }
+        finally
+        {
+            native.Dispose();
+        }
     }
 }
