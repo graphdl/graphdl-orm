@@ -3964,6 +3964,66 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 }
             }
         }
+        if layout.is_empty() {
+            // python's _reconcile_absorbed_heads reads NO cell: it computes
+            // the partition FRESH per call (engine.py:1520 → rmap_partition,
+            // which IS the canonical system:partition). rmapColumns is
+            // layout_cells' LATER materialization, so a pre-layout store (the
+            // native compile pipeline's post-model fixpoint) legitimately
+            // lacks it — derive the same layout canon-first: system:partition
+            // over D, then system:table_columns per absorbed table, the same
+            // ⟨table, 2+j, ft⟩ rows layout_cells would write (engine.py:1701).
+            let ev = NEval {
+                cells: ncells.clone(),
+                process: srv.nprocess.clone(),
+                defs_n: nd.clone(),
+                fuel: std::cell::Cell::new(-1),
+            };
+            let na = |s: &str| N::A(std::rc::Rc::new(Leaf::S(s.into())));
+            let pairs_v = n_to_v(&ev.mu(napp(na("system:partition"), nd.clone())));
+            // ⟨table, ft⟩ pairs in canon order; part: ft → table (engine.py:1685)
+            let mut part: Vec<(String, String)> = Vec::new();
+            if let Shape::Seq(l) = shape(&pairs_v) {
+                for p in items(&l) {
+                    let it = items(&list_of(&p));
+                    if it.len() >= 2 {
+                        if let (Some(t), Some(f)) = (aval(&it[0]), aval(&it[1])) {
+                            part.push((leaf_text(&f), leaf_text(&t)));
+                        }
+                    }
+                }
+            }
+            let items_v = seq(from_vec(
+                part.iter()
+                    .map(|(f, t)| {
+                        seqc(vec![atom(Leaf::S(f.clone())), atom(Leaf::S(t.clone()))])
+                    })
+                    .collect(),
+            ));
+            let mut tables: Vec<String> = Vec::new();
+            for (f, t) in &part {
+                if f != t && !tables.iter().any(|x| x == t) {
+                    tables.push(t.clone());
+                }
+            }
+            tables.sort();
+            for t in &tables {
+                let cols_v = n_to_v(&ev.mu(napp(
+                    napp(na("system:table_columns"), na(t)),
+                    v_to_n(&items_v),
+                )));
+                if let Shape::Seq(l) = shape(&cols_v) {
+                    for (j, c) in items(&l).iter().enumerate() {
+                        if let Some(f) = aval(c) {
+                            let col = 2 + j;
+                            let w = widths.entry(t.clone()).or_insert(1);
+                            *w = (*w).max(col);
+                            layout.insert(leaf_text(&f), (t.clone(), col));
+                        }
+                    }
+                }
+            }
+        }
         if !layout.is_empty() {
             // unary heads write "T"; the role rows carry each head's arity
             let mut maxpos: HashMap<String, i64> = HashMap::new();
