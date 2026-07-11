@@ -20,6 +20,7 @@
 //! newline-delimited JSON-RPC 2.0 over stdio against an apps directory of
 //! persisted stores; see "the MCP binding" below.
 
+mod cooks;
 mod uilayout;
 
 use std::cell::RefCell;
@@ -4280,22 +4281,23 @@ fn sm_suspect(stmt: &str) -> bool {
     false
 }
 
-// The _COOK boundary (compiler.py:1949, the #18 doctrine at system.canon:5504):
-// Stage-1 text→X resolution the HOST performs before a translator body sees its
-// groups (reading→ft-id via _clause_ft, name/ref-mode splits, constraint
-// reading→ft resolution, value-spec parsing, the subtype/fact/rule cooks).
-// Those cooks are PYTHON today; the native port lands with #18's Stage-1/handler
-// boundary refactor. Mirrors `kind in _COOK` exactly: Err names the gate, Ok
-// means the kind's groups pass through raw (the already-canonized handlers).
-fn native_cook(kind: &str) -> Result<(), String> {
-    match kind {
-        "sm_trigger" | "sm_guard" | "ring" | "frequency" | "value_constraint"
-        | "uniqueness" | "mandatory" | "neg_uniqueness" | "neg_mandatory"
-        | "for_each_mandatory" | "inverse_uc" | "spanning_uc" | "spanning_uc2"
-        | "negation" | "subtype_of" | "fact_type_reading" | "derivation_rule"
-        | "class_rule" => Err(format!("cook not ported: {}", kind)),
-        _ => Ok(()),
-    }
+// The _COOK boundary (compiler.py, the #18 doctrine at system.canon:5504):
+// Stage-1 text→X resolution the HOST performs before a translator body sees
+// its groups. PORTED (#20): src/cooks.rs carries the productions (the
+// _CLASSIFY table with group extraction), every _COOK entry (rule_if/rule_iff
+// included), the cs_rows/sm_rows canon reductions, and the _plan/_h_* handler
+// layer, so the dispatch loop below translates natively when a translator name
+// carries no canon DEF. native_cook is that boundary: production match →
+// cooks::cook → the crows groups through the translator body, answering the
+// per-statement ⟨asserts, objs⟩ (python _stmt_translator_impl's contract).
+fn native_cook(
+    t: &str,
+    inner: &str,
+    mfield: &str,
+    known: &cooks::Known,
+    srv: &Srv,
+) -> Result<Option<cooks::Fire>, String> {
+    cooks::translate(translator_kinds(t), inner, mfield, known, srv)
 }
 
 // register_translators' table (compiler.py:2151): the Stage-1 kinds each
@@ -5309,15 +5311,22 @@ fn context_of(
     std::collections::HashSet<String>,
     Vec<(String, String)>,
     std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
 ) {
     let leaf = |s: &str| Leaf::S(s.to_string());
     let strv = |x: &V| aval(x).and_then(|l| leaf_str(&l));
     let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // #31: the VALUE-TYPE names ride the context too — a quoted instance-fact
+    // literal filling a value-typed role coerces via _num at the cook boundary
+    let mut vals: std::collections::HashSet<String> = std::collections::HashSet::new();
     for r in pop_rows(cells, &leaf("instanceOf")) {
         let it = items(&list_of(&r));
         if it.len() >= 2 {
             if let (Some(a), Some(b)) = (strv(&it[0]), strv(&it[1])) {
                 if b == "ObjectType" || b == "ValueType" {
+                    if b == "ValueType" {
+                        vals.insert(a.clone());
+                    }
                     names.insert(a);
                 }
             }
@@ -5339,7 +5348,26 @@ fn context_of(
             }
         }
     }
-    (names, edges, fts)
+    (names, edges, fts, vals)
+}
+
+// _known_vals (compiler.py, #31): the VALUE-TYPE names declared in-text —
+// explicit value-type readings plus each reference scheme's identifying value
+fn known_vals(stmts: &[String]) -> std::collections::HashSet<String> {
+    let mut vals: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for s in stmts {
+        let (k, g) = classify_kind(s);
+        match k {
+            "value_type" => {
+                vals.insert(name_refmode(&g[0]));
+            }
+            "ref_scheme" => {
+                vals.insert(g[1].clone());
+            }
+            _ => {}
+        }
+    }
+    vals
 }
 
 // ======================= the grammar thaw (gap 1) =============================
@@ -5511,10 +5539,6 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
         );
     }
     missing.push("model D starts EMPTY (meta.initial_D process seed not ported)".to_string());
-    missing.push(
-        "translator bodies are host closures until #18 canonizes them; native dispatch answers only for canon DEFs"
-            .to_string(),
-    );
 
     // (a) statements + (b) modality split; a possibility statement is the
     // absence of a constraint (informational) and never enters the g-loop
@@ -5532,13 +5556,19 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
     // declared names (plus the base's, read off the RESIDENT store when the
     // caller passes context_from:"resident" — python's context_from store),
     // the subtype closure, fact-type slugs, and the plain reading set
-    let (b_names, b_edges, b_fts) = match jget(j, "context_from") {
+    let (b_names, b_edges, b_fts, b_vals) = match jget(j, "context_from") {
         Some(J::S(s)) if s == "resident" => context_of(&srv.cells),
-        _ => (HashSet::new(), Vec::new(), HashSet::new()),
+        _ => (HashSet::new(), Vec::new(), HashSet::new(), HashSet::new()),
     };
     let mut names = known_names(&stmts);
     for n in b_names {
         names.insert(n);
+    }
+    // #31: the value-type names (in-text ∪ base) ride the context so the fact
+    // cook can coerce quoted literals on value-typed roles
+    let mut vals = known_vals(&stmts);
+    for v in b_vals {
+        vals.insert(v);
     }
     let b_fts_vec: Vec<String> = b_fts.into_iter().collect();
     let (subs, fts, plain) = prepass_context(&stmts, &names, &b_edges, &b_fts_vec);
@@ -5649,17 +5679,27 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
             ])
         })
         .collect();
+    let mut vals_sorted: Vec<String> = vals.iter().cloned().collect();
+    vals_sorted.sort();
     let ctx = seqc(vec![
         seq(from_vec(names_sorted.iter().map(|n| atom_s(n)).collect())),
         seq(from_vec(subs_pairs)),
         seq(from_vec(fts.iter().map(|f| atom_s(f)).collect())),
         seq(from_vec(plain.iter().map(|f| atom_s(f)).collect())),
+        seq(from_vec(vals_sorted.iter().map(|v| atom_s(v)).collect())),
     ]);
     let empty_cls: HashSet<String> = HashSet::new();
     let mut unclassified: Vec<String> = Vec::new();
     let mut prose: Vec<String> = Vec::new();
     let mut blocked: Vec<String> = Vec::new();
     let mut classified = 0usize;
+    // the native cook context (#20): the SAME names/subs/fts/plain/vals the
+    // ctx operand carries, in cooks form, built once per compile
+    let kn = cooks::Known::new(&names, &subs, &fts, &plain, &vals);
+    // {"trace":1} answers the per-statement ⟨asserts, objs⟩ emissions — the
+    // differential's dump (python compile per-statement fires, verbatim)
+    let trace_on = matches!(jget(j, "trace"), Some(J::I(1)));
+    let mut translated: Vec<String> = Vec::new();
     for (i, (stmt, m, inner, sg)) in work.iter().enumerate() {
         let sid = format!("s{}", i + 1);
         let cls = cls_by_sid.get(&sid).unwrap_or(&empty_cls);
@@ -5674,11 +5714,22 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
         for g in GENERIC {
             residual.remove(g);
         }
+        // every WORK statement earns a trace entry, the guard exits included
+        // (the differential aligns per statement; a skipped entry misaligns)
+        let trace_empty = |stmt: &str, translated: &mut Vec<String>| {
+            let mut e = String::from("{\"stmt\":");
+            esc(stmt, &mut e);
+            e.push_str(",\"fires\":[]}");
+            translated.push(e);
+        };
         if cls.contains("Prose") && residual.is_empty() {
             if sm_suspect(stmt) {
                 unclassified.push(stmt.clone());
             } else {
                 prose.push(stmt.clone());
+            }
+            if trace_on {
+                trace_empty(stmt, &mut translated);
             }
             continue;
         }
@@ -5691,6 +5742,9 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
             // a NEGATIVE alethic statement is a constraint by definition; the
             // generic fallbacks must never declare a fact type from it
             unclassified.push(stmt.clone());
+            if trace_on {
+                trace_empty(stmt, &mut translated);
+            }
             continue;
         }
         let mut sorted_cls: Vec<String> = if specific.is_empty() {
@@ -5711,6 +5765,9 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
         }
         if translators.is_empty() {
             unclassified.push(stmt.clone());
+            if trace_on {
+                trace_empty(stmt, &mut translated);
+            }
             continue;
         }
         // deontic carries its operator sign through the modality field
@@ -5720,12 +5777,20 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
             (*m).to_string()
         };
         let mut accepted = false;
+        let mut fires: Vec<String> = Vec::new();
         for t in &translators {
+            if translator_kinds(t).is_empty() {
+                // python's graceful absence: a name M declares that this host
+                // has not registered is intentionally absent — handled, never
+                // refused (the gate-three contract)
+                accepted = true;
+                continue;
+            }
             // rho: dispatch through DEFS via the reducer — the direct analog
             // of python D = _apply(_A(t), operand). When #18 lands a canon
-            // translator DEF this arm runs it for free; today a host-only
-            // name reduces to ⊥ (or stays a stuck app) and the _COOK gate
-            // below explains what blocks the native path.
+            // translator DEF this arm runs it for free; a host-only name
+            // reduces to ⊥ (or stays a stuck app) and the NATIVE cook path
+            // below translates instead (#20: the ported _COOK boundary).
             let operand = seqc(vec![
                 atom(Leaf::S(inner.clone())),
                 atom(Leaf::S(mfield.clone())),
@@ -5736,23 +5801,56 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
             if matches!(shape(&res), Shape::Seq(_)) && !isapp(&res) {
                 model_d = res;
                 accepted = true;
-            } else {
-                for k in translator_kinds(t) {
-                    if let Err(reason) = native_cook(k) {
+                continue;
+            }
+            match native_cook(t, inner, &mfield, &kn, srv) {
+                Ok(Some(fire)) => {
+                    // the translator fired: python's _plan answered its
+                    // ⟨asserts, objs⟩ (the acceptance surface of the
+                    // differential); acceptance mirrors _apply succeeding
+                    accepted = true;
+                    if trace_on {
+                        let mut f = String::new();
+                        cooks::fire_json(t, &fire, &mut f);
+                        fires.push(f);
+                    }
+                }
+                Ok(None) => {
+                    // no production matched: the translator's own refusal
+                    // (python raise ValueError -> the dispatcher's except);
+                    // dispatch continues to the next translator
+                }
+                Err(reason) => {
+                    // a handler refusing its statement is that handler's
+                    // verdict (python except ValueError: continue). A canon
+                    // reduction failing is a PORT gap instead — reported.
+                    if trace_on {
+                        let mut f = String::from("{\"t\":");
+                        esc(t, &mut f);
+                        f.push_str(",\"refused\":");
+                        esc(&reason, &mut f);
+                        f.push('}');
+                        fires.push(f);
+                    }
+                    if reason.starts_with("canon ") || reason.starts_with("no canon def") {
                         if !blocked.contains(&reason) {
                             blocked.push(reason);
                         }
                     }
-                }
-                let miss = format!("translator not native: {}", t);
-                if !blocked.contains(&miss) {
-                    blocked.push(miss);
                 }
             }
         }
         if !accepted {
             // NO translator accepted: reported loudly — never a silent vanish
             unclassified.push(stmt.clone());
+        }
+        if trace_on {
+            let mut e = String::from("{\"stmt\":");
+            esc(stmt, &mut e);
+            e.push_str(",\"fires\":[");
+            e.push_str(&fires.join(","));
+            e.push_str("]}");
+            translated.push(e);
         }
     }
     // the report: the seed contract's surviving keys (total/unclassified/prose)
@@ -5781,6 +5879,12 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
     arr(&missing, &mut r);
     r.push_str(",\"blocked\":");
     arr(&blocked, &mut r);
+    if trace_on {
+        // the differential dump: per statement, the fires' ⟨asserts, objs⟩
+        r.push_str(",\"translated\":[");
+        r.push_str(&translated.join(","));
+        r.push(']');
+    }
     r.push('}');
     Ok(r)
 }
