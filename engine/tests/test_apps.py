@@ -88,3 +88,49 @@ def test_sql_over_the_app(tmp_path):
     assert rows and rows[0][1]
     syms = reg.sql("t", "SELECT text FROM symbols")
     assert any("t1" in t for (t,) in syms)
+
+
+def _mk_pkg(root, name, deps):
+    import json
+    with open(os.path.join(root, name, "package.json"), "w",
+              encoding="utf-8") as f:
+        json.dump({"name": f"arest-{name}", "dependencies": deps}, f)
+
+
+def test_package_dependency_readings_compile_leaf_first(tmp_path):
+    # the TS engine's dependencyClosure semantics (apps.ts): file: deps'
+    # readings enter the compile BEFORE the app's own, so the dependency's
+    # nouns are in context when the app's facts arrive
+    root = str(tmp_path)
+    _mk_app(root, "lib", {"app.md": """Widget(.id) is an entity type.
+Grade is a value type.
+Widget has Grade.
+Widget 'w1' has Grade '5'.
+"""})
+    _mk_app(root, "top", {"app.md": "Widget 'w2' has Grade '7'.\n"})
+    _mk_pkg(root, "top", {"arest-lib": "file:../lib"})
+    reg = apps.Registry(root)
+    order = reg._readings("top")
+    assert [os.path.basename(os.path.dirname(os.path.dirname(p)))
+            for p in order] == ["lib", "top"]
+    reg.compile("top")
+    assert set(reg.query("top", "Widget_has_Grade")) == {("w1", 5), ("w2", 7)}
+
+
+def test_dependency_diamond_reads_once_and_cycles_stop(tmp_path):
+    # diamond: top -> l1, l2 -> base (base read ONCE, before both libs);
+    # cycle: l1 -> l2 -> l1 terminates at the visited set
+    root = str(tmp_path)
+    _mk_app(root, "base", {"app.md": "Thing(.id) is an entity type.\n"})
+    _mk_app(root, "l1", {"app.md": "Thing 'a' is an entity type.\n"})
+    _mk_app(root, "l2", {"app.md": "Thing 'b' is an entity type.\n"})
+    _mk_app(root, "top", {"app.md": "Thing 'c' is an entity type.\n"})
+    _mk_pkg(root, "l1", {"arest-base": "file:../base", "arest-l2": "file:../l2"})
+    _mk_pkg(root, "l2", {"arest-base": "file:../base", "arest-l1": "file:../l1"})
+    _mk_pkg(root, "top", {"arest-l1": "file:../l1", "arest-l2": "file:../l2"})
+    reg = apps.Registry(root)
+    order = [os.path.basename(os.path.dirname(os.path.dirname(p)))
+             for p in reg._readings("top")]
+    assert order.count("base") == 1                     # diamond: once
+    assert order.index("base") < order.index("l1")      # leaf-first
+    assert order[-1] == "top"                           # the app itself last

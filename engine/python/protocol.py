@@ -1680,12 +1680,11 @@ class Registry:
     def _db(self, name):
         return os.path.join(self._app_dir(name), f"{name}.db")
 
-    def _readings(self, name):
-        """The app's reading files, the old engine's walk (rebuild.rs
+    def _readings_of_dir(self, d):
+        """One readings dir, the old engine's walk (rebuild.rs
         load_app_readings): RECURSIVE over readings/, app.md first, then
         depth-then-name — instance slices live in subdirectories (the claude
         app's readings/instances/), and core nouns must be in context first."""
-        d = os.path.join(self._app_dir(name), "readings")
         if not os.path.isdir(d):
             return []
         found = []
@@ -1697,6 +1696,59 @@ class Registry:
         app_md = [p for p in found if os.path.basename(p) == "app.md"
                   and os.path.dirname(p) == d]
         return app_md + [p for p in found if p not in app_md]
+
+    def _dep_closure(self, app_dir):
+        """Package-dependency closure, the TS engine's semantics (apps.ts
+        dependencyClosure): direct deps are package.json "dependencies"
+        entries with file: specs resolved against the app root, name-sorted;
+        the closure is a DFS pre-order with a visited set (diamonds read
+        once, cycles stop — the app's own root is pre-seeded). Readings
+        assemble LEAF-FIRST (reverse pre-order), so a dependency's nouns are
+        in context before every dependent; a dep without readings is
+        skipped, exactly as buildCompileArgs filtered !exists||!hasReadings."""
+        import json as _json
+
+        def _direct(d):
+            pj = os.path.join(d, "package.json")
+            if not os.path.isfile(pj):
+                return []
+            try:
+                deps = _json.load(open(pj, encoding="utf-8")).get(
+                    "dependencies", {}) or {}
+            except Exception:
+                return []
+            roots = []
+            for _pkg, spec in deps.items():
+                if not isinstance(spec, str) or not spec.startswith("file:"):
+                    continue
+                root = os.path.realpath(os.path.join(d, spec[5:]))
+                if os.path.isdir(root):
+                    roots.append(root)
+            return sorted(roots, key=lambda r: os.path.basename(r).lower())
+
+        seen = {os.path.realpath(app_dir)}
+        closure = []
+
+        def _visit(root):
+            if root in seen:
+                return
+            seen.add(root)
+            closure.append(root)
+            for nested in _direct(root):
+                _visit(nested)
+
+        for root in _direct(app_dir):
+            _visit(root)
+        return closure
+
+    def _readings(self, name):
+        """The app's reading files: dependency readings leaf-first, then the
+        app's own (each dir in the app.md-first depth-then-name order)."""
+        app_dir = self._app_dir(name)
+        out = []
+        for dep in reversed(self._dep_closure(app_dir)):
+            out += self._readings_of_dir(os.path.join(dep, "readings"))
+        return out + self._readings_of_dir(os.path.join(app_dir, "readings"))
 
     def list(self):
         out = []
