@@ -2802,8 +2802,8 @@ const SESSION_VERBS: [&str; 11] =
 const APP_VERBS: [&str; 13] =
     ["apply", "ask", "cells", "compile", "explain", "get", "induce", "propose",
      "query", "retract", "schema", "sql", "synthesize"];
-const RESIDENT_OPS: [&str; 6] =
-    ["cells", "compile_model", "query", "run_rules", "synthesize_pairs", "verbs"];
+const RESIDENT_OPS: [&str; 7] =
+    ["cells", "compile_model", "query", "run_rules", "sql_project", "synthesize_pairs", "verbs"];
 
 fn reduce_in(mu: &V, cells: &[(Leaf, V)], d: &V, f: V, x: V, fuel: Option<i64>) -> V {
     // one reduction under a given store binding, the case path's frame
@@ -5771,6 +5771,503 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
     Ok(r)
 }
 
+// ============================ the 3NF SQL projection ==========================
+// Transplant #2 (docs/2026-07-10-old-engine-mining.md): the old engine's native
+// RMAP + ONE projection plan — rmap_from_state -> Vec<TableDef> (rmap.rs:181),
+// create_table_sql (:1455) as the single DDL source, and projection_plan
+// (cli/entry.rs:115/376) whose Kahn parents-first order drove both the sql
+// verb and persist — re-grown over the NEW store. The STRUCTURE is the old
+// engine's (one table walk answers DDL + rows + order); the SEMANTICS is the
+// python side verbatim: protocol.py ddl.generate/ddl.project are the source of
+// truth for WHAT tables, columns, and rows exist, and byte-parity with
+// drv.project over the same store is the acceptance. So the op reads the
+// RESIDENT schema cells exactly as ddl._analyze reads D:
+//   rmapColumns ⟨table, col, ft⟩ — the RMAP partition AS DATA (layout_cells
+//     materialized it at compile; facts all the way down). The partition is
+//     NOT re-derived here: a store without the cell reads as all-own-table,
+//     which is layout_cells' own reading of such a store.
+//   factType ⟨ft, reading⟩ — the partition's domain (== rmap_partition's keys;
+//     checked against the identity store, diag 2026-07-10)
+//   role ⟨id, ft, pos, player⟩ (pos int, 1-based), refScheme/refMode ⟨noun,
+//     mode⟩ (refScheme wins, refMode fills), instanceOf ⟨noun, kind⟩ (kind
+//     "ObjectType" names the entities), constraint ⟨id, kind, ft, player, ..⟩
+//     (kind "mandatory" hardens columns — soft-stripped below, like project).
+// NO sqlite here: the answer carries the CREATE TABLE statements (project's
+// EXECUTED soft form — " TEXT NOT NULL" already relaxed to " TEXT", CREATE
+// TABLE IF NOT EXISTS — so the strings equal what ddl.project feeds its
+// connection byte for byte) plus the insertion rows; the consumer
+// materializes them (the old sql verb's :memory: move, sql.rs:48).
+
+fn ddl_sql_name(name: &str) -> String {
+    // ddl._sql_name: non-alnum RUNS collapse to one "_", strip, lower ( ==
+    // this host's sql_name/slug_str pair) PLUS the sqlite_ namespace guard
+    // (the codex app's 'SQLite Fact Base' noun projected to sqlite_fact_base
+    // and the CREATE refused — prefix our way out)
+    let s = sql_name(name);
+    if s.starts_with("sqlite_") {
+        format!("t_{}", s)
+    } else {
+        s
+    }
+}
+
+fn sql_q(name: &str) -> String {
+    // ddl._q verbatim: every emitted identifier is quoted — the base metamodel
+    // projects tables named constraint, transition, view (SQL reserved words)
+    format!("\"{}\"", name)
+}
+
+struct ProjTable {
+    key: String,          // the raw generate key (entity noun or fact type id)
+    sql: String,          // sql_name(key), the materialized table's name
+    create: String,       // ddl.project's executed CREATE (the soft form)
+    cols: Vec<String>,    // final column names in DDL order
+    rows: Vec<Vec<V>>,    // insertion rows (values as store leaves; ⊥ = NULL)
+    parents: Vec<String>, // referenced tables' sql names (the Kahn edges)
+}
+
+fn op_sql_project(_j: &J, srv: &Srv) -> Result<String, String> {
+    use std::collections::{HashMap, HashSet};
+    // ---- the cell reads (ddl._analyze over the resident index) ----
+    // one pass over the cached first-match-wins index; every later read is a
+    // map hit (python's project memoizes pop() the same way)
+    let mut pops: HashMap<String, Vec<V>> = HashMap::new();
+    for (k, contents) in &srv.cells {
+        if let Leaf::S(name) = k {
+            let rows = match shape(contents) {
+                Shape::Seq(l) => items(&l),
+                _ => Vec::new(), // an atom cell has no population (_pop_rows)
+            };
+            pops.entry(name.clone()).or_insert(rows);
+        }
+    }
+    let empty: Vec<V> = Vec::new();
+    let pop = |name: &str| pops.get(name).unwrap_or(&empty);
+    let row_items = |r: &V| items(&list_of(r));
+    // schema NAMES are strings in the store; a non-string where a name belongs
+    // drops the row (python would carry it into re.sub and crash — a store
+    // that malformed never reaches project)
+    let sstr = |v: &V| match aval(v) {
+        Some(l) => match &*l {
+            Leaf::S(s) => Some(s.clone()),
+            _ => None,
+        },
+        None => None,
+    };
+    let ipos = |v: &V| {
+        aval(v).and_then(|l| match &*l {
+            Leaf::I(i) => Some(*i),
+            Leaf::S(s) => s.parse::<i64>().ok(),
+            _ => None,
+        })
+    };
+    // sorted(ids, key=str): python's str() over the leaf; a structured id
+    // (never minted by the engine) falls back to its set encoding
+    let str_form = |v: &V| match shape(v) {
+        Shape::Atom(l) => leaf_text(&l),
+        _ => key_of(v),
+    };
+
+    // the partition FROM rmapColumns: absorbed ft -> table, per-table columns
+    // in cell order (layout_cells wrote ⟨table, 2+j, ft⟩ in table_columns
+    // order, so sorting by the col number reproduces it exactly)
+    let mut absorbed: HashMap<String, String> = HashMap::new();
+    let mut table_cols: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+    for r in pop("rmapColumns") {
+        let it = row_items(r);
+        if it.len() >= 3 {
+            if let (Some(t), Some(c), Some(ft)) = (sstr(&it[0]), ipos(&it[1]), sstr(&it[2])) {
+                absorbed.insert(ft.clone(), t.clone());
+                table_cols.entry(t).or_default().push((c, ft));
+            }
+        }
+    }
+    for v in table_cols.values_mut() {
+        v.sort();
+    }
+    // the domain: declared fact types (partition keys == factType rows); own
+    // = the non-absorbed remainder, exactly python's {ft: key} where key == ft
+    let mut declared: Vec<String> = Vec::new();
+    let mut seen_ft: HashSet<String> = HashSet::new();
+    for r in pop("factType") {
+        let it = row_items(r);
+        if let Some(ft) = it.first().and_then(&sstr) {
+            if seen_ft.insert(ft.clone()) {
+                declared.push(ft);
+            }
+        }
+    }
+    let mut own: Vec<String> = declared
+        .iter()
+        .filter(|ft| !absorbed.contains_key(*ft))
+        .cloned()
+        .collect();
+    own.sort();
+    let own_set: HashSet<String> = own.iter().cloned().collect();
+    // roles: ft -> [(pos, player)] sorted (python tuple sort: pos then player),
+    // with the ft FIRST-SEEN order kept — the entity-id sweep below walks
+    // roles.items() in python's dict insertion order, and a store carrying two
+    // ==-equal ids of different display (5 beside 5.0) keeps the first seen
+    let mut roles: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+    let mut role_ft_order: Vec<String> = Vec::new();
+    for r in pop("role") {
+        let it = row_items(r);
+        if it.len() >= 4 {
+            if let (Some(ft), Some(p), Some(player)) = (sstr(&it[1]), ipos(&it[2]), sstr(&it[3])) {
+                if !roles.contains_key(&ft) {
+                    role_ft_order.push(ft.clone());
+                }
+                roles.entry(ft).or_default().push((p, player));
+            }
+        }
+    }
+    for v in roles.values_mut() {
+        v.sort();
+    }
+    // reference modes: refScheme wins (dict build, last row wins), refMode
+    // fills the gaps (setdefault, first row wins); absent -> "id"
+    let mut refm: HashMap<String, String> = HashMap::new();
+    for r in pop("refScheme") {
+        let it = row_items(r);
+        if it.len() >= 2 {
+            if let (Some(n), Some(m)) = (sstr(&it[0]), sstr(&it[1])) {
+                refm.insert(n, m);
+            }
+        }
+    }
+    for r in pop("refMode") {
+        let it = row_items(r);
+        if it.len() >= 2 {
+            if let (Some(n), Some(m)) = (sstr(&it[0]), sstr(&it[1])) {
+                refm.entry(n).or_insert(m);
+            }
+        }
+    }
+    let mut entities: HashSet<String> = HashSet::new();
+    for r in pop("instanceOf") {
+        let it = row_items(r);
+        if it.len() >= 2 && matches!(sstr(&it[1]).as_deref(), Some("ObjectType")) {
+            if let Some(n) = sstr(&it[0]) {
+                entities.insert(n);
+            }
+        }
+    }
+    // NOTE ddl._analyze also reads the mandatory constraints (generate's
+    // NOT NULL), but project executes the SOFT form — every " TEXT NOT NULL"
+    // relaxed to " TEXT" (visibility over cascade on migrated populations) —
+    // so the op, answering the EXECUTED statements, never consults them.
+    // every declared entity gets a table, plus every absorbing table that is
+    // not itself an own-table fact type (python: entities | (partition.values()
+    // - set(own)))
+    let mut entity_tables: HashSet<String> = entities.clone();
+    for t in table_cols.keys() {
+        if !own_set.contains(t) {
+            entity_tables.insert(t.clone());
+        }
+    }
+    let key_col = |name: &str| -> String {
+        let m = refm.get(name).map(|s| s.as_str()).unwrap_or("id");
+        format!("{}_{}", ddl_sql_name(name), ddl_sql_name(m))
+    };
+    // ddl._entity_columns: the ordered absorbed columns of an entity table,
+    // (ft, col, kind 0=unary/1=value/2=ref, other), deduped by base with the
+    // position suffix from 2 — one naming pass, so DDL and rows never disagree
+    let entity_columns = |table: &str| -> Vec<(String, String, u8, Option<String>)> {
+        let mut out = Vec::new();
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        if let Some(fts) = table_cols.get(table) {
+            for (_c, ft) in fts {
+                let rs = roles.get(ft).map(|v| v.as_slice()).unwrap_or(&[]);
+                let (base, kind, other): (String, u8, Option<String>) = if rs.len() == 1 {
+                    let b = match ft.strip_prefix(table) {
+                        Some(rest) => ddl_sql_name(rest),
+                        None => ddl_sql_name(ft),
+                    };
+                    (b, 0, None)
+                } else {
+                    let other = rs.iter().map(|(_p, t)| t.clone()).find(|t| t != table);
+                    match &other {
+                        Some(o) if entities.contains(o) && entity_tables.contains(o) => {
+                            (key_col(o), 2, other.clone())
+                        }
+                        Some(o) => (ddl_sql_name(o), 1, other.clone()),
+                        None => (ddl_sql_name(ft), 1, None),
+                    }
+                };
+                let n = seen.entry(base.clone()).or_insert(0);
+                *n += 1;
+                let col = if *n == 1 { base } else { format!("{}_{}", base, *n) };
+                out.push((ft.clone(), col, kind, other));
+            }
+        }
+        out
+    };
+
+    let mut out_tables: Vec<ProjTable> = Vec::new();
+    // the drv.project report {table: rowcount}, in python's insertion order
+    // (entity tables sorted, then own fact types sorted)
+    let mut counts: Vec<(String, String)> = Vec::new();
+
+    // ---- entity tables (ddl.generate + ddl.project, the absorbed branch) ----
+    let mut sorted_entity: Vec<String> = entity_tables.iter().cloned().collect();
+    sorted_entity.sort();
+    for table in &sorted_entity {
+        let ecols = entity_columns(table);
+        let kc = key_col(table);
+        let mut lines: Vec<String> = vec![format!("    {} TEXT PRIMARY KEY", sql_q(&kc))];
+        let mut parents: Vec<String> = Vec::new();
+        for (ft, col, kind, other) in &ecols {
+            let _ = ft;
+            if *kind == 0 {
+                lines.push(format!("    {} BOOLEAN", sql_q(col))); // absorbed unary
+                continue;
+            }
+            let refs = if *kind == 2 {
+                let o = other.as_ref().expect("ref kind carries its player");
+                let p = ddl_sql_name(o);
+                if !parents.contains(&p) {
+                    parents.push(p.clone());
+                }
+                format!(" REFERENCES {}({})", sql_q(&p), sql_q(&key_col(o)))
+            } else {
+                String::new()
+            };
+            lines.push(format!("    {} TEXT{}", sql_q(col), refs));
+        }
+        let create = format!(
+            "CREATE TABLE IF NOT EXISTS {} (\n{}\n);",
+            sql_q(&ddl_sql_name(table)),
+            lines.join(",\n")
+        );
+        // the derived entity population: every id the entity's roles mention,
+        // plus its own cell — set semantics over python == (set_key coalesces
+        // 5 and 5.0, keeps "5" distinct), first-seen representative kept
+        let mut ids: Vec<(String, V)> = Vec::new();
+        let mut id_seen: HashSet<String> = HashSet::new();
+        for ft in &role_ft_order {
+            for (p, player) in &roles[ft] {
+                if player != table {
+                    continue;
+                }
+                for row in pop(ft) {
+                    let it = row_items(row);
+                    if *p >= 1 && it.len() >= *p as usize {
+                        let v = it[*p as usize - 1].clone();
+                        let k = key_of(&v);
+                        if id_seen.insert(k.clone()) {
+                            ids.push((k, v));
+                        }
+                    }
+                }
+            }
+        }
+        for row in pop(table) {
+            let it = row_items(row);
+            if !it.is_empty() {
+                let v = it[0].clone();
+                let k = key_of(&v);
+                if id_seen.insert(k.clone()) {
+                    ids.push((k, v));
+                }
+            }
+        }
+        ids.sort_by(|a, b| str_form(&a.1).cmp(&str_form(&b.1)).then_with(|| a.0.cmp(&b.0)));
+        // per-column value views: unary membership set / functional last-wins map
+        enum ColVals {
+            Unary(HashSet<String>),
+            Val(HashMap<String, V>),
+        }
+        let mut colvals: Vec<ColVals> = Vec::new();
+        for (ft, _col, kind, _o) in &ecols {
+            if *kind == 0 {
+                let mut m = HashSet::new();
+                for row in pop(ft) {
+                    let it = row_items(row);
+                    if !it.is_empty() {
+                        m.insert(key_of(&it[0]));
+                    }
+                }
+                colvals.push(ColVals::Unary(m));
+            } else {
+                let mut m: HashMap<String, V> = HashMap::new();
+                for row in pop(ft) {
+                    let it = row_items(row);
+                    if it.len() >= 2 {
+                        m.insert(key_of(&it[0]), it[1].clone()); // dict build: last wins
+                    }
+                }
+                colvals.push(ColVals::Val(m));
+            }
+        }
+        let mut rows: Vec<Vec<V>> = Vec::new();
+        for (ik, iv) in &ids {
+            let mut row = vec![iv.clone()];
+            for cv in &colvals {
+                row.push(match cv {
+                    ColVals::Unary(m) => atom(Leaf::I(if m.contains(ik) { 1 } else { 0 })),
+                    ColVals::Val(m) => m.get(ik).cloned().unwrap_or_else(bot), // ⊥ = NULL
+                });
+            }
+            rows.push(row);
+        }
+        let mut cols: Vec<String> = vec![kc];
+        cols.extend(ecols.iter().map(|(_ft, c, _k, _o)| c.clone()));
+        counts.push((table.clone(), ids.len().to_string()));
+        out_tables.push(ProjTable {
+            key: table.clone(),
+            sql: ddl_sql_name(table),
+            create,
+            cols,
+            rows,
+            parents,
+        });
+    }
+
+    // ---- own-table fact types (spanning or no UC: row per fact) ----
+    for ft in &own {
+        let rs = roles.get(ft).map(|v| v.as_slice()).unwrap_or(&[]);
+        if rs.is_empty() {
+            // no roles, no relational shape: reported None, never malformed SQL
+            counts.push((ft.clone(), "null".to_string()));
+            continue;
+        }
+        let mut lines: Vec<String> = Vec::new();
+        let mut key: Vec<String> = Vec::new();
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        let mut parents: Vec<String> = Vec::new();
+        for (_p, player) in rs {
+            let base = if entities.contains(player) {
+                key_col(player)
+            } else {
+                ddl_sql_name(player)
+            };
+            let n = seen.entry(base.clone()).or_insert(0);
+            *n += 1;
+            let col = if *n == 1 { base } else { format!("{}_{}", base, *n) };
+            let refs = if entities.contains(player) && entity_tables.contains(player) {
+                let p = ddl_sql_name(player);
+                if !parents.contains(&p) {
+                    parents.push(p.clone());
+                }
+                format!(" REFERENCES {}({})", sql_q(&p), sql_q(&key_col(player)))
+            } else {
+                String::new()
+            };
+            lines.push(format!("    {} TEXT{}", sql_q(&col), refs)); // NOT NULL soft-stripped
+            key.push(col);
+        }
+        let create = format!(
+            "CREATE TABLE IF NOT EXISTS {} (\n{},\n    PRIMARY KEY ({})\n);",
+            sql_q(&ddl_sql_name(ft)),
+            lines.join(",\n"),
+            key.iter().map(|c| sql_q(c)).collect::<Vec<_>>().join(", ")
+        );
+        let all = pop(ft);
+        let mut rows: Vec<Vec<V>> = Vec::new();
+        let mut narrow = 0usize;
+        for row in all {
+            let it = row_items(row);
+            if it.len() < rs.len() {
+                narrow += 1; // a row narrower than its role count cannot bind
+                continue;
+            }
+            rows.push(it[..rs.len()].to_vec());
+        }
+        let count = if all.is_empty() {
+            "0".to_string()
+        } else if narrow == 0 {
+            all.len().to_string()
+        } else {
+            format!("{{\"projected\":{},\"narrow\":{}}}", all.len() - narrow, narrow)
+        };
+        counts.push((ft.clone(), count));
+        out_tables.push(ProjTable {
+            key: ft.clone(),
+            sql: ddl_sql_name(ft),
+            create,
+            cols: key,
+            rows,
+            parents,
+        });
+    }
+
+    // ---- Kahn parents-first (the old engine's Phase 3, rmap.rs:1676-1700):
+    // ready = every referenced parent already placed, self-references pass,
+    // externals pass; ready sorted by name; a cycle appends the rest sorted ----
+    let names: HashSet<String> = out_tables.iter().map(|t| t.sql.clone()).collect();
+    let mut placed: HashSet<String> = HashSet::new();
+    let mut order: Vec<usize> = Vec::new();
+    let mut remaining: Vec<usize> = (0..out_tables.len()).collect();
+    while !remaining.is_empty() {
+        let (mut ready, rest): (Vec<usize>, Vec<usize>) = remaining.iter().partition(|&&i| {
+            out_tables[i]
+                .parents
+                .iter()
+                .all(|p| p == &out_tables[i].sql || placed.contains(p) || !names.contains(p))
+        });
+        if ready.is_empty() {
+            let mut rest_sorted = rest;
+            rest_sorted.sort_by(|&a, &b| out_tables[a].sql.cmp(&out_tables[b].sql));
+            order.extend(rest_sorted);
+            break;
+        }
+        ready.sort_by(|&a, &b| out_tables[a].sql.cmp(&out_tables[b].sql));
+        for &i in &ready {
+            placed.insert(out_tables[i].sql.clone());
+        }
+        order.extend(ready);
+        remaining = rest;
+    }
+
+    // ---- the answer: DDL + rows in Kahn order, plus the project report ----
+    let mut r = String::from("{\"tables\":[");
+    for (i, &ti) in order.iter().enumerate() {
+        let t = &out_tables[ti];
+        if i > 0 {
+            r.push(',');
+        }
+        r.push_str("{\"name\":");
+        esc(&t.sql, &mut r);
+        r.push_str(",\"source\":");
+        esc(&t.key, &mut r);
+        r.push_str(",\"create_sql\":");
+        esc(&t.create, &mut r);
+        r.push_str(",\"columns\":[");
+        for (k, c) in t.cols.iter().enumerate() {
+            if k > 0 {
+                r.push(',');
+            }
+            esc(c, &mut r);
+        }
+        r.push_str("],\"rows\":[");
+        for (k, row) in t.rows.iter().enumerate() {
+            if k > 0 {
+                r.push(',');
+            }
+            r.push('[');
+            for (m, v) in row.iter().enumerate() {
+                if m > 0 {
+                    r.push(',');
+                }
+                write_v(v, &mut r); // ⊥ prints null — exactly the NULL cell
+            }
+            r.push(']');
+        }
+        r.push_str("]}");
+    }
+    r.push_str("],\"counts\":{");
+    for (i, (k, v)) in counts.iter().enumerate() {
+        if i > 0 {
+            r.push(',');
+        }
+        esc(k, &mut r);
+        r.push(':');
+        r.push_str(v);
+    }
+    r.push_str("}}");
+    Ok(r)
+}
+
 fn op_ok(op: &str, result: &str) -> String {
     let mut s = String::from("{\"op\":");
     esc(op, &mut s);
@@ -5936,6 +6433,13 @@ fn op_answer(op: &str, j: &J, srv: &mut Srv) -> Result<String, String> {
             // (the python delegation) is untouched — this op is the native
             // primary being grown beside it (the lex twin pattern).
             op_compile_model(j, srv)
+        }
+        "sql_project" => {
+            // the RMAP 3NF projection over the resident store (transplant #2):
+            // CREATE TABLE statements + insertion rows in Kahn parents-first
+            // order, plus the {table: rowcount} report — python ddl.project's
+            // answer computed natively, no sqlite; the consumer materializes
+            op_sql_project(j, srv)
         }
         "neval" => {
             // DEBUG-ONLY (gated on AREST_NEVAL_TRACE): evaluate f : x over
