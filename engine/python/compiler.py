@@ -590,12 +590,40 @@ def _atomic_run_guard(toks, i, matched, known):
     return any(k == ext or k.startswith(ext + " ") for k in known)
 
 
+def _hyphen_tpl(tok):
+    """A template token's emitted form under NORMA hyphen binding (#24,
+    VerbalizationHyphenBinder — the certified twin of the lex record's field 8):
+    a single hyphen TOUCHING a word on exactly one side is the bind marker
+    ('valence- Coord' / 'Coord -local' — one word per hyphen, multi-word
+    adjectives chain internal hyphens: 'very-fast-'), so the marker is consumed
+    and the WORD stays in the template; the doubled hyphen is the escape that
+    keeps one LITERAL hyphen ('FORE--' -> 'FORE-', '--WORD' -> '-WORD', no
+    bind); a hyphen touching both sides ('from-Status') is just a word. The
+    collapse is context-free per token — WHICH role a bound word decorates is
+    the raw reading text's affair (NORMA: a reading-text convention re-parsed
+    on demand, never a stored field), read again by the RMAP naming pass."""
+    if len(tok) > 2 and tok.endswith("--"):
+        return tok[:-1]
+    if len(tok) > 2 and tok.startswith("--"):
+        return tok[1:]
+    if len(tok) > 1 and tok.endswith("-") and not tok.endswith("--"):
+        return tok[:-1]
+    if len(tok) > 1 and tok.startswith("-") and not tok.startswith("--"):
+        return tok[1:]
+    return tok
+
+
 def _reading(text, known):
     """A fact-type reading → (template, roles): a mixfix predicate template with {i} placeholders
     plus the ordered role object types (the paper's field-replacement model). Scans left to right,
     replacing each known type (longest, word-bounded) with a placeholder; front text, inter-object
     text, and trailing text remain in the template, so unary, binary and n-ary readings, front
-    text ('the birth of {0} occurred in {1}'), and hyphen binding ('adj-Type') all parse.
+    text ('the birth of {0} occurred in {1}'), and NORMA hyphen binding (leading 'adj- {N}',
+    trailing '{N} -adj', the '--' literal escape — _hyphen_tpl) all parse. The old TOUCHING
+    bind ('from-Status' claiming role Status) is RETIRED (#24): a touching hyphen is just a
+    word, and the bound word stays in the template — 'Transition is from- Status' and
+    'Transition is from Status' answer the SAME (template, roles), so the ftid and the
+    store are invariant under the respelling (the bind lives in the reading text alone).
 
     THE MEANING IS CANONICAL: system:reading_parse (shared/system.canon, over the
     lex boundary) answers the same (template, roles); this host scan is its
@@ -605,16 +633,12 @@ def _reading(text, known):
     toks, roles, out, i = text.split(), [], [], 0
     while i < len(toks):
         tok = toks[i]
-        if "-" in tok and not tok.endswith("-"):             # forward hyphen binding: adj-Type -> role Type
-            _pre, _, post = tok.partition("-")
-            if post in known:
-                roles.append(post); out.append("{%d}" % (len(roles) - 1)); i += 1; continue
         matched = next((k for k in kset if toks[i:i + len(k.split())] == k.split()
                         and _atomic_run_guard(toks, i, k, known)), None)
         if matched:
             roles.append(matched); out.append("{%d}" % (len(roles) - 1)); i += len(matched.split())
         else:
-            out.append(tok); i += 1
+            out.append(_hyphen_tpl(tok)); i += 1
     return " ".join(out), roles
 
 

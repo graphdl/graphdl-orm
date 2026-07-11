@@ -26,9 +26,9 @@ Status has HTTP Method.
 ### Transition
 Transition is defined in State Machine Definition.
   Each Transition is defined in exactly one State Machine Definition.
-Transition is from Status.
+Transition is from- Status.
   Each Transition is from exactly one Status.
-Transition is to Status.
+Transition is to- Status.
   Each Transition is to exactly one Status.
 Transition is triggered by Event Type.
   Each Transition is triggered by exactly one Event Type.
