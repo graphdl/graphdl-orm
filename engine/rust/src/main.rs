@@ -5487,6 +5487,149 @@ fn grammar_tables(
     (dispatch, vocab)
 }
 
+// ============================ the model_d fold (#20, the port after cooks) ===
+// meta.initial_D (compiler.py:71) / run_append (engine.py:224) / ast:DefineIn
+// (engine.py:71, shared/ast.canon:58), native twins. op_compile_model's
+// dispatch loop already produces per-statement Fires (cooks::translate,
+// #20 cooks); this section folds them into an actual store, in emission
+// order, for byte parity with python's g() (compiler.py's
+// _stmt_translator_impl, ~:2240 — asserts THEN objs, per fire).
+//
+// Shape: a Vec<(Leaf, V)> in cell order (srv.cells' own shape), the same
+// first-match-wins find. The re-top move is remove-first-match then
+// push_front — the same complexity argument as engine.py:224's docstring
+// (hot cells re-top to the front on first touch, so idx stays small). No
+// sorting, no unordered maps: cell order and row order are deterministic
+// consequences of these moves alone.
+
+// initial_D(): one FILE cell, PHI contents (to_lam(()) on an empty tuple —
+// SEQ(NIL), exactly phi()).
+fn initial_d_cells() -> Vec<(Leaf, V)> {
+    vec![(Leaf::S("FILE".to_string()), phi())]
+}
+
+// The RAW cell sequence off a Scott D, duplicates preserved — UNLIKE
+// cells_of (which keeps only the first match per name, correct for its own
+// resident-lookup-cache job but wrong as a fold SEED: it would silently
+// drop a shadowed same-named cell). context_from:"resident" must seed from
+// the store's actual sequence, or a later re-top could disagree with a
+// dump of the untouched resident D underneath it.
+fn raw_cells_of(d: &V) -> Vec<(Leaf, V)> {
+    let mut out: Vec<(Leaf, V)> = Vec::new();
+    for c in items(&list_of(d)) {
+        let it = items(&list_of(&c));
+        if it.len() == 3 {
+            if let Some(l0) = aval(&it[0]) {
+                if matches!(&*l0, Leaf::S(s) if s == "CELL") {
+                    if let Some(k) = aval(&it[1]) {
+                        out.push(((*k).clone(), it[2].clone()));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+// materialize the fold state as a Scott D: SEQ of ⟨CELL, name, contents⟩,
+// front to back — the exact shape cells_of/write_v/reduce_over expect.
+fn cells_to_d(cells: &[(Leaf, V)]) -> V {
+    seq(from_vec(
+        cells
+            .iter()
+            .map(|(name, contents)| {
+                seq(from_vec(vec![
+                    atom(Leaf::S("CELL".to_string())),
+                    atom(name.clone()),
+                    contents.clone(),
+                ]))
+            })
+            .collect(),
+    ))
+}
+
+// ast:Store / DefineIn's shared move: ↓name — pop THEN push (Backus
+// §13.3.4/§13.3.5 verbatim). Pop removes the FIRST cell named `name` only;
+// deeper same-named cells survive untouched underneath (first-match-wins
+// reads see the new top). Absent name: pop is a no-op, so this degrades to
+// a plain prepend.
+fn store_move(cells: &mut Vec<(Leaf, V)>, name: &str, contents: V) {
+    if let Some(idx) = cells
+        .iter()
+        .position(|(k, _)| matches!(k, Leaf::S(s) if s == name))
+    {
+        cells.remove(idx);
+    }
+    cells.insert(0, (Leaf::S(name.to_string()), contents));
+}
+
+// run_append (engine.py:224 — mirrored precisely): D' = Store(cell):
+// ⟨resolve_default(fact, FetchPop(cell, D)), D⟩. Absent cell -> fresh
+// singleton population, cell PREPENDED. Present -> _eqobj dedup
+// (type-strict: 1 ≠ "1" ≠ 1.0, the cook differential's own discipline)
+// REUSES the old population unchanged on a hit; otherwise the fact
+// PREPENDS. Either way the cell re-tops via store_move. Non-plain contents
+// (the decoded shape isn't a Seq) is python's canonical-`run`-fallback arm;
+// every compile-time cell here is plain by construction — a hit means a
+// genuine port gap, so this errors loudly rather than silently diverging.
+fn run_append_native(
+    fact: &cooks::Val,
+    cells: &mut Vec<(Leaf, V)>,
+    cell_name: &str,
+) -> Result<(), String> {
+    let fact_v = cooks::val_to_v(fact);
+    let found = cells
+        .iter()
+        .position(|(k, _)| matches!(k, Leaf::S(s) if s == cell_name));
+    let newpop = match found {
+        None => seq(from_vec(vec![fact_v])),
+        Some(idx) => match shape(&cells[idx].1) {
+            Shape::Seq(l) => {
+                let pop = items(&l);
+                if pop.iter().any(|y| eqobj(&fact_v, y)) {
+                    cells[idx].1.clone()
+                } else {
+                    let mut rows = Vec::with_capacity(pop.len() + 1);
+                    rows.push(fact_v);
+                    rows.extend(pop);
+                    seq(from_vec(rows))
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "run_append: cell {:?} holds non-plain contents (canonical \
+                     `run` fallback not ported for compile-time folds)",
+                    cell_name
+                ));
+            }
+        },
+    };
+    store_move(cells, cell_name, newpop);
+    Ok(())
+}
+
+// DefineIn (engine.py:71 / shared/ast.canon's ast:DefineIn): the definition
+// travels with the store as an ORDINARY cell — the SAME Store move as
+// run_append's re-top, but the contents is the definition VALUE verbatim
+// (no dedup, no population semantics). The cooks already deliver `obj` as
+// the reduced canonical value (from_lam-equal proven); store it as-is.
+fn define_in_native(name: &str, obj: &V, cells: &mut Vec<(Leaf, V)>) {
+    store_move(cells, name, obj.clone());
+}
+
+// One Fire's fold: asserts THEN objs, each list in emission order
+// (compiler.py's g(): "for cell,fact in asserts: D = ast.run_append(...);
+// for name,obj in objs: D = DefineIn(...)").
+fn fold_fire(fire: &cooks::Fire, cells: &mut Vec<(Leaf, V)>) -> Result<(), String> {
+    for (cell, fact) in &fire.asserts {
+        run_append_native(fact, cells, cell)?;
+    }
+    for (name, obj) in &fire.objs {
+        define_in_native(name, obj, cells);
+    }
+    Ok(())
+}
+
 fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
     use std::collections::{BTreeMap, HashMap, HashSet};
     // args parse before anything runs (op_run_rules' discipline: a malformed
@@ -5538,8 +5681,6 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
                 .to_string(),
         );
     }
-    missing.push("model D starts EMPTY (meta.initial_D process seed not ported)".to_string());
-
     // (a) statements + (b) modality split; a possibility statement is the
     // absence of a constraint (informational) and never enters the g-loop
     let stmts = split_statements(&text);
@@ -5556,9 +5697,11 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
     // declared names (plus the base's, read off the RESIDENT store when the
     // caller passes context_from:"resident" — python's context_from store),
     // the subtype closure, fact-type slugs, and the plain reading set
-    let (b_names, b_edges, b_fts, b_vals) = match jget(j, "context_from") {
-        Some(J::S(s)) if s == "resident" => context_of(&srv.cells),
-        _ => (HashSet::new(), Vec::new(), HashSet::new(), HashSet::new()),
+    let context_resident = matches!(jget(j, "context_from"), Some(J::S(s)) if s == "resident");
+    let (b_names, b_edges, b_fts, b_vals) = if context_resident {
+        context_of(&srv.cells)
+    } else {
+        (HashSet::new(), Vec::new(), HashSet::new(), HashSet::new())
     };
     let mut names = known_names(&stmts);
     for n in b_names {
@@ -5661,8 +5804,15 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
     // specific rule claimed is a constraint by definition and goes loud; the
     // classification set's translators dispatch in sorted order through rho.
     const GENERIC: [&str; 2] = ["Fact Type Reading", "Instance Fact"];
-    // TODO(#20): meta.initial_D — the skeleton's model store starts EMPTY
-    let mut model_d: V = seq(from_vec(Vec::new()));
+    // meta.initial_D() (compiler.py:71): one FILE cell — OR, under
+    // context_from:"resident", the resident store's OWN raw cell sequence
+    // (shadowed duplicates included; see raw_cells_of), so the fold
+    // continues exactly where the preloaded store leaves off
+    let mut model_cells: Vec<(Leaf, V)> = if context_resident {
+        raw_cells_of(&srv.d)
+    } else {
+        initial_d_cells()
+    };
     // the context operand, python's to_lam((tuple(sorted(names)),
     // tuple(sorted((s, tuple(sorted(a))) for s, a in subs.items())),
     // tuple(sorted(fts)), tuple(sorted(plain)))) — all four sorted, the
@@ -5699,6 +5849,10 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
     // {"trace":1} answers the per-statement ⟨asserts, objs⟩ emissions — the
     // differential's dump (python compile per-statement fires, verbatim)
     let trace_on = matches!(jget(j, "trace"), Some(J::I(1)));
+    // {"dump_store":1} answers the folded D itself, write_v form — the
+    // model_d fold's own acceptance surface (python compile_model_selfhost's
+    // returned D, full from_lam)
+    let dump_store_on = matches!(jget(j, "dump_store"), Some(J::I(1)));
     let mut translated: Vec<String> = Vec::new();
     for (i, (stmt, m, inner, sg)) in work.iter().enumerate() {
         let sid = format!("s{}", i + 1);
@@ -5795,11 +5949,15 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
                 atom(Leaf::S(inner.clone())),
                 atom(Leaf::S(mfield.clone())),
                 ctx.clone(),
-                model_d.clone(),
+                cells_to_d(&model_cells),
             ]);
             let res = reduce_over(srv, atom(Leaf::S(t.clone())), operand, fuel);
             if matches!(shape(&res), Shape::Seq(_)) && !isapp(&res) {
-                model_d = res;
+                // a canon translator DEF answered D' directly (python's own
+                // D = _apply(_A(t), operand)) — adopt it whole, raw (a
+                // canon def may thread shadowed duplicates too; #18's
+                // future seam, kept correct even though dormant today)
+                model_cells = raw_cells_of(&res);
                 accepted = true;
                 continue;
             }
@@ -5822,8 +5980,17 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
                 Ok(Some(fire)) => {
                     // the translator fired: python's _plan answered its
                     // ⟨asserts, objs⟩ (the acceptance surface of the
-                    // differential); acceptance mirrors _apply succeeding
+                    // differential); acceptance mirrors _apply succeeding.
+                    // The fold (#20, this slice): asserts THEN objs, in
+                    // emission order (compiler.py's g()) — a native
+                    // run_append/DefineIn twin per entry.
                     accepted = true;
+                    if let Err(e) = fold_fire(&fire, &mut model_cells) {
+                        return Err(format!(
+                            "compile_model fold: {} (statement: {})",
+                            e, stmt
+                        ));
+                    }
                     if trace_on {
                         let mut f = String::new();
                         cooks::fire_json(t, &fire, &mut f);
@@ -5899,6 +6066,12 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
         r.push_str(",\"translated\":[");
         r.push_str(&translated.join(","));
         r.push(']');
+    }
+    if dump_store_on {
+        // the folded store itself: python compile_model_selfhost's returned
+        // D, full from_lam — the fold's own differential surface
+        r.push_str(",\"store\":");
+        write_v(&cells_to_d(&model_cells), &mut r);
     }
     r.push('}');
     Ok(r)
