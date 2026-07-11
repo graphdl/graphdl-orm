@@ -36,7 +36,11 @@ The old engine's cells were plain maps with IndexBy hash-joins — its
 - The DUMP (write_v of the final D) is the certification surface: the twin
   must reproduce the exact final cell order and row order.
 
-## The twin
+## The twin — ONE store, no redundant views (Samuel, 2026-07-11)
+
+The whitepaper has ONE D. The four live views (d, cells, nd, ncells) are a
+port accident — serializations kept in sync as if they were stores. 3NF's
+own point: store once, without redundancy. So:
 
 ```rust
 struct FastStore {
@@ -49,7 +53,13 @@ struct FastStore {
 }
 ```
 
-- enter: from Vec<(Leaf, V)> once (O(store)); exit: to Vec<(Leaf, V)> once.
+- THE STORE IS THE ONLY COPY. The Scott d materializes ONLY at the dump
+  boundary; there is no maintained native mirror. NEval grows a
+  CELL-PROVIDER seam (an IStore trait: fetch_pop(name) -> rows): when a
+  FetchPop-shaped term reduces, the evaluator asks the store — no
+  ncells/nd copies, no per-write mirror maintenance. The canon-evaluation
+  sites (system:partition, ftpop_absorbed, sm_join …) read through the
+  same seam.
 - Store: O(1) amortized — remove name's top from order (positions via a
   name→order-slot map or tombstones + periodic compaction), push front.
 - setcell: O(1) replace, or push back.
@@ -58,10 +68,6 @@ struct FastStore {
 - join index: built on first use per (cell, column) per round; a write to
   the cell drops its indexes. Key = the same type-strict key_of the
   delta variants use.
-- The canon-evaluation sites (system:partition, ftpop_absorbed, sm_join …)
-  need an N view: materialize nd ONCE per fold/derive phase entry (they run
-  between fixpoints, not inside rounds) — or keep those exact call sites on
-  the existing path; they are not the hot loop.
 
 ## Where it lands
 
@@ -71,15 +77,30 @@ and exit convert once. op_compile_model's fold could adopt the same twin
 later (fold_fire's run_append/DefineIn map 1:1) — second step, after the
 fixpoint twin certifies.
 
-## Round-one hash-joins (IndexBy)
+## Lambdas are data: compile rule bodies to plans (Church–Turing license)
 
-The ruleAtom facts name each atom's join positions (the ~d delta variants
-already read them). Round one currently evaluates full bodies through the
-reducer; with FastStore.idx, evaluate two-atom joins as hash lookups
-(probe the smaller side), materializing only surviving rows. Rules whose
-bodies do not fit the indexed-join shapes (aggregates, negation groups,
+Within the computable layer a lambda term IS a data structure. A rule
+body's COMP/ALPHA/distl pipeline is a JOIN PLAN encoded as a term — so
+compile it ONCE (per op entry, or materialized at compile time next to
+passHeads, schedule-as-data) into a plan struct, and EXECUTE THE PLAN over
+FastStore's indexes: hash-join per atom pair (probe the smaller side),
+project, filter — materializing only surviving rows. The ruleAtom facts
+already carry the extracted join positions (the ~d delta variants read
+them today). The term stays as the SPEC and the differential oracle; the
+plan is the implementation; extensional equality is the certification.
+Shapes the planner does not recognize (aggregates, negation groups,
 comparators) keep the reducer path — twin what is hot, keep the canon for
 the rest, exactly the DEFS override discipline.
+
+## Entity-scoped deltas (the whitepaper's own grain)
+
+The whitepaper's cell design already shards by entity (noun:id row cells,
+the routed write). Use the same grain for derivation invalidation: the
+delta sets should name ROWS (dirty entities), not just cells — a
+frontier-bounded round then joins only the changed keys' rows against the
+indexes instead of re-scanning whole populations. machine_fold's per-entity
+walk and the routed create already work at this grain; the fixpoint should
+too.
 
 ## Certification
 
