@@ -3177,6 +3177,15 @@ struct FastStore {
     // name key (Self::key) -> node index of the FIRST (active, first-match-wins)
     // occurrence; a name never in this map has no active cell (pop_rows: empty).
     active: HashMap<String, usize>,
+    // the CACHE order: name keys in first-appearance order, APPEND-ONLY, never
+    // reordered by a later Store. This mirrors store_into/setcell_into's OWN
+    // `cells`/`ncells` Vec maintenance precisely -- both update an existing
+    // name's slot IN PLACE (`cells.iter_mut().find(..).slot.1 = contents`) and
+    // only PUSH a brand new name at the end; unlike `d`/`nd`, that Vec is never
+    // re-topped on a Store. The distinction is observable: srv.cells feeds the
+    // {"op":"cells"} verb directly (main.rs's "cells" op iterates &srv.cells in
+    // order), so this is a second dump-shaped surface, not an internal detail.
+    cache_order: Vec<String>,
     // the whole-store native snapshot, invalidated to None by ANY store/setcell;
     // rebuilt lazily (and only then) by ncells_native/nd_native.
     whole: RefCell<Option<(Rc<Vec<(Leaf, N)>>, N)>>,
@@ -3216,6 +3225,7 @@ impl FastStore {
             head: None,
             tail: None,
             active: HashMap::with_capacity(raw.len()),
+            cache_order: Vec::with_capacity(raw.len()),
             whole: RefCell::new(None),
         };
         let mut prev_idx: Option<usize> = None;
@@ -3236,6 +3246,9 @@ impl FastStore {
                 fs.head = Some(idx);
             }
             prev_idx = Some(idx);
+            if !fs.active.contains_key(&k) {
+                fs.cache_order.push(k.clone()); // cells_of's own first-match order
+            }
             fs.active.entry(k).or_insert(idx); // first occurrence wins; a
                                                 // deeper same-named raw entry
                                                 // stays un-indexed (inert)
@@ -3343,8 +3356,11 @@ impl FastStore {
     // Scott/native cons-list rebuild.
     fn store(&mut self, name: &Leaf, contents: V) {
         let k = Self::key(name);
-        if let Some(idx) = self.active.remove(&k) {
-            self.unlink(idx);
+        match self.active.remove(&k) {
+            Some(idx) => self.unlink(idx),
+            // a brand new name: joins the CACHE order at the end (cache_order
+            // is append-only, independent of dump-order re-topping below)
+            None => self.cache_order.push(k.clone()),
         }
         let idx = self.alloc(FSNode {
             name: name.clone(),
@@ -3376,7 +3392,8 @@ impl FastStore {
                 next: None,
             });
             self.push_back(idx);
-            self.active.insert(k, idx);
+            self.active.insert(k.clone(), idx);
+            self.cache_order.push(k);
         }
         *self.whole.borrow_mut() = None;
     }
@@ -3395,8 +3412,8 @@ impl FastStore {
     }
 
     fn rebuild_whole(&self) {
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut pairs: Vec<(Leaf, N)> = Vec::new();
+        // dump-order triples: nd's own mirror of `d` -- reorders on Store,
+        // shadow-inclusive (every physical node, active or inert).
         let mut triples: Vec<N> = Vec::new();
         for idx in self.iter_indices() {
             let (name, n) = {
@@ -3405,12 +3422,17 @@ impl FastStore {
             };
             triples.push(N::S(Rc::new(vec![
                 N::A(Rc::new(Leaf::S("CELL".to_string()))),
-                N::A(Rc::new(name.clone())),
-                n.clone(),
+                N::A(Rc::new(name)),
+                n,
             ])));
-            if seen.insert(Self::key(&name)) {
-                pairs.push((name, n));
-            }
+        }
+        // cache-order pairs: ncells' own mirror of `cells` -- stable,
+        // append-only, first-match, exactly cache_order's own contract.
+        let mut pairs: Vec<(Leaf, N)> = Vec::with_capacity(self.cache_order.len());
+        for k in &self.cache_order {
+            let idx = self.active[k];
+            let node = self.nodes[idx].as_ref().unwrap();
+            pairs.push((node.name.clone(), self.node_native(idx)));
         }
         *self.whole.borrow_mut() = Some((Rc::new(pairs), N::S(Rc::new(triples))));
     }
@@ -3482,18 +3504,19 @@ impl FastStore {
             .collect()
     }
 
-    // the active (first-match) view, srv.cells' own contract (cells_of's
-    // dedup, in current dump order).
+    // the active (first-match) view, srv.cells' own contract: stable
+    // cache_order (NOT dump order -- see cache_order's own comment; a Store's
+    // re-top moves a cell to the front of `d`/`nd` but never moves its slot in
+    // `cells`/`ncells`, so this must walk cache_order, not the linked list).
     fn to_active_cells(&self) -> Vec<(Leaf, V)> {
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut out = Vec::new();
-        for idx in self.iter_indices() {
-            let node = self.nodes[idx].as_ref().unwrap();
-            if seen.insert(Self::key(&node.name)) {
-                out.push((node.name.clone(), node.content.clone()));
-            }
-        }
-        out
+        self.cache_order
+            .iter()
+            .map(|k| {
+                let idx = self.active[k];
+                let node = self.nodes[idx].as_ref().unwrap();
+                (node.name.clone(), node.content.clone())
+            })
+            .collect()
     }
 }
 
@@ -13244,5 +13267,267 @@ pub mod worker {
         write_v(&res, &mut out);
         out.push('}');
         out
+    }
+}
+
+// ============================ FastStore property tests (#35) ==================
+// Stage A's own certification item 1 (docs/2026-07-11-store-twin-spec.md): random
+// Store/setcell sequences must byte-equal the EXISTING store_into/setcell_into
+// primitives' result over the identical sequence. Twin equivalence, not just
+// unit behavior -- both codepaths run side by side over the same operations and
+// the dumps are compared, so the test fails the instant the twin's observable
+// contract drifts from the primitives it must remain indistinguishable from.
+#[cfg(test)]
+mod faststore_tests {
+    use super::*;
+
+    fn row(vals: &[&str]) -> V {
+        seq(from_vec(vals.iter().map(|s| atom(Leaf::S((*s).to_string()))).collect()))
+    }
+
+    fn rows_of(rows: &[Vec<String>]) -> V {
+        seq(from_vec(
+            rows.iter()
+                .map(|r| row(&r.iter().map(|s| s.as_str()).collect::<Vec<_>>()))
+                .collect(),
+        ))
+    }
+
+    fn dump(v: &V) -> String {
+        let mut s = String::new();
+        write_v(v, &mut s);
+        s
+    }
+
+    fn seed_srv_from_d(d: V) -> Srv {
+        let nd = v_to_n(&d);
+        let cells = cells_of(&d);
+        let ncells = n_cells_of(&nd);
+        Srv { d, cells, mu: bot(), nd, ncells, nprocess: Vec::new() }
+    }
+
+    fn seed_srv(cells: Vec<(Leaf, V)>) -> Srv {
+        seed_srv_from_d(cells_to_d(&cells))
+    }
+
+    fn cell_triple(name: &str, contents: V) -> V {
+        seq(from_vec(vec![atom(Leaf::S("CELL".to_string())), atom(Leaf::S(name.to_string())), contents]))
+    }
+
+    // ---- directed: the four primitive behaviors the spec names verbatim ----
+
+    #[test]
+    fn store_on_absent_cell_is_a_fresh_prepend() {
+        let srv = seed_srv(vec![(Leaf::S("Other".into()), rows_of(&[vec!["x".into()]]))]);
+        let mut store = FastStore::from_srv(&srv);
+        store.store(&Leaf::S("Fresh".into()), rows_of(&[vec!["a".into()], vec!["b".into()]]));
+        assert_eq!(store.pop_rows(&Leaf::S("Fresh".into())).len(), 2);
+        // re-topped: Fresh must be the FIRST physical cell now
+        let all = store.to_all_cells();
+        assert!(matches!(&all[0].0, Leaf::S(s) if s == "Fresh"));
+    }
+
+    #[test]
+    fn store_on_present_cell_pops_the_top_and_prepends() {
+        let srv = seed_srv(vec![
+            (Leaf::S("A".into()), rows_of(&[vec!["old".into()]])),
+            (Leaf::S("B".into()), rows_of(&[vec!["b".into()]])),
+        ]);
+        let mut store = FastStore::from_srv(&srv);
+        store.store(&Leaf::S("A".into()), rows_of(&[vec!["new".into()]]));
+        let got = store.pop_rows(&Leaf::S("A".into()));
+        assert_eq!(got.len(), 1);
+        assert_eq!(dump(&got[0]), dump(&row(&["new"])));
+        let all = store.to_all_cells();
+        assert!(matches!(&all[0].0, Leaf::S(s) if s == "A")); // re-topped to front
+        assert_eq!(all.len(), 2); // old A content replaced, not appended as a 3rd cell
+    }
+
+    #[test]
+    fn setcell_on_present_cell_replaces_in_place() {
+        let srv = seed_srv(vec![
+            (Leaf::S("A".into()), rows_of(&[vec!["old".into()]])),
+            (Leaf::S("B".into()), rows_of(&[vec!["b".into()]])),
+        ]);
+        let mut store = FastStore::from_srv(&srv);
+        store.setcell(&Leaf::S("A".into()), rows_of(&[vec!["new".into()]]));
+        let all = store.to_all_cells();
+        // position UNCHANGED (still first) -- setcell never re-tops
+        assert!(matches!(&all[0].0, Leaf::S(s) if s == "A"));
+        assert_eq!(dump(&all[0].1), dump(&rows_of(&[vec!["new".into()]])));
+    }
+
+    #[test]
+    fn setcell_on_absent_cell_appends_at_the_end() {
+        let srv = seed_srv(vec![(Leaf::S("A".into()), rows_of(&[vec!["a".into()]]))]);
+        let mut store = FastStore::from_srv(&srv);
+        store.setcell(&Leaf::S("Z".into()), rows_of(&[vec!["z".into()]]));
+        let all = store.to_all_cells();
+        assert_eq!(all.len(), 2);
+        assert!(matches!(&all[1].0, Leaf::S(s) if s == "Z")); // appended LAST
+    }
+
+    // ---- directed: a pre-existing shadowed same-named cell survives, inert,
+    // exactly as raw_cells_of's own comment describes and store_into's actual
+    // pop-only-the-first-match behavior produces ----
+
+    #[test]
+    fn shadowed_same_named_cell_round_trips_untouched() {
+        let d = seq(from_vec(vec![
+            cell_triple("Foo", rows_of(&[vec!["top".into()]])),
+            cell_triple("Foo", rows_of(&[vec!["shadow".into()]])),
+            cell_triple("Bar", rows_of(&[vec!["only".into()]])),
+        ]));
+        let srv = seed_srv_from_d(d.clone());
+        let store = FastStore::from_srv(&srv);
+        // reads see only the top
+        let got = store.pop_rows(&Leaf::S("Foo".into()));
+        assert_eq!(got.len(), 1);
+        assert_eq!(dump(&got[0]), dump(&row(&["top"])));
+        // a pure entry+exit round trip must be byte-identical to the input --
+        // nothing observed the shadow, but it must still be there on the way out
+        let out_d = cells_to_d(&store.to_all_cells());
+        assert_eq!(dump(&out_d), dump(&d));
+    }
+
+    #[test]
+    fn shadowed_cell_survives_a_store_to_the_active_occurrence() {
+        let d = seq(from_vec(vec![
+            cell_triple("Foo", rows_of(&[vec!["top".into()]])),
+            cell_triple("Foo", rows_of(&[vec!["shadow".into()]])),
+            cell_triple("Bar", rows_of(&[vec!["only".into()]])),
+        ]));
+        // the existing primitive, run on the identical input/operation, is the
+        // oracle for this test (not just an inspection of the twin alone)
+        let mut d_prim = d.clone();
+        let mut cells_prim = cells_of(&d_prim);
+        let mut nd_prim = v_to_n(&d_prim);
+        let mut ncells_prim = n_cells_of(&nd_prim);
+        store_into(&mut d_prim, &mut cells_prim, &mut nd_prim, &mut ncells_prim,
+                   &Leaf::S("Foo".into()), rows_of(&[vec!["new".into()]]));
+
+        let srv = seed_srv_from_d(d);
+        let mut store = FastStore::from_srv(&srv);
+        store.store(&Leaf::S("Foo".into()), rows_of(&[vec!["new".into()]]));
+        let out_d = cells_to_d(&store.to_all_cells());
+
+        assert_eq!(dump(&out_d), dump(&d_prim));
+        // and the shadow ("shadow") must appear exactly once in the dump text,
+        // proving it rode through rather than being silently dropped
+        assert_eq!(dump(&out_d).matches("shadow").count(), 1);
+    }
+
+    // ---- the random differential: many Store/setcell sequences, twin vs the
+    // existing primitives, final dump compared byte for byte ----
+
+    struct Rng(u64);
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next_u64() % n
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        Store(String, Vec<Vec<String>>),
+        SetCell(String, Vec<Vec<String>>),
+    }
+
+    fn random_ops(rng: &mut Rng, names: &[&str], n: usize) -> Vec<Op> {
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let name = names[rng.below(names.len() as u64) as usize].to_string();
+            let nrows = rng.below(4) as usize;
+            let rows: Vec<Vec<String>> =
+                (0..nrows).map(|_| vec![format!("v{}", rng.below(25))]).collect();
+            if rng.below(2) == 0 {
+                out.push(Op::Store(name, rows));
+            } else {
+                out.push(Op::SetCell(name, rows));
+            }
+        }
+        out
+    }
+
+    fn run_primitives(mut srv: Srv, ops: &[Op]) -> Srv {
+        for op in ops {
+            match op {
+                Op::Store(name, rows) => store_into(
+                    &mut srv.d, &mut srv.cells, &mut srv.nd, &mut srv.ncells,
+                    &Leaf::S(name.clone()), rows_of(rows),
+                ),
+                Op::SetCell(name, rows) => setcell_into(
+                    &mut srv.d, &mut srv.cells, &mut srv.nd, &mut srv.ncells,
+                    &Leaf::S(name.clone()), rows_of(rows),
+                ),
+            }
+        }
+        srv
+    }
+
+    fn run_faststore(srv: &Srv, ops: &[Op]) -> (V, Vec<(Leaf, V)>, Vec<(Leaf, N)>) {
+        let mut store = FastStore::from_srv(srv);
+        for op in ops {
+            match op {
+                Op::Store(name, rows) => store.store(&Leaf::S(name.clone()), rows_of(rows)),
+                Op::SetCell(name, rows) => store.setcell(&Leaf::S(name.clone()), rows_of(rows)),
+            }
+        }
+        let d = cells_to_d(&store.to_all_cells());
+        let cells = store.to_active_cells();
+        let ncells = (*store.ncells_native()).clone();
+        (d, cells, ncells)
+    }
+
+    fn ncells_dump(ncells: &[(Leaf, N)]) -> String {
+        // a stable text rendering for comparison: name then write_n(content)
+        let mut out = String::new();
+        for (name, n) in ncells {
+            out.push_str(&leaf_text(name));
+            out.push(':');
+            write_n(n, &mut out);
+            out.push(';');
+        }
+        out
+    }
+
+    #[test]
+    fn random_store_setcell_sequences_match_primitives() {
+        let names = ["Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta"];
+        for seed in 0..80u64 {
+            let mut rng = Rng((seed.wrapping_mul(2654435761)).wrapping_add(0x9e3779b97f4a7c15) | 1);
+            let ops = random_ops(&mut rng, &names, 50);
+            let seed_cells = initial_d_cells();
+
+            let srv_prim = seed_srv(seed_cells.clone());
+            let after_prim = run_primitives(srv_prim, &ops);
+            let prim_dump = dump(&after_prim.d);
+            let prim_cells_dump = dump(&cells_to_d(&after_prim.cells));
+            let prim_ncells_dump = ncells_dump(&after_prim.ncells);
+
+            let srv_twin = seed_srv(seed_cells);
+            let (twin_d, twin_cells, twin_ncells) = run_faststore(&srv_twin, &ops);
+            let twin_dump = dump(&twin_d);
+            let twin_cells_dump = dump(&cells_to_d(&twin_cells));
+            let twin_ncells_dump = ncells_dump(&twin_ncells);
+
+            assert_eq!(prim_dump, twin_dump, "seed {}: d diverged over {:?}", seed, ops);
+            assert_eq!(
+                prim_cells_dump, twin_cells_dump,
+                "seed {}: cells diverged over {:?}", seed, ops
+            );
+            assert_eq!(
+                prim_ncells_dump, twin_ncells_dump,
+                "seed {}: ncells diverged over {:?}", seed, ops
+            );
+        }
     }
 }
