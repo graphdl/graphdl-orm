@@ -3138,6 +3138,365 @@ fn setcell_into(
     }
 }
 
+// ============================ FastStore: the store twin (#35) ==================
+// docs/2026-07-11-store-twin-spec.md. ONE store, no redundant views: op_run_rules'
+// round loop paid a four-views tax on every write (Scott `d`, the Vec<(Leaf,V)>
+// `cells` cache, the native `nd`, the Vec<(Leaf,N)> `ncells` cache) -- store_into/
+// setcell_into rebuilt BOTH the Scott cons-list (a walk of closure calls) and the
+// native Vec on every single write, and pop_rows scanned `cells` linearly by name.
+// FastStore replaces all four with one HashMap-indexed, doubly-linked-list-in-an-
+// arena cell sequence: O(1) amortized store/setcell/pop_rows, and the Scott `d`
+// materializes ONLY at the op's exit (nothing inside the loop -- pop_rows,
+// neval_rule, eval_rules -- ever reads it mid-round; only the final commit does).
+// The native carrier's contract (NEval wants a monolithic Vec<(Leaf,N)> / N
+// snapshot per rule evaluation) is UNCHANGED -- ncells_native/nd_native satisfy it
+// from a lazy per-node cache (invalidated only on THAT node's own write) plus a
+// whole-store cache (invalidated on ANY write, rebuilt from the per-node caches --
+// so a cell read many times between writes, or a rule considered but not fired,
+// costs nothing beyond the first read since the last write).
+//
+// Built from raw_cells_of, NOT cells_of: a pre-existing shadowed same-named cell
+// (raw_cells_of's own comment two screens below -- "duplicates preserved...
+// cells_of... would silently drop a shadowed same-named cell") rides along in the
+// list inertly, exactly as `d`'s own pop-only-the-first-match Store semantics
+// leave it today -- the twin changes REPRESENTATION, never boundary semantics
+// (the frontier-failure lesson: mirror the canon exactly, never innovate it).
+struct FSNode {
+    name: Leaf,
+    content: V,
+    ncache: RefCell<Option<N>>,
+    prev: Option<usize>,
+    next: Option<usize>,
+}
+
+struct FastStore {
+    nodes: Vec<Option<FSNode>>,
+    free: Vec<usize>,
+    head: Option<usize>,
+    tail: Option<usize>,
+    // name key (Self::key) -> node index of the FIRST (active, first-match-wins)
+    // occurrence; a name never in this map has no active cell (pop_rows: empty).
+    active: HashMap<String, usize>,
+    // the whole-store native snapshot, invalidated to None by ANY store/setcell;
+    // rebuilt lazily (and only then) by ncells_native/nd_native.
+    whole: RefCell<Option<(Rc<Vec<(Leaf, N)>>, N)>>,
+}
+
+impl FastStore {
+    // a type-strict cell-name key mirroring Leaf::nateq exactly (S/I/F/AppTag
+    // never cross-equal; unlike key_of/set_key this does NOT coalesce an int and
+    // an equal-valued float, since store_into/setcell_into/pop_rows all match
+    // cell names via nateq, never via python-set-style value equality). The 's'
+    // branch is length-prefixed so no string's content can imitate another
+    // variant's tag.
+    fn key(l: &Leaf) -> String {
+        match l {
+            Leaf::S(s) => format!("s{}:{}", s.len(), s),
+            Leaf::I(i) => format!("I{}", i),
+            Leaf::F(f) => format!("F{}", float_text(*f)),
+            Leaf::AppTag => "T".to_string(),
+        }
+    }
+
+    // ENTRY conversion (paid ONCE): raw_cells_of walks d's Scott cons-list a
+    // single time, duplicates preserved; the native cache seeds for free from
+    // srv.ncells wherever the mirror-coherence invariant already computed it
+    // (2026-07-08's write-site audit), so entry pays no redundant v_to_n for any
+    // cell already resident.
+    fn from_srv(srv: &Srv) -> FastStore {
+        let raw = raw_cells_of(&srv.d);
+        let seed: HashMap<String, N> = srv
+            .ncells
+            .iter()
+            .map(|(k, v)| (FastStore::key(k), v.clone()))
+            .collect();
+        let mut fs = FastStore {
+            nodes: Vec::with_capacity(raw.len()),
+            free: Vec::new(),
+            head: None,
+            tail: None,
+            active: HashMap::with_capacity(raw.len()),
+            whole: RefCell::new(None),
+        };
+        let mut prev_idx: Option<usize> = None;
+        for (name, content) in raw {
+            let k = FastStore::key(&name);
+            let ncache = seed.get(&k).cloned();
+            let idx = fs.nodes.len();
+            fs.nodes.push(Some(FSNode {
+                name: name.clone(),
+                content,
+                ncache: RefCell::new(ncache),
+                prev: prev_idx,
+                next: None,
+            }));
+            if let Some(p) = prev_idx {
+                fs.nodes[p].as_mut().unwrap().next = Some(idx);
+            } else {
+                fs.head = Some(idx);
+            }
+            prev_idx = Some(idx);
+            fs.active.entry(k).or_insert(idx); // first occurrence wins; a
+                                                // deeper same-named raw entry
+                                                // stays un-indexed (inert)
+        }
+        fs.tail = prev_idx;
+        fs
+    }
+
+    fn alloc(&mut self, node: FSNode) -> usize {
+        if let Some(idx) = self.free.pop() {
+            self.nodes[idx] = Some(node);
+            idx
+        } else {
+            self.nodes.push(Some(node));
+            self.nodes.len() - 1
+        }
+    }
+
+    // splice a node out of the dump-order list WITHOUT touching `active` --
+    // callers that pop an active occurrence remove its `active` entry
+    // themselves first (Store: about to prepend a brand new node in its place).
+    fn unlink(&mut self, idx: usize) {
+        let (prev, next) = {
+            let node = self.nodes[idx].as_ref().unwrap();
+            (node.prev, node.next)
+        };
+        match prev {
+            Some(p) => self.nodes[p].as_mut().unwrap().next = next,
+            None => self.head = next,
+        }
+        match next {
+            Some(n) => self.nodes[n].as_mut().unwrap().prev = prev,
+            None => self.tail = prev,
+        }
+        self.nodes[idx] = None;
+        self.free.push(idx);
+    }
+
+    fn push_front(&mut self, idx: usize) {
+        let old_head = self.head;
+        {
+            let node = self.nodes[idx].as_mut().unwrap();
+            node.prev = None;
+            node.next = old_head;
+        }
+        if let Some(h) = old_head {
+            self.nodes[h].as_mut().unwrap().prev = Some(idx);
+        }
+        self.head = Some(idx);
+        if self.tail.is_none() {
+            self.tail = Some(idx);
+        }
+    }
+
+    fn push_back(&mut self, idx: usize) {
+        let old_tail = self.tail;
+        {
+            let node = self.nodes[idx].as_mut().unwrap();
+            node.next = None;
+            node.prev = old_tail;
+        }
+        if let Some(t) = old_tail {
+            self.nodes[t].as_mut().unwrap().next = Some(idx);
+        }
+        self.tail = Some(idx);
+        if self.head.is_none() {
+            self.head = Some(idx);
+        }
+    }
+
+    fn iter_indices(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut cur = self.head;
+        while let Some(idx) = cur {
+            out.push(idx);
+            cur = self.nodes[idx].as_ref().unwrap().next;
+        }
+        out
+    }
+
+    // FetchPop's view over the active index: O(1) to the top pop; rows stay
+    // decoded (Vec<V>) -- the read side of "no repeated from_lam".
+    fn pop_rows(&self, name: &Leaf) -> Vec<V> {
+        match self.active.get(&Self::key(name)) {
+            Some(&idx) => {
+                let node = self.nodes[idx].as_ref().unwrap();
+                match shape(&node.content) {
+                    Shape::Seq(l) => items(&l),
+                    _ => Vec::new(),
+                }
+            }
+            None => Vec::new(),
+        }
+    }
+
+    // presence, independent of row content (an explicitly-materialized empty
+    // cell reads differently from an absent one -- op_run_rules' passHeads
+    // fallback gate needs exactly this distinction).
+    fn has_cell(&self, name: &Leaf) -> bool {
+        self.active.contains_key(&Self::key(name))
+    }
+
+    // ast:Store (Backus 13.3.4): pop the topmost same-named cell, prepend the
+    // new one at the front -- O(1) via the active index + the linked list, no
+    // Scott/native cons-list rebuild.
+    fn store(&mut self, name: &Leaf, contents: V) {
+        let k = Self::key(name);
+        if let Some(idx) = self.active.remove(&k) {
+            self.unlink(idx);
+        }
+        let idx = self.alloc(FSNode {
+            name: name.clone(),
+            content: contents,
+            ncache: RefCell::new(None),
+            prev: None,
+            next: None,
+        });
+        self.push_front(idx);
+        self.active.insert(k, idx);
+        *self.whole.borrow_mut() = None;
+    }
+
+    // the reassembly's setcell: replace in place when present, append at the
+    // end when absent -- never moves an existing cell (setcell_into's own
+    // comment: Store's re-top would reorder the dump against python here).
+    fn setcell(&mut self, name: &Leaf, contents: V) {
+        let k = Self::key(name);
+        if let Some(&idx) = self.active.get(&k) {
+            let node = self.nodes[idx].as_mut().unwrap();
+            node.content = contents;
+            node.ncache = RefCell::new(None);
+        } else {
+            let idx = self.alloc(FSNode {
+                name: name.clone(),
+                content: contents,
+                ncache: RefCell::new(None),
+                prev: None,
+                next: None,
+            });
+            self.push_back(idx);
+            self.active.insert(k, idx);
+        }
+        *self.whole.borrow_mut() = None;
+    }
+
+    fn node_native(&self, idx: usize) -> N {
+        let node = self.nodes[idx].as_ref().unwrap();
+        {
+            let cache = node.ncache.borrow();
+            if let Some(n) = cache.as_ref() {
+                return n.clone();
+            }
+        }
+        let n = v_to_n(&node.content);
+        *node.ncache.borrow_mut() = Some(n.clone());
+        n
+    }
+
+    fn rebuild_whole(&self) {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut pairs: Vec<(Leaf, N)> = Vec::new();
+        let mut triples: Vec<N> = Vec::new();
+        for idx in self.iter_indices() {
+            let (name, n) = {
+                let node = self.nodes[idx].as_ref().unwrap();
+                (node.name.clone(), self.node_native(idx))
+            };
+            triples.push(N::S(Rc::new(vec![
+                N::A(Rc::new(Leaf::S("CELL".to_string()))),
+                N::A(Rc::new(name.clone())),
+                n.clone(),
+            ])));
+            if seen.insert(Self::key(&name)) {
+                pairs.push((name, n));
+            }
+        }
+        *self.whole.borrow_mut() = Some((Rc::new(pairs), N::S(Rc::new(triples))));
+    }
+
+    // the native carrier's view: a monolithic Vec<(Leaf,N)> (DEFS, first match
+    // wins) and the whole-store N (the rule-evaluation operand) -- NEval's
+    // existing contract, untouched; only rebuilt on the first ask since the
+    // last write (any write invalidates both at once, since they are one
+    // gather over the same list).
+    fn ncells_native(&self) -> Rc<Vec<(Leaf, N)>> {
+        if self.whole.borrow().is_none() {
+            self.rebuild_whole();
+        }
+        self.whole.borrow().as_ref().unwrap().0.clone()
+    }
+
+    fn nd_native(&self) -> N {
+        if self.whole.borrow().is_none() {
+            self.rebuild_whole();
+        }
+        self.whole.borrow().as_ref().unwrap().1.clone()
+    }
+
+    // rule-body evaluation, routed through FastStore's own native view (the
+    // spec's "eval_rules routes through FastStore" -- neval_rule/eval_rules
+    // themselves are untouched; FastStore only supplies their operands).
+    fn eval_full(&self, nprocess: &[(String, N)], rid: &Leaf) -> V {
+        let ncells = self.ncells_native();
+        let nd = self.nd_native();
+        neval_rule(&ncells, nprocess, &nd, rid, nd.clone())
+    }
+
+    fn eval_delta(&self, nprocess: &[(String, N)], variant: &Leaf, drows_n: Vec<N>) -> V {
+        let ncells = self.ncells_native();
+        let nd = self.nd_native();
+        let operand = N::S(Rc::new(vec![N::S(Rc::new(drows_n)), nd.clone()]));
+        neval_rule(&ncells, nprocess, &nd, variant, operand)
+    }
+
+    fn eval_rules_many(&self, nprocess: &[(String, N)], rids: &[Leaf]) -> Vec<V> {
+        let ncells = self.ncells_native();
+        let nd = self.nd_native();
+        eval_rules(&ncells, nprocess, &nd, rids)
+    }
+
+    // a fresh NEval over the current view, for call sites that build one
+    // directly (the reassembly's canon-first partition fallback).
+    fn build_neval(&self, process: Vec<(String, N)>) -> NEval {
+        let ncells = self.ncells_native();
+        let nd = self.nd_native();
+        NEval {
+            cells: (*ncells).clone(),
+            process,
+            defs_n: nd,
+            fuel: std::cell::Cell::new(-1),
+        }
+    }
+
+    // EXIT conversion (paid once): every physical cell, active or shadow, head
+    // to tail -- cells_to_d's own input shape, so d comes back exactly as
+    // raw_cells_of would re-read it.
+    fn to_all_cells(&self) -> Vec<(Leaf, V)> {
+        self.iter_indices()
+            .into_iter()
+            .map(|idx| {
+                let node = self.nodes[idx].as_ref().unwrap();
+                (node.name.clone(), node.content.clone())
+            })
+            .collect()
+    }
+
+    // the active (first-match) view, srv.cells' own contract (cells_of's
+    // dedup, in current dump order).
+    fn to_active_cells(&self) -> Vec<(Leaf, V)> {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for idx in self.iter_indices() {
+            let node = self.nodes[idx].as_ref().unwrap();
+            if seen.insert(Self::key(&node.name)) {
+                out.push((node.name.clone(), node.content.clone()));
+            }
+        }
+        out
+    }
+}
+
 // eval_rules is engine.py's _eval_rules (line 1188): the UNION of the given
 // rules' outputs over the store, deduplicated by row key in first-seen order
 // and keeping only sequence rows (Python keeps only tuples). It is the shared
@@ -3426,18 +3785,14 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
             )
         }
     };
-    let mut d = srv.d.clone();
-    let mut cells = srv.cells.clone();
-    // The native view of the current store, seeded from the resident mirror
-    // (coherent by the write-site audit, 2026-07-08 — every store replacement
-    // refreshes it, so the fresh v_to_n rebuild this seed used to pay is gone).
-    // Every rule body evaluates through the native carrier NEval over this view
-    // instead of the Scott mu, the measured fast path, and store_into keeps it
-    // in lockstep with d/cells so a head is visible to later rules the instant
-    // it is stored. The resident process defs carry the compiled canon; a
-    // hand-built store without them falls through to NCANON in NEval.
-    let mut nd = srv.nd.clone();
-    let mut ncells = srv.ncells.clone();
+    // FastStore (#35, the store twin, docs/2026-07-11-store-twin-spec.md): ONE
+    // store for the round loop, built once at entry (raw_cells_of, duplicates
+    // preserved) and converted back once at exit. Every rule body still
+    // evaluates through NEval/the native carrier -- FastStore only supplies its
+    // ncells/nd operands (eval_full/eval_delta/eval_rules_many/build_neval), so
+    // the reduction semantics are byte-for-byte what they were; only the
+    // bookkeeping around them changed representation.
+    let mut store = FastStore::from_srv(srv);
     let nprocess = srv.nprocess.clone();
     let mut changed: BTreeSet<String> = BTreeSet::new();
     let leaf = |s: &str| Leaf::S(s.to_string());
@@ -3446,7 +3801,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     // rules through it, round one intersects it with the frontier, and the
     // later rounds' full fallback intersects it with the delta.
     let mut reads: HashMap<String, HashSet<String>> = HashMap::new();
-    for r in pop_rows(&cells, &leaf("ruleReads")) {
+    for r in store.pop_rows(&leaf("ruleReads")) {
         let it = items(&list_of(&r));
         if it.len() >= 2 {
             reads.entry(key_of(&it[0])).or_default().insert(key_of(&it[1]));
@@ -3466,7 +3821,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     const MIRROR: &str = "Resource_is_instance_of_Noun";
     if any_reads(MIRROR) {
         let mut nouns: HashSet<String> = HashSet::new();
-        for r in pop_rows(&cells, &leaf("instanceOf")) {
+        for r in store.pop_rows(&leaf("instanceOf")) {
             let it = items(&list_of(&r));
             if it.len() >= 2
                 && matches!(aval(&it[1]).as_deref(), Some(Leaf::S(s)) if s == "ObjectType")
@@ -3480,7 +3835,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
         // faulted on it, and the resident must not)
         let mut order: Vec<V> = Vec::new();
         let mut groups: HashMap<String, Vec<(usize, V)>> = HashMap::new();
-        for r in pop_rows(&cells, &leaf("role")) {
+        for r in store.pop_rows(&leaf("role")) {
             let it = items(&list_of(&r));
             if it.len() >= 4 {
                 if let Some(Leaf::I(p)) = aval(&it[2]).as_deref() {
@@ -3507,7 +3862,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                             Some(l) => (*l).clone(),
                             None => continue,
                         };
-                        ft_rows = Some(pop_rows(&cells, &name));
+                        ft_rows = Some(store.pop_rows(&name));
                     }
                     for row in ft_rows.as_ref().unwrap() {
                         let rit = items(&list_of(row));
@@ -3522,9 +3877,9 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 }
             }
         }
-        if !out.is_empty() && pop_rows(&cells, &leaf(MIRROR)).is_empty() {
+        if !out.is_empty() && store.pop_rows(&leaf(MIRROR)).is_empty() {
             sort_rows(&mut out);
-            store_into(&mut d, &mut cells, &mut nd, &mut ncells, &leaf(MIRROR), seq(from_vec(out)));
+            store.store(&leaf(MIRROR), seq(from_vec(out)));
             changed.insert(MIRROR.to_string());
         }
     }
@@ -3534,7 +3889,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     if any_reads(FTR) {
         let mut out: Vec<V> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
-        for r in pop_rows(&cells, &leaf("role")) {
+        for r in store.pop_rows(&leaf("role")) {
             let it = items(&list_of(&r));
             if it.len() >= 2 {
                 let pair = seq(from_vec(vec![it[1].clone(), it[0].clone()]));
@@ -3543,9 +3898,9 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 }
             }
         }
-        if !out.is_empty() && pop_rows(&cells, &leaf(FTR)).is_empty() {
+        if !out.is_empty() && store.pop_rows(&leaf(FTR)).is_empty() {
             sort_rows(&mut out);
-            store_into(&mut d, &mut cells, &mut nd, &mut ncells, &leaf(FTR), seq(from_vec(out)));
+            store.store(&leaf(FTR), seq(from_vec(out)));
             changed.insert(FTR.to_string());
         }
     }
@@ -3554,7 +3909,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     // the DEFS cell named "<rule id>~d<position>", exactly the name Python
     // formats
     let mut atomsof: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    for r in pop_rows(&cells, &leaf("ruleAtom")) {
+    for r in store.pop_rows(&leaf("ruleAtom")) {
         let it = items(&list_of(&r));
         if it.len() >= 3 {
             if let Some(p) = aval(&it[1]) {
@@ -3571,7 +3926,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     // head supersedes instead of unioning, so the closure must never run
     // one)
     let mut aggids: HashSet<String> = HashSet::new();
-    for r in pop_rows(&cells, &leaf("ruleAgg")) {
+    for r in store.pop_rows(&leaf("ruleAgg")) {
         let it = items(&list_of(&r));
         if !it.is_empty() {
             aggids.insert(key_of(&it[0]));
@@ -3585,7 +3940,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     }
     let mut rules: Vec<RuleRow> = Vec::new();
     let mut agg_rules: Vec<RuleRow> = Vec::new();
-    for r in pop_rows(&cells, &leaf("ruleDerives")) {
+    for r in store.pop_rows(&leaf("ruleDerives")) {
         let it = items(&list_of(&r));
         if it.len() >= 2 {
             if let (Some(rid), Some(head)) = (aval(&it[0]), aval(&it[1])) {
@@ -3621,8 +3976,8 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
         let mut fired = false;
         let mut next_delta: HashMap<String, Vec<V>> = HashMap::new();
         for rr in &rules {
-            let full = |nd: &N, ncells: &Vec<(Leaf, N)>| -> Option<Vec<V>> {
-                let res = neval_rule(ncells, &nprocess, nd, &rr.rid, nd.clone());
+            let full = |store: &FastStore, rid: &Leaf| -> Option<Vec<V>> {
+                let res = store.eval_full(&nprocess, rid);
                 match shape(&res) {
                     Shape::Seq(l) => Some(items(&l)),
                     // the rule is not compiled (M-facts only) or bottomed
@@ -3640,7 +3995,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                             continue;
                         }
                     }
-                    match full(&nd, &ncells) {
+                    match full(&store, &rr.rid) {
                         Some(c) => c,
                         None => continue,
                     }
@@ -3668,11 +4023,12 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                             // rows, D⟩ exactly: a two-element SEQ of the delta rows
                             // as N and the maintained native store, built directly
                             // so D is not re-converted each hit. seq never collapses
-                            // on bottom, so the rows use N::S, not nseq.
+                            // on bottom, so the rows use N::S, not nseq. Routed
+                            // through FastStore's own eval_delta -- same
+                            // neval_rule call, same operand shape, the store just
+                            // supplies ncells/nd from its own cache now.
                             let drows_n: Vec<N> = drows.iter().map(v_to_n).collect();
-                            let operand =
-                                N::S(Rc::new(vec![N::S(Rc::new(drows_n)), nd.clone()]));
-                            let res = neval_rule(&ncells, &nprocess, &nd, &vid, operand);
+                            let res = store.eval_delta(&nprocess, &vid, drows_n);
                             if let Shape::Seq(l) = shape(&res) {
                                 c.extend(items(&l));
                             }
@@ -3685,7 +4041,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                     {
                         // a rule without atom facts falls back to its full
                         // body in rounds where its reads changed
-                        match full(&nd, &ncells) {
+                        match full(&store, &rr.rid) {
                             Some(c) => c,
                             None => continue,
                         }
@@ -3699,7 +4055,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                         // The compiler records ruleReads for every rule it
                         // compiles, so on compiled stores this branch never
                         // fires and the loop is exactly Python's.
-                        match full(&nd, &ncells) {
+                        match full(&store, &rr.rid) {
                             Some(c) => c,
                             None => continue,
                         }
@@ -3708,7 +4064,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                     }
                 }
             };
-            let old = pop_rows(&cells, &rr.head);
+            let old = store.pop_rows(&rr.head);
             let mut merged: Vec<V> = Vec::new();
             let mut keys: HashSet<String> = HashSet::new();
             for r in &old {
@@ -3729,7 +4085,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
             }
             if !added.is_empty() {
                 sort_rows(&mut merged);
-                store_into(&mut d, &mut cells, &mut nd, &mut ncells, &rr.head, seq(from_vec(merged)));
+                store.store(&rr.head, seq(from_vec(merged)));
                 fired = true;
                 changed.insert(leaf_text(&rr.head));
                 closure_keys.insert(rr.head_key.clone());
@@ -3800,10 +4156,8 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     // run time, which is what run_rules does anyway") — see the fallback
     // block after `reach` below. A PRESENT-but-empty cell is an
     // explicitly-materialized empty schedule and is honored as before.
-    let has_passheads_cell = cells
-        .iter()
-        .any(|(k, _)| matches!(k, Leaf::S(s) if s == "passHeads"));
-    for r in pop_rows(&cells, &leaf("passHeads")) {
+    let has_passheads_cell = store.has_cell(&leaf("passHeads"));
+    for r in store.pop_rows(&leaf("passHeads")) {
         let it = items(&list_of(&r));
         if it.len() >= 2 {
             let p = match aval(&it[0]).as_deref() {
@@ -3841,7 +4195,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     // ⟨constraint id, position⟩). A BTreeSet keeps positions sorted, so the
     // keyed key reads columns in Python's sorted(keyspans[head]) order.
     let mut spans_of: HashMap<String, BTreeSet<i64>> = HashMap::new();
-    for r in pop_rows(&cells, &leaf("spans")) {
+    for r in store.pop_rows(&leaf("spans")) {
         let it = items(&list_of(&r));
         if it.len() >= 2 {
             if let Some(Leaf::I(p)) = aval(&it[1]).as_deref() {
@@ -3853,7 +4207,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     // spanning_uniqueness constraints (constraint rows are ⟨constraint id,
     // kind, fact type, ..⟩). A fact type with a key span is a keyed head.
     let mut keyspans: HashMap<String, BTreeSet<i64>> = HashMap::new();
-    for c in pop_rows(&cells, &leaf("constraint")) {
+    for c in store.pop_rows(&leaf("constraint")) {
         let it = items(&list_of(&c));
         if it.len() >= 3 {
             let is_uc = matches!(aval(&it[1]).as_deref(),
@@ -3929,7 +4283,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
         // pass_sweep/pass_dred differs transiently (classify_heads_native
         // sorts by head text), which is moot since the sweep/sweep_cyclic
         // construction just below re-sorts by leaf text anyway.
-        let hc = classify_heads_native(&cells);
+        let hc = classify_heads_native(&store.to_active_cells());
         for (hk, _) in &hc.keyed {
             pass_keyed.insert(hk.clone());
         }
@@ -3990,7 +4344,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     // doctrine literals when a store lacks the cells. Unknown pass names
     // skip (forward compatibility).
     let mut pass_order: Vec<(i64, String)> = Vec::new();
-    for r in pop_rows(&cells, &leaf("passOrder")) {
+    for r in store.pop_rows(&leaf("passOrder")) {
         let it = items(&list_of(&r));
         if it.len() >= 2 {
             // the pass NAME must extract as the bare string (key_of would
@@ -4014,7 +4368,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
         pass_order.into_iter().map(|(_i, p)| p).collect()
     };
     let mut bound: i64 = 12;
-    for r in pop_rows(&cells, &leaf("passBound")) {
+    for r in store.pop_rows(&leaf("passBound")) {
         let it = items(&list_of(&r));
         if !it.is_empty() {
             if let Some(Leaf::I(n)) = aval(&it[0]).as_deref() {
@@ -4043,7 +4397,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                     continue;
                 }
             }
-            let res = neval_rule(&ncells, &nprocess, &nd, &rr.rid, nd.clone());
+            let res = store.eval_full(&nprocess, &rr.rid);
             let outs = match shape(&res) {
                 Shape::Seq(l) => items(&l),
                 // an uncompiled aggregate (M-facts only) stores nothing
@@ -4056,7 +4410,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                     merged.push(r.clone());
                 }
             }
-            let before = pop_rows(&cells, &rr.head);
+            let before = store.pop_rows(&rr.head);
             let mut before_keys: HashSet<String> = HashSet::new();
             let mut before_rows: Vec<V> = Vec::new();
             for r in &before {
@@ -4069,7 +4423,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 // rows ARE the cell; nothing older survives
                 for rid in plain_of.get(&rr.head_key).map(|v| v.as_slice()).unwrap_or(&[])
                 {
-                    let res = neval_rule(&ncells, &nprocess, &nd, rid, nd.clone());
+                    let res = store.eval_full(&nprocess, rid);
                     if let Shape::Seq(l) = shape(&res) {
                         for r in items(&l) {
                             if matches!(shape(&r), Shape::Seq(_))
@@ -4097,7 +4451,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 round_changed.insert(rr.head_key.clone());
                 changed.insert(leaf_text(&rr.head));
                 sort_rows(&mut merged);
-                store_into(&mut d, &mut cells, &mut nd, &mut ncells, &rr.head, seq(from_vec(merged)));
+                store.store(&rr.head, seq(from_vec(merged)));
             }
         }
                 }
@@ -4122,12 +4476,12 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 }
             }
             let rids: Vec<Leaf> = rls.iter().map(|(rid, _)| rid.clone()).collect();
-            let outs = eval_rules(&ncells, &nprocess, &nd, &rids);
+            let outs = store.eval_rules_many(&nprocess, &rids);
             let mut prod_keys: HashSet<String> = HashSet::new();
             for r in &outs {
                 prod_keys.insert(keyed_key(r, key_pos));
             }
-            let stored = pop_rows(&cells, hl);
+            let stored = store.pop_rows(hl);
             let mut merged: Vec<V> = Vec::new();
             let mut mkeys: HashSet<String> = HashSet::new();
             for r in &outs {
@@ -4152,7 +4506,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 round_changed.insert(hk.clone());
                 changed.insert(leaf_text(hl));
                 sort_rows(&mut merged);
-                store_into(&mut d, &mut cells, &mut nd, &mut ncells, hl, seq(from_vec(merged)));
+                store.store(hl, seq(from_vec(merged)));
             }
         }
                 }
@@ -4169,8 +4523,8 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 continue;
             }
             let rids = plain_of.get(hk).map(|v| v.as_slice()).unwrap_or(&[]);
-            let outs = eval_rules(&ncells, &nprocess, &nd, rids);
-            let stored = pop_rows(&cells, hl);
+            let outs = store.eval_rules_many(&nprocess, rids);
+            let stored = store.pop_rows(hl);
             let mut oks: HashSet<String> = HashSet::new();
             for r in &outs {
                 oks.insert(key_of(r));
@@ -4186,7 +4540,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 changed.insert(leaf_text(hl));
                 let mut m = outs;
                 sort_rows(&mut m);
-                store_into(&mut d, &mut cells, &mut nd, &mut ncells, hl, seq(from_vec(m)));
+                store.store(hl, seq(from_vec(m)));
             }
         }
                 }
@@ -4204,12 +4558,12 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
             if !touched_by(rs.iter(), &dirty, &round_changed) {
                 continue;
             }
-            let stored = pop_rows(&cells, hl);
+            let stored = store.pop_rows(hl);
             let mut cur_keys: HashSet<String> = HashSet::new();
             for r in &stored {
                 cur_keys.insert(key_of(r));
             }
-            store_into(&mut d, &mut cells, &mut nd, &mut ncells, hl, seq(from_vec(Vec::new())));
+            store.store(hl, seq(from_vec(Vec::new())));
             let rids: Vec<Leaf> = plain_of.get(hk).cloned().unwrap_or_default();
             let mut prev: Option<HashSet<String>> = None;
             let mut outs_keys: HashSet<String> = HashSet::new();
@@ -4218,11 +4572,11 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                     break;
                 }
                 prev = Some(outs_keys.clone());
-                let outs = eval_rules(&ncells, &nprocess, &nd, &rids);
+                let outs = store.eval_rules_many(&nprocess, &rids);
                 outs_keys = outs.iter().map(|r| key_of(r)).collect();
                 let mut m = outs;
                 sort_rows(&mut m);
-                store_into(&mut d, &mut cells, &mut nd, &mut ncells, hl, seq(from_vec(m)));
+                store.store(hl, seq(from_vec(m)));
             }
             let same = outs_keys.len() == cur_keys.len()
                 && outs_keys.iter().all(|k| cur_keys.contains(k));
@@ -4255,7 +4609,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     {
         let mut layout: HashMap<String, (String, usize)> = HashMap::new();
         let mut widths: HashMap<String, usize> = HashMap::new();
-        for r in pop_rows(&cells, &leaf("rmapColumns")) {
+        for r in store.pop_rows(&leaf("rmapColumns")) {
             let it = items(&list_of(&r));
             if it.len() >= 3 {
                 if let (Some(t), Some(Leaf::I(c)), Some(f)) =
@@ -4281,14 +4635,10 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
             // lacks it — derive the same layout canon-first: system:partition
             // over D, then system:table_columns per absorbed table, the same
             // ⟨table, 2+j, ft⟩ rows layout_cells would write (engine.py:1701).
-            let ev = NEval {
-                cells: ncells.clone(),
-                process: srv.nprocess.clone(),
-                defs_n: nd.clone(),
-                fuel: std::cell::Cell::new(-1),
-            };
+            let ev = store.build_neval(srv.nprocess.clone());
             let na = |s: &str| N::A(std::rc::Rc::new(Leaf::S(s.into())));
-            let pairs_v = n_to_v(&ev.mu(napp(na("system:partition"), nd.clone())));
+            let nd_v = store.nd_native();
+            let pairs_v = n_to_v(&ev.mu(napp(na("system:partition"), nd_v)));
             // ⟨table, ft⟩ pairs in canon order; part: ft → table (engine.py:1685)
             let mut part: Vec<(String, String)> = Vec::new();
             if let Shape::Seq(l) = shape(&pairs_v) {
@@ -4335,7 +4685,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
         if !layout.is_empty() {
             // unary heads write "T"; the role rows carry each head's arity
             let mut maxpos: HashMap<String, i64> = HashMap::new();
-            for r in pop_rows(&cells, &leaf("role")) {
+            for r in store.pop_rows(&leaf("role")) {
                 let it = items(&list_of(&r));
                 if it.len() >= 4 {
                     if let (Some(f), Some(Leaf::I(p))) =
@@ -4375,7 +4725,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 let unary = maxpos.get(ftname).copied() == Some(1);
                 // want: key text → ⟨key atom, the value the column must carry⟩
                 let mut want: HashMap<String, (V, V)> = HashMap::new();
-                for r in pop_rows(&cells, &leaf(ftname)) {
+                for r in store.pop_rows(&leaf(ftname)) {
                     let it = items(&list_of(&r));
                     if it.is_empty() {
                         continue;
@@ -4394,7 +4744,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                     want.insert(kt, (it[0].clone(), v));
                 }
                 let tleaf = leaf(&table);
-                let mut tbl = pop_rows(&cells, &tleaf);
+                let mut tbl = store.pop_rows(&tleaf);
                 // every indexed key gets its column written or holed; a
                 // duplicate index entry visits once, as Python's key set does
                 let mut seen: HashSet<String> = HashSet::new();
@@ -4413,7 +4763,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                 for kt in visits {
                     let v = want.remove(&kt).map(|(_, v)| v).unwrap_or_else(hole);
                     let rc = Leaf::S(format!("{}:{}", table, kt));
-                    let mut row = pop_rows(&cells, &rc);
+                    let mut row = store.pop_rows(&rc);
                     if row.is_empty() {
                         row = vec![atom(Leaf::S(kt.clone()))];
                     }
@@ -4422,7 +4772,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                     }
                     if !eqobj(&row[col - 1], &v) {
                         row[col - 1] = v;
-                        setcell_into(&mut d, &mut cells, &mut nd, &mut ncells, &rc,
+                        store.setcell(&rc,
                                    seq(from_vec(row)));
                     }
                 }
@@ -4444,7 +4794,7 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                         None => continue,
                     };
                     let rc = Leaf::S(format!("{}:{}", table, kt));
-                    let mut row = pop_rows(&cells, &rc);
+                    let mut row = store.pop_rows(&rc);
                     if row.is_empty() {
                         row = vec![ka.clone()];
                     }
@@ -4452,12 +4802,12 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
                         row.push(hole());
                     }
                     row[col - 1] = v;
-                    setcell_into(&mut d, &mut cells, &mut nd, &mut ncells, &rc,
+                    store.setcell(&rc,
                                seq(from_vec(row)));
                     tbl.push(seq(from_vec(vec![ka])));
                 }
                 if grew {
-                    setcell_into(&mut d, &mut cells, &mut nd, &mut ncells, &tleaf,
+                    store.setcell(&tleaf,
                                seq(from_vec(tbl)));
                 }
             }
@@ -4469,10 +4819,10 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     // already IS the fixpoint; ncells rebuilds from it once so its canonical
     // order matches n_cells_of). Keeping the mirror current here means a native
     // machine step after a derive reads the derived store, not a stale one.
-    srv.d = d;
-    srv.cells = cells;
-    srv.nd = nd;
-    srv.ncells = n_cells_of(&srv.nd);
+    srv.d = cells_to_d(&store.to_all_cells());
+    srv.cells = store.to_active_cells();
+    srv.nd = store.nd_native();
+    srv.ncells = (*store.ncells_native()).clone();
     let mut r = String::from("{\"rounds\":");
     r.push_str(&rounds.to_string());
     r.push_str(",\"changed\":[");
