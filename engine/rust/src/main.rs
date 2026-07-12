@@ -10878,8 +10878,29 @@ fn op_answer(op: &str, j: &J, srv: &mut Srv) -> Result<String, String> {
                 Some(a) => a,
                 None => return Err("query needs a scalar fact_type".to_string()),
             };
-            let f = mkapp(atom(Leaf::S("ast:FetchPop".into())), ft.clone());
-            let res = reduce_over(srv, f, srv.d.clone(), fuel);
+            // FAST NATIVE OVERRIDE (#35, "register a fast override for the slow
+            // interpreted part"): the interpreted reduce_over(FetchPop) walks the
+            // whole Scott D list per read -- ~26 s for a cell deep in a 4 MB store
+            // (measured on the tasks app's derived-fact cells; stored facts near
+            // the list front were instant) while a native first-match is
+            // microseconds. FetchPop's canon contract is exactly first-match-of-
+            // name's contents, else PHI (ast:FetchPop = COND(Fetch==#, PHI,
+            // Fetch)), so cells_of(D)'s first match by nateq is byte-identical.
+            // AREST_QUERY_INTERPRETED forces the canon path (the differential
+            // oracle the byte-equality is certified against).
+            let res = if std::env::var_os("AREST_QUERY_INTERPRETED").is_some() {
+                let f = mkapp(atom(Leaf::S("ast:FetchPop".into())), ft.clone());
+                reduce_over(srv, f, srv.d.clone(), fuel)
+            } else {
+                match aval(&ft) {
+                    Some(name) => cells_of(&srv.d)
+                        .into_iter()
+                        .find(|(k, _)| k.nateq(name.as_ref()))
+                        .map(|(_, contents)| contents)
+                        .unwrap_or_else(phi),
+                    None => phi(),
+                }
+            };
             let mut r = String::from("{\"fact_type\":");
             write_v(&ft, &mut r);
             r.push_str(",\"rows\":");
