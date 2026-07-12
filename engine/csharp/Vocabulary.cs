@@ -40,14 +40,12 @@ static partial class Canon
                      object g, object h, object i)
         => new[] { a, b, c, d, e, f, g, h, i };
 
-    // Load order is the discipline's: theta, constraints, ast, system.
+    // One merged file (arest.canon); discipline order is preserved WITHIN it:
+    // theta, constraints, ast, system.
     internal static List<KeyValuePair<string, object>> LoadAll()
     {
         Defs.Clear();
-        LoadTheta();
-        LoadConstraints();
-        LoadAst();
-        LoadSystem();
+        LoadArest();
         return Defs;
     }
 }

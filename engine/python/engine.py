@@ -283,7 +283,7 @@ def run_append(fact, D, cell_name="FILE"):
 # value), else #. SYSTEM : ⟨⟨entity, op⟩, D⟩ → apply:⟨↑entity:D, ⟨op, D⟩⟩. Both are
 # the CANON's (shared/ast.canon, eq. sys verbatim); this module binds them.
 from . import canon as _canon
-_C = dict(_canon.read("ast.canon"))
+_C = dict(_canon.read("arest.canon"))
 
 
 def DynFetch():
@@ -468,7 +468,7 @@ def _canon_c(name):
     global _CC
     if _CC is None:
         from . import canon as _canon
-        _CC = dict(_canon.read("constraints.canon"))
+        _CC = dict(_canon.read("arest.canon"))
     return _CC[name]
 
 

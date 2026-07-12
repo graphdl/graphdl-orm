@@ -23,32 +23,17 @@
        of a varargs method call by BYTE CONCATENATION (prefix + file + suffix),
        never parsing. The same bytes CPython execs and rustc tokenizes. -->
   <Target Name="WrapCanon" BeforeTargets="CoreCompile"
-          Inputs="../shared/theta.canon;../shared/constraints.canon;../shared/ast.canon;../shared/system.canon;../shared/scenarios.canon"
+          Inputs="../shared/arest.canon;../shared/scenarios.canon"
           Outputs="$(IntermediateOutputPath)Canon.g.cs">
     <PropertyGroup>
-      <CanonTheta>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/theta.canon'))</CanonTheta>
-      <CanonConstraints>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/constraints.canon'))</CanonConstraints>
-      <CanonAst>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/ast.canon'))</CanonAst>
-      <CanonSystem>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/system.canon'))</CanonSystem>
+      <CanonArest>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/arest.canon'))</CanonArest>
       <CanonScenarios>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/scenarios.canon'))</CanonScenarios>
       <CanonWrapped>namespace Arestlam%3B
 
 static partial class Canon
 {
-    static object LoadTheta() =&gt; T
-$(CanonTheta)
-%3B
-
-    static object LoadConstraints() =&gt; T
-$(CanonConstraints)
-%3B
-
-    static object LoadAst() =&gt; T
-$(CanonAst)
-%3B
-
-    static object LoadSystem() =&gt; T
-$(CanonSystem)
+    static object LoadArest() =&gt; T
+$(CanonArest)
 %3B
 
     internal static object LoadScenarios() =&gt; T

@@ -94,7 +94,7 @@ def read_native(name):
     return out
 
 
-def load(name="theta.canon"):
+def load(name="arest.canon"):
     """Consume a shared intersection file: exec under BOTH vocabularies, register
     each definition with its native twin (the fast path's store then skips the
     Scott boundary for canonical names). Returns the names, in file order."""
@@ -108,8 +108,7 @@ def load(name="theta.canon"):
 def load_all():
     """Every intersection file, in dependency order (constraints, ast, and system
     reference theta; system's pipeline references ast)."""
-    return (load("theta.canon") + load("constraints.canon") + load("ast.canon")
-            + load("system.canon"))
+    return load("arest.canon")
 
 
 # --- Codd's adequate collection theta1 (Codd §2.2), from theta.canon: the Python
@@ -119,7 +118,7 @@ def load_all():
 # with the package, so the names resolve). Nothing is defined twice: this half
 # binds, it does not author. "Navigation needs no separate query language" —
 # each operator is a rho-application over the population P. ---
-_C = dict(read("theta.canon"))                                  # the shared file, verbatim
+_C = dict(read("arest.canon"))                                  # the shared file, verbatim
 
 member = _C["theta:member"]
 dedup = _C["theta:dedup"]

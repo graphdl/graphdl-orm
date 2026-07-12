@@ -13140,10 +13140,7 @@ fn canon_defs() -> Vec<(String, V)> {
         let S7 = |a: V, b: V, c: V, d: V, e: V, f: V, g: V| seqv(vec![a, b, c, d, e, f, g]);
         let S8 = |a: V, b: V, c: V, d: V, e: V, f: V, g: V, h: V| seqv(vec![a, b, c, d, e, f, g, h]);
         let S9 = |a: V, b: V, c: V, d: V, e: V, f: V, g: V, h: V, i: V| seqv(vec![a, b, c, d, e, f, g, h, i]);
-        include!("../../shared/theta.canon");
-        include!("../../shared/constraints.canon");
-        include!("../../shared/ast.canon");
-        include!("../../shared/system.canon");
+        include!("../../shared/arest.canon");
     }
     out.into_inner()
 }

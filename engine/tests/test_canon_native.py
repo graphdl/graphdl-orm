@@ -10,7 +10,7 @@ from pyarest import canon, delta
 
 
 def test_the_native_vocabulary_matches_the_boundary_conversion():
-    for fname in ("theta.canon", "constraints.canon", "ast.canon", "system.canon"):
+    for fname in ("arest.canon",):
         canonical = dict(canon.read(fname))
         native = dict(canon.read_native(fname))
         assert set(native) == set(canonical), fname
