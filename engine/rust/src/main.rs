@@ -1331,6 +1331,265 @@ fn n_eq(a: &N, b: &N) -> bool {
     }
 }
 
+// ============================ theta native arms (#35 Stage C) =================
+// The join/set vocabulary of theta.canon reduces fully INTERPRETED through the
+// FP reducer today: theta:NatJoin's built term (embedded in every compiled
+// rule body by system:compile_rule / compile_rule_delta / compile_agg_rule at
+// COMPILE time) runs an O(n*m) distr/distl/Filter nested loop with ~10 mu
+// recursions of combinator interpretation per row pair, and the helper atoms
+// (theta:flatten, theta:append_phi, theta:join_combine, theta:dedup,
+// theta:member) each re-reduce their canon bodies per call — INSERT(cat) and
+// INSERT(member-cond) folds that are quadratic in their own right. These arms
+// are certified-equal native overrides at the SAME two seams the engine
+// already uses for exactly this pattern (the FAST table on the Scott side,
+// the system:vb_fetch canon-NAMED arm on the native side): the canon stays
+// the spec, the arm exists for speed only, and the differential (property
+// tests here + the standing corpus byte-compare) is the certification.
+//
+// AREST_NO_THETA_ARMS=1 disables every arm (and the property tests flip the
+// same switch per-thread to reduce their oracle side through the interpreted
+// path) — the reduction then runs exactly as before this slice.
+thread_local! {
+    static THETA_ARMS_OFF: std::cell::Cell<bool> =
+        std::cell::Cell::new(std::env::var_os("AREST_NO_THETA_ARMS").is_some());
+}
+fn theta_arms_off() -> bool {
+    THETA_ARMS_OFF.with(|c| c.get())
+}
+#[cfg(test)]
+fn set_theta_arms_off(v: bool) {
+    THETA_ARMS_OFF.with(|c| c.set(v));
+}
+
+// n_join_key: a hash key over N that is FAITHFUL to n_eq (type-strict nateq at
+// the leaves: 1, 1.0 and "1" are three distinct keys; sequences recurse,
+// length-prefixed strings so no content imitates structure). NOT key_of /
+// set_key (those coalesce int/float per Python ==); the join's own equality
+// is the `eq` prim = n_eq, so the key mirrors n_eq exactly.
+fn n_join_key(n: &N, out: &mut String) {
+    match n {
+        N::A(l) => match &**l {
+            Leaf::S(s) => {
+                out.push('s');
+                out.push_str(&s.len().to_string());
+                out.push(':');
+                out.push_str(s);
+            }
+            Leaf::I(i) => {
+                out.push('I');
+                out.push_str(&i.to_string());
+            }
+            Leaf::F(f) => {
+                out.push('F');
+                out.push_str(&float_text(*f));
+            }
+            Leaf::AppTag => out.push('T'),
+        },
+        N::S(v) => {
+            out.push('(');
+            for e in v.iter() {
+                n_join_key(e, out);
+                out.push(',');
+            }
+            out.push(')');
+        }
+        N::Bot => out.push('!'),
+    }
+}
+
+fn na_is(n: &N, s: &str) -> bool {
+    matches!(n, N::A(l) if matches!(&**l, Leaf::S(t) if t == s))
+}
+fn na_int(n: &N) -> Option<i64> {
+    match n {
+        N::A(l) => match &**l {
+            Leaf::I(i) => Some(*i),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+// natjoin_config recognizes theta:NatJoin's BUILT term — the exact tree
+// apply(theta:NatJoin, c) constructs (dumped from the live engine, 2026-07-12:
+//   ["COMP","theta:flatten",
+//     ["ALPHA",["COMP",["ALPHA","theta:join_combine"],
+//               ["COMP",["INSERT",["COND",["COMP",["COMP","eq",
+//                        ["CONS",["COMP",c,1],["COMP",1,2]]],1],"apndl",2]],
+//                "theta:append_phi"],"distl"]],
+//    "distr"]
+// ) — and answers its join column c. The stored rule bodies embed this term
+// verbatim (compile time reduced it once); recognizing the SHAPE at the
+// application seam changes nothing observable — the stored term, its dump
+// bytes, and its meaning are untouched; only its reduction is the native
+// hash join below. Any deviation from the template (including a non-1..=32
+// column) answers None and the canonical interpreted path runs unchanged.
+fn natjoin_config(v: &[N]) -> Option<i64> {
+    // cheap gate first: COMP / theta:flatten / _ / distr, arity 4
+    if v.len() != 4
+        || !na_is(&v[0], "COMP")
+        || !na_is(&v[1], "theta:flatten")
+        || !na_is(&v[3], "distr")
+    {
+        return None;
+    }
+    let alpha = match &v[2] {
+        N::S(a) if a.len() == 2 && na_is(&a[0], "ALPHA") => a,
+        _ => return None,
+    };
+    let inner = match &alpha[1] {
+        N::S(i)
+            if i.len() == 4
+                && na_is(&i[0], "COMP")
+                && na_is(&i[3], "distl") =>
+        {
+            i
+        }
+        _ => return None,
+    };
+    match &inner[1] {
+        N::S(am) if am.len() == 2 && na_is(&am[0], "ALPHA") && na_is(&am[1], "theta:join_combine") => {}
+        _ => return None,
+    }
+    let filter = match &inner[2] {
+        N::S(f)
+            if f.len() == 3
+                && na_is(&f[0], "COMP")
+                && na_is(&f[2], "theta:append_phi") =>
+        {
+            f
+        }
+        _ => return None,
+    };
+    let insert = match &filter[1] {
+        N::S(i) if i.len() == 2 && na_is(&i[0], "INSERT") => i,
+        _ => return None,
+    };
+    let cond = match &insert[1] {
+        N::S(c)
+            if c.len() == 4
+                && na_is(&c[0], "COND")
+                && na_is(&c[2], "apndl")
+                && na_int(&c[3]) == Some(2) =>
+        {
+            c
+        }
+        _ => return None,
+    };
+    let predc = match &cond[1] {
+        N::S(p) if p.len() == 3 && na_is(&p[0], "COMP") && na_int(&p[2]) == Some(1) => p,
+        _ => return None,
+    };
+    let pred = match &predc[1] {
+        N::S(p) if p.len() == 3 && na_is(&p[0], "COMP") && na_is(&p[1], "eq") => p,
+        _ => return None,
+    };
+    let consp = match &pred[2] {
+        N::S(c) if c.len() == 3 && na_is(&c[0], "CONS") => c,
+        _ => return None,
+    };
+    let left = match &consp[1] {
+        N::S(l) if l.len() == 3 && na_is(&l[0], "COMP") && na_int(&l[2]) == Some(1) => l,
+        _ => return None,
+    };
+    let right = match &consp[2] {
+        N::S(r)
+            if r.len() == 3
+                && na_is(&r[0], "COMP")
+                && na_int(&r[1]) == Some(1)
+                && na_int(&r[2]) == Some(2) =>
+        {
+            r
+        }
+        _ => return None,
+    };
+    let _ = right;
+    let c = na_int(&left[1])?;
+    // the selector prim serves 1..=32 only; anything else must take the
+    // canonical path (whose own behavior for such a column differs)
+    if (1..=32).contains(&c) {
+        Some(c)
+    } else {
+        None
+    }
+}
+
+// natjoin_run executes the recognized join natively: the SAME rows in the
+// SAME order the canonical nested loop emits (outer A-major in A's order,
+// inner matches in B's order — a hash of B keyed on column 1, probed per A
+// row in sequence, preserves exactly that), with the canonical term's own
+// bottom semantics transcribed from the prim implementations:
+//   - operand not an exact pair, or A not a sequence: distr bottoms — Bot.
+//   - A empty: distr answers the empty list, ALPHA/flatten pass it — φ,
+//     B never inspected (even a non-sequence B).
+//   - B not a sequence (A nonempty): distl bottoms per element, the ALPHA's
+//     nseq collapses — Bot.
+//   - B empty: every per-a Filter folds to φ — φ, row shapes never checked.
+//   - both nonempty: the CONS pair ⟨a[c], b[1]⟩ evaluates BOTH selectors for
+//     EVERY pair (nseq collapses on either Bot), so ANY a not a seq of len
+//     ≥ c, or ANY b not a seq of len ≥ 1, bottoms the WHOLE join — checked
+//     up front over both sides.
+//   - survivors combine as a ++ b[1..] (theta:join_combine's cat∘⟨1,tl∘2⟩).
+fn natjoin_run(c: i64, x: &N) -> N {
+    let cu = c as usize;
+    let pair = match x {
+        N::S(v) if v.len() == 2 => v,
+        _ => return N::Bot,
+    };
+    let a_rows = match &pair[0] {
+        N::S(a) => a,
+        _ => return N::Bot,
+    };
+    if a_rows.is_empty() {
+        return N::S(Rc::new(Vec::new()));
+    }
+    let b_rows = match &pair[1] {
+        N::S(b) => b,
+        _ => return N::Bot,
+    };
+    if b_rows.is_empty() {
+        return N::S(Rc::new(Vec::new()));
+    }
+    // validity scan (the canonical fold evaluates every pair's selectors)
+    for a in a_rows.iter() {
+        match a {
+            N::S(r) if r.len() >= cu => {}
+            _ => return N::Bot,
+        }
+    }
+    for b in b_rows.iter() {
+        match b {
+            N::S(r) if !r.is_empty() => {}
+            _ => return N::Bot,
+        }
+    }
+    // hash B on column 1 (join key), bucket lists preserving B order
+    let mut idx: HashMap<String, Vec<&Rc<Vec<N>>>> = HashMap::with_capacity(b_rows.len());
+    for b in b_rows.iter() {
+        if let N::S(br) = b {
+            let mut k = String::new();
+            n_join_key(&br[0], &mut k);
+            idx.entry(k).or_default().push(br);
+        }
+    }
+    let mut out: Vec<N> = Vec::new();
+    for a in a_rows.iter() {
+        if let N::S(ar) = a {
+            let mut k = String::new();
+            n_join_key(&ar[cu - 1], &mut k);
+            if let Some(bs) = idx.get(&k) {
+                for br in bs {
+                    let mut row: Vec<N> = Vec::with_capacity(ar.len() + br.len() - 1);
+                    row.extend(ar.iter().cloned());
+                    row.extend(br[1..].iter().cloned());
+                    out.push(N::S(Rc::new(row)));
+                }
+            }
+        }
+    }
+    N::S(Rc::new(out))
+}
+
 struct NEval {
     cells: Vec<(Leaf, N)>,            // the step's DEFS-in-D, first match wins
     process: Vec<(String, N)>,        // compiled process defs (converted once)
@@ -1358,6 +1617,15 @@ impl NEval {
         match &f {
             N::S(v) => {
                 if v.is_empty() { return N::Bot; }
+                // theta:NatJoin's built term, recognized at its application
+                // (#35 Stage C): the stored bytes and the canonical meaning
+                // are untouched; only the reduction becomes the native hash
+                // join. Non-matching shapes fall through unchanged.
+                if !theta_arms_off() {
+                    if let Some(c) = natjoin_config(v) {
+                        return natjoin_run(c, &x);
+                    }
+                }
                 let pair = nseq(vec![f.clone(), x]);
                 self.mu(napp(v[0].clone(), pair))            // metacomposition on the head
             }
@@ -1609,6 +1877,84 @@ impl NEval {
                 _ => N::Bot,
             },
             "DEFS" => self.defs_n.clone(),
+            // ---- theta atom arms (#35 Stage C): certified-equal native
+            // twins of the theta.canon set/join helpers, the exact same
+            // canon-NAMED-arm pattern as system:vb_fetch below. Semantics
+            // transcribed from the canon bodies over the prim behaviors
+            // (INSERT right-fold, nseq Bot-collapse, apndl/cat/tl shape
+            // demands); the property tests reduce every case against the
+            // interpreted path (arms off) as the oracle. Precedence is
+            // unchanged where it can matter: a DEFS cell of the same name
+            // still wins (cells are consulted before prim()); the process/
+            // NCANON entries these arms now shadow are the same canon text
+            // the arms mirror.
+            "theta:append_phi" if !theta_arms_off() => match x {
+                // apndr∘⟨id, K(φ)⟩ — append the empty sequence
+                N::S(v) => {
+                    let mut w = v.to_vec();
+                    w.push(N::S(Rc::new(Vec::new())));
+                    N::S(Rc::new(w))
+                }
+                _ => N::Bot,
+            },
+            "theta:flatten" if !theta_arms_off() => match x {
+                // INSERT(cat)∘append_phi — concatenate a list of lists in
+                // order; any non-sequence element bottoms (cat's demand)
+                N::S(v) => {
+                    let mut out: Vec<N> = Vec::new();
+                    for e in v.iter() {
+                        match e {
+                            N::S(inner) => out.extend(inner.iter().cloned()),
+                            _ => return Some(N::Bot),
+                        }
+                    }
+                    N::S(Rc::new(out))
+                }
+                _ => N::Bot,
+            },
+            "theta:join_combine" if !theta_arms_off() => match x {
+                // cat∘⟨1, tl∘2⟩ — ⟨a,b⟩ → a ++ b[1..]; a must be a seq, b a
+                // NONEMPTY seq (tl's demand); extra operand columns beyond
+                // the two selectors are ignored, as the selectors ignore them
+                N::S(v) if v.len() >= 2 => match (&v[0], &v[1]) {
+                    (N::S(a), N::S(b)) if !b.is_empty() => {
+                        let mut row: Vec<N> = Vec::with_capacity(a.len() + b.len() - 1);
+                        row.extend(a.iter().cloned());
+                        row.extend(b[1..].iter().cloned());
+                        N::S(Rc::new(row))
+                    }
+                    _ => N::Bot,
+                },
+                _ => N::Bot,
+            },
+            "theta:member" if !theta_arms_off() => match pairv(x) {
+                // not∘null∘filter_eq∘distl — ⟨e, ys⟩ → T iff some y in ys is
+                // n_eq-equal to e (distl demands the exact pair, ys a seq)
+                Some((e, N::S(ys))) => nb(ys.iter().any(|y| n_eq(&e, y))),
+                _ => N::Bot,
+            },
+            "theta:dedup" if !theta_arms_off() => match x {
+                // INSERT(COND(member, 2, apndl))∘append_phi — the RIGHT fold:
+                // an element is kept iff it is not a member of the already-
+                // folded suffix, so duplicates keep their LAST occurrence's
+                // position ([a,b,a] → [b,a]); mirrored by walking from the
+                // right, keeping first-seen (by n_eq key), prepending.
+                N::S(v) => {
+                    let mut seen: std::collections::HashSet<String> =
+                        std::collections::HashSet::with_capacity(v.len());
+                    let mut kept: std::collections::VecDeque<N> =
+                        std::collections::VecDeque::with_capacity(v.len());
+                    for e in v.iter().rev() {
+                        let mut k = String::new();
+                        n_join_key(e, &mut k);
+                        if seen.insert(k) {
+                            kept.push_front(e.clone());
+                        }
+                    }
+                    N::S(Rc::new(kept.into_iter().collect()))
+                }
+                _ => N::Bot,
+            },
             "cellkey" => match pairv(x) {
                 Some((N::A(a), N::A(b))) => {
                     let sv = |l: &Leaf| match l {
@@ -13267,6 +13613,327 @@ pub mod worker {
         write_v(&res, &mut out);
         out.push('}');
         out
+    }
+}
+
+// ============================ theta-arm property tests (#35 Stage C) ==========
+// Twin certification for the native theta arms: every reduction runs TWICE --
+// once with the arms disabled (the interpreted canon path, the oracle) and
+// once enabled -- and the write_n dumps must be identical. Random inputs
+// include malformed shapes (atom rows, short rows, empty rows, non-pair
+// operands) so the Bot semantics are pinned, not just the happy path.
+#[cfg(test)]
+mod theta_arms_tests {
+    use super::*;
+
+    fn ensure_ncanon() {
+        CANON.with(|c| {
+            if c.borrow().is_empty() {
+                *c.borrow_mut() = canon_defs();
+            }
+        });
+        NCANON.with(|nc| {
+            if nc.borrow().is_empty() {
+                *nc.borrow_mut() = CANON.with(|c| {
+                    c.borrow().iter().map(|(n, v)| (n.clone(), v_to_n(v))).collect()
+                });
+            }
+        });
+    }
+
+    fn ev() -> NEval {
+        NEval {
+            cells: Vec::new(),
+            process: Vec::new(),
+            defs_n: N::Bot,
+            fuel: std::cell::Cell::new(-1),
+        }
+    }
+
+    fn ndump(n: &N) -> String {
+        let mut s = String::new();
+        write_n(n, &mut s);
+        s
+    }
+
+    // reduce napp(f, x) with the arms ON and OFF; assert identical dumps and
+    // answer the (shared) result text
+    fn both_ways(f: N, x: N, label: &str) -> String {
+        set_theta_arms_off(true);
+        let interp = ev().mu(napp(f.clone(), x.clone()));
+        set_theta_arms_off(false);
+        let native = ev().mu(napp(f, x));
+        let (di, dn) = (ndump(&interp), ndump(&native));
+        assert_eq!(di, dn, "arm diverged from interpreted path: {}", label);
+        dn
+    }
+
+    fn ns(s: &str) -> N {
+        N::A(Rc::new(Leaf::S(s.to_string())))
+    }
+    fn ni(i: i64) -> N {
+        N::A(Rc::new(Leaf::I(i)))
+    }
+    fn nf(f: f64) -> N {
+        N::A(Rc::new(Leaf::F(f)))
+    }
+    fn nrow(xs: Vec<N>) -> N {
+        N::S(Rc::new(xs))
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    // a random leaf drawn from a SMALL value space so join keys collide often
+    // (collisions are the interesting case), type-strictness exercised by
+    // including 1, 1.0 and "1"-alikes
+    fn rand_leaf(rng: &mut Rng) -> N {
+        match rng.below(6) {
+            0 => ni(rng.below(4) as i64),
+            1 => nf(rng.below(4) as f64),
+            2 => ns(&format!("{}", rng.below(4))),
+            3 => ns(&format!("v{}", rng.below(4))),
+            4 => nrow(vec![ni(rng.below(3) as i64)]), // nested key
+            _ => ns("k"),
+        }
+    }
+
+    fn rand_row(rng: &mut Rng, min_len: usize, allow_malformed: bool) -> N {
+        if allow_malformed && rng.below(12) == 0 {
+            return rand_leaf(rng); // an atom where a row belongs
+        }
+        let len = if allow_malformed && min_len > 0 && rng.below(12) == 0 {
+            rng.below(min_len as u64) as usize // too short
+        } else {
+            min_len + rng.below(3) as usize
+        };
+        nrow((0..len).map(|_| rand_leaf(rng)).collect())
+    }
+
+    fn rand_rows(rng: &mut Rng, n: usize, min_len: usize, allow_malformed: bool) -> N {
+        nrow((0..n).map(|_| rand_row(rng, min_len, allow_malformed)).collect())
+    }
+
+    #[test]
+    fn natjoin_shape_is_recognized_and_hash_join_matches_interpreted() {
+        ensure_ncanon();
+        for seed in 0..40u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e3779b97f4a7c15) | 1);
+            for c in 1..=3i64 {
+                // the built term, constructed by the canon itself
+                let term = ev().mu(napp(ns("theta:NatJoin"), ni(c)));
+                assert!(
+                    matches!(&term, N::S(v) if natjoin_config(v).is_some()),
+                    "seed {} c {}: built term not recognized by the matcher",
+                    seed,
+                    c
+                );
+                let na = rng.below(7) as usize;
+                let nb = rng.below(7) as usize;
+                let a = rand_rows(&mut rng, na, c as usize, true);
+                let b = rand_rows(&mut rng, nb, 1, true);
+                let x = nrow(vec![a, b]);
+                both_ways(term, x, &format!("NatJoin seed {} c {}", seed, c));
+            }
+        }
+    }
+
+    #[test]
+    fn natjoin_edge_operands_match_interpreted() {
+        ensure_ncanon();
+        let term = ev().mu(napp(ns("theta:NatJoin"), ni(2)));
+        let cases: Vec<(N, &str)> = vec![
+            (ns("notapair"), "atom operand"),
+            (nrow(vec![]), "empty seq operand"),
+            (nrow(vec![nrow(vec![])]), "one-element operand"),
+            (
+                nrow(vec![nrow(vec![]), ns("Bnotseq")]),
+                "A empty, B an atom (B never inspected)",
+            ),
+            (
+                nrow(vec![ns("Anotseq"), nrow(vec![])]),
+                "A an atom (distr bottoms)",
+            ),
+            (
+                nrow(vec![nrow(vec![nrow(vec![ns("x"), ns("k")])]), ns("Bnotseq")]),
+                "A nonempty, B an atom",
+            ),
+            (
+                nrow(vec![
+                    nrow(vec![nrow(vec![ns("x"), ns("k")])]),
+                    nrow(vec![]),
+                ]),
+                "B empty (row shapes never checked)",
+            ),
+            (
+                nrow(vec![
+                    nrow(vec![ns("malformed-a-row")]),
+                    nrow(vec![nrow(vec![ns("k"), ns("y")])]),
+                ]),
+                "malformed A row with nonempty B",
+            ),
+            (
+                nrow(vec![
+                    nrow(vec![nrow(vec![ns("x"), ns("k")])]),
+                    nrow(vec![nrow(vec![])]),
+                ]),
+                "empty B row (selector 1 bottoms)",
+            ),
+            (
+                nrow(vec![
+                    nrow(vec![nrow(vec![ns("x"), ni(1)])]),
+                    nrow(vec![nrow(vec![nf(1.0), ns("y")])]),
+                ]),
+                "int vs float key must NOT join (type-strict eq)",
+            ),
+        ];
+        for (x, label) in cases {
+            both_ways(term.clone(), x, label);
+        }
+    }
+
+    #[test]
+    fn natjoin_known_answer_and_order() {
+        ensure_ncanon();
+        // A-major, B-order within: the canonical nested loop's emission order
+        let term = ev().mu(napp(ns("theta:NatJoin"), ni(2)));
+        let a = nrow(vec![
+            nrow(vec![ns("a1"), ns("k1")]),
+            nrow(vec![ns("a2"), ns("k2")]),
+            nrow(vec![ns("a3"), ns("k1")]),
+        ]);
+        let b = nrow(vec![
+            nrow(vec![ns("k1"), ns("b1")]),
+            nrow(vec![ns("k2"), ns("b2")]),
+            nrow(vec![ns("k1"), ns("b3")]),
+        ]);
+        let got = both_ways(term, nrow(vec![a, b]), "known answer");
+        assert_eq!(
+            got,
+            r#"[["a1","k1","b1"],["a1","k1","b3"],["a2","k2","b2"],["a3","k1","b1"],["a3","k1","b3"]]"#
+        );
+    }
+
+    #[test]
+    fn atom_arms_match_interpreted_on_random_and_malformed_inputs() {
+        ensure_ncanon();
+        for seed in 0..60u64 {
+            let mut rng = Rng(seed.wrapping_mul(2654435761).wrapping_add(0x9e37) | 1);
+            // flatten: list of lists (sometimes with a non-seq element)
+            let nll = rng.below(5) as usize;
+            let ll = nrow(
+                (0..nll)
+                    .map(|_| {
+                        if rng.below(10) == 0 {
+                            rand_leaf(&mut rng)
+                        } else {
+                            let k = rng.below(4) as usize;
+                            rand_rows(&mut rng, k, 1, false)
+                        }
+                    })
+                    .collect(),
+            );
+            both_ways(ns("theta:flatten"), ll, &format!("flatten seed {}", seed));
+            both_ways(
+                ns("theta:flatten"),
+                rand_leaf(&mut rng),
+                &format!("flatten atom seed {}", seed),
+            );
+            // append_phi
+            let nap = rng.below(4) as usize;
+            both_ways(
+                ns("theta:append_phi"),
+                rand_rows(&mut rng, nap, 0, true),
+                &format!("append_phi seed {}", seed),
+            );
+            both_ways(
+                ns("theta:append_phi"),
+                rand_leaf(&mut rng),
+                &format!("append_phi atom seed {}", seed),
+            );
+            // join_combine: pairs, including malformed and >2-length operands
+            let jc = nrow(vec![
+                rand_row(&mut rng, 1, true),
+                rand_row(&mut rng, 1, true),
+                rand_leaf(&mut rng), // extra column, ignored by the selectors
+            ]);
+            both_ways(ns("theta:join_combine"), jc, &format!("join_combine seed {}", seed));
+            both_ways(
+                ns("theta:join_combine"),
+                nrow(vec![rand_row(&mut rng, 1, true), nrow(vec![])]),
+                &format!("join_combine empty-b seed {}", seed),
+            );
+            // member: exact pair ⟨e, ys⟩
+            let nmem = rng.below(5) as usize;
+            let mem_e = rand_leaf(&mut rng);
+            both_ways(
+                ns("theta:member"),
+                nrow(vec![mem_e, rand_rows(&mut rng, nmem, 0, true)]),
+                &format!("member seed {}", seed),
+            );
+            both_ways(
+                ns("theta:member"),
+                nrow(vec![rand_leaf(&mut rng), rand_leaf(&mut rng)]),
+                &format!("member non-seq seed {}", seed),
+            );
+            // dedup: duplicates guaranteed by the small value space
+            let ndd = rng.below(8) as usize;
+            both_ways(
+                ns("theta:dedup"),
+                rand_rows(&mut rng, ndd, 0, true),
+                &format!("dedup seed {}", seed),
+            );
+        }
+    }
+
+    #[test]
+    fn dedup_keeps_the_last_occurrence_position() {
+        ensure_ncanon();
+        let xs = nrow(vec![ns("a"), ns("b"), ns("a")]);
+        let got = both_ways(ns("theta:dedup"), xs, "dedup [a,b,a]");
+        assert_eq!(got, r#"["b","a"]"#);
+    }
+
+    #[test]
+    fn near_miss_shapes_fall_through_to_the_interpreted_path() {
+        ensure_ncanon();
+        // c = 33 is outside the selector prim's range: the matcher must
+        // reject it and the two paths (both interpreted then) must agree
+        let term = ev().mu(napp(ns("theta:NatJoin"), ni(33)));
+        if let N::S(v) = &term {
+            assert!(natjoin_config(v).is_none(), "c=33 must not match");
+        }
+        let x = nrow(vec![
+            nrow(vec![nrow(vec![ns("x"), ns("k")])]),
+            nrow(vec![nrow(vec![ns("k"), ns("y")])]),
+        ]);
+        both_ways(term, x, "c=33 fallthrough");
+        // JoinOn's built term (a DIFFERENT shape) must not match the
+        // NatJoin matcher and must reduce identically both ways
+        let jterm = ev().mu(napp(
+            ns("theta:JoinOn"),
+            nrow(vec![nrow(vec![ni(1)]), nrow(vec![ni(1)])]),
+        ));
+        if let N::S(v) = &jterm {
+            assert!(natjoin_config(v).is_none(), "JoinOn shape must not match");
+        }
+        let xj = nrow(vec![
+            nrow(vec![nrow(vec![ns("k"), ns("a")])]),
+            nrow(vec![nrow(vec![ns("k"), ns("b")])]),
+        ]);
+        both_ways(jterm, xj, "JoinOn fallthrough");
     }
 }
 
