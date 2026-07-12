@@ -3206,6 +3206,195 @@ fn touched_by<'a>(
     }
 }
 
+// classify_heads_native (engine.py:1724 _classify_heads): the joint
+// fixpoint's head classification, extracted as ONE shared function so
+// op_run_rules' absent-passHeads fallback (below) and scheduler_cells_native
+// (#20, the final pipeline slice) materialize the SAME answer instead of two
+// independently-maintained copies -- the spec's own instruction: "the
+// op_run_rules fallback IS the live classifier; the cell just materializes
+// its answer, share the code, do not duplicate." A faithful, self-contained
+// twin of python's _classify_heads(D): re-derives aggids/plain rules/agg
+// rules/keyspans/reach/kindmap fresh from `cells` on every call, exactly as
+// python re-derives them on every _classify_heads(D) call (neither host
+// memoizes) -- correct to call from op_run_rules (once per run_rules
+// invocation, only when passHeads is absent) and from scheduler_cells_native
+// (once per compile, unconditionally, mirroring scheduler_cells' own
+// unconditional _classify_heads(D) call).
+struct HeadClasses {
+    agg: Vec<(String, Leaf)>,
+    keyed: Vec<(String, Leaf)>,
+    sweep: Vec<(String, Leaf)>,
+    dred: Vec<(String, Leaf)>,
+    aggwhole: Vec<(String, Leaf)>,
+}
+
+fn classify_heads_native(cells: &[(Leaf, V)]) -> HeadClasses {
+    use std::collections::{BTreeSet, HashMap, HashSet};
+    let leaf = |s: &str| Leaf::S(s.to_string());
+
+    // aggids: rule id key -> membership in ruleAgg (the aggregate rule set)
+    let mut aggids: HashSet<String> = HashSet::new();
+    for r in pop_rows(cells, &leaf("ruleAgg")) {
+        let it = items(&list_of(&r));
+        if !it.is_empty() {
+            aggids.insert(key_of(&it[0]));
+        }
+    }
+    // ruleDerives rows <rule id, head>, split on aggids -- plain_rows feed
+    // plain_of/reach (python's own split); agg_rows feed agg_heads/aggwhole
+    struct HRow {
+        head: Leaf,
+        head_key: String,
+        rid_key: String,
+    }
+    let mut plain_rows: Vec<HRow> = Vec::new();
+    let mut agg_rows: Vec<HRow> = Vec::new();
+    for r in pop_rows(cells, &leaf("ruleDerives")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            if let (Some(rid), Some(head)) = (aval(&it[0]), aval(&it[1])) {
+                let row = HRow {
+                    head: (*head).clone(),
+                    head_key: key_of(&it[1]),
+                    rid_key: key_of(&it[0]),
+                };
+                if aggids.contains(&row.rid_key) {
+                    agg_rows.push(row);
+                } else {
+                    plain_rows.push(row);
+                }
+            }
+        }
+    }
+    // plain_of's keys (python: `for h in plain_of`) as head_key -> head Leaf
+    // (first occurrence wins; only membership + the Leaf are ever needed
+    // here, never the rid list plain_of itself carries)
+    let mut head_leaf_of: HashMap<String, Leaf> = HashMap::new();
+    for r in &plain_rows {
+        head_leaf_of.entry(r.head_key.clone()).or_insert_with(|| r.head.clone());
+    }
+    let mut agg_head_leaf_of: HashMap<String, Leaf> = HashMap::new();
+    for r in &agg_rows {
+        agg_head_leaf_of.entry(r.head_key.clone()).or_insert_with(|| r.head.clone());
+    }
+    // keyspanned: fact type keys carrying a uniqueness/spanning_uniqueness
+    // constraint with a non-empty spans row set (constraint rows are <id,
+    // kind, ft, ..>; spans rows are <constraint id, position>)
+    let mut spans_of: HashMap<String, BTreeSet<i64>> = HashMap::new();
+    for r in pop_rows(cells, &leaf("spans")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            if let Some(Leaf::I(p)) = aval(&it[1]).as_deref() {
+                spans_of.entry(key_of(&it[0])).or_default().insert(*p);
+            }
+        }
+    }
+    let mut keyspanned: HashSet<String> = HashSet::new();
+    for c in pop_rows(cells, &leaf("constraint")) {
+        let it = items(&list_of(&c));
+        if it.len() >= 3 {
+            let is_uc = matches!(aval(&it[1]).as_deref(),
+                Some(Leaf::S(s)) if s == "uniqueness" || s == "spanning_uniqueness");
+            if is_uc {
+                if let Some(ps) = spans_of.get(&key_of(&it[0])) {
+                    if !ps.is_empty() {
+                        keyspanned.insert(key_of(&it[2]));
+                    }
+                }
+            }
+        }
+    }
+    // reads: rule id key -> its ruleReads cell-key set
+    let mut reads: HashMap<String, HashSet<String>> = HashMap::new();
+    for r in pop_rows(cells, &leaf("ruleReads")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            reads.entry(key_of(&it[0])).or_default().insert(key_of(&it[1]));
+        }
+    }
+    // reach: plain head_key -> union of its (plain) rules' reads, exactly
+    // python's reach = {h: {...} for h, rids in plain_of.items()} (agg rules
+    // never contribute -- plain_of never held them)
+    let mut reach: HashMap<String, HashSet<String>> = HashMap::new();
+    for r in &plain_rows {
+        let e = reach.entry(r.head_key.clone()).or_default();
+        if let Some(rs) = reads.get(&r.rid_key) {
+            e.extend(rs.iter().cloned());
+        }
+    }
+    // kindmap: fact type key -> derivation kind, LAST ROW WINS (python's
+    // dict comprehension over _pop_rows(D,"derivation") in pop order)
+    let mut kindmap: HashMap<String, String> = HashMap::new();
+    for r in pop_rows(cells, &leaf("derivation")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            if let Some(k) = aval(&it[1]) {
+                kindmap.insert(key_of(&it[0]), leaf_text(&k));
+            }
+        }
+    }
+    let owned = |hk: &String| {
+        matches!(kindmap.get(hk).map(|s| s.as_str()),
+            Some("fully-derived") | Some("derived-and-stored"))
+    };
+    let agg_head_keys: HashSet<String> = agg_rows.iter().map(|r| r.head_key.clone()).collect();
+    let derived_heads: HashSet<String> = agg_head_keys
+        .iter()
+        .cloned()
+        .chain(head_leaf_of.keys().cloned())
+        .collect();
+    let self_supporting = |h: &String| -> bool {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut stack: Vec<String> = reach
+            .get(h)
+            .map(|rs| rs.iter().filter(|x| derived_heads.contains(*x)).cloned().collect())
+            .unwrap_or_default();
+        while let Some(x) = stack.pop() {
+            if &x == h {
+                return true;
+            }
+            if !seen.insert(x.clone()) {
+                continue;
+            }
+            if let Some(rx) = reach.get(&x) {
+                stack.extend(rx.iter().filter(|y| derived_heads.contains(*y)).cloned());
+            }
+        }
+        false
+    };
+    let mut agg: Vec<(String, Leaf)> =
+        agg_head_leaf_of.iter().map(|(k, l)| (k.clone(), l.clone())).collect();
+    let mut keyed: Vec<(String, Leaf)> = Vec::new();
+    let mut sweep: Vec<(String, Leaf)> = Vec::new();
+    let mut dred: Vec<(String, Leaf)> = Vec::new();
+    for (hk, hl) in &head_leaf_of {
+        if keyspanned.contains(hk) {
+            // python: 'keyed' = plain-ruled heads with a key span; owned
+            // EXCLUDES keyspanned (h not in keyspanned), so the else-if
+            // chain matches _classify_heads exactly
+            keyed.push((hk.clone(), hl.clone()));
+        } else if owned(hk) && !agg_head_keys.contains(hk) {
+            if self_supporting(hk) {
+                dred.push((hk.clone(), hl.clone()));
+            } else {
+                sweep.push((hk.clone(), hl.clone()));
+            }
+        }
+    }
+    let mut aggwhole: Vec<(String, Leaf)> = agg_head_leaf_of
+        .iter()
+        .filter(|(hk, _)| owned(hk))
+        .map(|(k, l)| (k.clone(), l.clone()))
+        .collect();
+    let by_text = |a: &(String, Leaf), b: &(String, Leaf)| leaf_text(&a.1).cmp(&leaf_text(&b.1));
+    agg.sort_by(by_text);
+    keyed.sort_by(by_text);
+    sweep.sort_by(by_text);
+    dred.sort_by(by_text);
+    aggwhole.sort_by(by_text);
+    HeadClasses { agg, keyed, sweep, dred, aggwhole }
+}
+
 fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     use std::collections::{BTreeSet, HashMap, HashSet};
     // the optional frontier: an array of cell names bounding ROUND ONE to
@@ -3732,72 +3921,26 @@ fn op_run_rules(j: &J, srv: &mut Srv) -> Result<String, String> {
     // a head reachable from itself is 'dred', GMS93's recursive form).
     // Stores WITH the cell never enter this block — byte-unchanged path.
     if !has_passheads_cell {
-        let mut kindmap: HashMap<String, String> = HashMap::new();
-        for r in pop_rows(&cells, &leaf("derivation")) {
-            let it = items(&list_of(&r));
-            if it.len() >= 2 {
-                if let Some(k) = aval(&it[1]) {
-                    kindmap.insert(key_of(&it[0]), leaf_text(&k));
-                }
-            }
+        // classify_heads_native (just above) is the extracted twin of this
+        // block's former inline computation -- SHARED now with
+        // scheduler_cells_native (#20) rather than duplicated. Behavior
+        // unchanged: same locals this function already builds are re-derived
+        // identically inside the shared function; only the ORDER of
+        // pass_sweep/pass_dred differs transiently (classify_heads_native
+        // sorts by head text), which is moot since the sweep/sweep_cyclic
+        // construction just below re-sorts by leaf text anyway.
+        let hc = classify_heads_native(&cells);
+        for (hk, _) in &hc.keyed {
+            pass_keyed.insert(hk.clone());
         }
-        let owned = |hk: &String| {
-            matches!(
-                kindmap.get(hk).map(|s| s.as_str()),
-                Some("fully-derived") | Some("derived-and-stored")
-            )
-        };
-        let agg_head_keys: HashSet<String> =
-            agg_rules.iter().map(|rr| rr.head_key.clone()).collect();
-        let derived_heads: HashSet<String> = agg_head_keys
-            .iter()
-            .cloned()
-            .chain(plain_of.keys().cloned())
-            .collect();
-        let self_supporting = |h: &String| -> bool {
-            let mut seen: HashSet<String> = HashSet::new();
-            let mut stack: Vec<String> = reach
-                .get(h)
-                .map(|rs| {
-                    rs.iter()
-                        .filter(|x| derived_heads.contains(*x))
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
-            while let Some(x) = stack.pop() {
-                if &x == h {
-                    return true;
-                }
-                if !seen.insert(x.clone()) {
-                    continue;
-                }
-                if let Some(rx) = reach.get(&x) {
-                    stack.extend(
-                        rx.iter().filter(|y| derived_heads.contains(*y)).cloned(),
-                    );
-                }
-            }
-            false
-        };
-        for hk in plain_of.keys() {
-            if keyspans.contains_key(hk) {
-                // python: 'keyed' = plain-ruled heads with a key span;
-                // owned EXCLUDES keyspanned (h not in keyspanned), so the
-                // else-if chain matches _classify_heads exactly
-                pass_keyed.insert(hk.clone());
-            } else if owned(hk) && !agg_head_keys.contains(hk) {
-                if self_supporting(hk) {
-                    pass_dred.push(hk.clone());
-                } else {
-                    pass_sweep.push(hk.clone());
-                }
-            }
+        for (hk, _) in &hc.sweep {
+            pass_sweep.push(hk.clone());
         }
-        for hk in &agg_head_keys {
-            if owned(hk) {
-                pass_aggwhole.insert(hk.clone());
-            }
+        for (hk, _) in &hc.dred {
+            pass_dred.push(hk.clone());
+        }
+        for (hk, _) in &hc.aggwhole {
+            pass_aggwhole.insert(hk.clone());
         }
     }
     // sweep / sweep_cyclic straight from the cell's lists: a listed head
@@ -6778,6 +6921,317 @@ fn layout_cells_native(cells: &[(Leaf, V)], srv: &Srv) -> Vec<(Leaf, V)> {
     out
 }
 
+// scheduler_cells_native (engine.py:1797 scheduler_cells, #20 the final
+// pipeline slice): materializes the SCHEDULE as data -- the passHeads cell,
+// rows <pass, head> from classify_heads_native (the SAME classifier
+// op_run_rules' absent-cell fallback shares, above it in this file: "share
+// the code, do not duplicate"), plus passOrder/passBound evaluated through
+// their canon defs (system:pass_order / system:pass_bound, shared/
+// system.canon) exactly as python's own
+// `from_lam(_ap(_A("system:pass_order"), to_lam(())))` reduces them -- the
+// constants of doctrine, materialized beside the membership so a reader
+// holds the whole schedule without ever needing kindmap. Recompile replaces
+// the three cells wholesale; a store without them classifies/dispatches
+// live, which op_run_rules already does (both the with-cell and the
+// absent-cell paths).
+fn scheduler_cells_native(cells: &[(Leaf, V)], srv: &Srv) -> Vec<(Leaf, V)> {
+    let d0 = cells_to_d(cells);
+    let nd = v_to_n(&d0);
+    let ncells = n_cells_of(&nd);
+    let ev = NEval {
+        cells: ncells,
+        process: srv.nprocess.clone(),
+        defs_n: nd.clone(),
+        fuel: std::cell::Cell::new(-1),
+    };
+    let hc = classify_heads_native(cells);
+    let mut rows: Vec<V> = Vec::new();
+    for (pass_name, list) in [
+        ("agg", &hc.agg),
+        ("keyed", &hc.keyed),
+        ("sweep", &hc.sweep),
+        ("dred", &hc.dred),
+        ("aggwhole", &hc.aggwhole),
+    ] {
+        for (_hk, hl) in list {
+            rows.push(seqc(vec![atom(Leaf::S(pass_name.to_string())), atom(hl.clone())]));
+        }
+    }
+    let order_v = n_to_v(&ev.mu(napp(mf_na("system:pass_order"), nseq(vec![]))));
+    let bound_v = n_to_v(&ev.mu(napp(mf_na("system:pass_bound"), nseq(vec![]))));
+    let mut out: Vec<(Leaf, V)> = cells
+        .iter()
+        .filter(|(k, _)| {
+            !matches!(k, Leaf::S(s) if s == "passHeads" || s == "passOrder" || s == "passBound")
+        })
+        .cloned()
+        .collect();
+    out.push((Leaf::S("passHeads".to_string()), seq(from_vec(rows))));
+    out.push((Leaf::S("passOrder".to_string()), order_v));
+    out.push((Leaf::S("passBound".to_string()), bound_v));
+    out
+}
+
+// format_reading mirrors python's str.format(*players) applied to a FORML
+// reading template ("{0} has {1}."-style placeholders): each "{N}"
+// substitutes players[N]; "{{"/"}}" escape to a literal brace (python's own
+// str.format convention). ANY placeholder whose index is out of range (or
+// non-numeric, or unterminated) reverts the WHOLE result to the RAW
+// template unchanged -- python's try/except IndexError/KeyError wraps the
+// WHOLE .format() call, not a per-placeholder fallback.
+fn format_reading(template: &str, players: &[String]) -> String {
+    let chars: Vec<char> = template.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '{' if i + 1 < chars.len() && chars[i + 1] == '{' => {
+                out.push('{');
+                i += 2;
+            }
+            '}' if i + 1 < chars.len() && chars[i + 1] == '}' => {
+                out.push('}');
+                i += 2;
+            }
+            '{' => {
+                let mut j = i + 1;
+                while j < chars.len() && chars[j] != '}' {
+                    j += 1;
+                }
+                if j >= chars.len() {
+                    return template.to_string();
+                }
+                let idxs: String = chars[i + 1..j].iter().collect();
+                match idxs.parse::<usize>() {
+                    Ok(idx) if idx < players.len() => {
+                        out.push_str(&players[idx]);
+                        i = j + 1;
+                    }
+                    _ => return template.to_string(),
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+// generator_cells_native (engine.py:1825 generator_cells): the generator
+// family's base member -- dsl:<Noun> cells, the per-noun model summary
+// (noun, object/value kind, sorted verbalized readings, verbalized
+// constraints as kind-text pairs, sorted deduped machine transitions). THE
+// OPT-IN XSD/OWL/EDM/HTML/DTD/WSDL/XFORMS/PLIX/NAV/Solidity FAMILY
+// (engine.py:1881-2200, gated on App_uses_Generator instance facts) IS
+// DELIBERATELY NOT PORTED: a repo-wide grep of "uses Generator" against
+// every acceptance corpus (naming/kinds/rp-fixture/the tasks app's
+// readings) found zero hits, so python's own `active` set is always empty
+// and that whole block is dead code for every corpus this slice certifies
+// against -- descoped, not silently skipped; see the task report's own
+// section. The dsl: cells (the base member every corpus CAN reach) are
+// ported in full.
+fn generator_cells_native(cells: &[(Leaf, V)], srv: &Srv) -> Vec<(Leaf, V)> {
+    use std::collections::HashMap;
+    let leaf = |s: &str| Leaf::S(s.to_string());
+    let sval = |v: &V| -> Option<String> {
+        match aval(v) {
+            Some(l) => match &*l {
+                Leaf::S(s) => Some(s.clone()),
+                _ => None,
+            },
+            None => None,
+        }
+    };
+
+    let mut kinds: Vec<(String, &'static str)> = {
+        let mut seen: HashMap<String, &'static str> = HashMap::new();
+        for r in pop_rows(cells, &leaf("instanceOf")) {
+            let it = items(&list_of(&r));
+            if it.len() >= 2 {
+                if let (Some(n), Some(k)) = (sval(&it[0]), sval(&it[1])) {
+                    let kind = if k == "ObjectType" {
+                        Some("entity")
+                    } else if k == "ValueType" {
+                        Some("value")
+                    } else {
+                        None
+                    };
+                    if let Some(kind) = kind {
+                        seen.insert(n, kind);
+                    }
+                }
+            }
+        }
+        let mut v: Vec<(String, &'static str)> = seen.into_iter().collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    };
+
+    // roles: ft -> [(pos, player)], sorted per read site (python's own
+    // `sorted(roles[ft])`/`sorted(roles.get(ft, []))` at each use)
+    let mut roles: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+    for r in pop_rows(cells, &leaf("role")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 4 {
+            if let (Some(ft), Some(player)) = (sval(&it[1]), sval(&it[3])) {
+                if let Some(Leaf::I(pos)) = aval(&it[2]).as_deref() {
+                    roles.entry(ft).or_default().push((*pos, player));
+                }
+            }
+        }
+    }
+    let sorted_players = |ft: &str| -> Vec<String> {
+        let mut ps = roles.get(ft).cloned().unwrap_or_default();
+        ps.sort();
+        ps.into_iter().map(|(_, p)| p).collect()
+    };
+
+    // readings: ft -> the {0}/{1}-formatted reading, only for fact types
+    // that actually have roles (python's `if f[0] in roles`)
+    let mut readings: HashMap<String, String> = HashMap::new();
+    for f in pop_rows(cells, &leaf("factType")) {
+        let it = items(&list_of(&f));
+        if it.len() >= 2 {
+            if let Some(ft) = sval(&it[0]) {
+                if roles.contains_key(&ft) {
+                    if let Some(l) = aval(&it[1]) {
+                        let template = leaf_text(&l);
+                        let players = sorted_players(&ft);
+                        readings.insert(ft, format_reading(&template, &players));
+                    }
+                }
+            }
+        }
+    }
+
+    // cons: (players, kind_tag, text) -- UC/MC/deontic verbalization, exactly
+    // python's uniqueness/mandatory/deontic* dispatch over constraint rows
+    struct ConEntry {
+        players: Vec<String>,
+        kind_tag: &'static str,
+        text: String,
+    }
+    let mut cons: Vec<ConEntry> = Vec::new();
+    for c in pop_rows(cells, &leaf("constraint")) {
+        let it = items(&list_of(&c));
+        if it.len() < 3 {
+            continue;
+        }
+        let cid = match aval(&it[0]) {
+            Some(l) => leaf_text(&l),
+            None => continue,
+        };
+        let kind = match sval(&it[1]) {
+            Some(k) => k,
+            None => continue,
+        };
+        let ft = match sval(&it[2]) {
+            Some(f) => f,
+            None => continue,
+        };
+        let players = sorted_players(&ft);
+        if kind == "uniqueness" && players.len() >= 2 {
+            cons.push(ConEntry {
+                players: players.clone(),
+                kind_tag: "UC",
+                text: format!("Each {} has at most one {}.", players[0], players[1]),
+            });
+        } else if kind == "mandatory" && players.len() >= 2 {
+            cons.push(ConEntry {
+                players: players.clone(),
+                kind_tag: "MC",
+                text: format!("Each {} has some {}.", players[0], players[1]),
+            });
+        } else if kind.starts_with("deontic") {
+            cons.push(ConEntry { players, kind_tag: "UC", text: format!("{}.", cid) });
+        }
+    }
+
+    // sms: noun -> ALL (trigger, from, to) triples of every governed machine
+    // (python: a triple carries no machine id, so every governed noun sees
+    // the union -- exact for the single-machine case, every app in the
+    // fleet today)
+    let d0 = cells_to_d(cells);
+    let nd = v_to_n(&d0);
+    let ncells = n_cells_of(&nd);
+    let ev = NEval {
+        cells: ncells,
+        process: srv.nprocess.clone(),
+        defs_n: nd.clone(),
+        fuel: std::cell::Cell::new(-1),
+    };
+    let triples: Vec<(String, String, String)> = mf_sm_triples(cells, &ev)
+        .into_iter()
+        .map(|(frm, trig, to)| (trig, frm, to))
+        .collect();
+    let mut sms: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
+    for r in pop_rows(cells, &leaf("smDef")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            if let Some(noun) = sval(&it[1]) {
+                sms.entry(noun).or_default().extend(triples.iter().cloned());
+            }
+        }
+    }
+
+    // the dsl:<Noun> cells, one row per noun, in noun-sorted order (matching
+    // both python's `for noun, kind in sorted(kinds.items())` and the final
+    // `sorted(cells.items())` re-sort -- the two coincide since the cell key
+    // is always "dsl:" + noun)
+    let mut fresh: Vec<(Leaf, V)> = Vec::new();
+    for (noun, kind) in &kinds {
+        let my_fts: Vec<&String> = roles
+            .iter()
+            .filter(|(_ft, ps)| ps.iter().any(|(_i, p)| p == noun))
+            .map(|(ft, _)| ft)
+            .collect();
+        let mut my_readings: Vec<String> =
+            my_fts.iter().filter_map(|ft| readings.get(*ft).cloned()).collect();
+        my_readings.sort();
+        let my_cons: Vec<V> = cons
+            .iter()
+            .filter(|c| c.players.iter().any(|p| p == noun))
+            .map(|c| {
+                seqc(vec![atom(Leaf::S(c.kind_tag.to_string())), atom(Leaf::S(c.text.clone()))])
+            })
+            .collect();
+        let mut my_trans: Vec<(String, String, String)> = sms.get(noun).cloned().unwrap_or_default();
+        my_trans.sort();
+        my_trans.dedup();
+        let trans_v: Vec<V> = my_trans
+            .iter()
+            .map(|(a, b, c)| {
+                seqc(vec![atom(Leaf::S(a.clone())), atom(Leaf::S(b.clone())), atom(Leaf::S(c.clone()))])
+            })
+            .collect();
+        let row = seqc(vec![
+            atom(Leaf::S(noun.clone())),
+            atom(Leaf::S(kind.to_string())),
+            seq(from_vec(my_readings.into_iter().map(|s| atom(Leaf::S(s))).collect())),
+            seq(from_vec(my_cons)),
+            seq(from_vec(trans_v)),
+        ]);
+        fresh.push((Leaf::S(format!("dsl:{}", noun)), seq(from_vec(vec![row]))));
+    }
+
+    const GEN_PREFIXES: [&str; 11] = [
+        "dsl:", "xsd:", "owl:", "edm:", "html:", "dtd:", "wsdl:", "xforms:", "plix:", "nav:",
+        "solidity:",
+    ];
+    let mut out: Vec<(Leaf, V)> = cells
+        .iter()
+        .filter(|(k, _)| match k {
+            Leaf::S(s) => !GEN_PREFIXES.iter().any(|p| s.starts_with(p)),
+            _ => true,
+        })
+        .cloned()
+        .collect();
+    out.extend(fresh);
+    out
+}
+
 // compile_lines_native is a SELF-CONTAINED twin of op_compile_model's own
 // dispatch loop (grammar load through rekey_transitions_native), used ONLY
 // by status_facts_native's nested "compile these synthesized lines atop the
@@ -7674,17 +8128,26 @@ struct RpSpec {
 }
 
 // rp_create_spec (engine.py:3063 create_spec): the schema-determined create
-// recipe for a trigger fact type, restricted to this arm's own call shape
-// (replay only ever calls this for a ft ALREADY known to be in the frozen
-// trigger set -- see `trig_fts` in replay_entries_native -- so create_spec's
-// own unconditional `any(r[1]==fact_type for r in _pop_rows(D,"smTrigger"))`
-// re-check is always true here and is not reproduced). Every read below is
+// recipe for a fact type. `is_trigger` gates the noun/machine/mealy/links
+// computation exactly as python's own unconditional
+// `any(r[1]==fact_type for r in _pop_rows(D,"smTrigger"))` guard does --
+// added for create_handlers_native (#20, the final pipeline slice), which
+// must call this for EVERY fact type in the schema, not just known triggers
+// (replay's own call site, below, only ever reaches a ft ALREADY known to be
+// in the frozen trigger set -- see `trig_fts` in replay_entries_native --
+// and passes `is_trigger: true` unconditionally, so this parameter is a
+// pure widening: replay's byte-for-byte behavior is unchanged, since
+// `if true {...}` is exactly the unconditional call the prior slice shipped).
+// The gate is LOAD-BEARING for create_handlers: system:governed_player finds
+// a governed noun for ANY fact type with a role pointing at one (a plain
+// data attribute of a governed entity qualifies), NOT only its smTrigger
+// fact types -- without this gate every such attribute would wrongly grow
+// machine/mealy/links wiring in its create:<ft> handler. Every read below is
 // SCHEMA-only (smTrigger/role/governedBy/smStatusFt/valueConstraint are
 // compile-time populations replay never writes), so the FROZEN initial
-// ev0/nd0/cells0 -- computed once in replay_entries_native, the same
-// part_box precedent extended to the whole spec computation -- are exact,
-// not an approximation, for every ft this is called with, not just the
-// partition.
+// ev0/nd0/cells0 -- computed once by the caller, the same part_box
+// precedent extended to the whole spec computation -- are exact, not an
+// approximation, for every ft this is called with, not just the partition.
 fn rp_create_spec(
     cells0: &[(Leaf, V)],
     ev0: &NEval,
@@ -7692,6 +8155,7 @@ fn rp_create_spec(
     part: &HashMap<String, String>,
     pairs_v: &V,
     ft: &str,
+    is_trigger: bool,
 ) -> Result<RpSpec, String> {
     let leaf = |s: &str| Leaf::S(s.to_string());
     let table = part.get(ft).cloned().unwrap_or_else(|| ft.to_string());
@@ -7707,7 +8171,7 @@ fn rp_create_spec(
         None
     };
 
-    let noun = mf_governed_player(ev0, nd0, ft);
+    let noun = if is_trigger { mf_governed_player(ev0, nd0, ft) } else { None };
     let mut machine: Option<RpMachine> = None;
     let mut mealy: Option<N> = None;
     let mut links: Option<N> = None;
@@ -7902,6 +8366,235 @@ fn rp_create_from_spec(ev: &NEval, nd: &N, ft: &str, fact_n: N, spec: &RpSpec) -
         N::S(v) if v.len() == 2 => v[1].clone(),
         _ => nd.clone(), // _transition's fallback: a non-pair answer is <ERROR, D unchanged>
     }
+}
+
+// rp_absorbed_handler_tree (engine.py:3134 _absorbed_handler): the
+// fact-DEPENDENT create handler stored WHOLE, UNREDUCED -- the nine-slot
+// build_system record computes its cell name from the fact at REDUCE time
+// (apply(cellkey, <table, key>), key = N1(N1(fact)) since the row's first
+// element is the entity's key), so ONE stored cell serves every future fact
+// of this absorbed type. Every OTHER slot is spec's own constant, CONST-
+// wrapped (K_) so the record ignores the fact for them; only the cell_name
+// slot (cellfn) is a real function of the input. Built at the N level
+// (napp/nseq/mf_na, the same vocabulary rp_create_spec's siblings use) and
+// converted to V only at the storage site (create_handlers_native), never
+// reduced here -- apply_core/rp_reduce_apply reduce it LATER, once per
+// actual write, computing ast:build_system fresh with THAT write's cell
+// name (create_spec's own docstring: "any host builds the handler and
+// reduces it natively on apply").
+fn rp_absorbed_handler_tree(ev: &NEval, spec: &RpSpec, ft: &str) -> N {
+    let k_ = |x: N| nseq(vec![mf_na("CONST"), x]);
+    let slot = |v: Option<N>| match v {
+        None => nseq(vec![]),
+        Some(x) => nseq(vec![x]),
+    };
+    // EAGERLY reduced (ev.mu), matching python's own eager `apply()` calls
+    // inside row_resolve/machine_step/mealy_step/row_validate (engine.py's
+    // "thin canon wrapper" functions all call the REAL reducer, not a lazy
+    // AST constructor -- confirmed empirically: create_handlers' python
+    // output embeds the FULLY EXPANDED combinator tree at these slots, never
+    // an unreduced "apply(name, operand)" reference). rp_create_spec's own
+    // siblings (rp_machine_step/rp_mealy_step/rp_transitions_of/
+    // rp_row_resolve/rp_row_validate) build UNREDUCED nodes because
+    // replay's call sites (rp_create_from_spec) immediately fold them into
+    // ONE outer apply-to-a-fact reduction that forces everything needed
+    // regardless (Church-Rosser: same normal form either way) -- but HERE
+    // the handler tree is PERSISTED AS DATA, never further reduced as a
+    // whole, so any unreduced sub-node would show up verbatim in the
+    // dumped store. Forcing here, once, at the point of embedding, is
+    // provably behavior-preserving for every OTHER consumer of these
+    // helpers (same Leaf/N result either way) and is what fixed the first
+    // real byte divergence this slice's differential caught.
+    let resolve = ev.mu(rp_row_resolve(
+        spec.col.expect("absorbed spec always sets col"),
+        spec.width.expect("absorbed spec always sets width"),
+        spec.unary.unwrap_or(false),
+    ));
+    let m = match &spec.machine {
+        None => nseq(vec![]),
+        Some(mach) => {
+            let target = nseq(vec![
+                mf_na(&mach.status_table),
+                N::A(Rc::new(Leaf::I(mach.status_col))),
+                N::A(Rc::new(Leaf::I(mach.status_width))),
+            ]);
+            let role_atom = match mach.role_pos {
+                Some(p) => N::A(Rc::new(Leaf::I(p))),
+                None => N::Bot,
+            };
+            nseq(vec![target, ev.mu(mach.sm_obj.clone()), role_atom])
+        }
+    };
+    let mealy_reduced = spec.mealy.clone().map(|n| ev.mu(n));
+    let validate_reduced = spec.validate.clone().map(|n| ev.mu(n));
+    let one = N::A(Rc::new(Leaf::I(1)));
+    // key = COMP(1,1): first-of-first over the reduce-time operand <fact,D>
+    // -- N1(N1(P)) reads the fact's own first element, its key
+    let key = nseq(vec![mf_na("COMP"), one.clone(), one]);
+    // cellfn = COMP(apply, CONS(K(cellkey), CONS(K(table), key))): at reduce
+    // time, apply(cellkey, <table, key(P)>) -- the entity's routed cell name
+    let cellfn = nseq(vec![
+        mf_na("COMP"),
+        mf_na("apply"),
+        nseq(vec![
+            mf_na("CONS"),
+            k_(mf_na("cellkey")),
+            nseq(vec![mf_na("CONS"), k_(mf_na(&spec.table)), key]),
+        ]),
+    ]);
+    // rec: the 9-slot build_system record, cellfn RAW (a function of P),
+    // every other slot CONST-wrapped -- build_system's own canonical order:
+    // cell_name, validate, resolve, derive(always empty), links(always
+    // empty for an absorbed handler -- create_spec never sets it when
+    // absorbed), machine, mealy, index_cell=table, append_cell=ft
+    let rec = nseq(vec![
+        mf_na("CONS"),
+        cellfn,
+        k_(slot(validate_reduced)),
+        k_(slot(Some(resolve))),
+        k_(nseq(vec![])),
+        k_(nseq(vec![])),
+        k_(m),
+        k_(slot(mealy_reduced)),
+        k_(slot(Some(mf_na(&spec.table)))),
+        k_(slot(Some(mf_na(ft)))),
+    ]);
+    // build = COMP(apply, CONS(K(ast:build_system), rec)): at reduce time,
+    // apply(ast:build_system, rec(P)) -- builds the CONCRETE handler for
+    // THIS P's computed cell name
+    let build = nseq(vec![
+        mf_na("COMP"),
+        mf_na("apply"),
+        nseq(vec![mf_na("CONS"), k_(mf_na("ast:build_system")), rec]),
+    ]);
+    // the whole handler = COMP(apply, CONS(build, id)): apply(build(P), P)
+    // -- build the concrete handler, THEN apply it to the same P
+    nseq(vec![mf_na("COMP"), mf_na("apply"), nseq(vec![mf_na("CONS"), build, mf_na("id")])])
+}
+
+// rp_own_table_handler mirrors engine.py:3167 create_handlers' own-table
+// branch (`ast.build_system(cell_name=ft, machine=..., mealy_obj=...,
+// links_obj=...)`), which is build_system's OWN tail (engine.py:79-103): the
+// 9-slot record with a FIXED cell_name=ft and no validate/resolve/index/
+// append (create_handlers passes none of those for an own-table fact type),
+// reduced through ast:build_system ONCE -- the SAME record shape
+// rp_create_from_spec's own non-absorbed branch assembles, stopping short of
+// that function's final apply-to-a-fact step (there is no fact yet; this
+// runs at compile time, before any write). The REDUCED handler is stored
+// whole -- an own-table handler is fact-INDEPENDENT, unlike the absorbed
+// tree above.
+fn rp_own_table_handler(ev: &NEval, ft: &str, spec: &RpSpec) -> N {
+    let slot = |v: Option<N>| match v {
+        None => nseq(vec![]),
+        Some(x) => nseq(vec![x]),
+    };
+    // EAGERLY reduced (ev.mu) -- see rp_absorbed_handler_tree's own comment:
+    // python's machine_step/mealy_step/transitions_of are "thin canon
+    // wrappers" that call the REAL reducer eagerly, so the record
+    // build_system reduces here must never carry an unreduced reference in
+    // these slots (this function's own OUTER ev.mu(napp(ast:build_system,
+    // record)) reduces the RECORD's own top-level shape, but does not
+    // itself guarantee every embedded CONS-carried sub-value gets forced --
+    // found empirically by this slice's own byte differential, on the
+    // ABSORBED sibling; applied here too since rp-fixture's own machine
+    // exercises an own-table trigger ('reset') alongside the absorbed one).
+    let machine_slot = match &spec.machine {
+        None => nseq(vec![]),
+        Some(m) => {
+            let target = nseq(vec![
+                mf_na(&m.status_table),
+                N::A(Rc::new(Leaf::I(m.status_col))),
+                N::A(Rc::new(Leaf::I(m.status_width))),
+            ]);
+            let role_atom = match m.role_pos {
+                Some(p) => N::A(Rc::new(Leaf::I(p))),
+                None => N::Bot,
+            };
+            nseq(vec![target, ev.mu(m.sm_obj.clone()), role_atom])
+        }
+    };
+    let links_reduced = spec.links.clone().map(|n| ev.mu(n));
+    let mealy_reduced = spec.mealy.clone().map(|n| ev.mu(n));
+    let record = nseq(vec![
+        mf_na(ft),
+        nseq(vec![]), // validate: none for own-table (create_handlers passes none)
+        nseq(vec![]), // resolve: none for own-table
+        nseq(vec![]), // derive_obj: create never sets it
+        slot(links_reduced),
+        machine_slot,
+        slot(mealy_reduced),
+        nseq(vec![]), // index_cell: none for own-table
+        nseq(vec![]), // append_cell: none for own-table
+    ]);
+    ev.mu(napp(mf_na("ast:build_system"), record))
+}
+
+// create_handlers_native (engine.py:3167 create_handlers): store create:<ft>
+// handler cells for EVERY declared fact type -- the goal being full native
+// for every part but lambda and defs, a create handler is a DEF the
+// resident reduces over the fact, no host orchestration at write time. An
+// own-table handler is fact-INDEPENDENT and stores build_system's reduction
+// whole (rp_own_table_handler); an absorbed handler computes its cell name
+// from the fact at reduce time (rp_absorbed_handler_tree), so apply_core
+// serves BOTH shapes natively off the cell's presence alone -- already true
+// today (apply_core/native_apply predate this slice and already consume
+// whatever create:<ft> cells a store carries; this function is what MINTS
+// them natively for the first time, closing the loop). Called at compile
+// beside the layout, scheduler and generator cells; recompile replaces the
+// family wholesale.
+fn create_handlers_native(cells: &[(Leaf, V)], srv: &Srv) -> Result<Vec<(Leaf, V)>, String> {
+    use std::collections::HashSet;
+    let leaf = |s: &str| Leaf::S(s.to_string());
+    let d0 = cells_to_d(cells);
+    let nd = v_to_n(&d0);
+    let ncells = n_cells_of(&nd);
+    let ev = NEval {
+        cells: ncells,
+        process: srv.nprocess.clone(),
+        defs_n: nd.clone(),
+        fuel: std::cell::Cell::new(-1),
+    };
+    let (part, pairs_v) = mf_partition(&ev, &nd);
+    let trig_fts: HashSet<String> = pop_rows(cells, &leaf("smTrigger"))
+        .iter()
+        .filter_map(|r| {
+            let it = items(&list_of(r));
+            if it.len() >= 2 {
+                aval(&it[1]).map(|l| leaf_text(&l))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut fresh: Vec<(Leaf, V)> = Vec::new();
+    for f in pop_rows(cells, &leaf("factType")) {
+        let it = items(&list_of(&f));
+        if it.is_empty() {
+            continue;
+        }
+        let ft = match aval(&it[0]) {
+            Some(l) => leaf_text(&l),
+            None => continue,
+        };
+        let is_trig = trig_fts.contains(&ft);
+        let spec = rp_create_spec(cells, &ev, &nd, &part, &pairs_v, &ft, is_trig)
+            .map_err(|e| format!("create_handlers: {}", e))?;
+        let handler_n = if spec.absorbed {
+            rp_absorbed_handler_tree(&ev, &spec, &ft)
+        } else {
+            rp_own_table_handler(&ev, &ft, &spec)
+        };
+        fresh.push((Leaf::S(format!("create:{}", ft)), n_to_v(&handler_n)));
+    }
+
+    let mut out: Vec<(Leaf, V)> = cells
+        .iter()
+        .filter(|(k, _)| !matches!(k, Leaf::S(s) if s.starts_with("create:")))
+        .cloned()
+        .collect();
+    out.extend(fresh);
+    Ok(out)
 }
 
 // with_watermark_native (protocol.py:364 _with_watermark): filter any
@@ -8101,7 +8794,11 @@ fn replay_entries_native(
             let spec = match spec_box.get(&ft) {
                 Some(s) => s.clone(),
                 None => {
-                    let s = rp_create_spec(cells, &ev0, &nd0, &part, &pairs_v, &ft)?;
+                    // is_trigger: true -- this arm is only ever reached for
+                    // ft in trig_fts (the `if trig_fts.contains(&ft)` guard
+                    // above), the exact call shape rp_create_spec's own
+                    // is_trigger parameter documents; unchanged behavior.
+                    let s = rp_create_spec(cells, &ev0, &nd0, &part, &pairs_v, &ft, true)?;
                     spec_box.insert(ft.clone(), s.clone());
                     s
                 }
@@ -8708,22 +9405,83 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
         srv.ncells = saved_ncells3;
         derived3?;
     }
-    // the watermark stamp (protocol.py:1847, `persist._with_watermark` --
-    // corrected position, #20: an early draft of this slice stamped it
-    // BEFORE machine_fold, matching a compressed restatement of the
-    // boundary; protocol.py's own source is unambiguous that the stamp
-    // lands AFTER machine_fold's conditional run_rules and BEFORE
-    // layout_cells, found by a byte-level differential against this exact
-    // fixture — see rp-REPORT.md's deltas section) filters the old
-    // eventWatermark cell, appends the new one LAST, rows ((len entries,),).
-    // Gated on the SAME "did the request actually carry entries" condition
-    // as the replay phase itself, per the empty-list acceptance case above.
-    if let Some(entries) = &replay_entries_json {
-        if !entries.is_empty() {
-            model_cells = with_watermark_native(&model_cells, entries.len() as i64);
-        }
-    }
+    // the watermark stamp (protocol.py:1847, `persist._with_watermark`):
+    // filters the old eventWatermark cell, appends the new one LAST, rows
+    // ((len entries,),). UNCONDITIONAL (#20, the final pipeline slice --
+    // THE GATE REWORKED): the replay slice's own draft gated this stamp on
+    // "did the request actually carry entries", because that slice's
+    // acceptance (naming.md's "replay_entries":[] case) demanded byte
+    // identity with the PRE-replay boundary, which had no eventWatermark
+    // cell at all -- a deliberate, narrow, forward-flagged departure from
+    // protocol.py's own literal always-watermark (Registry.compile stamps
+    // eventWatermark unconditionally, even at len(entries)==0; entries =
+    // self._sink(name).read(), always a list, never None). THIS slice lifts
+    // that gate, matching protocol.py:1847 exactly: watermark(0) now stamps
+    // even when the request never carried a replay field at all. The
+    // naming.md corpus's fresh acceptance dump reflects this directly -- an
+    // eventWatermark((0,)) cell that the pre-lift dump never carried -- the
+    // lifted gate's own proof, named in the task's acceptance list.
+    let watermark_n: i64 = replay_entries_json.as_ref().map(|e| e.len()).unwrap_or(0) as i64;
+    model_cells = with_watermark_native(&model_cells, watermark_n);
     model_cells = layout_cells_native(&model_cells, srv);
+    // ======================= scheduler_cells -> generator_cells ->
+    // create_handlers (#20, the final pipeline slice, completing the
+    // boundary) =============================================================
+    // protocol.py:1849-1852's own order, continued right after layout_cells:
+    // scheduler_cells (engine.py:1797) materializes the passHeads/passOrder/
+    // passBound cells through classify_heads_native -- the SAME classifier
+    // op_run_rules' own absent-passHeads fallback shares, defined above in
+    // this file ("share the code, do not duplicate" per the task); generator_
+    // cells (engine.py:1825) mints the dsl:<Noun> cells (the opt-in XSD/OWL/
+    // EDM/etc. family is deliberately not ported -- see generator_cells_
+    // native's own comment: zero acceptance corpus ever sets
+    // App_uses_Generator, so python's own `active` set is always empty
+    // there too); create_handlers (engine.py:3167) mints create:<ft> handler
+    // cells -- consumed by the resident's ALREADY-SHIPPED write path
+    // (apply_core/native_apply, landed well before this slice), which until
+    // now has only ever served stores some OTHER writer (the python CLI)
+    // minted create: cells for. This closes that loop natively.
+    model_cells = scheduler_cells_native(&model_cells, srv);
+    model_cells = generator_cells_native(&model_cells, srv);
+    model_cells = create_handlers_native(&model_cells, srv)
+        .map_err(|e| format!("create_handlers: {}", e))?;
+    // ======================= save: <app>.store.json sidecar (#20) =========
+    // protocol.py:1854-1857's `drv.save(D); self._sidecar(name, D)` -- the
+    // ONE side effect this otherwise-pure op ever performs, and only when
+    // the request explicitly asks for it via "save_path": "<path>" (an
+    // explicit path field, matching the base_seed/replay_path convention:
+    // these ops resolve every path from the request itself, never from an
+    // Apps registry object op_compile_model was never handed). Reuses
+    // write_sidecar's core (sidecar_payload, defined beside write_sidecar)
+    // with the SAME <d, process> shape python's own _sidecar(name, D)
+    // serializes: process is NCANON (the compiled canon this binary loads
+    // once at startup -- the exact analog of python's _defs.latest filtered
+    // to kind=="compiled" entries, which canon.load_all() populates once at
+    // package import, corpus-independent) PLUS host_bootstrap_defs (the 8
+    // python-only names engine.py binds directly at module level, outside
+    // canon.load_all() -- transcribed by hand, see that function's own
+    // comment) -- 325 + 8 = 333, python's own total. Not reflected in the
+    // response JSON (python's own save/sidecar are side effects too, never
+    // rep fields); "saved" rides only as a diagnostic convenience.
+    let mut saved_path: Option<String> = None;
+    if let Some(J::S(path)) = jget(j, "save_path") {
+        let d_final = cells_to_d(&model_cells);
+        let process: Vec<(String, N)> = NCANON
+            .with(|nc| nc.borrow().clone())
+            .into_iter()
+            .chain(host_bootstrap_defs())
+            .collect();
+        let payload = sidecar_payload(&d_final, &process);
+        let out_path = std::path::PathBuf::from(path);
+        let mut tmp = out_path.clone().into_os_string();
+        tmp.push(format!(".{}.tmp", std::process::id()));
+        let tmp_path = std::path::PathBuf::from(tmp);
+        std::fs::write(&tmp_path, payload.as_bytes())
+            .map_err(|e| format!("save_path {}: {}", out_path.display(), e))?;
+        std::fs::rename(&tmp_path, &out_path)
+            .map_err(|e| format!("save_path rename {}: {}", out_path.display(), e))?;
+        saved_path = Some(out_path.display().to_string());
+    }
     // rule_diagnostics: the ruleDiag population AFTER rules (python's own
     // compiler.py:2489 reads it right after rekey, BEFORE the pipeline's
     // separate run_rules call — but ruleDiag is a STAGE-1 COMPILE diagnostic,
@@ -8784,30 +9542,54 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
         r.push(']');
     }
     if dump_store_on {
-        // the store as of THIS op's own boundary (#20, machine_fold +
-        // replay): fold -> rekey_transitions -> post-model run_rules ->
-        // status_facts -> [replay -> run_rules, IFF the request carried
-        // "replay_entries"/"replay_path" resolving to at least one entry —
-        // see the replay section's own comment for the gate's exact shape
-        // and the naming.md-empty-list acceptance case it exists for] ->
+        // the store as of THIS op's own boundary (#20, NOW THE COMPLETE
+        // Registry.compile boundary, minus the sql projection): fold ->
+        // rekey_transitions -> post-model run_rules -> status_facts ->
+        // [replay -> run_rules, IFF the request carried "replay_entries"/
+        // "replay_path" resolving to at least one entry -- see the replay
+        // section's own comment for the gate's exact shape and the
+        // naming.md-empty-list acceptance case it exists for] ->
         // machine_fold -> run_rules IFF machine_fold changed anything ->
-        // [watermark, same gate] -> layout_cells, full from_lam — python's
+        // watermark (UNCONDITIONAL, #20) -> layout_cells -> scheduler_cells
+        // -> generator_cells -> create_handlers, full from_lam — python's
         // compile_model (WITH rekey) + protocol.py's own run_rules/
         // status_facts/replay/(run_rules)/machine_fold/(run_rules)/
-        // watermark/layout_cells calls (protocol.py:1793-1848 read in full:
-        // the watermark stamp lands BETWEEN machine_fold's conditional
-        // run_rules and layout_cells, not after layout_cells — a position
-        // this slice corrected against the literal source after an initial
-        // draft placed it earlier; see rp-REPORT.md), excluding everything
-        // after layout_cells (scheduler/generator/create_handlers/save --
-        // still the next slice's own seat). (Earlier
-        // slices' narrower boundaries — compile_model_selfhost's bare
-        // return, and the post-rules-pre-status_facts point — are no longer
-        // what dump_store answers; those comparisons live in
-        // fold_pydump.py/rules-pydump.py calling the narrower python
-        // boundary directly.)
+        // watermark/layout_cells/scheduler_cells/generator_cells/
+        // create_handlers calls (protocol.py:1793-1852 read in full). Only
+        // drv.save/_sidecar (side effects, see "save_path" above) and the
+        // sql projection (see "sql_project" below) sit outside dump_store's
+        // own "store" field, matching python's own rep shape (drv.save and
+        // _sidecar are never reflected in rep either). (Earlier slices'
+        // narrower boundaries are no longer what dump_store answers; those
+        // comparisons live in their own reference scripts calling the
+        // narrower python boundary directly.)
         r.push_str(",\"store\":");
         write_v(&cells_to_d(&model_cells), &mut r);
+    }
+    if let Some(p) = &saved_path {
+        r.push_str(",\"saved\":");
+        esc(p, &mut r);
+    }
+    // ======================= optional sql projection (#20) ================
+    // protocol.py:1862-1864's `if drv.sql: rep["projected"] = drv.project(D)`
+    // -- mirrored behind an EXPLICIT flag ("sql_project":1) since a native op
+    // has no storage-driver object to read a `.sql` attribute from (every
+    // object-backend/SQL-backend choice a caller would otherwise make
+    // through `drv.sql` collapses to this one boolean here). op_sql_project
+    // already exists at certified byte parity (an earlier slice) and is
+    // reused verbatim, over model_cells via the SAME save/swap/restore
+    // discipline this op uses throughout -- never re-implemented. op_sql_
+    // project reads only srv.cells (no NEval/reduction involved in a 3NF
+    // projection), so only that field needs swapping. Explicitly OUT of
+    // this slice's acceptance ("the FULL Registry.compile minus the sql
+    // projection") -- wired for completeness, not re-certified here.
+    if matches!(jget(j, "sql_project"), Some(J::I(1))) {
+        let saved_cells5 = srv.cells.clone();
+        srv.cells = model_cells.clone();
+        let projected = op_sql_project(&J::O(Vec::new()), srv);
+        srv.cells = saved_cells5;
+        r.push_str(",\"projected\":");
+        r.push_str(&projected?);
     }
     r.push('}');
     Ok(r)
@@ -10033,21 +10815,105 @@ fn append_event(apps: &Apps, app: &str, ft: &str, fact: &[J]) -> std::io::Result
 // _sidecar's os.replace. A fresh resident boots this file through the same
 // ingestion apps_use takes, so the native write is durable to the resident.
 #[cfg(feature = "host")]
-fn write_sidecar(apps: &Apps, app: &str, srv: &Srv) -> std::io::Result<()> {
-    let mut payload = String::from("{\"d\":");
-    write_v(&srv.d, &mut payload);
-    payload.push_str(",\"process\":[");
-    for (i, (name, obj)) in srv.nprocess.iter().enumerate() {
+// write_v_spaced / write_n_spaced / sidecar_payload (#20, the final pipeline
+// slice): protocol.py's Registry._sidecar writes the sidecar through plain
+// `json.dump(payload, f, ensure_ascii=False)` -- NO `separators=` override --
+// so python's OWN default applies: item/key separators (", ", ": ") when
+// indent is None (verified empirically: json.dumps({"a":[1,2]}) ==
+// '{"a": [1, 2]}', confirmed independently against the checked-in
+// tests/fixtures/apps/flow/flow.store.json, which is spaced throughout).
+// This is DIFFERENT from write_v/write_n, the COMPACT serializers every
+// differential dump (dump_store's "store" field, rp-pydump.py's hand-mirror
+// write_v) has used since the first slice -- that pairing is a DELIBERATE,
+// mutually-agreed TEST convention on both hosts, unrelated to this
+// PRODUCTION file format. write_sidecar (below) previously used the compact
+// write_v/write_n here too -- a real, silent divergence from python's actual
+// on-disk bytes that this slice's own sidecar byte-compare acceptance
+// caught (see the task report): every native write (native_apply's own
+// already-shipped path, unchanged in behavior otherwise) was quietly
+// rewriting a python-produced spaced sidecar into a compact one. Fixed once,
+// here, for every writer.
+fn write_v_spaced(v: &V, out: &mut String) {
+    match shape(v) {
+        Shape::Bot => out.push_str("null"),
+        Shape::Atom(l) => match &*l {
+            Leaf::S(s) => esc(s, out),
+            Leaf::I(i) => out.push_str(&i.to_string()),
+            Leaf::F(f) => {
+                if f.fract() == 0.0 && f.is_finite() {
+                    out.push_str(&format!("{:.1}", f));
+                } else {
+                    out.push_str(&format!("{}", f));
+                }
+            }
+            Leaf::AppTag => out.push_str("\"#APP#\""),
+        },
+        Shape::Seq(l) => {
+            out.push('[');
+            let xs = items(&l);
+            for (i, x) in xs.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_v_spaced(x, out);
+            }
+            out.push(']');
+        }
+    }
+}
+
+fn write_n_spaced(n: &N, out: &mut String) {
+    match n {
+        N::Bot => out.push_str("null"),
+        N::A(l) => match &**l {
+            Leaf::S(s) => esc(s, out),
+            Leaf::I(i) => out.push_str(&i.to_string()),
+            Leaf::F(f) => {
+                if f.fract() == 0.0 && f.is_finite() {
+                    out.push_str(&format!("{:.1}", f));
+                } else {
+                    out.push_str(&format!("{}", f));
+                }
+            }
+            Leaf::AppTag => out.push_str("\"#APP#\""),
+        },
+        N::S(v) => {
+            out.push('[');
+            for (i, x) in v.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_n_spaced(x, out);
+            }
+            out.push(']');
+        }
+    }
+}
+
+// sidecar_payload is the ONE core the resident's every sidecar writer
+// shares: native_apply's live-write path (write_sidecar, below) and
+// op_compile_model's new "save" surface (#20) both serialize a <d, process>
+// pair through it, so the two writers can never quietly disagree on format.
+fn sidecar_payload(d: &V, process: &[(String, N)]) -> String {
+    let mut payload = String::from("{\"d\": ");
+    write_v_spaced(d, &mut payload);
+    payload.push_str(", \"process\": [");
+    for (i, (name, obj)) in process.iter().enumerate() {
         if i > 0 {
-            payload.push(',');
+            payload.push_str(", ");
         }
         payload.push('[');
         esc(name, &mut payload);
-        payload.push(',');
-        write_n(obj, &mut payload);
+        payload.push_str(", ");
+        write_n_spaced(obj, &mut payload);
         payload.push(']');
     }
-    payload.push_str("],\"overrides\":1,\"cases\":[]}");
+    payload.push_str("], \"overrides\": 1, \"cases\": []}");
+    payload
+}
+
+fn write_sidecar(apps: &Apps, app: &str, srv: &Srv) -> std::io::Result<()> {
+    let payload = sidecar_payload(&srv.d, &srv.nprocess);
     let path = apps.sidecar(app);
     let mut tmp = path.clone().into_os_string();
     // the tmp name carries the pid, matching _sidecar: the Python CLI writes
@@ -11440,6 +12306,92 @@ fn seqv(xs: Vec<V>) -> V {
         l = cons(x, l);
     }
     seq(l)
+}
+
+// host_bootstrap_defs (#20, the final pipeline slice's sidecar completion):
+// the 8 python-only compiled defs engine.py binds directly at MODULE level
+// -- NOT via canon.load() -- confirmed by tracing every kernel.define() call
+// during a real package import: these are the LAST 8 entries in
+// kernel.latest, right after the 325 theta/constraints/ast/system.canon
+// names canon.load_all() installs (NCANON's own content, below), and they
+// appear in NEITHER any of the four shared .canon files NOR any other
+// canon.load() call site -- engine.py:805-809 ("the default (minimal)
+// stages") and :3586/3608/3615 (machine_run/rmap/csdp, the self-host
+// bootstrap's own RMAP/machine-run/CSDP values) bind them as literal,
+// hand-built Scott trees over the SAME _S(...)/A(...) vocabulary the canon
+// files use. Transcribed here line-for-line from that source (verified
+// against a python probe of _conv(from_lam(obj)) for each of the 8 names) so
+// the sidecar's "process" field reaches python's own 333-entry content
+// byte-for-byte, not merely NCANON's 325 -- these 8 have no OTHER purpose in
+// this binary (op_run_rules/scheduler_cells/create_handlers etc. never
+// dispatch through them; they are dead weight for every op except this
+// diagnostic completeness).
+fn host_bootstrap_defs() -> Vec<(String, N)> {
+    let a1 = || N::A(Rc::new(Leaf::I(1)));
+    let a2 = || N::A(Rc::new(Leaf::I(2)));
+    let a3 = || N::A(Rc::new(Leaf::I(3)));
+    let phi_n = || nseq(vec![]); // PHI = seq(nil()) -- the V-level phi()'s own N analog
+
+    // resolve/derive/validate/emit/create (engine.py:799-809)
+    let resolve_def = mf_na("apndl");
+    let derive_def = mf_na("id");
+    let validate_def = nseq(vec![mf_na("CONS"), mf_na("id"), nseq(vec![mf_na("CONST"), phi_n()])]);
+    let emit_def = a1();
+    let create_def = nseq(vec![
+        mf_na("COMP"),
+        mf_na("emit"),
+        mf_na("validate"),
+        mf_na("derive"),
+        mf_na("resolve"),
+    ]);
+
+    // run: machine_run (engine.py:3575-3586), foldl(t, acc0, inputs) as one
+    // WHILE loop over the state triple <t, acc, remaining>
+    let input_ = nseq(vec![mf_na("COMP"), a1(), a3()]);
+    let new_acc = nseq(vec![
+        mf_na("COMP"),
+        mf_na("apply"),
+        nseq(vec![mf_na("CONS"), a1(), nseq(vec![mf_na("CONS"), a2(), input_])]),
+    ]);
+    let new_rem = nseq(vec![mf_na("COMP"), mf_na("tl"), a3()]);
+    let step = nseq(vec![mf_na("CONS"), a1(), new_acc, new_rem]);
+    let hasmore = nseq(vec![mf_na("COMP"), mf_na("not"), mf_na("null"), a3()]);
+    let loop_ = nseq(vec![mf_na("WHILE"), hasmore, step]);
+    let init_ = nseq(vec![
+        mf_na("CONS"),
+        a1(),
+        nseq(vec![mf_na("COMP"), a1(), a2()]),
+        nseq(vec![mf_na("COMP"), a2(), a2()]),
+    ]);
+    let run_def = nseq(vec![mf_na("COMP"), a2(), loop_, init_]);
+
+    // rmap (engine.py:3595-3608): the RMAP table-key assignment as a value
+    let kind_ = nseq(vec![mf_na("COMP"), a3(), a2()]);
+    let ot_ = nseq(vec![mf_na("COMP"), a2(), a2()]);
+    let ft_ = nseq(vec![mf_na("COMP"), a1(), a2()]);
+    let is_functional = nseq(vec![
+        mf_na("COMP"),
+        mf_na("eq"),
+        nseq(vec![mf_na("CONS"), kind_, nseq(vec![mf_na("CONST"), mf_na("functional")])]),
+    ]);
+    let table_key = nseq(vec![mf_na("COND"), is_functional, ot_, ft_.clone()]);
+    let entry = nseq(vec![mf_na("CONS"), table_key, ft_]);
+    let rmap_def =
+        nseq(vec![mf_na("COMP"), mf_na("apndr"), nseq(vec![mf_na("CONS"), a1(), entry])]);
+
+    // csdp (engine.py:3611-3615): the CSDP populate step, literally apndr
+    let csdp_def = mf_na("apndr");
+
+    vec![
+        ("resolve".to_string(), resolve_def),
+        ("derive".to_string(), derive_def),
+        ("validate".to_string(), validate_def),
+        ("emit".to_string(), emit_def),
+        ("create".to_string(), create_def),
+        ("run".to_string(), run_def),
+        ("rmap".to_string(), rmap_def),
+        ("csdp".to_string(), csdp_def),
+    ]
 }
 
 // ============================ intersection source =============================
