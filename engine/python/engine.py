@@ -1740,6 +1740,36 @@ def layout_cells(D):
     return to_lam(cells + (("CELL", "rmapColumns", tuple(rows)),))
 
 
+def induce_domain(D, noun):
+    """A role noun's enumeration domain, the induce oracle's order: the
+    declared enum literals first (the enumValues cell when present, else
+    parsed from valueConstraint specs), then the noun's own cell rows, then
+    every non-# value observed at any role position the noun plays, the
+    later legs appending only what is absent so far (keep-first). This is
+    the target the canon system:role_domain differential pins."""
+    import re as _re
+    vals = []
+    enum_rows = [r for r in _pop_rows(D, "enumValues")
+                 if len(r) >= 2 and r[0] == noun]
+    if enum_rows:
+        vals += [r[1] for r in enum_rows]
+    else:
+        for vc in _pop_rows(D, "valueConstraint"):
+            if len(vc) >= 2 and vc[0] == noun:
+                vals += _re.findall(r"'([^']*)'", str(vc[1]))
+    for row in _pop_rows(D, noun):
+        if row and row[0] not in vals:
+            vals.append(row[0])
+    for r in _pop_rows(D, "role"):
+        if len(r) >= 4 and r[3] == noun:
+            pos = r[2]
+            for frow in _pop_rows(D, r[1]):
+                if len(frow) >= pos and frow[pos - 1] != "#" \
+                        and frow[pos - 1] not in vals:
+                    vals.append(frow[pos - 1])
+    return vals
+
+
 def enum_values_cells(D):
     """Materialize the declared enum domains AS DATA: the enumValues cell,
     rows ⟨noun, value⟩ from each valueConstraint spec's quoted literals, in

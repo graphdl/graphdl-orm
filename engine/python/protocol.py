@@ -2464,25 +2464,9 @@ class Registry:
         if ft_id not in fts or not roles:
             return []
         nouns = [n for (_p, n) in roles]
-
-        def domain(noun):
-            vals = []
-            for vc in system._pop_rows(D, "valueConstraint"):
-                if len(vc) >= 2 and vc[0] == noun:
-                    vals += re.findall(r"'([^']*)'", str(vc[1]))
-            for row in system._pop_rows(D, noun):
-                if row and row[0] not in vals:
-                    vals.append(row[0])
-            for r in system._pop_rows(D, "role"):
-                if len(r) >= 4 and r[3] == noun:
-                    pos = r[2]
-                    for frow in system._pop_rows(D, r[1]):
-                        if len(frow) >= pos and frow[pos - 1] != "#" \
-                                and frow[pos - 1] not in vals:
-                            vals.append(frow[pos - 1])
-            return vals
-
-        domains = [domain(n) for n in nouns]
+        # the domain leg is module-level (system.induce_domain) so the canon
+        # system:role_domain differential pins the same function the verb runs
+        domains = [system.induce_domain(D, n) for n in nouns]
         if any(not d for d in domains):
             return []
         import itertools
