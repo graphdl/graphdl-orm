@@ -175,5 +175,31 @@ def test_the_canon_gate_and_coverage_match_the_oracle():
                      L.SEQ(L.CONS(te_hit)(L.CONS(D3)(L.NIL)))) == "T"
         assert canon("system:cand_covers",
                      L.SEQ(L.CONS(te_miss)(L.CONS(D3)(L.NIL)))) == "F"
+
+        # slice (c): score is a Filter-and-sum judgment over MARSHALED
+        # normalized rows (numeric-or-one is the oracle's int(str(v))
+        # boundary transduction, applied where the operand is built, the
+        # same seam ruling as the typed to_explain above); rank is the
+        # descending INSERT insertion sort, enumeration-stable on ties
+        def norm(v):
+            try:
+                return int(str(v))
+            except ValueError:
+                return 1
+
+        score_rows = (("hyp-0", 2), ("hyp-0", "High"), ("hyp-1", 3))
+        marshaled = tuple((h, norm(v)) for (h, v) in score_rows)
+        for hyp, want in (("hyp-0", 3), ("hyp-1", 3), ("hyp-9", 0)):
+            got = canon("system:cand_score",
+                        L.SEQ(L.CONS(_A(hyp))(
+                            L.CONS(to_lam(marshaled))(L.NIL))))
+            assert got == want, (hyp, got, want)
+
+        ranked_in = ((0, "a"), (5, "b"), (3, "c"), (5, "d"), (0, "e"))
+        got = canon("system:rank_desc", to_lam(ranked_in))
+        want = tuple(sorted(ranked_in, key=lambda r: -r[0]))
+        assert tuple(tuple(r) for r in got) == want
+        # ties keep enumeration order: b before d, a before e
+        assert [r[1] for r in got] == ["b", "d", "c", "a", "e"]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
