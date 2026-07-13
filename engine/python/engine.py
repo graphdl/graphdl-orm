@@ -1873,8 +1873,12 @@ def generator_cells(D):
                   if any(p == noun for (_i, p) in ps)]
         my_readings = tuple(sorted(readings[ft] for ft in my_fts
                                    if ft in readings))
-        my_cons = tuple(pair for (ft, players, pair) in cons
-                        if noun in players)
+        # sorted like the readings and transitions components: the list
+        # projects a SET of constraints, so store emission order must not
+        # leak into the row bytes (it differed across hosts on rule-chain
+        # apps and embedded the constraint cell's row order into dsl rows)
+        my_cons = tuple(sorted(pair for (ft, players, pair) in cons
+                               if noun in players))
         my_trans = tuple(sorted(set(sms.get(noun, ()))))
         cells["dsl:" + noun] = ((noun, kind, my_readings, my_cons,
                                  my_trans),)

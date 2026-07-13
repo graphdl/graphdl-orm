@@ -45,6 +45,16 @@ OVERRIDES = {
     "get_view": "system:entity_view",
     "_classify_heads": "system:classify_heads",
     "verify": "system:verify_store",
+    # theta join/dedup primitives: canon DEFs (arest.canon) with certified-equal
+    # native overrides in Rust `fn prim`, each gated by the `theta_arms_off` kill
+    # switch (flip it and the differential oracle falls back to the canon DEF) —
+    # the same certified-twin pattern as system:ev_cols above, the "fast override
+    # per platform" for the hot join/dedup path (the store-twin / join slices).
+    "theta:append_phi": "theta:append_phi",
+    "theta:dedup": "theta:dedup",
+    "theta:flatten": "theta:flatten",
+    "theta:join_combine": "theta:join_combine",
+    "theta:member": "theta:member",
 }
 
 

@@ -181,3 +181,19 @@ It is forbidden that Message names API Product by Field Name 'EndpointSlug'.
     fb = by_op["deontic_forbidden"]
     assert ob[2] == fb[2] == "Message_names_API_Product_by_Field_Name"
     assert ("Title",) in ob and ("EndpointSlug",) in fb
+
+
+def test_compound_deontic_does_not_mint_a_phantom_fact_type():
+    # #34: 'It is forbidden that X and that Y and that Z' is a multi-fact-type
+    # JOIN exclusion, not one fact type. The fact_type_reading catch-all used to
+    # dequote the whole 'X and that Y' clause into a single PHANTOM fact type
+    # (silent deontic loss). It must instead refuse LOUDLY (report unparsed),
+    # leaving no junk 'X_and_that_Y' fact type in the schema.
+    model = ("Explanation is an entity type. Hypothesis is an entity type. "
+             "Explanation selects Hypothesis. "
+             "It is forbidden that Explanation selects Hypothesis and that "
+             "Explanation selects other Hypothesis.")
+    D, _ = forml.compile_model(model)
+    fts = [r[0] for r in system._pop_rows(D, "factType")]
+    assert not any("and_that" in f for f in fts), fts     # no phantom
+    assert "Explanation_selects_Hypothesis" in fts         # the real ft still compiles

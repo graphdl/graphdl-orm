@@ -2399,8 +2399,19 @@ fn h_subset_trailing(
     sign: &str,
     srv: &Srv,
 ) -> Result<(Asserts, Objs), String> {
-    let head_txt = g[0].as_deref().unwrap_or("");
-    let cond_txt = g[1].as_deref().unwrap_or("");
+    // #34: groups are [marker, head, cond] (marker optional, mirroring Python).
+    // A leading storage marker makes the head DERIVED — a value-headed stored
+    // derivation, not a subset CHECK. Classify it here (not the catch-all) and
+    // refuse LOUDLY until the value-headed derivation build lands.
+    if g[0].is_some() {
+        let head_txt = g[1].as_deref().unwrap_or("");
+        return Err(format!(
+            "marked (stored-derivation) trailing-if awaits the value-headed derivation build (#34): {}",
+            take_chars(head_txt, 60)
+        ));
+    }
+    let head_txt = g[1].as_deref().unwrap_or("");
+    let cond_txt = g[2].as_deref().unwrap_or("");
     if head_txt.contains('\'') {
         return Err(format!(
             "value-restricted HEAD awaits its slice: {}",
@@ -2535,6 +2546,17 @@ fn deontic_fact(
     let mut rd = strip_derivation(g0).1;
     if rd.to_lowercase().starts_with("each ") {
         rd = rd[5..].to_string();
+    }
+    if rd.contains(" and that ") {
+        // #34: a compound deontic ('It is {obligatory|forbidden} that X and that
+        // Y and that Z') is a multi-fact-type JOIN constraint, NOT one fact type;
+        // the catch-all would dequote the whole clause into a PHANTOM fact type
+        // (silent deontic loss — Sherlock's core). Refuse LOUDLY, mirroring the
+        // compiler.py _plan guard, until the join-exclusion translator lands.
+        return Err(format!(
+            "compound deontic (X and that Y ...) awaits the join-exclusion translator (#34): {}",
+            take_chars(&rd, 70)
+        ));
     }
     let ids = quoted_findall(&rd);
     let dequoted = if !ids.is_empty() {
@@ -3202,18 +3224,44 @@ fn p_negation(s: &str) -> Option<Vec<Option<String>>> {
 }
 
 fn p_subset_trailing(s: &str) -> Option<Vec<Option<String>>> {
-    if s.starts_with('*') || s.starts_with('+') || !s.ends_with('.') {
+    if !s.ends_with('.') {
         return None;
     }
-    let qs = quote_positions(s);
-    for (p, _) in s.match_indices(" if ") {
-        if p >= 1 && even_before(&qs, p) {
-            let tail = &s[p + 4..s.len() - 1];
-            if !tail.is_empty() && quote_positions(tail).len() % 2 == 0 {
-                return Some(vec![
-                    Some(s[..p].to_string()),
-                    Some(tail.to_string()),
-                ]);
+    // #34: capture an optional leading storage marker (* ** + ++) instead of
+    // refusing it, mirroring p_rule_iff and the Python subset_trailing recognizer.
+    // A marked head is a value-headed stored derivation; the handler dispatches
+    // on the marker. Refusing the marker sent '+ E has W "x" if Y.' to the
+    // fact_type_reading catch-all (a silent phantom instance fact).
+    let b = s.as_bytes();
+    let marker_at = |n: usize| -> bool {
+        s.len() > n && b[..n].iter().all(|c| *c == b'*' || *c == b'+') && b[n] == b' '
+    };
+    let mut starts: Vec<usize> = Vec::new();
+    if s.len() > 2 && marker_at(2) {
+        starts.push(3);
+    }
+    if s.len() > 1 && marker_at(1) {
+        starts.push(2);
+    }
+    starts.push(0);
+    for off in starts {
+        let body = &s[off..];
+        let qs = quote_positions(body);
+        for (p, _) in body.match_indices(" if ") {
+            if p >= 1 && even_before(&qs, p) {
+                let tail = &body[p + 4..body.len() - 1];
+                if !tail.is_empty() && quote_positions(tail).len() % 2 == 0 {
+                    let marker = if off > 0 {
+                        Some(s[..off - 1].to_string())
+                    } else {
+                        None
+                    };
+                    return Some(vec![
+                        marker,
+                        Some(body[..p].to_string()),
+                        Some(tail.to_string()),
+                    ]);
+                }
             }
         }
     }

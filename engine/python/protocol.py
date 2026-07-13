@@ -1898,9 +1898,18 @@ class Registry:
         from .lam import from_lam
         from .polyglot import _conv
         from . import defs as _defs
+        # An app's sidecar must carry only its OWN defs, never a frozen copy of the
+        # shared engine canon. The engine canon is namespaced (system:/ast:/theta:/
+        # constraints:/monad:); an app's own defs are bare-named (the 8 op dispatchers
+        # resolve/derive/validate/emit/create/run/rmap/csdp — verified identical across
+        # the whole app corpus). Freezing the 325 namespaced engine defs SHADOWED every
+        # later canon fix for already-compiled apps: NEval::mu resolves process-before-
+        # NCANON, so the resident read the stale frozen copy instead of the live NCANON
+        # (the 2026-07-12 nav divergence — 7 edges vs the corrected 30). Engine canon is
+        # the shared LIVE reference; drop it here so namespaced names resolve from NCANON.
         process = [[n, _conv(from_lam(obj))]
                    for n, (kind, obj) in _defs.latest.items()
-                   if kind == "compiled"]
+                   if kind == "compiled" and ":" not in n]
         payload = {"d": _conv(from_lam(D)), "process": process,
                    "overrides": 1, "cases": []}
         path = os.path.join(self._app_dir(name), f"{name}.store.json")

@@ -72,6 +72,34 @@ Per-host optimizations (delta, FAST, the native carrier) are DEFS registrations
 over the same names, never forks of the source. A new platform joins by defining
 the vocabulary, consuming the same files, and passing the differential.
 
+## The twin gate
+
+A per-host optimization is legitimate only while it stays byte-equal to the canon
+name it overrides, and that equality is now a RUNTIME fact on real app compiles,
+not a synthetic-input claim. Each fast twin (the theta join/dedup arms, vb_fetch,
+entity_view, ...) is a `prim` arm that returns `Some` to win and defers to the
+canon DEF by returning `None`. One kill-switch convention bypasses any registered
+override by its canon name — `AREST_NO_OVERRIDE=<name>[,...]`, or `*` for the pure
+reference oracle — so the very same compile runs through the shared lambda instead:
+slower, identical. (Per-name aliases such as `AREST_NO_THETA_ARMS` remain honored
+during the migration.) The canon side carries the catalog of override-eligible
+names (`shared/base/resolution.md`, `Operation is overridable`); a host's
+registered names must be a subset of it, and the Rust host asserts exactly that in
+its test suite. Two standing harnesses hold the line from opposite directions:
+
+* `tools/apps_compile_parity.py` — native `apps_compile` vs Python `Registry.compile`
+  over real readings through the real flow: the CROSS-HOST axis, both hosts must
+  agree. Needs Python present; Python IS the reference of record.
+* `tools/twin_equality.py` — native with the twins ON vs the twins flipped to their
+  canon DEFs: the INTRA-HOST override axis, the fast path must equal the slow canon
+  reference. Needs only the Rust binary and shared/*.canon — no Python in the loop.
+  It also times both runs; twins-off must be measurably slower, else the arm never
+  fired and EQUAL is vacuous.
+
+Run the twin gate after any change to a `prim` twin arm or a theta canon DEF: a
+cross-host parity run alone cannot catch a twin that has drifted from its canon
+meaning, because both hosts could carry the same fast twin and the same drift.
+
 ## The fourth host, recorded ahead of need
 
 C# consumes the files as written: the tuple literal is a valid C# expression of

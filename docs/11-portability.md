@@ -22,6 +22,10 @@ you leave the standard environment.
 **Key:** `supported` = fully implemented, `stub` = returns a deterministic no-op or error,
 `planned` = on the roadmap, `n/a` = architecturally excluded.
 
+> **Note on `compile`.** `compile` resolves through the chapter 15 seam: native override
+> by default, portable canon reference beneath it, Python as an opt-in differential oracle
+> (`AREST_PYTHON_COMPILE`) — never required.
+
 ## Feature flags
 
 Declare features in `Cargo.toml`. The recommended combinations are:

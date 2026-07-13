@@ -90,7 +90,11 @@ fn verb_ops_answer_over_a_store_built_via_serve_ops() {
             r#""engine_version","orient"],"#,
             r#""app":["apply","ask","cells","compile","explain","get","induce","#,
             r#""propose","query","retract","schema","sql","synthesize"],"#,
-            r#""resident":["cells","query","run_rules","synthesize_pairs","verbs"]}}"#
+            // the resident-native op surface (RESIDENT_OPS, main.rs): grew with the
+            // #20 native pipeline — base_seed, compile_model (native op_compile_model,
+            // no python delegate), and sql_project joined cells/query/run_rules/
+            // synthesize_pairs/verbs. Kept in sorted order to match the verbs op.
+            r#""resident":["base_seed","cells","compile_model","query","run_rules","sql_project","synthesize_pairs","verbs"]}}"#
         )
     );
 
@@ -155,4 +159,25 @@ fn verb_ops_answer_over_a_store_built_via_serve_ops() {
         s.rpc(r#"{"cases":[{"f":"length","x":["a","b","c"],"fuel":0}]}"#),
         "[3]"
     );
+}
+
+#[test]
+fn host_overrides_are_a_subset_of_the_canon_catalog() {
+    // The Resolution Registry's cross-layer assertion (docs ch. 15): every
+    // override name this host registers (HOST_OVERRIDES) must appear in the
+    // canon-side catalog (shared/base/resolution.md, `Operation is
+    // overridable`), read back through the real flow — base_seed thaws or
+    // recomputes the base store, and the query op answers the compiled rows.
+    let mut s = Serve::spawn();
+    let seeded = s.rpc(r#"{"op":"base_seed"}"#);
+    assert!(seeded.contains(r#""cells""#), "base_seed failed: {seeded}");
+    let rows = s.rpc(r#"{"op":"query","fact_type":"Operation_is_overridable"}"#);
+    for name in arest_core::HOST_OVERRIDES {
+        let quoted = format!("[\"{}\"]", name);
+        assert!(
+            rows.contains(&quoted),
+            "host override {name:?} is not in the canon catalog \
+             (shared/base/resolution.md); catalog rows: {rows}"
+        );
+    }
 }

@@ -833,6 +833,13 @@ impl Mcp {
             .arg("--mcp")
             .arg("--apps-dir")
             .arg(apps_dir)
+            // The test's premise is a PYTHON-derived store (the Rust fixpoint must
+            // be idempotent over it — the cross-host axis), so pin apps_compile to
+            // the Python oracle: the 2026-07-13 default flip made apps_compile
+            // native, which both changed this test's premise and blew the 60s rpc
+            // timeout (native base-atop compile in a DEBUG binary). The native
+            // path's own gate is tools/apps_compile_parity.py on the release binary.
+            .env("AREST_PYTHON_COMPILE", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()

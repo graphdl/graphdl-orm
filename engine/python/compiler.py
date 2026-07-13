@@ -338,8 +338,14 @@ _CLASSIFY = [
     # Quote-aware: an ' if ' inside a literal is not the keyword.
     # Ordered just above the fact_type_reading catch-all so
     # trailing-if prose stops prepass-declaring junk fact types.
+    # #34: a leading NORMA storage marker (* ** + ++) makes the head DERIVED
+    # (a stored derivation), so capture it here — mirroring rule_iff (above) —
+    # instead of REFUSING the line with (?![*+]). Refusing sent '+ E has W "x"
+    # if Y.' to the fact_type_reading catch-all, which dequoted it into a
+    # PHANTOM instance fact (silent deontic/derivation loss). The marker rides
+    # as group 1; the handler dispatches on it.
     ("subset_trailing", re.compile(
-        r"^(?![*+])((?:[^']|'[^']*')+?) if ((?:[^']|'[^']*')+)\.$")),
+        r"^(?:([*+]{1,2}) )?((?:[^']|'[^']*')+?) if ((?:[^']|'[^']*')+)\.$")),
     ("fact_type_reading", re.compile(r"^(.+)\.$")),
 ]
 
@@ -1113,7 +1119,18 @@ def _h_subset_trailing(g, k, m, sign="positive"):
     that X if Y' is an EXCLUSION (pi(Y) disjoint pi(X) — Y and X must never
     co-occur on the bound entity). Value literals and compound conditions
     refuse until their slices land."""
-    head_txt, cond_txt = g
+    mark, head_txt, cond_txt = g
+    if mark:
+        # #34: a leading storage marker (+ ++ * **) makes the head DERIVED —
+        # 'store E has Weight "Strong" WHEN E comes from Source' is a
+        # value-headed STORED DERIVATION, not a subset CHECK over an asserted
+        # head. We now CLASSIFY it correctly (this handler, not the catch-all
+        # that silently minted a phantom instance fact), but refuse LOUDLY
+        # until the value-headed derivation build lands, rather than
+        # mis-building it as a subset. Loud-absent >> silently-absent.
+        raise ValueError(
+            "marked (stored-derivation) trailing-if awaits the value-headed "
+            "derivation build (#34): " + head_txt[:60])
     fts = getattr(k, "fts", None) or ()
     plain = getattr(k, "plain", None) or ()
     if "'" in head_txt:
@@ -2120,6 +2137,18 @@ def _plan(kind, g, known, modality="alethic", sign=""):
         # Message_is_natural while the constraint text keeps the statement)
         if reading.lower().startswith("each "):
             reading = reading[5:]
+        if " and that " in reading:
+            # #34: a compound deontic — 'It is {obligatory|forbidden} that X and
+            # that Y and that Z' — is a multi-fact-type JOIN constraint (a subset
+            # or exclusion over the anaphoric join of X, Y, Z), NOT one fact type.
+            # The fact_type_reading catch-all would dequote the whole clause into a
+            # single PHANTOM fact type (silent deontic loss — Sherlock's core, #34).
+            # Refuse LOUDLY until the join-exclusion translator lands, so the line
+            # reports as unparsed instead of minting junk schema. Loud-absent >>
+            # silently-absent.
+            raise ValueError(
+                "compound deontic (X and that Y ...) awaits the join-exclusion "
+                "translator (#34): " + reading[:70])
         ids = tuple(_QUOTED.findall(reading))
         dequoted = (re.sub(r"\s+", " ", _QUOTED.sub("", reading)).strip()
                     if ids else reading)

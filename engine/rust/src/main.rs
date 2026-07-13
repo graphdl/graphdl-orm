@@ -25,6 +25,7 @@ mod uilayout;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+#[cfg(feature = "host")]
 use std::io::Read;
 use std::rc::Rc;
 
@@ -1361,6 +1362,105 @@ fn set_theta_arms_off(v: bool) {
     THETA_ARMS_OFF.with(|c| c.set(v));
 }
 
+// ======================= THE RESOLUTION REGISTRY (docs ch. 15) =================
+// One kill-switch convention over every certified override this host registers:
+//   AREST_NO_OVERRIDE=<name>[,<name>...]   bypass the named overrides
+//   AREST_NO_OVERRIDE=*                    bypass ALL overrides (the reference oracle)
+// A killed name resolves through its REFERENCE route instead of the fast
+// override: a canon DEF reduces through mu, a verb reaches its delegate. The
+// pre-registry per-name switches stay as documented aliases during the
+// migration, each folding into the same set: AREST_NO_THETA_ARMS (the theta
+// family), AREST_QUERY_INTERPRETED (query), AREST_SYNTH_SCOTT (synthesize),
+// AREST_DELEGATE_READS (get, actions, schema, synthesize),
+// AREST_PYTHON_COMPILE (apps_compile).
+//
+// HOST_OVERRIDES enumerates every override name this host registers. The canon
+// carries the CATALOG (shared/base/resolution.md, `Operation is overridable`);
+// the host's names must be a subset of the catalog, asserted by the
+// host_overrides_are_a_subset_of_the_canon_catalog test. Registering a new
+// override means: a catalog row (canon), a HOST_OVERRIDES row (here), the
+// override consulting overrides_killed at its seam, and a parity pin.
+pub const HOST_OVERRIDES: &[&str] = &[
+    // DEF-level: the name is the canon DEF the native arm twins.
+    "system:ev_cols",
+    "system:entity_view",
+    "system:vb_fetch",
+    "theta:NatJoin",
+    "theta:append_phi",
+    "theta:flatten",
+    "theta:join_combine",
+    "theta:member",
+    "theta:dedup",
+    // Verb-level: the name is the op whose native route bypasses a delegate
+    // or an interpreted reduction.
+    "query",
+    "synthesize",
+    "apps_compile",
+    "verify",
+    "validate",
+    "apply",
+    "retract",
+    "get",
+    "actions",
+    "schema",
+];
+
+thread_local! {
+    // Parsed once per thread from the environment (the same seam the theta
+    // switch uses; a spawned differential run sets the env before spawn).
+    // (star, killed-name set); aliases fold in at parse time.
+    static NO_OVERRIDE: (bool, std::collections::HashSet<String>) = parse_no_override();
+}
+
+fn parse_no_override() -> (bool, std::collections::HashSet<String>) {
+    let mut star = false;
+    let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(v) = std::env::var_os("AREST_NO_OVERRIDE") {
+        for part in v.to_string_lossy().split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if part == "*" {
+                star = true;
+            } else {
+                set.insert(part.to_string());
+            }
+        }
+    }
+    if std::env::var_os("AREST_NO_THETA_ARMS").is_some() {
+        for n in ["theta:NatJoin", "theta:append_phi", "theta:flatten",
+                  "theta:join_combine", "theta:member", "theta:dedup"] {
+            set.insert(n.to_string());
+        }
+    }
+    if std::env::var_os("AREST_QUERY_INTERPRETED").is_some() {
+        set.insert("query".to_string());
+    }
+    if std::env::var_os("AREST_SYNTH_SCOTT").is_some() {
+        set.insert("synthesize".to_string());
+    }
+    if std::env::var_os("AREST_DELEGATE_READS").is_some() {
+        for n in ["get", "actions", "schema", "synthesize"] {
+            set.insert(n.to_string());
+        }
+    }
+    if std::env::var_os("AREST_PYTHON_COMPILE").is_some() {
+        set.insert("apps_compile".to_string());
+    }
+    (star, set)
+}
+
+fn overrides_killed(name: &str) -> bool {
+    NO_OVERRIDE.with(|c| c.0 || c.1.contains(name))
+}
+
+// The theta arms keep their test-settable thread-local family switch and gain
+// the per-name registry kill: off means the canon body reduces.
+fn theta_off(name: &str) -> bool {
+    theta_arms_off() || overrides_killed(name)
+}
+
 // n_join_key: a hash key over N that is FAITHFUL to n_eq (type-strict nateq at
 // the leaves: 1, 1.0 and "1" are three distinct keys; sequences recurse,
 // length-prefixed strings so no content imitates structure). NOT key_of /
@@ -1621,7 +1721,7 @@ impl NEval {
                 // (#35 Stage C): the stored bytes and the canonical meaning
                 // are untouched; only the reduction becomes the native hash
                 // join. Non-matching shapes fall through unchanged.
-                if !theta_arms_off() {
+                if !theta_off("theta:NatJoin") {
                     if let Some(c) = natjoin_config(v) {
                         return natjoin_run(c, &x);
                     }
@@ -1888,7 +1988,7 @@ impl NEval {
             // still wins (cells are consulted before prim()); the process/
             // NCANON entries these arms now shadow are the same canon text
             // the arms mirror.
-            "theta:append_phi" if !theta_arms_off() => match x {
+            "theta:append_phi" if !theta_off("theta:append_phi") => match x {
                 // apndr∘⟨id, K(φ)⟩ — append the empty sequence
                 N::S(v) => {
                     let mut w = v.to_vec();
@@ -1897,7 +1997,7 @@ impl NEval {
                 }
                 _ => N::Bot,
             },
-            "theta:flatten" if !theta_arms_off() => match x {
+            "theta:flatten" if !theta_off("theta:flatten") => match x {
                 // INSERT(cat)∘append_phi — concatenate a list of lists in
                 // order; any non-sequence element bottoms (cat's demand)
                 N::S(v) => {
@@ -1912,7 +2012,7 @@ impl NEval {
                 }
                 _ => N::Bot,
             },
-            "theta:join_combine" if !theta_arms_off() => match x {
+            "theta:join_combine" if !theta_off("theta:join_combine") => match x {
                 // cat∘⟨1, tl∘2⟩ — ⟨a,b⟩ → a ++ b[1..]; a must be a seq, b a
                 // NONEMPTY seq (tl's demand); extra operand columns beyond
                 // the two selectors are ignored, as the selectors ignore them
@@ -1927,13 +2027,13 @@ impl NEval {
                 },
                 _ => N::Bot,
             },
-            "theta:member" if !theta_arms_off() => match pairv(x) {
+            "theta:member" if !theta_off("theta:member") => match pairv(x) {
                 // not∘null∘filter_eq∘distl — ⟨e, ys⟩ → T iff some y in ys is
                 // n_eq-equal to e (distl demands the exact pair, ys a seq)
                 Some((e, N::S(ys))) => nb(ys.iter().any(|y| n_eq(&e, y))),
                 _ => N::Bot,
             },
-            "theta:dedup" if !theta_arms_off() => match x {
+            "theta:dedup" if !theta_off("theta:dedup") => match x {
                 // INSERT(COND(member, 2, apndl))∘append_phi — the RIGHT fold:
                 // an element is kept iff it is not a member of the already-
                 // folded suffix, so duplicates keep their LAST occurrence's
@@ -1990,7 +2090,7 @@ impl NEval {
             // classified column layout, one spine pass (the WHILE-fold is
             // interpretive-minutes at fleet scale). Twinned beside
             // entity_view's pin.
-            "system:ev_cols" => match pairv(x) {
+            "system:ev_cols" if !overrides_killed("system:ev_cols") => match pairv(x) {
                 Some((N::A(nl), d)) => {
                     let noun = match leaf_str(&nl) {
                         Some(s) => s,
@@ -2034,7 +2134,7 @@ impl NEval {
                 }
                 _ => N::Bot,
             },
-            "system:entity_view" => match x {
+            "system:entity_view" if !overrides_killed("system:entity_view") => match x {
                 N::S(v3) if v3.len() == 3 => {
                     let noun = match &v3[0] {
                         N::A(l) => match leaf_str(l) { Some(s) => s, None => return Some(N::Bot) },
@@ -2192,7 +2292,7 @@ impl NEval {
                 }
                 _ => N::Bot,
             },
-            "system:vb_fetch" => match pairv(x) {
+            "system:vb_fetch" if !overrides_killed("system:vb_fetch") => match pairv(x) {
                 Some((ft, d)) => {
                     let spine: Vec<(String, N)> = match &d {
                         N::S(cells) => cells
@@ -3048,6 +3148,19 @@ fn handle(j: &J, srv: &mut Srv, serve: bool) -> String {
             for entry in procs {
                 if let J::A(pair) = entry {
                     if let (J::S(name), val) = (&pair[0], &pair[1]) {
+                        // sidecar-staleness fix: an app sidecar carries its OWN defs
+                        // (the 8 bare op names, which are NOT in NCANON) plus — in a
+                        // pre-fix store — a frozen copy of the shared engine canon (the
+                        // namespaced system:/ast:/theta:/constraints:/monad: defs). Skip
+                        // the namespaced ones so they resolve LIVE from NCANON instead of
+                        // the stale frozen snapshot, which shadowed every later canon fix
+                        // (NEval::mu resolves process-before-NCANON; the 2026-07-12 nav
+                        // divergence, 7 vs 30). Mirrors the Python writer (protocol.py
+                        // _sidecar: keep iff ':' not in name). Both mus read this same
+                        // filtered list, so Scott/native stay twin-equivalent.
+                        if name.contains(':') {
+                            continue;
+                        }
                         b.push((name.clone(), to_v(val)));
                         srv.nprocess.push((name.clone(), j_to_n(val)));
                     }
@@ -3190,6 +3303,27 @@ fn reduce_in(mu: &V, cells: &[(Leaf, V)], d: &V, f: V, x: V, fuel: Option<i64>) 
 fn reduce_over(srv: &Srv, f: V, x: V, fuel: Option<i64>) -> V {
     // one reduction over the resident store
     reduce_in(&srv.mu, &srv.cells, &srv.d, f, x, fuel)
+}
+
+// reduce_over_n: reduction on the N CARRIER (tagged values), the delta/tuple analog of
+// reduce_over's Scott path — the SAME mu, a faster representation. Python ships two evaluators
+// (kernel.py) and DEFAULTS to "delta" (the native carrier) precisely because the Scott/"lambda"
+// path blows up: PYAREST_EVALUATOR=lambda RecursionErrors on the constraint validators where
+// delta converges (49.7s). reduce_over uses the Scott V CLOSURES (make_mu) — correct but far
+// slower per step and prone to the same stack/blowup. The N carrier (NEval::mu — what compile and
+// native_verbalize already reduce through) is native's fast reduction; validate/verify must use
+// it, exactly as python's delta default and native compile do. Normal form is the same (one mu),
+// only the representation differs; DEFS resolve through the resident's N mirror (ncells/nprocess/
+// nd + NCANON), the same path the compile reductions use. fuel<0 = unbounded (native_verbalize's
+// idiom); a bound guards a pathological term.
+fn reduce_over_n(srv: &Srv, f: V, x: V, fuel: i64) -> V {
+    let ev = NEval {
+        cells: srv.ncells.clone(),
+        process: srv.nprocess.clone(),
+        defs_n: srv.nd.clone(),
+        fuel: std::cell::Cell::new(fuel),
+    };
+    n_to_v(&ev.mu(napp(v_to_n(&f), v_to_n(&x))))
 }
 
 // (system:verbalize : id) : D over the NATIVE carrier — the ~40x plumb
@@ -3980,7 +4114,7 @@ fn classify_heads_native(cells: &[(Leaf, V)]) -> HeadClasses {
     for r in pop_rows(cells, &leaf("ruleDerives")) {
         let it = items(&list_of(&r));
         if it.len() >= 2 {
-            if let (Some(rid), Some(head)) = (aval(&it[0]), aval(&it[1])) {
+            if let (Some(_rid), Some(head)) = (aval(&it[0]), aval(&it[1])) {
                 let row = HRow {
                     head: (*head).clone(),
                     head_key: key_of(&it[1]),
@@ -6546,6 +6680,12 @@ fn load_grammar_scratch(j: &J) -> Result<(GrammarScratch, String), String> {
             if let J::A(pair) = entry {
                 if pair.len() >= 2 {
                     if let J::S(name) = &pair[0] {
+                        // sidecar-staleness fix (mirrors the main ingest loop): skip a
+                        // frozen copy of the shared engine canon (namespaced defs) so it
+                        // resolves live from NCANON, never a stale snapshot.
+                        if name.contains(':') {
+                            continue;
+                        }
                         gproc.push((name.clone(), j_to_n(&pair[1])));
                     }
                 }
@@ -7909,12 +8049,18 @@ fn generator_cells_native(cells: &[(Leaf, V)], srv: &Srv) -> Vec<(Leaf, V)> {
         let mut my_readings: Vec<String> =
             my_fts.iter().filter_map(|ft| readings.get(*ft).cloned()).collect();
         my_readings.sort();
-        let my_cons: Vec<V> = cons
+        // sorted like the readings and transitions components (python's own
+        // sorted(...) mirror): the list projects a SET of constraints, so
+        // store emission order must not leak into the row bytes
+        let mut cons_pairs: Vec<(String, String)> = cons
             .iter()
             .filter(|c| c.players.iter().any(|p| p == noun))
-            .map(|c| {
-                seqc(vec![atom(Leaf::S(c.kind_tag.to_string())), atom(Leaf::S(c.text.clone()))])
-            })
+            .map(|c| (c.kind_tag.to_string(), c.text.clone()))
+            .collect();
+        cons_pairs.sort();
+        let my_cons: Vec<V> = cons_pairs
+            .into_iter()
+            .map(|(k, t)| seqc(vec![atom(Leaf::S(k)), atom(Leaf::S(t))]))
             .collect();
         let mut my_trans: Vec<(String, String, String)> = sms.get(noun).cloned().unwrap_or_default();
         my_trans.sort();
@@ -9557,6 +9703,11 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
         Some(J::I(n)) if *n > 0 => Some(*n),
         _ => None,
     };
+    // #20 sub-second profiling: AREST_COMPILE_PROFILE prints per-phase wall times
+    // to stderr (zero-cost when unset), so the base-proportional flat compile cost
+    // (~4s regardless of app size, 2026-07-13) can be localized before optimizing.
+    let profile = std::env::var_os("AREST_COMPILE_PROFILE").is_some();
+    let prof_start = std::time::Instant::now();
     let leaf = |s: &str| Leaf::S(s.to_string());
     let strv = |x: &V| aval(x).and_then(|l| leaf_str(&l));
 
@@ -10160,10 +10311,23 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
     // (apply_core/native_apply, landed well before this slice), which until
     // now has only ever served stores some OTHER writer (the python CLI)
     // minted create: cells for. This closes that loop natively.
+    let prof_pre = prof_start.elapsed(); // classify+translate+fold+rekey+run_rules+status+machine+layout
+    let _pt = std::time::Instant::now();
     model_cells = scheduler_cells_native(&model_cells, srv);
+    let prof_sched = _pt.elapsed();
+    let _pt = std::time::Instant::now();
     model_cells = generator_cells_native(&model_cells, srv);
+    let prof_gen = _pt.elapsed();
+    let _pt = std::time::Instant::now();
     model_cells = create_handlers_native(&model_cells, srv)
         .map_err(|e| format!("create_handlers: {}", e))?;
+    let prof_ch = _pt.elapsed();
+    if profile {
+        eprintln!(
+            "[compile-profile] pre-downstream={:?} scheduler={:?} generator={:?} create_handlers={:?}",
+            prof_pre, prof_sched, prof_gen, prof_ch
+        );
+    }
     // ======================= save: <app>.store.json sidecar (#20) =========
     // protocol.py:1854-1857's `drv.save(D); self._sidecar(name, D)` -- the
     // ONE side effect this otherwise-pure op ever performs, and only when
@@ -10173,23 +10337,20 @@ fn op_compile_model(j: &J, srv: &mut Srv) -> Result<String, String> {
     // Apps registry object op_compile_model was never handed). Reuses
     // write_sidecar's core (sidecar_payload, defined beside write_sidecar)
     // with the SAME <d, process> shape python's own _sidecar(name, D)
-    // serializes: process is NCANON (the compiled canon this binary loads
-    // once at startup -- the exact analog of python's _defs.latest filtered
-    // to kind=="compiled" entries, which canon.load_all() populates once at
-    // package import, corpus-independent) PLUS host_bootstrap_defs (the 8
-    // python-only names engine.py binds directly at module level, outside
-    // canon.load_all() -- transcribed by hand, see that function's own
-    // comment) -- 325 + 8 = 333, python's own total. Not reflected in the
-    // response JSON (python's own save/sidecar are side effects too, never
-    // rep fields); "saved" rides only as a diagnostic convenience.
+    // serializes: process is the app's OWN defs only -- host_bootstrap_defs (the
+    // 8 bare python-only names engine.py binds at module level, absent from
+    // NCANON). The shared engine canon (NCANON's 325 namespaced defs) is NO
+    // LONGER frozen into the sidecar: python's _sidecar now filters it out
+    // (keep iff ':' not in name) so every app resolves engine canon LIVE from
+    // NCANON, never a stale copy that shadows later canon fixes (the 2026-07-12
+    // sidecar-staleness fix; was 325+8=333). This native writer matches that --
+    // 8 bare defs -- so the native compile (#20) can never reintroduce the
+    // freeze. Not reflected in the response JSON (python's own save/sidecar are
+    // side effects too, never rep fields); "saved" rides as a diagnostic.
     let mut saved_path: Option<String> = None;
     if let Some(J::S(path)) = jget(j, "save_path") {
         let d_final = cells_to_d(&model_cells);
-        let process: Vec<(String, N)> = NCANON
-            .with(|nc| nc.borrow().clone())
-            .into_iter()
-            .chain(host_bootstrap_defs())
-            .collect();
+        let process: Vec<(String, N)> = host_bootstrap_defs();
         let payload = sidecar_payload(&d_final, &process);
         let out_path = std::path::PathBuf::from(path);
         let mut tmp = out_path.clone().into_os_string();
@@ -10888,7 +11049,7 @@ fn op_answer(op: &str, j: &J, srv: &mut Srv) -> Result<String, String> {
             // Fetch)), so cells_of(D)'s first match by nateq is byte-identical.
             // AREST_QUERY_INTERPRETED forces the canon path (the differential
             // oracle the byte-equality is certified against).
-            let res = if std::env::var_os("AREST_QUERY_INTERPRETED").is_some() {
+            let res = if overrides_killed("query") {
                 let f = mkapp(atom(Leaf::S("ast:FetchPop".into())), ft.clone());
                 reduce_over(srv, f, srv.d.clone(), fuel)
             } else {
@@ -10965,7 +11126,7 @@ fn op_answer(op: &str, j: &J, srv: &mut Srv) -> Result<String, String> {
                 Some(a) => a,
                 None => return Err("synthesize_pairs needs a scalar id".to_string()),
             };
-            let res = if std::env::var_os("AREST_SYNTH_SCOTT").is_some() {
+            let res = if overrides_killed("synthesize") {
                 let f = mkapp(atom(Leaf::S("system:verbalize".into())),
                               id.clone());
                 reduce_over(srv, f, srv.d.clone(), fuel)
@@ -11111,7 +11272,7 @@ const MCP_TOOLS: &str = concat!(
     r#""description":"Commits one fact row (eq. create) and answers its receipt, NATIVELY in the resident for own-table and absorbed fact types alike (the stored create:<ft> handler computes its cell from the fact; the machine leg advances the status column; the bounded derive and the sidecar ride the same step); a refused write answers committed false with the violations.","#,
     r#""inputSchema":{"type":"object","properties":{"app":{"type":"string"},"fact_type":{"type":"string"},"fact":{"type":"array","items":{"type":"string"}}},"required":["app","fact_type","fact"]}},"#,
     r#"{"name":"retract","#,
-    r#""description":"Delegates one fact-row retraction to the Python compiler host and answers its receipt; a refused retraction answers committed false with the violations.","#,
+    r#""description":"Retracts one exact fact row, validated: the shrunk population must satisfy the fact type's own constraints, so a retract can refuse like a create. Resolves natively over the retained store when AREST_NATIVE_RETRACT is set or no Python CLI resolves; otherwise delegates to the Python compiler host. A refused retraction answers committed false with the violations.","#,
     r#""inputSchema":{"type":"object","properties":{"app":{"type":"string"},"fact_type":{"type":"string"},"fact":{"type":"array","items":{"type":"string"}}},"required":["app","fact_type","fact"]}},"#,
     r#"{"name":"apps_compile","#,
     r#""description":"Delegates a readings compile to the Python compiler host, rebuilding the app's database and store sidecar, and answers the compile report.","#,
@@ -11119,6 +11280,9 @@ const MCP_TOOLS: &str = concat!(
     r#"{"name":"get","#,
     r#""description":"Answers the per-entity view of the retained app through the Python compiler host: the key, the absorbed values, and the facts the id participates in.","#,
     r#""inputSchema":{"type":"object","properties":{"noun":{"type":"string"},"id":{"type":"string"}},"required":["noun","id"]}},"#,
+    r#"{"name":"nav","#,
+    r#""description":"Answers the noun's Entity Navigation Graph edges from the retained store, NATIVELY: system:nav classifies each fact type the noun plays by its uniqueness cardinality into child (1:n), peer (1:1), or collection (m:n) and answers per edge {kind, fact_type, targets} (whitepaper ch.25). No id — the schema-level graph the per-entity HATEOAS links project from.","#,
+    r#""inputSchema":{"type":"object","properties":{"noun":{"type":"string"}},"required":["noun"]}},"#,
     r#"{"name":"schema","#,
     r#""description":"Answers the retained app's model surface through the Python compiler host: object types, fact types with readings and roles, and constraints.","#,
     r#""inputSchema":{"type":"object","properties":{}}},"#,
@@ -11443,6 +11607,193 @@ fn delegate_call(verb: &str, args: &J, apps: &Apps, srv: &mut Srv, reload: bool)
 }
 
 #[cfg(feature = "host")]
+// native_apps_compile (#20, the flip): a Rust-configured environment compiles an
+// app with NO Python. It reproduces the exact sequence the 2026-07-13 base-context
+// byte-parity differential proved byte-identical to python's Registry.compile (1192
+// cells, zero divergence): compose the app's readings/*.md into one text, seed the
+// base into the resident, then op_compile_model ATOP it (context_from:"resident"),
+// saving <app>.store.json. base and grammar auto-resolve by walking the exe's
+// ancestors for shared/ (base_seed_paths / load_grammar_scratch), so no path args.
+// The resident store is saved and restored so apps_compile stays side-effect-free on
+// the loaded app, exactly like the python delegate (which runs out of process). NATIVE
+// BY DEFAULT as of 2026-07-13 (the flip): apps_compile never names python unless the
+// AREST_PYTHON_COMPILE oracle is explicitly requested; byte-parity-certified against the
+// delegate (apps_compile_parity.py) and ~11-31x faster.
+#[cfg(feature = "host")]
+fn native_apps_compile(app: &str, apps: &Apps, srv: &mut Srv)
+    -> Result<String, (i64, String)>
+{
+    let rd = apps.dir.join(app).join("readings");
+    let mut mds: Vec<std::path::PathBuf> = std::fs::read_dir(&rd)
+        .map_err(|e| (-32603, format!("readings dir {}: {}", rd.display(), e)))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("md"))
+        .collect();
+    mds.sort(); // Registry._base_D's own sorted(os.listdir) assembly order
+    if mds.is_empty() {
+        return Err((-32602, format!("app {:?} has no readings/*.md to compile", app)));
+    }
+    let mut text = String::new();
+    for f in &mds {
+        let s = std::fs::read_to_string(f)
+            .map_err(|e| (-32603, format!("read {}: {}", f.display(), e)))?;
+        text.push_str(&s);
+        if !s.ends_with('\n') {
+            text.push('\n');
+        }
+    }
+    // save the resident store: base_seed/compile_model mutate srv as scratch
+    let saved = (srv.d.clone(), srv.cells.clone(), srv.nd.clone(),
+                 srv.ncells.clone(), srv.nprocess.clone());
+    op_base_seed(&J::O(Vec::new()), srv)
+        .map_err(|e| (-32603, format!("base_seed: {}", e)))?;
+    let save = apps.sidecar(app);
+    let mut req_fields = vec![
+        ("text".to_string(), J::S(text)),
+        ("context_from".to_string(), J::S("resident".to_string())),
+        ("save_path".to_string(), J::S(save.to_string_lossy().to_string())),
+    ];
+    // the app's event sink replays through the SAME create the live apply path
+    // uses, exactly as python Registry.compile does (protocol.py: the _sink
+    // read + replay_entries + post-replay run_rules). Omitting this silently
+    // DROPPED every event-sourced row on a native recompile (found on the
+    // claude app's 117-entry log: the migrate batches and bare-fact applies
+    // vanished while the readings rows survived). op_compile_model owns the
+    // replay seat (replay_path); this caller's job is only to point at the
+    // sink when it exists and is nonempty.
+    let events = apps.dir.join(app).join(format!("{}.events.jsonl", app));
+    if let Ok(md) = std::fs::metadata(&events) {
+        if md.is_file() && md.len() > 0 {
+            req_fields.push((
+                "replay_path".to_string(),
+                J::S(events.to_string_lossy().to_string()),
+            ));
+        }
+    }
+    let req = J::O(req_fields);
+    let out = op_compile_model(&req, srv)
+        .map_err(|e| (-32603, format!("compile_model: {}", e)));
+    // restore the resident store (side-effect-free, matching the delegate)
+    srv.d = saved.0;
+    srv.cells = saved.1;
+    srv.nd = saved.2;
+    srv.ncells = saved.3;
+    srv.nprocess = saved.4;
+    out
+}
+
+// native_retract (the registry's write-verb completion): python
+// Registry.retract's exact semantics over the RETAINED store, no Python.
+// Membership is exact-tuple; the SHRUNK candidate population must satisfy the
+// fact type's own validator (Def. Violation is direction-blind, so a retract
+// can violate mandatory and frequency lower bounds exactly like a create); a
+// pass appends the retract entry to the event sink and rebuilds the app
+// through native_apps_compile (the log applied, derived rows recomputed), then
+// reloads the sidecar into the retained store. Receipts are byte-shaped like
+// the delegate's (python json.dumps, spaced separators; key order app,
+// fact_type, fact, committed, violations, note). None = the target is not the
+// retained app; the caller falls through to the delegate.
+#[cfg(feature = "host")]
+fn native_retract(args: &J, apps: &Apps, srv: &mut Srv) -> Option<Result<String, (i64, String)>> {
+    let app = match jget(args, "app") {
+        Some(J::S(a)) => a.clone(),
+        _ => return Some(Err((-32602, "retract needs a string app".to_string()))),
+    };
+    if apps.current.as_deref() != Some(app.as_str()) {
+        return None;
+    }
+    let ft = match jget(args, "fact_type") {
+        Some(J::S(s)) => s.clone(),
+        _ => return Some(Err((-32602, "retract needs a string fact_type".to_string()))),
+    };
+    let fact = match jget(args, "fact") {
+        Some(J::A(xs)) => xs.clone(),
+        _ => return Some(Err((-32602, "retract needs a fact array".to_string()))),
+    };
+    let leaf = |s: &str| Leaf::S(s.to_string());
+    let receipt_head = |committed: bool| {
+        let mut r = String::from("{\"app\": ");
+        esc(&app, &mut r);
+        r.push_str(", \"fact_type\": ");
+        esc(&ft, &mut r);
+        r.push_str(", \"fact\": [");
+        for (i, e) in fact.iter().enumerate() {
+            if i > 0 {
+                r.push_str(", ");
+            }
+            write_j(e, &mut r);
+        }
+        r.push_str("], \"committed\": ");
+        r.push_str(if committed { "true" } else { "false" });
+        r
+    };
+    // membership: the exact fact tuple must be present (python's `row not in pop`)
+    let target = seq(from_vec(fact.iter().map(to_v).collect()));
+    let rows: Vec<V> = pop_rows(&srv.cells, &leaf(&ft));
+    if !rows.iter().any(|r| eqobj(r, &target)) {
+        let mut r = receipt_head(false);
+        r.push_str(", \"violations\": [], \"note\": \"no such fact\"}");
+        return Some(Ok(r));
+    }
+    // the SHRUNK candidate population, sorted (python's sorted(pop - {row}))
+    let mut cand: Vec<V> = rows.iter().filter(|r| !eqobj(r, &target)).cloned().collect();
+    sort_rows(&mut cand);
+    let nfuel: i64 = std::env::var("AREST_VALIDATE_FUEL")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(-1);
+    let vctx = val_ctx(srv);
+    let validator = match assemble_validator_for(srv, &vctx, &ft, nfuel) {
+        Ok(v) => v,
+        Err(e) => return Some(Err(e)),
+    };
+    let pair = seq(from_vec(vec![seq(from_vec(cand)), srv.d.clone()]));
+    let result = reduce_over_n(srv, validator, pair, nfuel);
+    let parts = items(&list_of(&result));
+    if parts.len() < 3 {
+        return Some(Err((-32012, format!(
+            "native retract: the validator for fact type '{}' did not reduce to \
+             <pass, violations, flag>",
+            ft))));
+    }
+    let flag = leaf_text(&aval(&parts[2]).unwrap_or_else(|| Rc::new(leaf("F"))));
+    if flag == "T" {
+        let v_rows = items(&list_of(&parts[1]));
+        let mut r = receipt_head(false);
+        r.push_str(", \"violations\": [");
+        for (i, row) in v_rows.iter().enumerate() {
+            if i > 0 {
+                r.push_str(", ");
+            }
+            match shape(row) {
+                Shape::Seq(_) => write_v_spaced(row, &mut r),
+                _ => {
+                    r.push('[');
+                    write_v_spaced(row, &mut r);
+                    r.push(']');
+                }
+            }
+        }
+        r.push_str("]}");
+        return Some(Ok(r));
+    }
+    // commit: the log entry, then the rebuild through the native compile (the
+    // log applied; derived rows recomputed), then the retained store reloads
+    if let Err(e) = append_retract_event(apps, &app, &ft, &fact) {
+        return Some(Err((-32603, format!("retract append: {}", e))));
+    }
+    if let Err(e) = native_apps_compile(&app, apps, srv) {
+        return Some(Err(e));
+    }
+    if let Err(e) = load_sidecar(apps, &app, srv) {
+        return Some(Err((-32603, format!("retract reload: {}", e))));
+    }
+    let mut r = receipt_head(true);
+    r.push_str(", \"violations\": []}");
+    Some(Ok(r))
+}
+
+#[cfg(feature = "host")]
 fn delegate_verb(tool: &str, args: &J, apps: &Apps, srv: &mut Srv)
     -> Result<String, (i64, String)>
 {
@@ -11545,6 +11896,28 @@ fn append_event(apps: &Apps, app: &str, ft: &str, fact: &[J]) -> std::io::Result
     f.write_all(line.as_bytes())
 }
 
+// append_retract_event: the retract entry in FileEventSink's format, byte for
+// byte python's json.dumps({"op": "retract", "ft": ..., "fact": [...]}) + "\n"
+// (dict insertion order; default spaced separators). replay_entries on both
+// hosts applies it as the exact-tuple removal.
+#[cfg(feature = "host")]
+fn append_retract_event(apps: &Apps, app: &str, ft: &str, fact: &[J]) -> std::io::Result<()> {
+    use std::io::Write;
+    let path = apps.dir.join(app).join(format!("{}.events.jsonl", app));
+    let mut line = String::from("{\"op\": \"retract\", \"ft\": ");
+    esc(ft, &mut line);
+    line.push_str(", \"fact\": [");
+    for (i, e) in fact.iter().enumerate() {
+        if i > 0 {
+            line.push_str(", ");
+        }
+        write_j(e, &mut line);
+    }
+    line.push_str("]}\n");
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+    f.write_all(line.as_bytes())
+}
+
 // write_sidecar refreshes the app's store sidecar with the retained store,
 // Registry._sidecar's payload: {"d": <store>, "process": [[name, obj]..],
 // "overrides": 1, "cases": []}. The d field is the whole retained store; the
@@ -11554,7 +11927,6 @@ fn append_event(apps: &Apps, app: &str, ft: &str, fact: &[J]) -> std::io::Result
 // tmp-then-rename, so a concurrent reader never sees a torn file, exactly as
 // _sidecar's os.replace. A fresh resident boots this file through the same
 // ingestion apps_use takes, so the native write is durable to the resident.
-#[cfg(feature = "host")]
 // write_v_spaced / write_n_spaced / sidecar_payload (#20, the final pipeline
 // slice): protocol.py's Registry._sidecar writes the sidecar through plain
 // `json.dump(payload, f, ensure_ascii=False)` -- NO `separators=` override --
@@ -11652,6 +12024,7 @@ fn sidecar_payload(d: &V, process: &[(String, N)]) -> String {
     payload
 }
 
+#[cfg(feature = "host")]
 fn write_sidecar(apps: &Apps, app: &str, srv: &Srv) -> std::io::Result<()> {
     let payload = sidecar_payload(&srv.d, &srv.nprocess);
     let path = apps.sidecar(app);
@@ -11847,6 +12220,473 @@ thread_local! {
     // (protocol.Registry.last_receipt's analog)
     static LAST_RECEIPT: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
+}
+
+// native verify (Rust-only, no Python): the reimplementation of
+// protocol.Registry.verify over the resident store. WHICH heads must reproduce
+// (system:audit_heads — the destructive sweep/dred/aggwhole passes plus the
+// derivation-OWNED keyed heads) and WHAT reproducing means (a head's stored rows
+// equal the rows its rules recompute over D) are the canon meaning; this host
+// keeps the per-head counts and the unevaluable-rule-reads-as-mismatch robustness
+// as report decoration, exactly as the Python twin (protocol.py:2345) does. It
+// reuses the native classify_heads twin and the same reduce_over the run_rules
+// fixpoint applies a rule through, so no Python and no cli.py are touched. Wired as
+// the Python-absent fallback for the verify verb, mirroring apps_compile: a
+// Rust-configured environment with no cli.py verifies natively instead of failing.
+// Receipt is byte-shaped like the delegate's: {"app", "checks":[{head,stored,
+// recomputed,match}]}, checks sorted by head name.
+#[cfg(feature = "host")]
+fn native_verify(app: &str, srv: &Srv) -> Result<String, (i64, String)> {
+    use std::collections::{HashMap, HashSet};
+    let leaf = |s: &str| Leaf::S(s.to_string());
+    let cells = &srv.cells;
+    // kinds: head key -> derivation kind (derivation rows <head, kind, ..>)
+    let mut kinds: HashMap<String, String> = HashMap::new();
+    for r in pop_rows(cells, &leaf("derivation")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            if let Some(k) = aval(&it[1]) {
+                kinds.insert(key_of(&it[0]), leaf_text(&k));
+            }
+        }
+    }
+    // rules: head key -> [(rid sort key, rid atom)]  (ruleDerives rows <rid, head>)
+    let mut rules: HashMap<String, Vec<(String, V)>> = HashMap::new();
+    for r in pop_rows(cells, &leaf("ruleDerives")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            rules
+                .entry(key_of(&it[1]))
+                .or_default()
+                .push((leaf_text(&aval(&it[0]).unwrap_or_else(|| Rc::new(Leaf::S(String::new())))),
+                       it[0].clone()));
+        }
+    }
+    // audit = sweep ∪ dred ∪ aggwhole ∪ {keyed whose kind is derivation-OWNED};
+    // _OWNED mirrors engine.py:1721
+    const OWNED: [&str; 2] = ["fully-derived", "derived-and-stored"];
+    let hc = classify_heads_native(cells);
+    let mut audit: HashMap<String, Leaf> = HashMap::new(); // head key -> head leaf
+    for (hk, hl) in hc.sweep.iter().chain(hc.dred.iter()).chain(hc.aggwhole.iter()) {
+        audit.insert(hk.clone(), hl.clone());
+    }
+    for (hk, hl) in &hc.keyed {
+        if kinds.get(hk).is_some_and(|k| OWNED.contains(&k.as_str())) {
+            audit.insert(hk.clone(), hl.clone());
+        }
+    }
+    // sorted(audit ∩ rules) by head NAME (python str sort of the head values)
+    let mut heads: Vec<(String, Leaf)> = audit
+        .into_iter()
+        .filter(|(hk, _)| rules.contains_key(hk))
+        .collect();
+    heads.sort_by(|a, b| leaf_text(&a.1).cmp(&leaf_text(&b.1)));
+    let mut checks = String::from("[");
+    for (i, (hk, hl)) in heads.iter().enumerate() {
+        // recomputed: the union of rows every rule for this head recomputes over D;
+        // an unevaluable rule (⊥) contributes nothing, python's except-pass
+        let mut recomputed: HashSet<String> = HashSet::new();
+        let mut rids = rules.get(hk).cloned().unwrap_or_default();
+        rids.sort_by(|a, b| a.0.cmp(&b.0));
+        for (_sk, rid) in &rids {
+            // N-CARRIER reduction (reduce_over_n): recompute each rule on native's fast
+            // tuple carrier, the delta analog — NOT the Scott closure path (reduce_over),
+            // which is far slower per step and blew up on metamodel rules over EMPTY
+            // populations (verify hung on viol-test). The N carrier is what compile reduces
+            // through; python's default delta evaluator is the same choice. An unevaluable
+            // rule still yields ⊥ -> no rows (python's except-pass).
+            let out = reduce_over_n(srv, rid.clone(), srv.d.clone(), -1);
+            if let Shape::Seq(l) = shape(&out) {
+                for x in items(&l) {
+                    if matches!(shape(&x), Shape::Seq(_)) {
+                        recomputed.insert(key_of(&x));
+                    }
+                }
+            }
+        }
+        // stored: the head cell's current rows as a set (python == via set_key)
+        let mut stored: HashSet<String> = HashSet::new();
+        for row in pop_rows(cells, hl) {
+            stored.insert(key_of(&row));
+        }
+        let matched = stored == recomputed;
+        if i > 0 {
+            checks.push(',');
+        }
+        checks.push_str("{\"head\":");
+        esc(&leaf_text(hl), &mut checks);
+        checks.push_str(",\"stored\":");
+        checks.push_str(&stored.len().to_string());
+        checks.push_str(",\"recomputed\":");
+        checks.push_str(&recomputed.len().to_string());
+        checks.push_str(",\"match\":");
+        checks.push_str(if matched { "true" } else { "false" });
+        checks.push('}');
+    }
+    checks.push(']');
+    let mut r = String::from("{\"app\":");
+    esc(app, &mut r);
+    r.push_str(",\"checks\":");
+    r.push_str(&checks);
+    r.push('}');
+    Ok(r)
+}
+
+// native validate (Rust-only, no Python): the reimplementation of
+// protocol.Registry.validate (protocol.py:2300) over the resident store. It is the
+// keystone that de-Pythonizes BOTH the validate verb and retract. forml.validate_for
+// (compiler.py:2621) is decomposed into three layers, TWO already fully canon — only
+// the ASSEMBLY is ported here:
+//   families      -> constraints:scoped_subset / scoped_mandatory_facts / scoped_*
+//                    / constraints:uniqueness   (canon, evaluated by reduce_over)
+//   composition   -> system:validate_of         (canon; rec = <local, alethic?, scoped,
+//                                                 scoped_alethic?>)
+//   absorbed pop  -> system:ftpop_absorbed<table,col>  (canon)
+// The assembly reads the constraint cell, dispatches by kind (_ATTACH, compiler.py:
+// 2589-2609) to a per-fact-type name/is_local list, rebuilds the scoped families over
+// the absorbed VIEW where the read fact type is absorbed (_rebuilt), and composes via
+// system:validate_of. A stored constraint is referenced by NAME ATOM (resolved through
+// D's DEFS in reduce_over, exactly like a rule in native_verify). Per fact type the
+// validator is applied to <pop, D> -> <_p, v, flag>; a non-empty v is a violation, flag
+// == "T" is alethic (commit-blocking). Receipt shape matches the delegate:
+// {"app","violations":[{fact_type,kinds,offenders,alethic}]}. Wired behind
+// AREST_NATIVE_VALIDATE / apps.cli None, mirroring apps_compile; the default stays the
+// Python delegate this is certified against (validate_parity.py). NOTE: the absorbed
+// EXCLUSION-family rebuild (an exclusion/exclusive_or/disjunctive_mandatory whose clause
+// fact type is absorbed) is not yet ported and answers a -32011 error rather than a
+// wrong receipt; every other family is complete.
+#[cfg(feature = "host")]
+// ValCtx + assemble_validator_for: the per-fact-type validator assembly
+// (forml.validate_for's port), shared by native_validate (every fact type)
+// and native_retract (the one shrunk fact type). The ctx is the store-wide
+// precomputation done once per store; the assembly reads it per fact type.
+#[cfg(feature = "host")]
+struct ValCtx {
+    part: std::collections::HashMap<String, String>,
+    pairs_v: V,
+    copies: std::collections::HashSet<(String, String)>,
+    spans: std::collections::HashMap<String, Vec<i64>>,
+    constraint_rows: Vec<V>,
+}
+
+#[cfg(feature = "host")]
+fn val_ctx(srv: &Srv) -> ValCtx {
+    use std::collections::{HashMap, HashSet};
+    let leaf = |s: &str| Leaf::S(s.to_string());
+    let cells = &srv.cells;
+    let ev = NEval {
+        cells: srv.ncells.clone(),
+        process: srv.nprocess.clone(),
+        defs_n: srv.nd.clone(),
+        fuel: std::cell::Cell::new(-1),
+    };
+    let (part, pairs_v) = mf_partition(&ev, &srv.nd);
+    // ruleCopies: {(antecedent, consequent)} discharged inclusions (subtype/subset)
+    let mut copies: HashSet<(String, String)> = HashSet::new();
+    for r in pop_rows(cells, &leaf("ruleCopies")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 3 {
+            copies.insert((key_of(&it[1]), key_of(&it[2])));
+        }
+    }
+    // spans: constraint id -> sorted role positions (uniqueness families)
+    let mut spans: HashMap<String, Vec<i64>> = HashMap::new();
+    for r in pop_rows(cells, &leaf("spans")) {
+        let it = items(&list_of(&r));
+        if it.len() == 2 {
+            if let Some(Leaf::I(p)) = aval(&it[1]).as_deref() {
+                spans.entry(key_of(&it[0])).or_default().push(*p);
+            }
+        }
+    }
+    let constraint_rows: Vec<V> = pop_rows(cells, &leaf("constraint"));
+    ValCtx { part, pairs_v, copies, spans, constraint_rows }
+}
+
+// The assembly (validate_for): the fact type's local / scoped constraint
+// objects tagged by modality, composed through system:validate_of. Answers
+// the reduced validator awaiting <pop, D>. An absorbed exclusion-family
+// rebuild is not yet ported and answers an honest error.
+#[cfg(feature = "host")]
+fn assemble_validator_for(
+    srv: &Srv,
+    ctx: &ValCtx,
+    ft: &str,
+    nfuel: i64,
+) -> Result<V, (i64, String)> {
+    let leaf = |s: &str| Leaf::S(s.to_string());
+    let ev = NEval {
+        cells: srv.ncells.clone(),
+        process: srv.nprocess.clone(),
+        defs_n: srv.nd.clone(),
+        fuel: std::cell::Cell::new(-1),
+    };
+    let absorbed = |ft: &str| ctx.part.get(ft).map(|t| t != ft).unwrap_or(false);
+    // _vp(ft) for an ABSORBED ft: the system:ftpop_absorbed<table,col> partial (awaits D),
+    // the FFP expression the scoped families consume (engine.py ftpop_expr).
+    let vp = |ft: &str| -> V {
+        let table = ctx.part.get(ft).cloned().unwrap_or_else(|| ft.to_string());
+        let cols = mf_table_columns(&ev, &table, &ctx.pairs_v);
+        let col = 2 + cols.iter().position(|c| c == ft).unwrap_or(0);
+        reduce_over_n(
+            srv,
+            atom(leaf("system:ftpop_absorbed")),
+            seq(from_vec(vec![atom(leaf(&table)), atom(Leaf::I(col as i64))])),
+            -1,
+        )
+    };
+    let mut local: Vec<V> = Vec::new();
+    let mut local_alethic: Vec<V> = Vec::new();
+    let mut scoped: Vec<V> = Vec::new();
+    let mut scoped_alethic: Vec<V> = Vec::new();
+    for c in &ctx.constraint_rows {
+        let it = items(&list_of(c));
+        if it.len() < 3 {
+            continue;
+        }
+        let kind = leaf_text(&aval(&it[1]).unwrap_or_else(|| Rc::new(leaf(""))));
+        let f0 = leaf_text(&aval(&it[0]).unwrap_or_else(|| Rc::new(leaf(""))));
+        let f2 = leaf_text(&aval(&it[2]).unwrap_or_else(|| Rc::new(leaf(""))));
+        let f3 = if it.len() >= 4 {
+            leaf_text(&aval(&it[3]).unwrap_or_else(|| Rc::new(leaf(""))))
+        } else {
+            String::new()
+        };
+        let modality = leaf_text(&aval(&it[it.len() - 1]).unwrap_or_else(|| Rc::new(leaf(""))));
+        let is_alethic = modality == "alethic";
+        // discharged copy inclusion
+        if (kind == "subtype" || kind == "subset") && it.len() >= 4 && ctx.copies.contains(&(f2.clone(), f3.clone())) {
+            continue;
+        }
+        // _ATTACH dispatch -> the (name, is_local) attachments for THIS fact type
+        let mut attach: Vec<(String, bool)> = Vec::new();
+        match kind.as_str() {
+            "uniqueness" | "spanning_uniqueness" | "frequency" | "ring_irreflexive"
+            | "ring_symmetric" | "ring_asymmetric" | "ring_antisymmetric"
+            | "ring_intransitive" | "ring_acyclic" | "value" => {
+                if f2 == ft {
+                    attach.push((f0.clone(), true));
+                }
+            }
+            "subtype" | "external_uniqueness" | "subset" => {
+                if f2 == ft {
+                    attach.push((f0.clone(), false));
+                }
+            }
+            "mandatory" => {
+                if f2 == ft {
+                    attach.push((f0.clone(), false));
+                }
+                if f3 == ft {
+                    attach.push((format!("{}_e", f0), false));
+                }
+            }
+            "equality" => {
+                if f2 == ft {
+                    attach.push((format!("{}_a", f0), false));
+                }
+                if f3 == ft {
+                    attach.push((format!("{}_b", f0), false));
+                }
+            }
+            "exclusion" | "exclusive_or" | "disjunctive_mandatory" => {
+                // f[3] is the clause LIST; attach when ft is one of the clauses
+                let clause_in = it.len() >= 4
+                    && matches!(shape(&it[3]), Shape::Seq(_))
+                    && items(&list_of(&it[3])).iter().any(|c| {
+                        aval(c).map(|l| leaf_text(&l)).as_deref() == Some(ft)
+                    });
+                if clause_in {
+                    attach.push((format!("{}@{}", f0, ft), false));
+                }
+            }
+            _ => {}
+        }
+        for (name, is_local) in attach {
+            // uniqueness/spanning with spans -> constraints:uniqueness over sorted positions
+            if is_local
+                && (kind == "uniqueness" || kind == "spanning_uniqueness")
+                && ctx.spans.contains_key(&name)
+            {
+                let mut pos = ctx.spans.get(&name).cloned().unwrap_or_default();
+                pos.sort_unstable();
+                let pos_seq = seq(from_vec(pos.into_iter().map(|p| atom(Leaf::I(p))).collect()));
+                let uobj = reduce_over_n(srv, atom(leaf("constraints:uniqueness")), pos_seq, -1);
+                if is_alethic { local_alethic.push(uobj.clone()); }
+                local.push(uobj);
+                continue;
+            }
+            // scoped families rebuilt over the absorbed view, else a stored name atom
+            let rebuilt: Option<V> = if is_local {
+                None
+            } else if (kind == "subtype" || kind == "subset") && name == f0 && absorbed(&f3) {
+                Some(reduce_over_n(srv, atom(leaf("constraints:scoped_subset")), vp(&f3), -1))
+            } else if kind == "equality" && name == format!("{}_a", f0) && absorbed(&f3) {
+                Some(reduce_over_n(srv, atom(leaf("constraints:scoped_equality_side")), vp(&f3), -1))
+            } else if kind == "equality" && name == format!("{}_b", f0) && absorbed(&f2) {
+                Some(reduce_over_n(srv, atom(leaf("constraints:scoped_equality_side")), vp(&f2), -1))
+            } else if kind == "mandatory" && name == format!("{}_e", f0) && absorbed(&f2) {
+                Some(reduce_over_n(srv, atom(leaf("constraints:scoped_mandatory_facts")), vp(&f2), -1))
+            } else if (kind == "exclusion" || kind == "exclusive_or" || kind == "disjunctive_mandatory")
+                && name.contains('@')
+                && it.len() >= 4
+                && matches!(shape(&it[3]), Shape::Seq(_))
+                && items(&list_of(&it[3])).iter().any(|c| {
+                    aval(c).map(|l| leaf_text(&l)).map(|s| absorbed(&s)).unwrap_or(false)
+                })
+            {
+                // absorbed exclusion-family rebuild: not yet ported (see header note)
+                return Err((-32011, format!(
+                    "native validator: absorbed {} rebuild for constraint {} not yet ported",
+                    kind, f0)));
+            } else {
+                None
+            };
+            let obj = rebuilt.unwrap_or_else(|| atom(Leaf::S(name)));
+            if is_local {
+                if is_alethic { local_alethic.push(obj.clone()); }
+                local.push(obj);
+            } else {
+                if is_alethic { scoped_alethic.push(obj.clone()); }
+                scoped.push(obj);
+            }
+        }
+    }
+    // rec = <lst(local), slot(local_alethic), lst(scoped), slot(scoped_alethic)>;
+    // slot(v) is <lst(v)>, i.e. always a provided (possibly empty) subset here — validate_modal
+    // supplies alethic explicitly, so the slot is never the "absent" empty seq
+    let slot = |v: Vec<V>| seq(from_vec(vec![seq(from_vec(v))]));
+    let rec = seq(from_vec(vec![
+        seq(from_vec(local)),
+        slot(local_alethic),
+        seq(from_vec(scoped)),
+        slot(scoped_alethic),
+    ]));
+    Ok(reduce_over_n(srv, atom(leaf("system:validate_of")), rec, nfuel))
+}
+
+fn native_validate(app: &str, srv: &Srv) -> Result<String, (i64, String)> {
+    use std::collections::{BTreeSet, HashMap};
+    let leaf = |s: &str| Leaf::S(s.to_string());
+    let cells = &srv.cells;
+    // Validators reduce on the N CARRIER (reduce_over_n), python's delta default — NOT the
+    // Scott closure path (reduce_over), which blew up on metamodel constraints (the Scott/
+    // "lambda" evaluator RecursionErrors in python too; delta converges). A generous fuel bound
+    // still guards a pathological term so the apps.cli-None path can never hang the resident; a
+    // fuel-out yields a non-<p,v,flag> result, turned into an HONEST ERROR naming the fact type
+    // rather than a silent false-clean. AREST_VALIDATE_TRACE adds per-ft tracing.
+    let vtrace = std::env::var_os("AREST_VALIDATE_TRACE").is_some();
+    // Unbounded by default: the N carrier reduction is FINITE (native verify converges
+    // unbounded in ~12s; python validate converges in 49.7s). A too-low cap was the only
+    // reason validate errored where verify did not. AREST_VALIDATE_FUEL overrides for a
+    // safety bound on a pathological app (a fuel-out then yields the honest -32012 error).
+    let nfuel: i64 = std::env::var("AREST_VALIDATE_FUEL")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(-1);
+    let vctx = val_ctx(srv);
+    // kinds: fact type key -> the set of constraint KINDS scoped to it (receipt decoration,
+    // protocol.py:2317). scope = the fact-type columns; the last column is modality when it
+    // is "alethic"/"deontic"; an exclusion scope column is a clause TUPLE.
+    let mut kinds: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for c in &vctx.constraint_rows {
+        let it = items(&list_of(c));
+        if it.len() < 3 {
+            continue;
+        }
+        let kind = leaf_text(&aval(&it[1]).unwrap_or_else(|| Rc::new(leaf(""))));
+        let last = leaf_text(&aval(&it[it.len() - 1]).unwrap_or_else(|| Rc::new(leaf(""))));
+        let end = if last == "alethic" || last == "deontic" {
+            it.len() - 1
+        } else {
+            it.len()
+        };
+        for part_col in &it[2..end] {
+            let members = match shape(part_col) {
+                Shape::Seq(l) => items(&l),
+                _ => vec![part_col.clone()],
+            };
+            for t in &members {
+                if let Some(l) = aval(t) {
+                    if let Leaf::S(s) = &*l {
+                        kinds.entry(key_of(&atom(leaf(s)))).or_default().insert(kind.clone());
+                    }
+                }
+            }
+        }
+    }
+    // per fact type: assemble the validator, apply to <pop, D>, collect violations
+    let mut violations = String::from("[");
+    let mut first = true;
+    for fr in pop_rows(cells, &leaf("factType")) {
+        let fit = items(&list_of(&fr));
+        if fit.is_empty() {
+            continue;
+        }
+        let ft = leaf_text(&aval(&fit[0]).unwrap_or_else(|| Rc::new(leaf(""))));
+        if vtrace { eprintln!("[validate] START ft={}", ft); }
+        let validator = assemble_validator_for(srv, &vctx, &ft, nfuel)?;
+        // apply to <pop, D>
+        let pop = seq(from_vec(pop_rows(cells, &leaf(&ft))));
+        let pair = seq(from_vec(vec![pop, srv.d.clone()]));
+        if vtrace { eprintln!("[validate]   ft={} applying validator", ft); }
+        let result = reduce_over_n(srv, validator, pair, nfuel);
+        let parts = items(&list_of(&result));
+        if vtrace { eprintln!("[validate]   ft={} result_parts={}", ft, parts.len()); }
+        if parts.len() < 3 {
+            // the validator did not reduce to <pass, violations, flag> within the fuel
+            // bound — a divergent or not-yet-supported constraint shape (the known case:
+            // an absorbed fact type's scoped mandatory, a native-reducer divergence Python
+            // does not hit). Error HONESTLY, naming the fact type, rather than skip it
+            // (a false-clean) or hang the resident.
+            return Err((-32012, format!(
+                "native validate: the validator for fact type '{}' did not reduce to \
+                 <pass, violations, flag> (got {} parts, fuel-capped) — a divergent or \
+                 unsupported constraint shape; this fact type needs porting before native \
+                 validate is complete", ft, parts.len())));
+        }
+        let v_rows = items(&list_of(&parts[1]));
+        if v_rows.is_empty() {
+            continue;
+        }
+        let flag = leaf_text(&aval(&parts[2]).unwrap_or_else(|| Rc::new(leaf("F"))));
+        if !first {
+            violations.push(',');
+        }
+        first = false;
+        violations.push_str("{\"fact_type\":");
+        esc(&ft, &mut violations);
+        violations.push_str(",\"kinds\":[");
+        if let Some(ks) = kinds.get(&key_of(&atom(leaf(&ft)))) {
+            for (i, k) in ks.iter().enumerate() {
+                if i > 0 { violations.push(','); }
+                esc(k, &mut violations);
+            }
+        }
+        violations.push_str("],\"offenders\":[");
+        for (i, row) in v_rows.iter().enumerate() {
+            if i > 0 { violations.push(','); }
+            // each offender as a JSON array (list(x) if tuple else [x])
+            match shape(row) {
+                Shape::Seq(_) => write_v(row, &mut violations),
+                _ => {
+                    violations.push('[');
+                    write_v(row, &mut violations);
+                    violations.push(']');
+                }
+            }
+        }
+        violations.push_str("],\"alethic\":");
+        violations.push_str(if flag == "T" { "true" } else { "false" });
+        violations.push('}');
+    }
+    violations.push(']');
+    let mut r = String::from("{\"app\":");
+    esc(app, &mut r);
+    r.push_str(",\"violations\":");
+    r.push_str(&violations);
+    r.push('}');
+    Ok(r)
 }
 
 #[cfg(feature = "host")]
@@ -12324,6 +13164,65 @@ fn store_call(tool: &str, args: &J, app: &str, srv: &mut Srv)
             out.push_str("]}");
             Ok(out)
         }
+        "nav" => {
+            // NATIVE, canon-first: the schema-level Entity Navigation
+            // Graph (whitepaper ch.25). system:nav classifies each fact
+            // type the noun plays by its uniqueness cardinality — no UC
+            // => collection (m:n), a UC spanning all roles => peer (1:1),
+            // a UC on a subset => child (1:n) — and answers the noun's
+            // edge set <kind, fact_type, targets>. The host is the TWIN:
+            // it RESOLVES system:nav on the carrier (no rust
+            // reimplementation of the classification) and renders the
+            // triples. No id: this is the schema graph, not the per-entity
+            // projection (that is get's _links / system:nav_of).
+            let app = app.to_string();
+            let noun = match jget(args, "noun") {
+                Some(J::S(s)) => s.clone(),
+                _ => return Some(Err((-32602, "nav needs a string noun".to_string()))),
+            };
+            let ev = NEval {
+                cells: srv.ncells.clone(),
+                process: srv.nprocess.clone(),
+                defs_n: srv.nd.clone(),
+                fuel: std::cell::Cell::new(-1),
+            };
+            let na = |s: &str| N::A(Rc::new(Leaf::S(s.to_string())));
+            let edges = ev.mu(napp(
+                na("system:nav"),
+                nseq(vec![na(&noun), srv.nd.clone()]),
+            ));
+            let mut out = String::from("{\"app\":");
+            esc(&app, &mut out);
+            out.push_str(",\"noun\":");
+            esc(&noun, &mut out);
+            out.push_str(",\"nav\":[");
+            if let N::S(es) = &edges {
+                let mut first = true;
+                for e in es.iter() {
+                    if let N::S(tr) = e {
+                        if tr.len() == 3 {
+                            if !first { out.push(','); }
+                            first = false;
+                            out.push_str("{\"kind\":");
+                            match &tr[0] {
+                                N::A(l) => esc(&leaf_str(l).unwrap_or_default(), &mut out),
+                                _ => out.push_str("\"\""),
+                            }
+                            out.push_str(",\"fact_type\":");
+                            match &tr[1] {
+                                N::A(l) => esc(&leaf_str(l).unwrap_or_default(), &mut out),
+                                _ => out.push_str("\"\""),
+                            }
+                            out.push_str(",\"targets\":");
+                            n_json(&tr[2], &mut out);
+                            out.push('}');
+                        }
+                    }
+                }
+            }
+            out.push_str("]}");
+            Ok(out)
+        }
         "actions" => {
             // NATIVE (the store-only family): Theorem 4 off the retained
             // store — the machine walk (smDef + subtype chain), the status
@@ -12653,15 +13552,16 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
     // route through the hostless store_call the wasm Worker shares.
     // The host keeps the app-loaded guard and the delegate escape.
     if matches!(tool, "get" | "actions" | "schema" | "synthesize"
-                    | "query" | "cells" | "derive") {
+                    | "query" | "cells" | "derive" | "nav") {
         if apps.current.is_none() {
             return Err((-32602,
                 format!("no app loaded; call apps_use before {}", tool)));
         }
-        if (std::env::var_os("AREST_DELEGATE_READS").is_some()
-            && matches!(tool, "get" | "actions" | "schema" | "synthesize"))
-            || (tool == "synthesize"
-                && std::env::var_os("AREST_SYNTH_SCOTT").is_some())
+        // registry kill: a killed read-family override resolves through the
+        // delegate reference (AREST_DELEGATE_READS and AREST_SYNTH_SCOTT are
+        // the aliases; see parse_no_override).
+        if matches!(tool, "get" | "actions" | "schema" | "synthesize")
+            && overrides_killed(tool)
         {
             return delegate_read(tool, args, apps);
         }
@@ -12716,11 +13616,51 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
         // absorbed fact type, a non-retained target app, or a bare-ERROR
         // refusal answers None and falls through to the CLI delegate. retract
         // and apps_compile still delegate whole.
-        "apply" => match native_apply(args, apps, srv) {
+        "apply" if !overrides_killed("apply") => match native_apply(args, apps, srv) {
             Some(res) => res,
             None => delegate_verb(tool, args, apps, srv),
         },
-        "retract" | "apps_compile" => delegate_verb(tool, args, apps, srv),
+        // retract: native over the retained store when explicitly requested
+        // (AREST_NATIVE_RETRACT) or when no Python CLI is resolvable — the
+        // same pre-certification posture verify and validate take. The
+        // delegate stays the reference default; overrides_killed("retract")
+        // forces it even where native is wired.
+        "retract"
+            if (std::env::var_os("AREST_NATIVE_RETRACT").is_some() || apps.cli.is_none())
+                && !overrides_killed("retract") =>
+        {
+            match native_retract(args, apps, srv) {
+                Some(res) => res,
+                None => delegate_verb(tool, args, apps, srv),
+            }
+        }
+        // a killed apply or retract override reaches the delegate reference whole
+        "apply" | "retract" => delegate_verb(tool, args, apps, srv),
+        // apps_compile: NATIVE BY DEFAULT (2026-07-13 — the default flip). The directive
+        // is emphatic that compile must not be python-specific ("we can't guarantee Python
+        // in a Rust-configured environment"), and the native path is BOTH byte-parity-
+        // certified (apps_compile_parity.py) AND ~11-31x faster than the python delegate,
+        // so there is no reason to pay python's cost on the daily driver's most-run op.
+        // Python is now the opt-in differential ORACLE: reached only when explicitly asked
+        // for (AREST_PYTHON_COMPILE) AND resolvable — e.g. to regenerate the sqlite .db the
+        // `sql` verb reads from, or to re-certify parity. With no python present it was
+        // already native; this makes it native WITH python present too. (The old
+        // AREST_NATIVE_COMPILE force-native flag is now a harmless no-op — native is the
+        // default — so the parity harnesses that set it still get the native path.)
+        "apps_compile" => {
+            let use_python_oracle = apps.cli.is_some()
+                && overrides_killed("apps_compile");
+            if use_python_oracle {
+                delegate_verb(tool, args, apps, srv)
+            } else {
+                let app = match jget(args, "app") {
+                    Some(J::S(a)) => a.clone(),
+                    _ => return Err((-32602,
+                        "apps_compile needs a string app".to_string())),
+                };
+                native_apps_compile(&app, apps, srv)
+            }
+        }
         // synthesize delegates for now: the canonical verbalize over the
         // daily driver's store reduces in minutes on this path where the
         // Python host's native twins answer in seconds (measured 2026-07-05
@@ -12728,6 +13668,36 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
         // delegated). Plumbing the native carrier into op_answer is the
         // priced lever that brings it home.
 
+        // verify: native (Rust-only, no Python) when explicitly requested via
+        // AREST_NATIVE_VERIFY, OR no Python CLI is resolvable (apps.cli is None) —
+        // the directive's Rust-configured-no-Python case. Rather than fail spawning
+        // Python, reproduce the audit natively (native_verify) over the loaded
+        // resident store. Python present + no flag stays the delegate reference the
+        // native path is certified against. A guard miss falls through to the
+        // combined delegate arm below.
+        "verify"
+            if (std::env::var_os("AREST_NATIVE_VERIFY").is_some() || apps.cli.is_none())
+                && !overrides_killed("verify") =>
+        {
+            match &apps.current {
+                Some(name) => native_verify(name, srv),
+                None => Err((-32602,
+                    "no app loaded; call apps_use before verify".to_string())),
+            }
+        }
+        // validate: native (Rust-only) when AREST_NATIVE_VALIDATE, OR no Python CLI
+        // is resolvable — same fallback as apps_compile/verify. Python present + no
+        // flag stays the delegate reference the native path is certified against.
+        "validate"
+            if (std::env::var_os("AREST_NATIVE_VALIDATE").is_some() || apps.cli.is_none())
+                && !overrides_killed("validate") =>
+        {
+            match &apps.current {
+                Some(name) => native_validate(name, srv),
+                None => Err((-32602,
+                    "no app loaded; call apps_use before validate".to_string())),
+            }
+        }
         "sql" | "explain" | "validate" | "verify" => {
             delegate_read(tool, args, apps)
         }

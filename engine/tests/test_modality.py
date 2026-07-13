@@ -31,6 +31,26 @@ def test_modality_is_tagged():
     assert mod == "deontic"
 
 
+# ---- #34: leading-marker derivation rules (Sherlock deontic core) ----
+import pytest
+
+
+def test_leading_plus_if_rule_is_not_the_factype_catchall():
+    # #34 (FIXED): a leading '+' marks a STORED derivation; '+ <head> if <body>'
+    # classifies in the trailing-if family, NOT the fact_type_reading catch-all
+    # (which dequoted the whole line into a phantom instance fact). subset_trailing
+    # (compiler.py:341) now captures the optional leading marker, mirroring
+    # rule_iff (317). Sherlock evidence.md:54, reasoning.md:85.
+    kind, g, _mod = forml.analyze(
+        "+ Evidence has Evidence Weight 'Strong' if Evidence comes from some "
+        "Evidence Source.")
+    assert kind == "subset_trailing", (kind, g)
+    # the marker is captured as group 1 (head/body follow), so the handler can
+    # dispatch on the storage kind instead of the catch-all silently minting rows
+    assert g[0] == "+", g
+    assert g[1].startswith("Evidence has Evidence Weight"), g
+
+
 # ---- the commit rule with modality (the load-bearing point) ----
 def test_alethic_violation_blocks_commit():
     val = system.validate_modal([(C.uniqueness([1]), "alethic")])

@@ -35,12 +35,49 @@ impl Mcp {
             .arg("--mcp")
             .arg("--apps-dir")
             .arg(apps_dir)
+            // This suite tests the DELEGATION machinery (its write flow gates on
+            // Python + cli.py being present), so pin apps_compile to the Python
+            // oracle: the 2026-07-13 default flip made apps_compile native, and
+            // the native base-atop compile in a DEBUG test binary exceeds the 60s
+            // rpc timeout. The native path's own gate is the release-binary
+            // parity harness (tools/apps_compile_parity.py), not this suite.
+            .env("AREST_PYTHON_COMPILE", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn arest --mcp");
         // A reader thread feeds a channel so a missing reply fails the test
         // by timeout instead of hanging it.
+        let out = BufReader::new(child.stdout.take().unwrap());
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            for line in out.lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Mcp { child, rx }
+    }
+
+    // spawn_native_over: the PYTHON-FREE posture — no AREST_PYTHON_COMPILE pin
+    // (apps_compile runs its native default) and AREST_NATIVE_RETRACT=1 (the
+    // opt-in native retract this suite certifies). The write path then never
+    // names Python.
+    fn spawn_native_over(apps_dir: &str) -> Mcp {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_arest"))
+            .arg("--mcp")
+            .arg("--apps-dir")
+            .arg(apps_dir)
+            .env("AREST_NATIVE_RETRACT", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn arest --mcp");
         let out = BufReader::new(child.stdout.take().unwrap());
         let (tx, rx) = channel();
         std::thread::spawn(move || {
@@ -73,6 +110,15 @@ impl Mcp {
     fn rpc(&mut self, line: &str) -> String {
         self.send(line);
         self.recv()
+    }
+
+    // rpc_slow: for calls that embed a full native base-atop compile in a
+    // DEBUG binary (native apps_compile; a committed retract's rebuild).
+    fn rpc_slow(&mut self, line: &str) -> String {
+        self.send(line);
+        self.rx
+            .recv_timeout(Duration::from_secs(300))
+            .expect("no MCP reply within 300s (a debug native compile hung)")
     }
 }
 
@@ -400,6 +446,123 @@ fn mcp_write_verbs_delegate_to_the_cli_and_reload_the_sidecar() {
         r#"{"name":"synthesize","arguments":{"id":"t1"}}}"#
     ));
     assert!(r.contains("t1 has open"), "synthesize must render the fact: {r}");
+
+    drop(c);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn the_write_path_retracts_with_no_python() {
+    // The directive's Rust-configured-environment case, end to end, with NO
+    // Python named anywhere: compile natively (the default), boot the store,
+    // retract natively (AREST_NATIVE_RETRACT). Covers all three receipt
+    // shapes: no-such-fact, the mandatory refusal (Def. Violation is
+    // direction-blind, so removing the last Name violates the lower bound
+    // while the Person still exists through its Age row), and the committed
+    // retraction with its rebuild and reload.
+    let tmp = std::env::temp_dir().join(format!(
+        "arest-native-retract-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(tmp.join("board").join("readings")).unwrap();
+    std::fs::write(
+        tmp.join("board").join("readings").join("app.md"),
+        concat!(
+            "Name is a value type.\n",
+            "Age is a value type.\n",
+            "Person is an entity type.\n",
+            "Person has Name.\n",
+            "Each Person has some Name.\n",
+            "Person has Age.\n",
+            "\n",
+            "Person 'p1' has Name 'A'.\n",
+            "Person 'p1' has Age '30'.\n",
+            "Person 'p2' has Name 'B'.\n",
+            "Person 'p2' has Age '40'.\n"
+        ),
+    )
+    .unwrap();
+
+    let mut c = Mcp::spawn_native_over(&tmp.to_string_lossy());
+    let r = c.rpc(concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"#,
+        r#""protocolVersion":"2025-06-18","capabilities":{},"#,
+        r#""clientInfo":{"name":"itest","version":"0"}}}"#
+    ));
+    assert!(r.contains(r#""serverInfo""#), "{r}");
+
+    // ---- native compile (the default; nothing names Python) ----
+    let r = c.rpc_slow(concat!(
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":"#,
+        r#"{"name":"apps_compile","arguments":{"app":"board"}}}"#
+    ));
+    assert!(r.contains(r#"\"unparsed\":[]"#), "the model must parse clean: {r}");
+    let r = c.rpc(concat!(
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":"#,
+        r#"{"name":"apps_use","arguments":{"name":"board"}}}"#
+    ));
+    assert!(r.contains(r#"\"ok\":true"#), "{r}");
+
+    // ---- no such fact: refused without touching the store ----
+    let r = c.rpc(concat!(
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":"#,
+        r#"{"name":"retract","arguments":{"app":"board","#,
+        r#""fact_type":"Person_has_Age","fact":["p9","99"]}}}"#
+    ));
+    assert!(
+        r.contains(r#"\"committed\": false"#) && r.contains("no such fact"),
+        "{r}"
+    );
+
+    // ---- the mandatory lower bound refuses: p1's only Name ----
+    let r = c.rpc_slow(concat!(
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":"#,
+        r#"{"name":"retract","arguments":{"app":"board","#,
+        r#""fact_type":"Person_has_Name","fact":["p1","A"]}}}"#
+    ));
+    assert!(
+        r.contains(r#"\"committed\": false"#) && !r.contains("no such fact"),
+        "the shrunk population must refuse the mandatory violation: {r}"
+    );
+    assert!(!r.contains(r#"\"violations\": []"#), "the refusal names offenders: {r}");
+
+    // ---- a legal retraction commits, rebuilds, and the row is gone ----
+    let r = c.rpc_slow(concat!(
+        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":"#,
+        r#"{"name":"retract","arguments":{"app":"board","#,
+        r#""fact_type":"Person_has_Age","fact":["p2","40"]}}}"#
+    ));
+    assert!(r.contains(r#"\"committed\": true"#), "{r}");
+    let r = c.rpc(concat!(
+        r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":"#,
+        r#"{"name":"query","arguments":{"fact_type":"Person_has_Age"}}}"#
+    ));
+    assert!(
+        r.contains(r#"[\"p1\",\"30\"]"#) && !r.contains(r#"[\"p2\",\"40\"]"#),
+        "the retracted row must be gone and the sibling kept: {r}"
+    );
+
+    // ---- the event log carries the retract entry (the durable stream) ----
+    let log = std::fs::read_to_string(tmp.join("board").join("board.events.jsonl")).unwrap();
+    assert!(
+        log.contains(r#"{"op": "retract", "ft": "Person_has_Age", "fact": ["p2", "40"]}"#),
+        "{log}"
+    );
+
+    // ---- retracting the same row again: no such fact ----
+    let r = c.rpc(concat!(
+        r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":"#,
+        r#"{"name":"retract","arguments":{"app":"board","#,
+        r#""fact_type":"Person_has_Age","fact":["p2","40"]}}}"#
+    ));
+    assert!(
+        r.contains(r#"\"committed\": false"#) && r.contains("no such fact"),
+        "{r}"
+    );
 
     drop(c);
     let _ = std::fs::remove_dir_all(&tmp);
