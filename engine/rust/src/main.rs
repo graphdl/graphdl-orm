@@ -14328,9 +14328,11 @@ fn show_case(v: &V, out: &mut String) {
 #[cfg(feature = "host")]
 fn run() {
     // the intersection source loads ON THE WORKER (CANON is a thread_local; the
-    // reduction thread must hold it)
+    // reduction thread must hold it). Spec v3: the store artifact boots when it
+    // resolves; the baked copy is the fallback and the AREST_CANON_BOOT=baked
+    // differential, held equal by the store_boot pins.
     CANON.with(|c| {
-        *c.borrow_mut() = canon_defs();
+        *c.borrow_mut() = boot_canon_defs();
     });
     // the native mirror of the canon, converted once: the native carrier NEval
     // resolves a canon def through it when a partial process list does not carry
@@ -14346,9 +14348,9 @@ fn run() {
     register_overrides();                                     // twins on by default
     if std::env::args().any(|a| a == "--cases") {
         // the cross-host case table: reduce each pair and print name=result
-        // in the convention every host shares
+        // in the convention every host shares (store-booted like the canon)
         let mu = make_mu();
-        for (name, pair) in scenario_defs() {
+        for (name, pair) in boot_scenario_defs() {
             let expr = nth(&pair, 0);
             let operand = nth(&pair, 1);
             let v = mu.app(mkapp(expr, operand));
@@ -14499,6 +14501,129 @@ fn host_bootstrap_defs() -> Vec<(String, N)> {
 // elements evaluate left to right in both languages. Constraints the file honors:
 // double-quoted strings, no imports, no assignments; PHI is nullary (PHI()) so a
 // file may use it any number of times.
+// ---- spec v3: the host boots the canon from the store artifact ----
+// (shared/canon.store.json, built for every host by
+// tools/build_canon_store.py) when it resolves, the include!-baked copy
+// below remaining the no_std/worker path and the bare-binary fallback, so
+// a deployed binary with no repo beside it boots exactly as before.
+// AREST_CANON_BOOT=baked forces the baked copy (the differential); the
+// store_boot pins hold the two equal name for name and term for term.
+#[cfg(feature = "host")]
+fn j_to_v(j: &J) -> V {
+    match j {
+        J::S(s) => atom(Leaf::S(s.clone())),
+        J::I(i) => atom(Leaf::I(*i)),
+        J::F(f) => atom(Leaf::F(*f)),
+        J::A(xs) => seqv(xs.iter().map(j_to_v).collect()),
+        // canon terms carry only atoms and sequences; the impossible
+        // arms answer the empty sequence rather than inventing a value
+        J::O(_) | J::Null | J::B(_) => phi(),
+    }
+}
+
+#[cfg(feature = "host")]
+fn store_defs_from(file: &str) -> Option<Vec<(String, V)>> {
+    let path = match std::env::var_os("AREST_SHARED") {
+        Some(d) => std::path::PathBuf::from(d).join(file),
+        None => {
+            // resolve from the binary's own home upward to engine/shared
+            // (target/release and target/debug/deps both land within reach)
+            let exe = std::env::current_exe().ok()?;
+            let mut dir = exe.parent();
+            let mut found: Option<std::path::PathBuf> = None;
+            for _ in 0..8 {
+                let d = dir?;
+                let probe = d.join("shared").join(file);
+                if probe.is_file() {
+                    found = Some(probe);
+                    break;
+                }
+                dir = d.parent();
+            }
+            found?
+        }
+    };
+    let text = std::fs::read_to_string(&path).ok()?;
+    let doc = parse_json(&text)?;
+    let cells = match jget(&doc, "d") {
+        Some(J::A(xs)) => xs,
+        _ => return None,
+    };
+    let mut out: Vec<(String, V)> = Vec::new();
+    for c in cells {
+        if let J::A(row) = c {
+            if row.len() >= 3 && matches!(&row[0], J::S(s) if s == "CELL") {
+                if let J::S(name) = &row[1] {
+                    out.push((name.clone(), j_to_v(&row[2])));
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+#[cfg(feature = "host")]
+fn baked_forced() -> bool {
+    std::env::var_os("AREST_CANON_BOOT").map_or(false, |v| v == "baked")
+}
+
+#[cfg(feature = "host")]
+fn boot_canon_defs() -> Vec<(String, V)> {
+    if baked_forced() {
+        return canon_defs();
+    }
+    store_defs_from("canon.store.json").unwrap_or_else(canon_defs)
+}
+
+#[cfg(feature = "host")]
+fn boot_scenario_defs() -> Vec<(String, V)> {
+    if baked_forced() {
+        return scenario_defs();
+    }
+    store_defs_from("scenarios.store.json").unwrap_or_else(scenario_defs)
+}
+
+#[cfg(all(test, feature = "host"))]
+mod store_boot_tests {
+    use super::*;
+
+    // spec v3 pins: the store artifact and the baked canon are the same
+    // definitions, name for name and term for term. A divergence means a
+    // stale sidecar (run tools/build_canon_store.py) or an encoding drift
+    // in j_to_v; either must fail loudly, never boot silently different.
+    #[test]
+    fn store_boot_matches_the_baked_canon() {
+        let store = match store_defs_from("canon.store.json") {
+            Some(s) => s,
+            None => return, // no artifact beside this build: nothing to pin
+        };
+        let baked = canon_defs();
+        assert_eq!(store.len(), baked.len(), "def count diverges");
+        for ((sn, sv), (bn, bv)) in store.iter().zip(baked.iter()) {
+            assert_eq!(sn, bn, "def order diverges");
+            assert!(eqobj(sv, bv), "term diverges at {}", sn);
+        }
+    }
+
+    #[test]
+    fn store_boot_matches_the_baked_scenarios() {
+        let store = match store_defs_from("scenarios.store.json") {
+            Some(s) => s,
+            None => return,
+        };
+        let baked = scenario_defs();
+        assert_eq!(store.len(), baked.len(), "case count diverges");
+        for ((sn, sv), (bn, bv)) in store.iter().zip(baked.iter()) {
+            assert_eq!(sn, bn, "case order diverges");
+            assert!(eqobj(sv, bv), "case term diverges at {}", sn);
+        }
+    }
+}
+
 #[allow(non_snake_case, unused, path_statements)]
 fn canon_defs() -> Vec<(String, V)> {
     let out: RefCell<Vec<(String, V)>> = RefCell::new(Vec::new());
