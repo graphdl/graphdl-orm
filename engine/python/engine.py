@@ -1740,6 +1740,26 @@ def layout_cells(D):
     return to_lam(cells + (("CELL", "rmapColumns", tuple(rows)),))
 
 
+def enum_values_cells(D):
+    """Materialize the declared enum domains AS DATA: the enumValues cell,
+    rows ⟨noun, value⟩ from each valueConstraint spec's quoted literals, in
+    declaration order (the rmapColumns dispatch-to-data precedent). The
+    induce role domains and the canon enumeration family read rows here, so
+    no string parsing crosses the boundary at evaluation time. Recompile
+    replaces the cell wholesale."""
+    import re as _re
+    from .lam import to_lam, from_lam
+    rows = []
+    for r in _pop_rows(D, "valueConstraint"):
+        if len(r) >= 2:
+            for lit in _re.findall(r"'([^']*)'", str(r[1])):
+                rows.append((r[0], lit))
+    cells = tuple(c for c in from_lam(D)
+                  if not (isinstance(c, tuple) and len(c) >= 2
+                          and c[1] == "enumValues"))
+    return to_lam(cells + (("CELL", "enumValues", tuple(rows)),))
+
+
 # the storage kinds whose cell the DERIVATION owns: no user asserts into a
 # * or ** population (NORMA: * recomputes on demand, ** is "kept in sync" —
 # both are materialization of the rule's output), so delete-and-rederive is

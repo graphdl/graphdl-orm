@@ -7866,12 +7866,55 @@ fn layout_cells_native(cells: &[(Leaf, V)], srv: &Srv) -> Vec<(Leaf, V)> {
         }
     }
 
+    // the declared enum domains AS DATA (engine.py enum_values_cells, the
+    // rmapColumns dispatch-to-data precedent): rows ⟨noun, value⟩ from each
+    // valueConstraint spec's quoted literals, in declaration order, so the
+    // induce role domains and the canon enumeration family read rows and no
+    // string parsing crosses the boundary at evaluation time
+    let mut erows: Vec<V> = Vec::new();
+    if let Some((_, vc)) = cells
+        .iter()
+        .find(|(k, _)| matches!(k, Leaf::S(s) if s == "valueConstraint"))
+    {
+        for r in items(&list_of(vc)) {
+            let it = items(&list_of(&r));
+            if it.len() < 2 {
+                continue;
+            }
+            let (noun, spec) = match (aval(&it[0]), aval(&it[1])) {
+                (Some(a), Some(b)) => (leaf_text(&a), leaf_text(&b)),
+                _ => continue,
+            };
+            // python's findall("'([^']*)'") pairing: consume both quotes
+            // per hit, left to right
+            let chars: Vec<char> = spec.chars().collect();
+            let mut i = 0usize;
+            while i < chars.len() {
+                if chars[i] == '\'' {
+                    if let Some(j) = chars[i + 1..].iter().position(|c| *c == '\'') {
+                        let lit: String = chars[i + 1..i + 1 + j].iter().collect();
+                        erows.push(seqc(vec![
+                            atom(Leaf::S(noun.clone())),
+                            atom(Leaf::S(lit)),
+                        ]));
+                        i = i + j + 2;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+
     let mut out: Vec<(Leaf, V)> = cells
         .iter()
-        .filter(|(k, _)| !matches!(k, Leaf::S(s) if s == "rmapColumns"))
+        .filter(|(k, _)| {
+            !matches!(k, Leaf::S(s) if s == "rmapColumns" || s == "enumValues")
+        })
         .cloned()
         .collect();
     out.push((Leaf::S("rmapColumns".to_string()), seq(from_vec(rows))));
+    out.push((Leaf::S("enumValues".to_string()), seq(from_vec(erows))));
     out
 }
 

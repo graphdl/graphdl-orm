@@ -1846,6 +1846,7 @@ class Registry:
         # replay exactly the tail another host appended after this save
         D = persist._with_watermark(D, len(entries))
         D = system.layout_cells(D)
+        D = system.enum_values_cells(D)
         D = system.scheduler_cells(D)
         D = system.generator_cells(D)
         _tp = _phase("layout+scheduler+generator", _tp)
