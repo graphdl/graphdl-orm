@@ -3582,6 +3582,9 @@ DEF("system:rank_desc",
        S3(A("COMP"), A("apndr"),
           S3(A("CONS"), A("id"), S2(A("CONST"), PHI()))))),
 
+DEF("system:abduce",
+    A("system:induce_judge")),
+
 DEF("system:induce_judge",
     S4(A("COMP"),
        A("system:rank_desc"),

@@ -2437,6 +2437,16 @@ class Registry:
                 "fact_types": sorted(fts, key=lambda f: f["id"]),
                 "constraints": cons}
 
+    def abduce(self, name, ft_id, conclusion=None, bound=None, cap=5000):
+        """Abduction: the same search with the CONCLUSION riding to_explain
+        (docs/14: induction carries observed examples there, abduction
+        carries the conclusion; the shape distinction lives in the data,
+        never in a separate path — the canon records the identity as
+        DEF system:abduce = system:induce_judge). Candidates are premises
+        whose addition derives the conclusion."""
+        return self.induce(name, ft_id, to_explain=conclusion,
+                           bound=bound, cap=cap)
+
     def _induce_reference(self, name, ft_id, to_explain=None, bound=None,
                           cap=5000):
         """The verb through the CANON: every judgment reduces the shared

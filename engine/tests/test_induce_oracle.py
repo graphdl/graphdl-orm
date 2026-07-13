@@ -225,3 +225,64 @@ def test_the_python_reference_twins_the_inline_induce():
         assert [h["id"] for h in inline_te] == ["hyp-Coin_has_Side-1"]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_abduce_end_to_end_on_the_sherlock_forms():
+    # slice (e): the sherlock reasoning forms verbatim — the hidden hook
+    # declared, literal-pin scoring rules, and a single-role UC so the
+    # target fact type takes the ABSORBED path. Scoring flows through real
+    # declared rules (the hook world fires them), the inline oracle and the
+    # canon-reducing reference must twin on it, and abduce is the same
+    # search with the conclusion riding to_explain: only the candidate
+    # that IS the explanation survives coverage, ranked with its rule-fired
+    # score. Hypothesis Candidate and Confidence Score come from the base
+    # induction vocabulary; the fixture declares only its own nouns.
+    tmp = tempfile.mkdtemp(prefix="induce-oracle-")
+    os.makedirs(os.path.join(tmp, "mystery", "readings"))
+    with open(os.path.join(tmp, "mystery", "readings", "app.md"), "w",
+              encoding="utf-8") as f:
+        f.write(
+            "Plausibility is a value type.\n"
+            "The possible values of Plausibility are 'plausible', "
+            "'implausible'.\n"
+            "Label is a value type.\n"
+            "Verdict is a value type.\n"
+            "Hypothesis is an entity type.\n"
+            "Hypothesis has Plausibility.\n"
+            "Each Hypothesis has at most one Plausibility.\n"
+            "Hypothesis has Label.\n"
+            "Hypothesis has Verdict.\n"
+            "Hypothesis Candidate has hidden Plausibility.\n"
+            "\n"
+            "* Hypothesis has Verdict 'credible' iff "
+            "Hypothesis has Plausibility 'plausible'.\n"
+            "* Hypothesis Candidate has Confidence Score '5' iff "
+            "Hypothesis Candidate has hidden Plausibility 'plausible'.\n"
+            "* Hypothesis Candidate has Confidence Score '1' iff "
+            "Hypothesis Candidate has hidden Plausibility 'implausible'.\n"
+            "\n"
+            "Hypothesis 'h1' has Label 'locked-room'.\n")
+    try:
+        reg = A.Registry(tmp, base_dir=A.default_base())
+        reg.compile("mystery")
+        ft = "Hypothesis_has_Plausibility"
+        out = reg.induce("mystery", ft)
+        assert [h["id"] for h in out] == [f"hyp-{ft}-0", f"hyp-{ft}-1"]
+        assert [h["confidence_score"] for h in out] == [5, 1]
+        assert [h["hidden"]["fact"] for h in out] == [
+            ["h1", "plausible"], ["h1", "implausible"]]
+        # the canon-reducing reference twins the rules-driven scoring and
+        # the absorbed install path
+        assert reg._induce_reference("mystery", ft) == out
+        # abduction proper: the conclusion is ABSENT from the store and
+        # derivable only through the candidate premise firing the Verdict
+        # rule, so exactly one premise explains it
+        conclusion = [{"ft": "Hypothesis_has_Verdict",
+                       "fact": ["h1", "credible"]}]
+        abd = reg.abduce("mystery", ft, conclusion=conclusion)
+        assert [h["id"] for h in abd] == [f"hyp-{ft}-0"]
+        assert abd[0]["confidence_score"] == 5
+        assert abd == reg._induce_reference("mystery", ft,
+                                            to_explain=conclusion)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
