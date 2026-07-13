@@ -163,17 +163,21 @@ def test_canon_named_overrides_have_their_defs():
 #       domain meaning to twin.
 #   (3) DELEGATED: meaning that still rides the Python reference host.
 #       This set is the standing drain queue, ordered by the rebuild
-#       plan: sql and explain first (phase 3b), the compile verb next,
-#       then the induction and tutor surfaces. A verb leaves this set
-#       by gaining a canon reference and a catalog row. The set may
-#       only shrink.
+#       plan: explain drained 2026-07-13 (catalog row + native walk
+#       corroborated by canon system:explain); sql's native leg IS the
+#       phase 4 RMAP projection transplant (its python body is one
+#       line over the sqlite .db only the python compile regenerates,
+#       so the dispatch is not the seam); the compile verb next, then
+#       the induction and tutor surfaces. A verb leaves this set by
+#       gaining a canon reference and a catalog row. The set may only
+#       shrink.
 #
 # A verb that fits none of these fails here, exactly as a DEF-layer op
 # with no canon story fails above.
 SERVE = {"context", "orient", "engine_version", "apps_list", "apps_current",
          "apps_use", "apps_status", "apps_check", "apps_register",
          "apps_create"}
-DELEGATED = {"sql", "explain", "compile", "propose", "induce", "ask",
+DELEGATED = {"sql", "compile", "propose", "induce", "ask",
              "tutor_apply", "tutor_compile", "tutor_propose", "tutor_reset"}
 
 

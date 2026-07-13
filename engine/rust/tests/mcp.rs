@@ -74,6 +74,7 @@ impl Mcp {
             .arg("--apps-dir")
             .arg(apps_dir)
             .env("AREST_NATIVE_RETRACT", "1")
+            .env("AREST_NATIVE_EXPLAIN", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -565,6 +566,22 @@ fn the_write_path_retracts_with_no_python() {
     assert!(
         r.contains(r#"\"committed\": false"#) && r.contains("no such fact"),
         "{r}"
+    );
+
+    // ---- explain, natively (the derivation walk over the rule M-facts,
+    // fuel-bounded; the audit tail carries p2's committed retraction from
+    // the durable stream) ----
+    let r = c.rpc_slow(concat!(
+        r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":"#,
+        r#"{"name":"explain","arguments":{"id":"p2"}}}"#
+    ));
+    assert!(
+        r.contains(r#"\"app\":\"board\""#) && r.contains(r#"\"chains\":["#),
+        "explain must answer natively with the entity envelope: {r}"
+    );
+    assert!(
+        r.contains(r#"\"op\":\"retract\""#) && r.contains(r#"[\"p2\",40]"#),
+        "the audit tail must carry the retract event: {r}"
     );
 
     drop(c);

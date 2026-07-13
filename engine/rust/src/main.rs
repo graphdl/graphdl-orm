@@ -1402,6 +1402,7 @@ pub const HOST_OVERRIDES: &[&str] = &[
     "get",
     "actions",
     "schema",
+    "explain",
 ];
 
 thread_local! {
@@ -13789,6 +13790,184 @@ fn vo_validate(args: &J, apps: &mut Apps, srv: &mut Srv) -> Option<Result<String
     })
 }
 
+// explain: the derivation chains for an entity's facts (which rules fired,
+// supporting which rows, reading which cells; GMS93's derivation notion made
+// queryable) plus the audit tail from the events journal — the native walk
+// over the rule M-facts, corroborated through canon system:explain, row for
+// row the shape python protocol.explain answers. Native when explicitly
+// requested (AREST_NATIVE_EXPLAIN) or when no Python CLI is resolvable; the
+// delegate stays the reference default the native path certifies against.
+#[cfg(feature = "host")]
+fn native_explain(args: &J, apps: &Apps, srv: &mut Srv) -> Option<Result<String, (i64, String)>> {
+    let app = match &apps.current {
+        Some(n) => n.clone(),
+        None => {
+            return Some(Err((-32602,
+                "no app loaded; call apps_use before explain".to_string())))
+        }
+    };
+    let id = match jget(args, "id") {
+        Some(J::S(v)) => v.clone(),
+        _ => return Some(Err((-32602, "explain needs a string id".to_string()))),
+    };
+    let fact = match jget(args, "fact") {
+        Some(J::S(v)) => Some(v.clone()),
+        _ => None,
+    };
+    let leaf = |s: &str| Leaf::S(s.to_string());
+    let leaf_j = |l: &Leaf| -> J {
+        match l {
+            Leaf::S(s) => J::S(s.clone()),
+            Leaf::I(i) => J::I(*i),
+            Leaf::F(f) => J::F(*f),
+            _ => J::Null,
+        }
+    };
+    let row_j = |x: &V| -> J {
+        J::A(items(&list_of(x))
+            .iter()
+            .filter_map(|e| aval(e).map(|l| leaf_j(&l)))
+            .collect())
+    };
+    let mut reads: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for r in pop_rows(&srv.cells, &leaf("ruleReads")) {
+        let it = items(&list_of(&r));
+        if it.len() >= 2 {
+            if let (Some(a0), Some(a1)) = (aval(&it[0]), aval(&it[1])) {
+                reads.entry(leaf_text(&a0)).or_default().push(leaf_text(&a1));
+            }
+        }
+    }
+    let mut chains: Vec<J> = Vec::new();
+    for r in pop_rows(&srv.cells, &leaf("ruleDerives")) {
+        let it = items(&list_of(&r));
+        if it.len() < 2 {
+            continue;
+        }
+        let (rid, head) = match (aval(&it[0]), aval(&it[1])) {
+            (Some(a0), Some(a1)) => (leaf_text(&a0), leaf_text(&a1)),
+            _ => continue,
+        };
+        if let Some(f) = &fact {
+            if &head != f {
+                continue;
+            }
+        }
+        // rho: the rule lives in D's DEFS; applied to D it answers its rows.
+        // FUEL-BOUNDED per rule: python's walk swallows a failing rule into
+        // empty rows (try/except), and unbounded canonical reduction of every
+        // base rule is the interpretive-minutes wall; a fuel-out reduces to
+        // the same empty rows, honestly diagnostic, never a hang.
+        let efuel: i64 = std::env::var("AREST_EXPLAIN_FUEL")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(1_000_000);
+        let out = reduce_over_n(srv, atom(leaf(&rid)), srv.d.clone(), efuel);
+        let rows: Vec<V> = items(&list_of(&out))
+            .into_iter()
+            .filter(|x| matches!(shape(x), Shape::Seq(_)))
+            .collect();
+        let mine: Vec<&V> = rows
+            .iter()
+            .filter(|x| {
+                items(&list_of(x)).iter().any(|e| {
+                    aval(e)
+                        .map(|l| matches!(&*l, Leaf::S(s) if *s == id))
+                        .unwrap_or(false)
+                })
+            })
+            .collect();
+        if mine.is_empty() && fact.as_deref() != Some(head.as_str()) {
+            continue;
+        }
+        let mut rd = reads.get(&rid).cloned().unwrap_or_default();
+        rd.sort();
+        let mut entry: Vec<(String, J)> = vec![
+            ("rule".to_string(), J::S(rid.clone())),
+            ("head".to_string(), J::S(head.clone())),
+            ("supports".to_string(), J::A(mine.iter().map(|x| row_j(x)).collect())),
+            ("reads".to_string(), J::A(rd.into_iter().map(J::S).collect())),
+        ];
+        if let Some(first) = mine.first() {
+            // the canonical chain corroborates the host walk (the same
+            // computation any host performs over the canon)
+            let pair = seq(from_vec(vec![atom(leaf(&head)), (*first).clone()]));
+            let e1 = reduce_over_n(srv, atom(leaf("system:explain")), pair, efuel);
+            let c = reduce_over_n(srv, e1, srv.d.clone(), efuel);
+            let mut canon_rows: Vec<J> = Vec::new();
+            let mut well_formed = true;
+            for x in items(&list_of(&c)) {
+                let xi = items(&list_of(&x));
+                if xi.len() < 3 {
+                    well_formed = false;
+                    break;
+                }
+                let rule = match aval(&xi[0]) {
+                    Some(l) => leaf_text(&l),
+                    None => {
+                        well_formed = false;
+                        break;
+                    }
+                };
+                let fired = aval(&xi[1])
+                    .map(|l| matches!(&*l, Leaf::S(s) if s == "T"))
+                    .unwrap_or(false);
+                let mut crd: Vec<String> = items(&list_of(&xi[2]))
+                    .iter()
+                    .filter_map(|e| aval(e).map(|l| leaf_text(&l)))
+                    .collect();
+                crd.sort();
+                canon_rows.push(J::O(vec![
+                    ("rule".to_string(), J::S(rule)),
+                    ("fired".to_string(), J::B(fired)),
+                    ("reads".to_string(), J::A(crd.into_iter().map(J::S).collect())),
+                ]));
+            }
+            if well_formed && !canon_rows.is_empty() {
+                entry.push(("canonical".to_string(), J::A(canon_rows)));
+            }
+        }
+        chains.push(J::O(entry));
+    }
+    // the audit tail: the entity's entries from the durable stream
+    let mut audit: Vec<J> = Vec::new();
+    let path = apps.dir.join(&app).join(format!("{}.events.jsonl", app));
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        for line in text.lines() {
+            if let Some(e) = parse_json(line) {
+                let mut s = String::new();
+                write_j(&e, &mut s);
+                if s.contains(&id) {
+                    audit.push(e);
+                }
+            }
+        }
+    }
+    let tail = if audit.len() > 20 {
+        audit.split_off(audit.len() - 20)
+    } else {
+        audit
+    };
+    let doc = J::O(vec![
+        ("app".to_string(), J::S(app)),
+        ("id".to_string(), J::S(id)),
+        ("chains".to_string(), J::A(chains)),
+        ("audit".to_string(), J::A(tail)),
+    ]);
+    let mut r = String::new();
+    write_j(&doc, &mut r);
+    Some(Ok(r))
+}
+
+#[cfg(feature = "host")]
+fn vo_explain(args: &J, apps: &mut Apps, srv: &mut Srv) -> Option<Result<String, (i64, String)>> {
+    if std::env::var_os("AREST_NATIVE_EXPLAIN").is_none() && apps.cli.is_some() {
+        return None;
+    }
+    native_explain(args, apps, srv)
+}
+
 #[cfg(feature = "host")]
 type VerbOverride = fn(&J, &mut Apps, &mut Srv) -> Option<Result<String, (i64, String)>>;
 #[cfg(feature = "host")]
@@ -13798,6 +13977,7 @@ const VERB_OVERRIDES: &[(&str, VerbOverride)] = &[
     ("apps_compile", vo_apps_compile),
     ("verify", vo_verify),
     ("validate", vo_validate),
+    ("explain", vo_explain),
 ];
 #[cfg(feature = "host")]
 fn resolve_verb(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Option<Result<String, (i64, String)>> {
