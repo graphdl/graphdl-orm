@@ -186,13 +186,15 @@ def test_canon_store_sidecars_are_fresh():
 #   (3) DELEGATED: meaning that still rides the Python reference host.
 #       This set is the standing drain queue, ordered by the rebuild
 #       plan: explain drained 2026-07-13 (catalog row + native walk
-#       corroborated by canon system:explain); sql's native leg IS the
-#       phase 4 RMAP projection transplant (its python body is one
-#       line over the sqlite .db only the python compile regenerates,
-#       so the dispatch is not the seam); the compile verb next, then
-#       the induction and tutor surfaces. A verb leaves this set by
-#       gaining a canon reference and a catalog row. The set may only
-#       shrink.
+#       corroborated by canon system:explain); sql stays delegated BY
+#       DESIGN (2026-07-13 ruling): its meaning is canon (theta-1 over
+#       the RMAP projection) but its materialization is a sqlite
+#       artifact, and the host build is zero-dep by the 2026-07-09
+#       decision recorded in Cargo.toml, so the delegate is sql's
+#       reference and any native leg is an opt-in cargo feature; the
+#       compile verb next, then the induction and tutor surfaces. A
+#       verb leaves this set by gaining a canon reference and a
+#       catalog row. The set may only shrink.
 #
 # A verb that fits none of these fails here, exactly as a DEF-layer op
 # with no canon story fails above.
