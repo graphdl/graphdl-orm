@@ -20,8 +20,9 @@ public class Reducer {
     public static final Map<String, Object> STORE = new HashMap<String, Object>();
 
     public static void loadCanon() {
+        // spec v3: the DEFs boot from the store artifact, not a wrap
         STORE.clear();
-        for (Object[] kv : Canon.loadAll())
+        for (Object[] kv : StoreCanon.loadAll())
             STORE.put((String) kv[0], kv[1]);
     }
 

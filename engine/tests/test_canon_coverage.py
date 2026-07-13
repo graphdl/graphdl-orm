@@ -151,6 +151,28 @@ def test_canon_named_overrides_have_their_defs():
             "carries no such DEF — the meaning must land in canon first")
 
 
+def test_canon_store_sidecars_are_fresh():
+    # spec v3: hosts boot DEFS from the store artifacts (built by
+    # tools/build_canon_store.py). A canon edit without a rebuild leaves a
+    # stale sidecar silently shadowing the source (the nav-divergence
+    # lesson), so freshness is pinned BY NAME per artifact: every DEF of
+    # the source appears as a CELL, and no CELL outlives its DEF.
+    import json
+    for src, dst in (("arest.canon", "canon.store.json"),
+                     ("scenarios.canon", "scenarios.store.json")):
+        defs = set(re.findall(r'DEF\("([^"]+)"',
+                              _src("shared", src)))
+        store = json.load(open(os.path.join(ROOT, "shared", dst),
+                               encoding="utf-8"))
+        cells = {c[1] for c in store.get("d", [])
+                 if isinstance(c, list) and len(c) >= 3 and c[0] == "CELL"}
+        missing = defs - cells
+        stale = cells - defs
+        assert not missing and not stale, (
+            f"{dst} is stale against {src} (missing {sorted(missing)[:5]},"
+            f" stale {sorted(stale)[:5]}) — run tools/build_canon_store.py")
+
+
 # ---------------------------------------------------------------------------
 # THE VERB LAYER (the 2026-07-13 census, canon-first rebuild phase 1).
 # Every verb mcp_call_inner dispatches is one of exactly three things:

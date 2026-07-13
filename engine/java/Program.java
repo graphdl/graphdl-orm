@@ -49,9 +49,10 @@ public class Program {
             seq(seq("a", "b"), seq("b", "c"), seq("c", "d"))));
         System.out.println("closure=" + show(closure));
 
-        // the cross-host case table (shared/scenarios.py): each case is
-        // a pair of expr and operand; reduce and print for the differential
-        for (Object[] kv : Canon.loadScenarioDefs()) {
+        // the cross-host case table (shared/scenarios.canon, booted from the
+        // store artifact): each case is a pair of expr and operand; reduce
+        // and print for the differential
+        for (Object[] kv : StoreCanon.loadScenarioDefs()) {
             Object[] pair = (Object[]) kv[1];
             Object got = Reducer.mu(Reducer.app(pair[0], pair[1]));
             System.out.println(kv[0] + "=" + show(got));

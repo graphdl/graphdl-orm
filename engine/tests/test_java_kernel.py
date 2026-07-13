@@ -1,6 +1,7 @@
-"""The Java host as the fourth fleet member: gen_canon.py byte-wraps the
-shared intersection files into a varargs call (the include! equivalent),
-javac compiles the same bytes, and the differential holds the Java 8 reducer
+"""The Java host as the fourth fleet member, spec v3 shape: a store loader
+and a mu. The canon DEFs boot from shared/canon.store.json (built by
+tools/build_canon_store.py, the host-neutral artifact that retired the
+per-host gen_canon.py wrap), and the differential holds the Java 8 reducer
 to the Python evaluator's answers on the twin-test cases. Skips cleanly
 where the JDK is absent."""
 import os
@@ -27,11 +28,16 @@ def _show(o):
 
 @pytest.mark.skipif(not os.path.exists(_JDK), reason="no JDK")
 def test_the_java_kernel_agrees_with_the_python_evaluator():
-    subprocess.run(["python", os.path.join(_JAVA, "gen_canon.py")],
-                   check=True, capture_output=True, cwd=_JAVA)
+    # spec v3: the java host is a store loader and a mu. The canonical
+    # cross-host artifact (canon.store.json, scenarios.store.json) is
+    # rebuilt here so the differential always runs against the current
+    # canon; the per-host generator (gen_canon.py) is retired.
+    subprocess.run(["python", os.path.join(_ROOT, "tools",
+                                           "build_canon_store.py")],
+                   check=True, capture_output=True, cwd=_ROOT)
     os.makedirs(os.path.join(_JAVA, "out"), exist_ok=True)
     subprocess.run([os.path.join(_JDK, "javac.exe"), "-encoding", "UTF-8",
-                    "-d", "out", "Vocab.java", "Canon.java", "Reducer.java",
+                    "-d", "out", "StoreCanon.java", "Reducer.java",
                     "Program.java"],
                    check=True, capture_output=True, cwd=_JAVA, timeout=300)
     out = subprocess.run([os.path.join(_JDK, "java.exe"),
