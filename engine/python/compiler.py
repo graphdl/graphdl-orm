@@ -2679,6 +2679,22 @@ def validate_for(fact_type, D, partition=None):
             if is_local and f[1] in ("uniqueness", "spanning_uniqueness") and name in spans:
                 local.append((C.uniqueness(sorted(spans[name])), f[-1]))
                 continue
+            if f[1] == "mandatory" and name == f[0]:
+                # the ARC check reads the subject's IMPLIED population (Halpin:
+                # the union of the role populations it plays, from M's role
+                # rows). The stored named sibling reads only the subject's own
+                # cell, which is vacuous for a noun RMAP gives no cell (no
+                # reference scheme, no functional role — the 2026-07-13
+                # retract finding). The fact type under validation contributes
+                # from P, since its copy in D is stale (this seam's own rule).
+                subject = f[3]
+                pos = sorted(spans.get(f[0], [1]))[0]
+                members = [C.implied_member(r[1], r[2], fact_type, partition)
+                           for r in _cells(D, "role")
+                           if len(r) >= 4 and r[3] == subject]
+                scoped.append((C.scoped_mandatory_entities_implied(members, pos),
+                               f[-1]))
+                continue
             fresh = None if is_local else _rebuilt(f, name)
             if fresh is not None:
                 scoped.append((fresh, f[-1]))

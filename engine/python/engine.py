@@ -570,6 +570,37 @@ def scoped_mandatory_facts(ft_cell):
     return _scoped("constraints:scoped_mandatory_facts", ft_cell, host)
 
 
+def scoped_mandatory_entities_implied(spec_rows, pos=1):
+    """Mandatory arc check over the IMPLIED entity population (Halpin: an object
+    type's population is the union of the role populations it plays, including
+    its reference scheme). The stored named sibling reads only the subject's own
+    cell, which is VACUOUS for a noun with no reference scheme and no functional
+    role, since RMAP then gives it no cell at all (the 2026-07-13 retract
+    finding: both hosts committed a retraction that removed p1's only Name).
+    The CONSTRUCTION lives in the canon builder applied here to pure data:
+    ⟨pos, rows⟩ with each row ⟨kind, name, vcol, col⟩ (implied_member below).
+    V = dedup(flatten(members)) ∖ π_pos(P)."""
+    from .reduce import apply as _apply
+    from .lam import to_lam as _tl
+    return _apply(A("constraints:scoped_mandatory_entities_implied"),
+                  _tl((pos, tuple(spec_rows))))
+
+
+def implied_member(ft, col, ft_under, partition=None):
+    """One implied-population member as a PURE-DATA spec row for the canon
+    builder: ⟨"P", "", 0, col⟩ reads the CANDIDATE (operand 1) when ft is the
+    fact type under validation, because its copy in D is stale (this section's
+    own rule); ⟨"view", table, vcol, col⟩ reads an absorbed sibling through the
+    RMAP view; ⟨"cell", ft, 0, col⟩ reads a plain sibling from the frozen D."""
+    if ft == ft_under:
+        return ("P", "", 0, col)
+    if partition is not None and partition.get(ft, ft) != ft:
+        table = partition[ft]
+        vcol = 2 + table_columns(partition, table).index(ft)
+        return ("view", table, vcol, col)
+    return ("cell", ft, 0, col)
+
+
 def scoped_subset(consequent_cell):
     """Subset A ⊆ B, attached to the antecedent cell (P = A): V = P ∖ ↑B, tuple-wise —
     the clause readings resolve to fact types whose role order matches (modus ponens).

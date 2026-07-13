@@ -12612,6 +12612,64 @@ fn assemble_validator_for(
             // scoped families rebuilt over the absorbed view, else a stored name atom
             let rebuilt: Option<V> = if is_local {
                 None
+            } else if kind == "mandatory" && name == f0 {
+                // the ARC check reads the subject's IMPLIED population
+                // (Halpin: the union of the role populations it plays, from
+                // M's role rows). The stored named sibling reads only the
+                // subject's own cell — vacuous for a noun RMAP gives no cell
+                // (no reference scheme, no functional role; the 2026-07-13
+                // retract finding). The CONSTRUCTION lives in the canon
+                // builder (constraints:scoped_mandatory_entities_implied);
+                // this host only collects the role rows as pure data —
+                // ⟨pos, ⟨kind, name, vcol, col⟩…⟩ — and applies it, exactly
+                // as python validate_for does. The fact type under validation
+                // contributes from P, since its copy in D is stale.
+                let subject = f3.clone();
+                let pos = ctx
+                    .spans
+                    .get(&f0)
+                    .and_then(|v| v.iter().min().copied())
+                    .unwrap_or(1);
+                let mut rows_v: Vec<V> = Vec::new();
+                for r in pop_rows(&srv.cells, &leaf("role")) {
+                    let ri = items(&list_of(&r));
+                    if ri.len() < 4 {
+                        continue;
+                    }
+                    let noun = leaf_text(&aval(&ri[3]).unwrap_or_else(|| Rc::new(leaf(""))));
+                    if noun != subject {
+                        continue;
+                    }
+                    let ft2 = leaf_text(&aval(&ri[1]).unwrap_or_else(|| Rc::new(leaf(""))));
+                    let col = match aval(&ri[2]).as_deref() {
+                        Some(Leaf::I(i)) => *i,
+                        _ => continue,
+                    };
+                    let row = if ft2 == ft {
+                        vec![atom(leaf("P")), atom(leaf("")),
+                             atom(Leaf::I(0)), atom(Leaf::I(col))]
+                    } else if absorbed(&ft2) {
+                        let table = ctx.part.get(&ft2).cloned().unwrap_or_else(|| ft2.clone());
+                        let cols = mf_table_columns(&ev, &table, &ctx.pairs_v);
+                        let vcol = 2 + cols.iter().position(|c| c == &ft2).unwrap_or(0) as i64;
+                        vec![atom(leaf("view")), atom(leaf(&table)),
+                             atom(Leaf::I(vcol)), atom(Leaf::I(col))]
+                    } else {
+                        vec![atom(leaf("cell")), atom(leaf(&ft2)),
+                             atom(Leaf::I(0)), atom(Leaf::I(col))]
+                    };
+                    rows_v.push(seq(from_vec(row)));
+                }
+                let spec = seq(from_vec(vec![
+                    atom(Leaf::I(pos)),
+                    seq(from_vec(rows_v)),
+                ]));
+                Some(reduce_over_n(
+                    srv,
+                    atom(leaf("constraints:scoped_mandatory_entities_implied")),
+                    spec,
+                    -1,
+                ))
             } else if (kind == "subtype" || kind == "subset") && name == f0 && absorbed(&f3) {
                 Some(reduce_over_n(srv, atom(leaf("constraints:scoped_subset")), vp(&f3), -1))
             } else if kind == "equality" && name == format!("{}_a", f0) && absorbed(&f3) {

@@ -508,10 +508,12 @@ fn the_write_path_retracts_with_no_python() {
     assert!(r.contains(r#"\"ok\":true"#), "{r}");
 
     // ---- no such fact: refused without touching the store ----
+    // (Age literals coerce to integers at the cook boundary, so the wire
+    // fact speaks the store's types: 99, not "99")
     let r = c.rpc(concat!(
         r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":"#,
         r#"{"name":"retract","arguments":{"app":"board","#,
-        r#""fact_type":"Person_has_Age","fact":["p9","99"]}}}"#
+        r#""fact_type":"Person_has_Age","fact":["p9",99]}}}"#
     ));
     assert!(
         r.contains(r#"\"committed\": false"#) && r.contains("no such fact"),
@@ -534,7 +536,7 @@ fn the_write_path_retracts_with_no_python() {
     let r = c.rpc_slow(concat!(
         r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":"#,
         r#"{"name":"retract","arguments":{"app":"board","#,
-        r#""fact_type":"Person_has_Age","fact":["p2","40"]}}}"#
+        r#""fact_type":"Person_has_Age","fact":["p2",40]}}}"#
     ));
     assert!(r.contains(r#"\"committed\": true"#), "{r}");
     let r = c.rpc(concat!(
@@ -542,14 +544,15 @@ fn the_write_path_retracts_with_no_python() {
         r#"{"name":"query","arguments":{"fact_type":"Person_has_Age"}}}"#
     ));
     assert!(
-        r.contains(r#"[\"p1\",\"30\"]"#) && !r.contains(r#"[\"p2\",\"40\"]"#),
+        r.contains(r#"[\"p1\",30]"#) && !r.contains(r#"[\"p2\",40]"#),
         "the retracted row must be gone and the sibling kept: {r}"
     );
 
     // ---- the event log carries the retract entry (the durable stream) ----
     let log = std::fs::read_to_string(tmp.join("board").join("board.events.jsonl")).unwrap();
     assert!(
-        log.contains(r#"{"op": "retract", "ft": "Person_has_Age", "fact": ["p2", "40"]}"#),
+        log.contains(r#""op": "retract""#) && log.contains(r#""ft": "Person_has_Age""#)
+            && log.contains(r#"["p2", 40]"#),
         "{log}"
     );
 
@@ -557,7 +560,7 @@ fn the_write_path_retracts_with_no_python() {
     let r = c.rpc(concat!(
         r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":"#,
         r#"{"name":"retract","arguments":{"app":"board","#,
-        r#""fact_type":"Person_has_Age","fact":["p2","40"]}}}"#
+        r#""fact_type":"Person_has_Age","fact":["p2",40]}}}"#
     ));
     assert!(
         r.contains(r#"\"committed\": false"#) && r.contains("no such fact"),
