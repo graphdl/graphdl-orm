@@ -13639,6 +13639,119 @@ fn store_call(tool: &str, args: &J, app: &str, srv: &mut Srv)
     })
 }
 
+// The Resolution Registry, verb layer (docs ch. 15, migration step 3): each
+// row is a verb's registered fast route — native in-process, or nothing —
+// and answering None defers to the verb's REFERENCE binding in the match
+// below (the CLI delegate for apply/retract/apps_compile, delegate_read for
+// verify/validate). resolve_verb consults the same one kill switch as the
+// DEF layer, so AREST_NO_OVERRIDE=<name> forces any verb to its reference
+// and =* is the pure-reference oracle. Registering a new verb override
+// means a row here, a catalog row (shared/base/resolution.md), a
+// HOST_OVERRIDES row, and a parity pin — never a dispatch edit. The
+// read-family store routing at the top of mcp_call_inner is the wasm-shared
+// hostless binding with the same kill seam consulted inline.
+
+// apply flips native for OWN-TABLE: a fact type carrying a create:<ft>
+// handler cell computes and persists in process (native_apply); an absorbed
+// fact type, a non-retained target app, or a bare-ERROR refusal answers
+// None and falls through to the CLI delegate reference.
+#[cfg(feature = "host")]
+fn vo_apply(args: &J, apps: &mut Apps, srv: &mut Srv) -> Option<Result<String, (i64, String)>> {
+    native_apply(args, apps, srv)
+}
+
+// retract: native over the retained store when explicitly requested
+// (AREST_NATIVE_RETRACT) or when no Python CLI is resolvable — the same
+// pre-certification posture verify and validate take. The delegate stays
+// the reference default.
+#[cfg(feature = "host")]
+fn vo_retract(args: &J, apps: &mut Apps, srv: &mut Srv) -> Option<Result<String, (i64, String)>> {
+    if std::env::var_os("AREST_NATIVE_RETRACT").is_none() && apps.cli.is_some() {
+        return None;
+    }
+    native_retract(args, apps, srv)
+}
+
+#[cfg(feature = "host")]
+fn apps_compile_native(args: &J, apps: &mut Apps, srv: &mut Srv) -> Result<String, (i64, String)> {
+    let app = match jget(args, "app") {
+        Some(J::S(a)) => a.clone(),
+        _ => return Err((-32602,
+            "apps_compile needs a string app".to_string())),
+    };
+    native_apps_compile(&app, apps, srv)
+}
+
+// apps_compile: NATIVE BY DEFAULT (2026-07-13 — the default flip). The
+// directive is emphatic that compile must not be python-specific ("we can't
+// guarantee Python in a Rust-configured environment"), and the native path
+// is BOTH byte-parity-certified (apps_compile_parity.py) AND ~11-31x faster
+// than the python delegate. Python is the opt-in differential ORACLE,
+// reached through the reference arm when this row is killed
+// (AREST_PYTHON_COMPILE folds into the killed set) and a CLI is resolvable.
+// (The old AREST_NATIVE_COMPILE force-native flag is a harmless no-op —
+// native is the default — so the parity harnesses that set it still get
+// the native path.)
+#[cfg(feature = "host")]
+fn vo_apps_compile(args: &J, apps: &mut Apps, srv: &mut Srv) -> Option<Result<String, (i64, String)>> {
+    Some(apps_compile_native(args, apps, srv))
+}
+
+// verify: native (Rust-only, no Python) when explicitly requested via
+// AREST_NATIVE_VERIFY, OR no Python CLI is resolvable (apps.cli is None) —
+// the directive's Rust-configured-no-Python case. Rather than fail spawning
+// Python, reproduce the audit natively (native_verify) over the loaded
+// resident store. Python present + no flag defers to the delegate reference
+// the native path is certified against.
+#[cfg(feature = "host")]
+fn vo_verify(args: &J, apps: &mut Apps, srv: &mut Srv) -> Option<Result<String, (i64, String)>> {
+    let _ = args;
+    if std::env::var_os("AREST_NATIVE_VERIFY").is_none() && apps.cli.is_some() {
+        return None;
+    }
+    Some(match &apps.current {
+        Some(name) => native_verify(name, srv),
+        None => Err((-32602,
+            "no app loaded; call apps_use before verify".to_string())),
+    })
+}
+
+// validate: native (Rust-only) when AREST_NATIVE_VALIDATE, OR no Python CLI
+// is resolvable — same fallback as apps_compile/verify.
+#[cfg(feature = "host")]
+fn vo_validate(args: &J, apps: &mut Apps, srv: &mut Srv) -> Option<Result<String, (i64, String)>> {
+    let _ = args;
+    if std::env::var_os("AREST_NATIVE_VALIDATE").is_none() && apps.cli.is_some() {
+        return None;
+    }
+    Some(match &apps.current {
+        Some(name) => native_validate(name, srv),
+        None => Err((-32602,
+            "no app loaded; call apps_use before validate".to_string())),
+    })
+}
+
+#[cfg(feature = "host")]
+type VerbOverride = fn(&J, &mut Apps, &mut Srv) -> Option<Result<String, (i64, String)>>;
+#[cfg(feature = "host")]
+const VERB_OVERRIDES: &[(&str, VerbOverride)] = &[
+    ("apply", vo_apply),
+    ("retract", vo_retract),
+    ("apps_compile", vo_apps_compile),
+    ("verify", vo_verify),
+    ("validate", vo_validate),
+];
+#[cfg(feature = "host")]
+fn resolve_verb(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Option<Result<String, (i64, String)>> {
+    if overrides_killed(tool) {
+        return None;
+    }
+    VERB_OVERRIDES
+        .iter()
+        .find(|(n, _)| *n == tool)
+        .and_then(|(_, f)| f(args, apps, srv))
+}
+
 #[cfg(feature = "host")]
 fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Result<String, (i64, String)> {
     // ONE dispatch, two bindings (the doctrine): the STORE-ONLY verbs
@@ -13662,6 +13775,13 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
         if let Some(r) = store_call(tool, args, &app, srv) {
             return r;
         }
+    }
+
+    // ch. 15 step 3, verb layer: the registered fast routes resolve first;
+    // None (not registered, killed, or the row defers) falls through to the
+    // reference bindings below.
+    if let Some(r) = resolve_verb(tool, args, apps, srv) {
+        return r;
     }
 
     match tool {
@@ -13704,54 +13824,20 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
             r.push_str(",\"ok\":true}");
             Ok(r)
         }
-        // apply flips native for OWN-TABLE: a fact type carrying a create:<ft>
-        // handler cell computes and persists in process (native_apply); an
-        // absorbed fact type, a non-retained target app, or a bare-ERROR
-        // refusal answers None and falls through to the CLI delegate. retract
-        // and apps_compile still delegate whole.
-        "apply" if !overrides_killed("apply") => match native_apply(args, apps, srv) {
-            Some(res) => res,
-            None => delegate_verb(tool, args, apps, srv),
-        },
-        // retract: native over the retained store when explicitly requested
-        // (AREST_NATIVE_RETRACT) or when no Python CLI is resolvable — the
-        // same pre-certification posture verify and validate take. The
-        // delegate stays the reference default; overrides_killed("retract")
-        // forces it even where native is wired.
-        "retract"
-            if (std::env::var_os("AREST_NATIVE_RETRACT").is_some() || apps.cli.is_none())
-                && !overrides_killed("retract") =>
-        {
-            match native_retract(args, apps, srv) {
-                Some(res) => res,
-                None => delegate_verb(tool, args, apps, srv),
-            }
-        }
-        // a killed apply or retract override reaches the delegate reference whole
+        // the delegate REFERENCE for apply and retract: reached when the
+        // registered row is killed or defers (own-table miss, absorbed fact
+        // type, non-retained target, bare-ERROR refusal, no native opt-in)
         "apply" | "retract" => delegate_verb(tool, args, apps, srv),
-        // apps_compile: NATIVE BY DEFAULT (2026-07-13 — the default flip). The directive
-        // is emphatic that compile must not be python-specific ("we can't guarantee Python
-        // in a Rust-configured environment"), and the native path is BOTH byte-parity-
-        // certified (apps_compile_parity.py) AND ~11-31x faster than the python delegate,
-        // so there is no reason to pay python's cost on the daily driver's most-run op.
-        // Python is now the opt-in differential ORACLE: reached only when explicitly asked
-        // for (AREST_PYTHON_COMPILE) AND resolvable — e.g. to regenerate the sqlite .db the
-        // `sql` verb reads from, or to re-certify parity. With no python present it was
-        // already native; this makes it native WITH python present too. (The old
-        // AREST_NATIVE_COMPILE force-native flag is now a harmless no-op — native is the
-        // default — so the parity harnesses that set it still get the native path.)
+        // apps_compile REFERENCE: reached only when the native row is killed
+        // (AREST_PYTHON_COMPILE folds into the killed set) — the python
+        // differential oracle when a CLI is resolvable, e.g. to regenerate
+        // the sqlite .db the `sql` verb reads or to re-certify parity. With
+        // nothing to delegate to, the native pipeline runs regardless.
         "apps_compile" => {
-            let use_python_oracle = apps.cli.is_some()
-                && overrides_killed("apps_compile");
-            if use_python_oracle {
+            if apps.cli.is_some() {
                 delegate_verb(tool, args, apps, srv)
             } else {
-                let app = match jget(args, "app") {
-                    Some(J::S(a)) => a.clone(),
-                    _ => return Err((-32602,
-                        "apps_compile needs a string app".to_string())),
-                };
-                native_apps_compile(&app, apps, srv)
+                apps_compile_native(args, apps, srv)
             }
         }
         // synthesize delegates for now: the canonical verbalize over the
@@ -13761,43 +13847,12 @@ fn mcp_call_inner(tool: &str, args: &J, apps: &mut Apps, srv: &mut Srv) -> Resul
         // delegated). Plumbing the native carrier into op_answer is the
         // priced lever that brings it home.
 
-        // verify: native (Rust-only, no Python) when explicitly requested via
-        // AREST_NATIVE_VERIFY, OR no Python CLI is resolvable (apps.cli is None) —
-        // the directive's Rust-configured-no-Python case. Rather than fail spawning
-        // Python, reproduce the audit natively (native_verify) over the loaded
-        // resident store. Python present + no flag stays the delegate reference the
-        // native path is certified against. A guard miss falls through to the
-        // combined delegate arm below.
-        "verify"
-            if (std::env::var_os("AREST_NATIVE_VERIFY").is_some() || apps.cli.is_none())
-                && !overrides_killed("verify") =>
-        {
-            match &apps.current {
-                Some(name) => native_verify(name, srv),
-                None => Err((-32602,
-                    "no app loaded; call apps_use before verify".to_string())),
-            }
-        }
-        // validate: native (Rust-only) when AREST_NATIVE_VALIDATE, OR no Python CLI
-        // is resolvable — same fallback as apps_compile/verify. Python present + no
-        // flag stays the delegate reference the native path is certified against.
-        "validate"
-            if (std::env::var_os("AREST_NATIVE_VALIDATE").is_some() || apps.cli.is_none())
-                && !overrides_killed("validate") =>
-        {
-            match &apps.current {
-                Some(name) => native_validate(name, srv),
-                None => Err((-32602,
-                    "no app loaded; call apps_use before validate".to_string())),
-            }
-        }
+        // the delegate_read REFERENCE for the audit pair and the two verbs
+        // still on the drain queue (sql, explain — phase 3b gives them canon
+        // references); verify and validate land here when their rows defer
         "sql" | "explain" | "validate" | "verify" => {
             delegate_read(tool, args, apps)
         }
-
-
-
-
 
         "engine_version" => Ok("{\"engine\":\"arest\",\"version\":\"0.9.0\"}".to_string()),
         "apps_status" => {
