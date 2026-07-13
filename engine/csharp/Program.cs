@@ -49,11 +49,10 @@ static class Program
             Seq(Seq("a", "b"), Seq("b", "c"), Seq("c", "d"))));
         Console.WriteLine($"closure={Show(closure)}");
 
-        // the cross-host case table (shared/scenarios.py): each case is
-        // ⟨expr, operand⟩; reduce and print for the differential
-        Canon.Defs.Clear();
-        Canon.LoadScenarios();
-        foreach (var kv in Canon.Defs.ToList())
+        // the cross-host case table (shared/scenarios.canon, booted from
+        // the store artifact): each case is ⟨expr, operand⟩; reduce and
+        // print for the differential
+        foreach (var kv in StoreCanon.LoadScenarioDefs())
         {
             var pair = (object[])kv.Value;
             var got = Reducer.Mu(Reducer.App(pair[0], pair[1]));

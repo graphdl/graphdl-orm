@@ -19,34 +19,9 @@
     <None Remove="show/**" />
   </ItemGroup>
 
-  <!-- The include! equivalent: each shared intersection file becomes the body
-       of a varargs method call by BYTE CONCATENATION (prefix + file + suffix),
-       never parsing. The same bytes CPython execs and rustc tokenizes. -->
-  <Target Name="WrapCanon" BeforeTargets="CoreCompile"
-          Inputs="../shared/arest.canon;../shared/scenarios.canon"
-          Outputs="$(IntermediateOutputPath)Canon.g.cs">
-    <PropertyGroup>
-      <CanonArest>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/arest.canon'))</CanonArest>
-      <CanonScenarios>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../shared/scenarios.canon'))</CanonScenarios>
-      <CanonWrapped>namespace Arestlam%3B
-
-static partial class Canon
-{
-    static object LoadArest() =&gt; T
-$(CanonArest)
-%3B
-
-    internal static object LoadScenarios() =&gt; T
-$(CanonScenarios)
-%3B
-}
-</CanonWrapped>
-    </PropertyGroup>
-    <WriteLinesToFile File="$(IntermediateOutputPath)Canon.g.cs"
-                      Lines="$(CanonWrapped)" Overwrite="true" />
-    <ItemGroup>
-      <Compile Include="$(IntermediateOutputPath)Canon.g.cs" />
-    </ItemGroup>
-  </Target>
+  <!-- Spec v3 (2026-07-13): the canon boots from shared/canon.store.json
+       through StoreCanon.cs (a store loader and a mu); the WrapCanon
+       byte-wrap target, the generated Canon.g.cs, and Vocabulary.cs are
+       retired. -->
 
 </Project>

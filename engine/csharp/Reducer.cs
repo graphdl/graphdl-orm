@@ -30,8 +30,9 @@ static class Reducer
 
     internal static void LoadCanon()
     {
+        // spec v3: the DEFs boot from the store artifact, not a wrap
         Store.Clear();
-        foreach (var kv in Canon.LoadAll())
+        foreach (var kv in StoreCanon.LoadAll())
             Store[kv.Key] = kv.Value;
     }
 
