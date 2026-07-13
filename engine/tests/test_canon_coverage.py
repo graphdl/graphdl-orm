@@ -222,6 +222,27 @@ def test_no_verb_escapes_the_discipline():
         " SERVE here with its reasoning")
 
 
+def _rust_def_override_rows():
+    src = _src("rust", "src", "main.rs")
+    m = re.search(r"const DEF_OVERRIDES[^=]*= &\[(.*?)\];", src, re.S)
+    assert m, "the DEF_OVERRIDES table must exist (ch. 15 step 3)"
+    return set(re.findall(r'\("([^"]+)"', m.group(1)))
+
+
+def test_def_override_rows_are_registered_meaning():
+    # A table row is only speed: its meaning must already exist as a canon
+    # DEF of the same name, and the catalog must license the override.
+    defs = _canon_defs()
+    cat = _catalog()
+    for name in _rust_def_override_rows():
+        assert name in defs, (
+            f"DEF_OVERRIDES row {name!r} has no canon DEF — the meaning"
+            " must land in shared/*.canon first")
+        assert name in cat, (
+            f"DEF_OVERRIDES row {name!r} has no catalog row — declare it"
+            " overridable in shared/base/resolution.md")
+
+
 def test_delegated_verbs_are_a_drain_queue():
     # A delegated verb that gains its canon reference moves to the catalog
     # and must leave DELEGATED, so the two sets stay disjoint and the queue

@@ -1298,7 +1298,6 @@ fn register_overrides() {
     }));
 }
 
-
 // ============================ the native carrier ==============================
 // delta.py's analog, the deepest override behind the same universal interface: a
 // scalar IS an atom, a Vec IS a sequence, Bot is bottom, and an application node is a
@@ -1460,6 +1459,526 @@ fn overrides_killed(name: &str) -> bool {
 fn theta_off(name: &str) -> bool {
     theta_arms_off() || overrides_killed(name)
 }
+
+// Free twins of fn prim's local sequence viewers, for the lifted override
+// bodies below (prim keeps its own closures; consolidating them is cosmetic).
+fn n_seqv(x: &N) -> Option<Rc<Vec<N>>> {
+    if let N::S(v) = x { Some(v.clone()) } else { None }
+}
+fn n_pairv(x: &N) -> Option<(N, N)> {
+    n_seqv(x).and_then(|v| if v.len() == 2 { Some((v[0].clone(), v[1].clone())) } else { None })
+}
+
+// The Resolution Registry, DEF layer (docs ch. 15, migration step 3: lift,
+// don't rewrite). Every NAME-keyed certified-equal override is a row here,
+// keyed by the canon DEF it twins; the meaning stays in shared/*.canon and a
+// row is only speed. resolve_def consults the one kill switch; None (not
+// registered, killed, or the row defers on shape) falls through to the
+// reference reduction, and a DEFS cell of the same name still wins in mu's
+// precedence, then process, then NCANON. Registering a new override means a
+// row here, a catalog row (shared/base/resolution.md), a HOST_OVERRIDES row,
+// and a parity pin — never a dispatch edit. theta:NatJoin is the one
+// SHAPE-keyed override: natjoin_config recognizes the DEF's built term at
+// the application seam, under the same kill name and discipline.
+type DefOverride = fn(&N) -> Option<N>;
+const DEF_OVERRIDES: &[(&str, DefOverride)] = &[
+    ("theta:append_phi", ov_theta_append_phi),
+    ("theta:flatten", ov_theta_flatten),
+    ("theta:join_combine", ov_theta_join_combine),
+    ("theta:member", ov_theta_member),
+    ("theta:dedup", ov_theta_dedup),
+    ("system:ev_cols", ov_system_ev_cols),
+    ("system:entity_view", ov_system_entity_view),
+    ("system:vb_fetch", ov_system_vb_fetch),
+];
+fn resolve_def(name: &str, x: &N) -> Option<N> {
+    if overrides_killed(name) {
+        return None;
+    }
+    DEF_OVERRIDES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .and_then(|(_, f)| f(x))
+}
+
+    // ---- theta atom arms (#35 Stage C): certified-equal native
+    // twins of the theta.canon set/join helpers, the exact same
+    // canon-NAMED-arm pattern as system:vb_fetch below. Semantics
+    // transcribed from the canon bodies over the prim behaviors
+    // (INSERT right-fold, nseq Bot-collapse, apndl/cat/tl shape
+    // demands); the property tests reduce every case against the
+    // interpreted path (arms off) as the oracle. Precedence is
+    // unchanged where it can matter: a DEFS cell of the same name
+    // still wins (cells are consulted before prim()); the process/
+    // NCANON entries these arms now shadow are the same canon text
+    // the arms mirror.
+fn ov_theta_append_phi(x: &N) -> Option<N> {
+    if theta_arms_off() {
+        return None;
+    }
+    Some(match x {
+        // apndr∘⟨id, K(φ)⟩ — append the empty sequence
+        N::S(v) => {
+            let mut w = v.to_vec();
+            w.push(N::S(Rc::new(Vec::new())));
+            N::S(Rc::new(w))
+        }
+        _ => N::Bot,
+    })
+}
+
+
+fn ov_theta_flatten(x: &N) -> Option<N> {
+    if theta_arms_off() {
+        return None;
+    }
+    Some(match x {
+        // INSERT(cat)∘append_phi — concatenate a list of lists in
+        // order; any non-sequence element bottoms (cat's demand)
+        N::S(v) => {
+            let mut out: Vec<N> = Vec::new();
+            for e in v.iter() {
+                match e {
+                    N::S(inner) => out.extend(inner.iter().cloned()),
+                    _ => return Some(N::Bot),
+                }
+            }
+            N::S(Rc::new(out))
+        }
+        _ => N::Bot,
+    })
+}
+
+
+fn ov_theta_join_combine(x: &N) -> Option<N> {
+    if theta_arms_off() {
+        return None;
+    }
+    Some(match x {
+        // cat∘⟨1, tl∘2⟩ — ⟨a,b⟩ → a ++ b[1..]; a must be a seq, b a
+        // NONEMPTY seq (tl's demand); extra operand columns beyond
+        // the two selectors are ignored, as the selectors ignore them
+        N::S(v) if v.len() >= 2 => match (&v[0], &v[1]) {
+            (N::S(a), N::S(b)) if !b.is_empty() => {
+                let mut row: Vec<N> = Vec::with_capacity(a.len() + b.len() - 1);
+                row.extend(a.iter().cloned());
+                row.extend(b[1..].iter().cloned());
+                N::S(Rc::new(row))
+            }
+            _ => N::Bot,
+        },
+        _ => N::Bot,
+    })
+}
+
+
+fn ov_theta_member(x: &N) -> Option<N> {
+    if theta_arms_off() {
+        return None;
+    }
+    Some(match n_pairv(x) {
+        // not∘null∘filter_eq∘distl — ⟨e, ys⟩ → T iff some y in ys is
+        // n_eq-equal to e (distl demands the exact pair, ys a seq)
+        Some((e, N::S(ys))) => nb(ys.iter().any(|y| n_eq(&e, y))),
+        _ => N::Bot,
+    })
+}
+
+
+fn ov_theta_dedup(x: &N) -> Option<N> {
+    if theta_arms_off() {
+        return None;
+    }
+    Some(match x {
+        // INSERT(COND(member, 2, apndl))∘append_phi — the RIGHT fold:
+        // an element is kept iff it is not a member of the already-
+        // folded suffix, so duplicates keep their LAST occurrence's
+        // position ([a,b,a] → [b,a]); mirrored by walking from the
+        // right, keeping first-seen (by n_eq key), prepending.
+        N::S(v) => {
+            let mut seen: std::collections::HashSet<String> =
+                std::collections::HashSet::with_capacity(v.len());
+            let mut kept: std::collections::VecDeque<N> =
+                std::collections::VecDeque::with_capacity(v.len());
+            for e in v.iter().rev() {
+                let mut k = String::new();
+                n_join_key(e, &mut k);
+                if seen.insert(k) {
+                    kept.push_front(e.clone());
+                }
+            }
+            N::S(Rc::new(kept.into_iter().collect()))
+        }
+        _ => N::Bot,
+    })
+}
+
+    // CERTIFIED-EQUAL OVERRIDE of DEF("system:vb_fetch")
+    // (shared/system.canon) — the resident's first canon-NAMED
+    // native arm; the meaning stays in canon, this arm exists for
+    // SPEED only and is twinned by the parity pin (the canonical
+    // absorbed reassembly evaluates one interpretive ast:DynFetch
+    // per entity id: measured 301 s per fact type over the tasks
+    // store, 2026-07-08; this arm is one spine pass). Prim wins
+    // over the process/canon def by NEval's resolution order —
+    // cells still shadow it first, exactly as they shadow defs.
+    // CERTIFIED-EQUAL OVERRIDE of DEF("system:entity_view") — the
+    // whole 3NF per-entity view in one spine pass (the vb_fetch
+    // treatment: the canon def is the meaning, this arm exists
+    // because the interpretive evaluation is minutes at tasks
+    // scale). Answers the canon shape ⟨exists, fields, facts⟩
+    // with the canon encodings (unary T/F, absent "#"); kinds
+    // ride system:ev_cols for the render. Twinned by the
+    // entity-view parity pin (tests/derive.rs).
+    // CERTIFIED-EQUAL OVERRIDE of DEF("system:ev_cols") — the
+    // classified column layout, one spine pass (the WHILE-fold is
+    // interpretive-minutes at fleet scale). Twinned beside
+    // entity_view's pin.
+fn ov_system_ev_cols(x: &N) -> Option<N> {
+    Some(match n_pairv(x) {
+        Some((N::A(nl), d)) => {
+            let noun = match leaf_str(&nl) {
+                Some(s) => s,
+                None => return Some(N::Bot),
+            };
+            let spine: Vec<(String, N)> = match &d {
+                N::S(cells) => cells
+                    .iter()
+                    .filter_map(|c| {
+                        if let N::S(it) = c {
+                            if it.len() == 3 {
+                                if let (N::A(l0), N::A(k)) = (&it[0], &it[1]) {
+                                    if matches!(&**l0, Leaf::S(s) if s == "CELL") {
+                                        return leaf_str(k).map(|key| (key, it[2].clone()));
+                                    }
+                                }
+                            }
+                        }
+                        None
+                    })
+                    .collect(),
+                _ => return Some(N::Bot),
+            };
+            let hash = N::A(Rc::new(Leaf::S("#".into())));
+            N::S(Rc::new(
+                ev_cols_native(&spine, &noun)
+                    .into_iter()
+                    .map(|(ft, kind, other, col)| {
+                        N::S(Rc::new(vec![
+                            N::A(Rc::new(Leaf::S(ft))),
+                            N::A(Rc::new(Leaf::S(kind))),
+                            match other {
+                                Some(o) => N::A(Rc::new(Leaf::S(o))),
+                                None => hash.clone(),
+                            },
+                            N::A(Rc::new(Leaf::S(col))),
+                        ]))
+                    })
+                    .collect(),
+            ))
+        }
+        _ => N::Bot,
+    })
+}
+
+
+fn ov_system_entity_view(x: &N) -> Option<N> {
+    Some(match x {
+        N::S(v3) if v3.len() == 3 => {
+            let noun = match &v3[0] {
+                N::A(l) => match leaf_str(l) { Some(s) => s, None => return Some(N::Bot) },
+                _ => return Some(N::Bot),
+            };
+            let id = match &v3[1] {
+                N::A(l) => match leaf_str(l) { Some(s) => s, None => return Some(N::Bot) },
+                _ => return Some(N::Bot),
+            };
+            let spine: Vec<(String, N)> = match &v3[2] {
+                N::S(cells) => cells
+                    .iter()
+                    .filter_map(|c| {
+                        if let N::S(it) = c {
+                            if it.len() == 3 {
+                                if let (N::A(l0), N::A(k)) = (&it[0], &it[1]) {
+                                    if matches!(&**l0, Leaf::S(s) if s == "CELL") {
+                                        return leaf_str(k).map(|key| (key, it[2].clone()));
+                                    }
+                                }
+                            }
+                        }
+                        None
+                    })
+                    .collect(),
+                _ => return Some(N::Bot),
+            };
+            let fetch = |name: &str| -> Option<&N> {
+                spine.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+            };
+            let rows_of = |name: &str| -> Vec<N> {
+                match fetch(name) {
+                    Some(N::S(v)) => v.to_vec(),
+                    _ => Vec::new(),
+                }
+            };
+            let sv2 = |n: &N| -> Option<String> {
+                match n { N::A(l) => leaf_str(l), _ => None }
+            };
+            let hash = N::A(Rc::new(Leaf::S("#".into())));
+            let t_at = N::A(Rc::new(Leaf::S("T".into())));
+            let f_at = N::A(Rc::new(Leaf::S("F".into())));
+            let mut fields: Vec<N> = Vec::new();
+            let mut any_seen = false;
+            let classified = ev_cols_native(&spine, &noun);
+            for (ft, kind, other, col) in &classified {
+                let key = if kind == "unary" {
+                    col.clone()
+                } else {
+                    other.clone().unwrap_or_else(|| col.clone())
+                };
+                let pop = rows_of(ft);
+                let val: N = if kind.as_str() == "unary" {
+                    let hit = pop.iter().any(|r| match r {
+                        N::S(cc) if !cc.is_empty() =>
+                            sv2(&cc[0]).as_deref() == Some(id.as_str()),
+                        _ => false,
+                    });
+                    if hit { any_seen = true; t_at.clone() } else { f_at.clone() }
+                } else {
+                    let mut last: Option<N> = None;
+                    for r in pop.iter() {
+                        if let N::S(cc) = r {
+                            if cc.len() >= 2
+                                && sv2(&cc[0]).as_deref() == Some(id.as_str())
+                            {
+                                last = Some(cc[1].clone());
+                            }
+                        }
+                    }
+                    match last {
+                        Some(v) => { any_seen = true; v }
+                        None => hash.clone(),
+                    }
+                };
+                fields.push(N::S(Rc::new(vec![
+                    N::A(Rc::new(Leaf::S(key))),
+                    val,
+                ])));
+            }
+            // own facts: factType order, minus absorbed, the noun's
+            // role positions, any position matching the id
+            let all_absorbed: Vec<String> = rows_of("rmapColumns")
+                .iter()
+                .filter_map(|r| {
+                    if let N::S(cc) = r {
+                        if cc.len() >= 3 { return sv2(&cc[2]); }
+                    }
+                    None
+                })
+                .collect();
+            let mut facts: Vec<N> = Vec::new();
+            for fr in rows_of("factType") {
+                let ft = match &fr {
+                    N::S(cc) if !cc.is_empty() => match sv2(&cc[0]) {
+                        Some(f) => f,
+                        None => continue,
+                    },
+                    _ => continue,
+                };
+                if all_absorbed.iter().any(|a| *a == ft) {
+                    continue;
+                }
+                let positions: Vec<i64> = rows_of("role")
+                    .iter()
+                    .filter_map(|r| {
+                        if let N::S(cc) = r {
+                            if cc.len() >= 4
+                                && sv2(&cc[1]).as_deref() == Some(ft.as_str())
+                                && sv2(&cc[3]).as_deref() == Some(noun.as_str())
+                            {
+                                if let N::A(pl) = &cc[2] {
+                                    if let Leaf::I(pp) = &**pl {
+                                        return Some(*pp);
+                                    }
+                                }
+                            }
+                        }
+                        None
+                    })
+                    .collect();
+                if positions.is_empty() {
+                    continue;
+                }
+                for r in rows_of(&ft) {
+                    if let N::S(cc) = &r {
+                        let hit = positions.iter().any(|p| {
+                            let idx = (*p as usize).saturating_sub(1);
+                            cc.len() > idx
+                                && sv2(&cc[idx]).as_deref() == Some(id.as_str())
+                        });
+                        if hit {
+                            any_seen = true;
+                            facts.push(N::S(Rc::new(vec![
+                                N::A(Rc::new(Leaf::S(ft.clone()))),
+                                r.clone(),
+                            ])));
+                        }
+                    }
+                }
+            }
+            let spine_hit = rows_of(&noun).iter().any(|r| match r {
+                N::S(cc) if !cc.is_empty() =>
+                    sv2(&cc[0]).as_deref() == Some(id.as_str()),
+                _ => false,
+            });
+            let exists = any_seen || spine_hit;
+            Some(N::S(Rc::new(vec![
+                if exists { t_at } else { f_at },
+                N::S(Rc::new(fields)),
+                N::S(Rc::new(facts)),
+            ]))).map(|r| r)
+            .unwrap_or(N::Bot)
+            .into()
+        }
+        _ => N::Bot,
+    })
+}
+
+
+fn ov_system_vb_fetch(x: &N) -> Option<N> {
+    Some(match n_pairv(x) {
+        Some((ft, d)) => {
+            let spine: Vec<(String, N)> = match &d {
+                N::S(cells) => cells
+                    .iter()
+                    .filter_map(|c| {
+                        if let N::S(it) = c {
+                            if it.len() == 3 {
+                                if let (N::A(l0), N::A(k)) = (&it[0], &it[1]) {
+                                    if matches!(&**l0, Leaf::S(s) if s == "CELL") {
+                                        let key = match &**k {
+                                            Leaf::S(s) => s.clone(),
+                                            Leaf::I(i) => i.to_string(),
+                                            _ => return None,
+                                        };
+                                        return Some((key, it[2].clone()));
+                                    }
+                                }
+                            }
+                        }
+                        None
+                    })
+                    .collect(),
+                _ => return Some(N::Bot),
+            };
+            let hash = N::A(Rc::new(Leaf::S("#".into())));
+            // ast:Fetch — the FIRST cell of that name (n_cells_of's
+            // own precedence); ast:FetchPop — missing, or a value
+            // eq to the "#" sentinel, answers the empty population
+            let fetch = |name: &str| -> Option<N> {
+                spine.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+            };
+            let pop = |name: &str| -> N {
+                match fetch(name) {
+                    Some(v) if !n_eq(&v, &hash) => v,
+                    _ => N::S(Rc::new(vec![])),
+                }
+            };
+            // system:vb_colrow — rmapColumns rows ⟨noun, col, ft⟩
+            // filtered on this ft; a malformed row bottoms exactly
+            // like the canonical selector-through-Filter would
+            let rmap = pop("rmapColumns");
+            let rrows = match &rmap {
+                N::S(v) => v.clone(),
+                _ => return Some(N::Bot),
+            };
+            let mut colrow: Option<(N, N)> = None;
+            for r in rrows.iter() {
+                match r {
+                    N::S(cols) if cols.len() >= 3 => {
+                        if n_eq(&cols[2], &ft) && colrow.is_none() {
+                            colrow = Some((cols[0].clone(), cols[1].clone()));
+                        }
+                    }
+                    _ => return Some(N::Bot),
+                }
+            }
+            let (noun, col) = match colrow {
+                None => {
+                    // own-table: FetchPop(ft) : D — a non-atom ft
+                    // names no cell, so its population is empty
+                    let name = match &ft {
+                        N::A(l) => match &**l {
+                            Leaf::S(s) => s.clone(),
+                            Leaf::I(i) => i.to_string(),
+                            _ => return Some(N::Bot),
+                        },
+                        _ => return Some(N::S(Rc::new(vec![]))),
+                    };
+                    return Some(pop(&name));
+                }
+                Some(nc) => nc,
+            };
+            let noun_s = match &noun {
+                N::A(l) => match &**l {
+                    Leaf::S(s) => s.clone(),
+                    Leaf::I(i) => i.to_string(),
+                    _ => return Some(N::Bot),
+                },
+                _ => return Some(N::Bot),
+            };
+            // the composed column selector is a prim selector in
+            // the canonical pipeline: integer, 1..=32, else ⊥
+            let col_i = match &col {
+                N::A(l) => match &**l {
+                    Leaf::I(i) if (1..=32).contains(i) => *i as usize,
+                    _ => return Some(N::Bot),
+                },
+                _ => return Some(N::Bot),
+            };
+            let table = pop(&noun_s);
+            let trows = match &table {
+                N::S(v) => v.clone(),
+                _ => return Some(N::Bot),
+            };
+            // per spine id: ast:DynFetch of the per-entity cell
+            // noun:id — missing or atom-valued answers "#" and the
+            // outer Filter drops the pair; a wide row shorter than
+            // the selector bottoms the whole answer (α strictness)
+            let mut out: Vec<N> = Vec::new();
+            for r in trows.iter() {
+                let id = match r {
+                    N::S(cols) if !cols.is_empty() => cols[0].clone(),
+                    _ => return Some(N::Bot),
+                };
+                let id_s = match &id {
+                    N::A(l) => match &**l {
+                        Leaf::S(s) => s.clone(),
+                        Leaf::I(i) => i.to_string(),
+                        _ => return Some(N::Bot),
+                    },
+                    _ => return Some(N::Bot),
+                };
+                let val = match fetch(&format!("{}:{}", noun_s, id_s)) {
+                    None => hash.clone(),
+                    Some(N::A(_)) => hash.clone(),
+                    Some(N::S(w)) => {
+                        if w.len() < col_i {
+                            return Some(N::Bot);
+                        }
+                        w[col_i - 1].clone()
+                    }
+                    Some(N::Bot) => return Some(N::Bot),
+                };
+                if !n_eq(&val, &hash) {
+                    out.push(N::S(Rc::new(vec![id, val])));
+                }
+            }
+            N::S(Rc::new(out))
+        }
+        None => N::Bot,
+    })
+}
+
 
 // n_join_key: a hash key over N that is FAITHFUL to n_eq (type-strict nateq at
 // the leaves: 1, 1.0 and "1" are three distinct keys; sequences recurse,
@@ -1817,6 +2336,12 @@ impl NEval {
             return None;
         }
         let s = match name { Leaf::S(s) => s.as_str(), _ => return None };
+        // ch. 15 step 3: the name-keyed override rows resolve
+        // first; None falls through to the base vocabulary below,
+        // then process, then NCANON, through mu.
+        if let Some(r) = resolve_def(s, x) {
+            return Some(r);
+        }
         let seqv = |x: &N| -> Option<Rc<Vec<N>>> {
             if let N::S(v) = x { Some(v.clone()) } else { None }
         };
@@ -1977,84 +2502,7 @@ impl NEval {
                 _ => N::Bot,
             },
             "DEFS" => self.defs_n.clone(),
-            // ---- theta atom arms (#35 Stage C): certified-equal native
-            // twins of the theta.canon set/join helpers, the exact same
-            // canon-NAMED-arm pattern as system:vb_fetch below. Semantics
-            // transcribed from the canon bodies over the prim behaviors
-            // (INSERT right-fold, nseq Bot-collapse, apndl/cat/tl shape
-            // demands); the property tests reduce every case against the
-            // interpreted path (arms off) as the oracle. Precedence is
-            // unchanged where it can matter: a DEFS cell of the same name
-            // still wins (cells are consulted before prim()); the process/
-            // NCANON entries these arms now shadow are the same canon text
-            // the arms mirror.
-            "theta:append_phi" if !theta_off("theta:append_phi") => match x {
-                // apndr∘⟨id, K(φ)⟩ — append the empty sequence
-                N::S(v) => {
-                    let mut w = v.to_vec();
-                    w.push(N::S(Rc::new(Vec::new())));
-                    N::S(Rc::new(w))
-                }
-                _ => N::Bot,
-            },
-            "theta:flatten" if !theta_off("theta:flatten") => match x {
-                // INSERT(cat)∘append_phi — concatenate a list of lists in
-                // order; any non-sequence element bottoms (cat's demand)
-                N::S(v) => {
-                    let mut out: Vec<N> = Vec::new();
-                    for e in v.iter() {
-                        match e {
-                            N::S(inner) => out.extend(inner.iter().cloned()),
-                            _ => return Some(N::Bot),
-                        }
-                    }
-                    N::S(Rc::new(out))
-                }
-                _ => N::Bot,
-            },
-            "theta:join_combine" if !theta_off("theta:join_combine") => match x {
-                // cat∘⟨1, tl∘2⟩ — ⟨a,b⟩ → a ++ b[1..]; a must be a seq, b a
-                // NONEMPTY seq (tl's demand); extra operand columns beyond
-                // the two selectors are ignored, as the selectors ignore them
-                N::S(v) if v.len() >= 2 => match (&v[0], &v[1]) {
-                    (N::S(a), N::S(b)) if !b.is_empty() => {
-                        let mut row: Vec<N> = Vec::with_capacity(a.len() + b.len() - 1);
-                        row.extend(a.iter().cloned());
-                        row.extend(b[1..].iter().cloned());
-                        N::S(Rc::new(row))
-                    }
-                    _ => N::Bot,
-                },
-                _ => N::Bot,
-            },
-            "theta:member" if !theta_off("theta:member") => match pairv(x) {
-                // not∘null∘filter_eq∘distl — ⟨e, ys⟩ → T iff some y in ys is
-                // n_eq-equal to e (distl demands the exact pair, ys a seq)
-                Some((e, N::S(ys))) => nb(ys.iter().any(|y| n_eq(&e, y))),
-                _ => N::Bot,
-            },
-            "theta:dedup" if !theta_off("theta:dedup") => match x {
-                // INSERT(COND(member, 2, apndl))∘append_phi — the RIGHT fold:
-                // an element is kept iff it is not a member of the already-
-                // folded suffix, so duplicates keep their LAST occurrence's
-                // position ([a,b,a] → [b,a]); mirrored by walking from the
-                // right, keeping first-seen (by n_eq key), prepending.
-                N::S(v) => {
-                    let mut seen: std::collections::HashSet<String> =
-                        std::collections::HashSet::with_capacity(v.len());
-                    let mut kept: std::collections::VecDeque<N> =
-                        std::collections::VecDeque::with_capacity(v.len());
-                    for e in v.iter().rev() {
-                        let mut k = String::new();
-                        n_join_key(e, &mut k);
-                        if seen.insert(k) {
-                            kept.push_front(e.clone());
-                        }
-                    }
-                    N::S(Rc::new(kept.into_iter().collect()))
-                }
-                _ => N::Bot,
-            },
+
             "cellkey" => match pairv(x) {
                 Some((N::A(a), N::A(b))) => {
                     let sv = |l: &Leaf| match l {
@@ -2069,361 +2517,7 @@ impl NEval {
                 }
                 _ => N::Bot,
             },
-            // CERTIFIED-EQUAL OVERRIDE of DEF("system:vb_fetch")
-            // (shared/system.canon) — the resident's first canon-NAMED
-            // native arm; the meaning stays in canon, this arm exists for
-            // SPEED only and is twinned by the parity pin (the canonical
-            // absorbed reassembly evaluates one interpretive ast:DynFetch
-            // per entity id: measured 301 s per fact type over the tasks
-            // store, 2026-07-08; this arm is one spine pass). Prim wins
-            // over the process/canon def by NEval's resolution order —
-            // cells still shadow it first, exactly as they shadow defs.
-            // CERTIFIED-EQUAL OVERRIDE of DEF("system:entity_view") — the
-            // whole 3NF per-entity view in one spine pass (the vb_fetch
-            // treatment: the canon def is the meaning, this arm exists
-            // because the interpretive evaluation is minutes at tasks
-            // scale). Answers the canon shape ⟨exists, fields, facts⟩
-            // with the canon encodings (unary T/F, absent "#"); kinds
-            // ride system:ev_cols for the render. Twinned by the
-            // entity-view parity pin (tests/derive.rs).
-            // CERTIFIED-EQUAL OVERRIDE of DEF("system:ev_cols") — the
-            // classified column layout, one spine pass (the WHILE-fold is
-            // interpretive-minutes at fleet scale). Twinned beside
-            // entity_view's pin.
-            "system:ev_cols" if !overrides_killed("system:ev_cols") => match pairv(x) {
-                Some((N::A(nl), d)) => {
-                    let noun = match leaf_str(&nl) {
-                        Some(s) => s,
-                        None => return Some(N::Bot),
-                    };
-                    let spine: Vec<(String, N)> = match &d {
-                        N::S(cells) => cells
-                            .iter()
-                            .filter_map(|c| {
-                                if let N::S(it) = c {
-                                    if it.len() == 3 {
-                                        if let (N::A(l0), N::A(k)) = (&it[0], &it[1]) {
-                                            if matches!(&**l0, Leaf::S(s) if s == "CELL") {
-                                                return leaf_str(k).map(|key| (key, it[2].clone()));
-                                            }
-                                        }
-                                    }
-                                }
-                                None
-                            })
-                            .collect(),
-                        _ => return Some(N::Bot),
-                    };
-                    let hash = N::A(Rc::new(Leaf::S("#".into())));
-                    N::S(Rc::new(
-                        ev_cols_native(&spine, &noun)
-                            .into_iter()
-                            .map(|(ft, kind, other, col)| {
-                                N::S(Rc::new(vec![
-                                    N::A(Rc::new(Leaf::S(ft))),
-                                    N::A(Rc::new(Leaf::S(kind))),
-                                    match other {
-                                        Some(o) => N::A(Rc::new(Leaf::S(o))),
-                                        None => hash.clone(),
-                                    },
-                                    N::A(Rc::new(Leaf::S(col))),
-                                ]))
-                            })
-                            .collect(),
-                    ))
-                }
-                _ => N::Bot,
-            },
-            "system:entity_view" if !overrides_killed("system:entity_view") => match x {
-                N::S(v3) if v3.len() == 3 => {
-                    let noun = match &v3[0] {
-                        N::A(l) => match leaf_str(l) { Some(s) => s, None => return Some(N::Bot) },
-                        _ => return Some(N::Bot),
-                    };
-                    let id = match &v3[1] {
-                        N::A(l) => match leaf_str(l) { Some(s) => s, None => return Some(N::Bot) },
-                        _ => return Some(N::Bot),
-                    };
-                    let spine: Vec<(String, N)> = match &v3[2] {
-                        N::S(cells) => cells
-                            .iter()
-                            .filter_map(|c| {
-                                if let N::S(it) = c {
-                                    if it.len() == 3 {
-                                        if let (N::A(l0), N::A(k)) = (&it[0], &it[1]) {
-                                            if matches!(&**l0, Leaf::S(s) if s == "CELL") {
-                                                return leaf_str(k).map(|key| (key, it[2].clone()));
-                                            }
-                                        }
-                                    }
-                                }
-                                None
-                            })
-                            .collect(),
-                        _ => return Some(N::Bot),
-                    };
-                    let fetch = |name: &str| -> Option<&N> {
-                        spine.iter().find(|(k, _)| k == name).map(|(_, v)| v)
-                    };
-                    let rows_of = |name: &str| -> Vec<N> {
-                        match fetch(name) {
-                            Some(N::S(v)) => v.to_vec(),
-                            _ => Vec::new(),
-                        }
-                    };
-                    let sv2 = |n: &N| -> Option<String> {
-                        match n { N::A(l) => leaf_str(l), _ => None }
-                    };
-                    let hash = N::A(Rc::new(Leaf::S("#".into())));
-                    let t_at = N::A(Rc::new(Leaf::S("T".into())));
-                    let f_at = N::A(Rc::new(Leaf::S("F".into())));
-                    let mut fields: Vec<N> = Vec::new();
-                    let mut any_seen = false;
-                    let classified = ev_cols_native(&spine, &noun);
-                    for (ft, kind, other, col) in &classified {
-                        let key = if kind == "unary" {
-                            col.clone()
-                        } else {
-                            other.clone().unwrap_or_else(|| col.clone())
-                        };
-                        let pop = rows_of(ft);
-                        let val: N = if kind.as_str() == "unary" {
-                            let hit = pop.iter().any(|r| match r {
-                                N::S(cc) if !cc.is_empty() =>
-                                    sv2(&cc[0]).as_deref() == Some(id.as_str()),
-                                _ => false,
-                            });
-                            if hit { any_seen = true; t_at.clone() } else { f_at.clone() }
-                        } else {
-                            let mut last: Option<N> = None;
-                            for r in pop.iter() {
-                                if let N::S(cc) = r {
-                                    if cc.len() >= 2
-                                        && sv2(&cc[0]).as_deref() == Some(id.as_str())
-                                    {
-                                        last = Some(cc[1].clone());
-                                    }
-                                }
-                            }
-                            match last {
-                                Some(v) => { any_seen = true; v }
-                                None => hash.clone(),
-                            }
-                        };
-                        fields.push(N::S(Rc::new(vec![
-                            N::A(Rc::new(Leaf::S(key))),
-                            val,
-                        ])));
-                    }
-                    // own facts: factType order, minus absorbed, the noun's
-                    // role positions, any position matching the id
-                    let all_absorbed: Vec<String> = rows_of("rmapColumns")
-                        .iter()
-                        .filter_map(|r| {
-                            if let N::S(cc) = r {
-                                if cc.len() >= 3 { return sv2(&cc[2]); }
-                            }
-                            None
-                        })
-                        .collect();
-                    let mut facts: Vec<N> = Vec::new();
-                    for fr in rows_of("factType") {
-                        let ft = match &fr {
-                            N::S(cc) if !cc.is_empty() => match sv2(&cc[0]) {
-                                Some(f) => f,
-                                None => continue,
-                            },
-                            _ => continue,
-                        };
-                        if all_absorbed.iter().any(|a| *a == ft) {
-                            continue;
-                        }
-                        let positions: Vec<i64> = rows_of("role")
-                            .iter()
-                            .filter_map(|r| {
-                                if let N::S(cc) = r {
-                                    if cc.len() >= 4
-                                        && sv2(&cc[1]).as_deref() == Some(ft.as_str())
-                                        && sv2(&cc[3]).as_deref() == Some(noun.as_str())
-                                    {
-                                        if let N::A(pl) = &cc[2] {
-                                            if let Leaf::I(pp) = &**pl {
-                                                return Some(*pp);
-                                            }
-                                        }
-                                    }
-                                }
-                                None
-                            })
-                            .collect();
-                        if positions.is_empty() {
-                            continue;
-                        }
-                        for r in rows_of(&ft) {
-                            if let N::S(cc) = &r {
-                                let hit = positions.iter().any(|p| {
-                                    let idx = (*p as usize).saturating_sub(1);
-                                    cc.len() > idx
-                                        && sv2(&cc[idx]).as_deref() == Some(id.as_str())
-                                });
-                                if hit {
-                                    any_seen = true;
-                                    facts.push(N::S(Rc::new(vec![
-                                        N::A(Rc::new(Leaf::S(ft.clone()))),
-                                        r.clone(),
-                                    ])));
-                                }
-                            }
-                        }
-                    }
-                    let spine_hit = rows_of(&noun).iter().any(|r| match r {
-                        N::S(cc) if !cc.is_empty() =>
-                            sv2(&cc[0]).as_deref() == Some(id.as_str()),
-                        _ => false,
-                    });
-                    let exists = any_seen || spine_hit;
-                    Some(N::S(Rc::new(vec![
-                        if exists { t_at } else { f_at },
-                        N::S(Rc::new(fields)),
-                        N::S(Rc::new(facts)),
-                    ]))).map(|r| r)
-                    .unwrap_or(N::Bot)
-                    .into()
-                }
-                _ => N::Bot,
-            },
-            "system:vb_fetch" if !overrides_killed("system:vb_fetch") => match pairv(x) {
-                Some((ft, d)) => {
-                    let spine: Vec<(String, N)> = match &d {
-                        N::S(cells) => cells
-                            .iter()
-                            .filter_map(|c| {
-                                if let N::S(it) = c {
-                                    if it.len() == 3 {
-                                        if let (N::A(l0), N::A(k)) = (&it[0], &it[1]) {
-                                            if matches!(&**l0, Leaf::S(s) if s == "CELL") {
-                                                let key = match &**k {
-                                                    Leaf::S(s) => s.clone(),
-                                                    Leaf::I(i) => i.to_string(),
-                                                    _ => return None,
-                                                };
-                                                return Some((key, it[2].clone()));
-                                            }
-                                        }
-                                    }
-                                }
-                                None
-                            })
-                            .collect(),
-                        _ => return Some(N::Bot),
-                    };
-                    let hash = N::A(Rc::new(Leaf::S("#".into())));
-                    // ast:Fetch — the FIRST cell of that name (n_cells_of's
-                    // own precedence); ast:FetchPop — missing, or a value
-                    // eq to the "#" sentinel, answers the empty population
-                    let fetch = |name: &str| -> Option<N> {
-                        spine.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
-                    };
-                    let pop = |name: &str| -> N {
-                        match fetch(name) {
-                            Some(v) if !n_eq(&v, &hash) => v,
-                            _ => N::S(Rc::new(vec![])),
-                        }
-                    };
-                    // system:vb_colrow — rmapColumns rows ⟨noun, col, ft⟩
-                    // filtered on this ft; a malformed row bottoms exactly
-                    // like the canonical selector-through-Filter would
-                    let rmap = pop("rmapColumns");
-                    let rrows = match &rmap {
-                        N::S(v) => v.clone(),
-                        _ => return Some(N::Bot),
-                    };
-                    let mut colrow: Option<(N, N)> = None;
-                    for r in rrows.iter() {
-                        match r {
-                            N::S(cols) if cols.len() >= 3 => {
-                                if n_eq(&cols[2], &ft) && colrow.is_none() {
-                                    colrow = Some((cols[0].clone(), cols[1].clone()));
-                                }
-                            }
-                            _ => return Some(N::Bot),
-                        }
-                    }
-                    let (noun, col) = match colrow {
-                        None => {
-                            // own-table: FetchPop(ft) : D — a non-atom ft
-                            // names no cell, so its population is empty
-                            let name = match &ft {
-                                N::A(l) => match &**l {
-                                    Leaf::S(s) => s.clone(),
-                                    Leaf::I(i) => i.to_string(),
-                                    _ => return Some(N::Bot),
-                                },
-                                _ => return Some(N::S(Rc::new(vec![]))),
-                            };
-                            return Some(pop(&name));
-                        }
-                        Some(nc) => nc,
-                    };
-                    let noun_s = match &noun {
-                        N::A(l) => match &**l {
-                            Leaf::S(s) => s.clone(),
-                            Leaf::I(i) => i.to_string(),
-                            _ => return Some(N::Bot),
-                        },
-                        _ => return Some(N::Bot),
-                    };
-                    // the composed column selector is a prim selector in
-                    // the canonical pipeline: integer, 1..=32, else ⊥
-                    let col_i = match &col {
-                        N::A(l) => match &**l {
-                            Leaf::I(i) if (1..=32).contains(i) => *i as usize,
-                            _ => return Some(N::Bot),
-                        },
-                        _ => return Some(N::Bot),
-                    };
-                    let table = pop(&noun_s);
-                    let trows = match &table {
-                        N::S(v) => v.clone(),
-                        _ => return Some(N::Bot),
-                    };
-                    // per spine id: ast:DynFetch of the per-entity cell
-                    // noun:id — missing or atom-valued answers "#" and the
-                    // outer Filter drops the pair; a wide row shorter than
-                    // the selector bottoms the whole answer (α strictness)
-                    let mut out: Vec<N> = Vec::new();
-                    for r in trows.iter() {
-                        let id = match r {
-                            N::S(cols) if !cols.is_empty() => cols[0].clone(),
-                            _ => return Some(N::Bot),
-                        };
-                        let id_s = match &id {
-                            N::A(l) => match &**l {
-                                Leaf::S(s) => s.clone(),
-                                Leaf::I(i) => i.to_string(),
-                                _ => return Some(N::Bot),
-                            },
-                            _ => return Some(N::Bot),
-                        };
-                        let val = match fetch(&format!("{}:{}", noun_s, id_s)) {
-                            None => hash.clone(),
-                            Some(N::A(_)) => hash.clone(),
-                            Some(N::S(w)) => {
-                                if w.len() < col_i {
-                                    return Some(N::Bot);
-                                }
-                                w[col_i - 1].clone()
-                            }
-                            Some(N::Bot) => return Some(N::Bot),
-                        };
-                        if !n_eq(&val, &hash) {
-                            out.push(N::S(Rc::new(vec![id, val])));
-                        }
-                    }
-                    N::S(Rc::new(out))
-                }
-                None => N::Bot,
-            },
+
             "stage1_fields" => match x {
                 N::S(v) if v.len() == 4 => {
                     let strv = |n: &N| -> Option<String> {
@@ -11218,7 +11312,6 @@ fn op_answer(op: &str, j: &J, srv: &mut Srv) -> Result<String, String> {
         }
     }
 }
-
 
 // ============================ the MCP binding =================================
 // The daily-driver surface rides the Model Context Protocol's stdio transport
