@@ -216,11 +216,17 @@ to the oracle over real apps through the real flow.
 2. **Register the catalog in canon** — done: `shared/base/resolution.md` declares
    `Operation is overridable` and enumerates the catalog; the host's `HOST_OVERRIDES`
    is asserted a subset of it by test.
-3. **Lift, don't rewrite** — remaining: physically move the `prim` override arm bodies
-   and the `match tool` bindings into an `OVERRIDES` fn-pointer table consulted by one
-   resolver, so a new override is a table row rather than a dispatch edit. The kill
-   switch under `*` must stay byte-identical to the per-alias runs on the fixture and
-   corpus — the same discipline as every twin pass.
+3. **Lift, don't rewrite** — DONE (2026-07-13, the canon-first rebuild): the eight
+   name-keyed `prim` arms live in the `DEF_OVERRIDES` table behind `resolve_def`
+   (theta:NatJoin documented at the table as the one SHAPE-keyed override at the
+   application seam), and the five guarded verb bindings live in `VERB_OVERRIDES`
+   behind `resolve_verb`, with `mcp_call_inner`'s match reduced to the reference
+   bindings. A new override is a table row plus a catalog row plus a parity pin.
+   The coverage gate audits both tables: every DEF row must name an existing canon
+   DEF, every verb row a catalog row, and the DELEGATED drain queue may only
+   shrink (explain drained the same day; sql stays delegated by design under the
+   zero-dep host rule, its materialization being a sqlite artifact on the
+   registered-function side of the enumerable boundary).
 
 Each step is gated by the same differential the twins already use, so the registry is
 adopted without a single un-certified change. (`compile` is the seam's first op-level
