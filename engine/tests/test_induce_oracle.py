@@ -83,3 +83,97 @@ def test_the_canon_enumeration_family_matches_the_oracle():
         assert [tuple(r) for r in got] == want
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_the_canon_gate_and_coverage_match_the_oracle():
+    # the delta gate: a uniqueness constraint makes some candidates
+    # introduce violations the baseline lacks; the canon verdict must agree
+    # with the oracle's per candidate. Coverage judges HOST-BUILT
+    # post-worlds: install and derive stay engine machinery (the worlds are
+    # operands, like the validator), and the canon carries the judgment.
+    import itertools
+
+    from pyarest import ast as past, defs as _dm, forml
+    import pyarest.lam as L
+    from pyarest.lam import atom as _A, to_lam, from_lam
+    from pyarest.reduce import apply as _ap
+
+    tmp = tempfile.mkdtemp(prefix="induce-oracle-")
+    os.makedirs(os.path.join(tmp, "coin", "readings"))
+    with open(os.path.join(tmp, "coin", "readings", "app.md"), "w",
+              encoding="utf-8") as f:
+        f.write(
+            "Side is a value type.\n"
+            "The possible values of Side are 'heads', 'tails'.\n"
+            "Weight is a value type.\n"
+            "Coin is an entity type.\n"
+            "Coin has Side.\n"
+            "Coin has Weight.\n"
+            "\n"
+            "Coin 'c1' has Side 'heads'.\n"
+            "Coin 'c2' has Weight '5'.\n")
+    try:
+        reg = A.Registry(tmp, base_dir=A.default_base())
+        reg.compile("coin")
+        D = reg._load("coin")
+
+        def canon(name, operand):
+            with _dm.step(D):
+                return from_lam(_ap(_A(name), operand))
+
+        part = system.rmap_partition(D)
+        val = forml.validate_for("Coin_has_Side", D, part)
+        existing = tuple(tuple(r)
+                         for r in system.ft_view(D, "Coin_has_Side", part))
+
+        def py_viol(rows):
+            pair = L.SEQ(L.CONS(to_lam(tuple(rows)))(L.CONS(D)(L.NIL)))
+            with _dm.step(D):
+                out = from_lam(_ap(val, pair))
+            return {tuple(v) if isinstance(v, tuple) else (v,)
+                    for v in (out[1] if len(out) >= 2 else ())}
+
+        doms = [system.induce_domain(D, n) for n in ("Coin", "Side")]
+
+        # two validators: the app's compiled one (unconstrained here, every
+        # candidate passes), and a handcrafted role-1 uniqueness, the same
+        # object the compiler builds for a declared UC, which splits the
+        # verdicts: (c1, tails) doubles c1's role-1 count and must reject,
+        # while (c2, *) passes. Both feed the SAME oracle computation and
+        # the SAME canon gate, so agreement is pinned on both verdicts.
+        from pyarest import constraints as C
+        val_uc = system.validate_modal([(C.uniqueness([1]), "alethic")], [])
+        verdicts = []
+        for v in (val, val_uc):
+            def py_v(rows, _v=v):
+                pair = L.SEQ(L.CONS(to_lam(tuple(rows)))(L.CONS(D)(L.NIL)))
+                with _dm.step(D):
+                    out = from_lam(_ap(_v, pair))
+                return {tuple(x) if isinstance(x, tuple) else (x,)
+                        for x in (out[1] if len(out) >= 2 else ())}
+            base = py_v(existing)
+            for cand in itertools.product(*doms):
+                oracle_pass = not (py_v(existing + (tuple(cand),)) - base)
+                operand = L.SEQ(L.CONS(to_lam(tuple(cand)))(
+                    L.CONS(to_lam(existing))(L.CONS(v)(L.CONS(D)(L.NIL)))))
+                got = canon("system:cand_gate", operand)
+                assert (got == "T") == oracle_pass, (cand, got, oracle_pass)
+                verdicts.append(oracle_pass)
+        # the pair of validators must exercise both verdicts
+        assert True in verdicts and False in verdicts
+
+        # coverage on a host-built post-world
+        cand = ("c2", "tails")
+        D2 = _ap(past.Store("Coin_has_Side"),
+                 L.SEQ(L.CONS(to_lam(system._rowsort(set(existing)
+                                                     | {cand})))(
+                     L.CONS(D)(L.NIL))))
+        D3 = system.run_rules(D2, changed=["Coin_has_Side"])
+        te_hit = to_lam((("Coin_has_Side", ("c2", "tails")),))
+        te_miss = to_lam((("Coin_has_Side", ("c9", "tails")),))
+        assert canon("system:cand_covers",
+                     L.SEQ(L.CONS(te_hit)(L.CONS(D3)(L.NIL)))) == "T"
+        assert canon("system:cand_covers",
+                     L.SEQ(L.CONS(te_miss)(L.CONS(D3)(L.NIL)))) == "F"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
