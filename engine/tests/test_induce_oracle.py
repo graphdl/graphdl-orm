@@ -49,3 +49,37 @@ def test_the_domains_and_the_enumeration_are_the_oracle():
         assert all(h["explains"] == [] for h in out)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_the_canon_enumeration_family_matches_the_oracle():
+    # the canon meaning reduces to the oracle's exact answers: role domains
+    # per noun (declaration order, keep-first across the later legs) and
+    # the cartesian product in itertools order
+    import itertools
+
+    from pyarest import defs as _dm
+    import pyarest.lam as L
+    from pyarest.lam import atom as _A, to_lam, from_lam
+    from pyarest.reduce import apply as _ap
+
+    tmp = _fixture()
+    try:
+        reg = A.Registry(tmp, base_dir=A.default_base())
+        reg.compile("coin")
+        D = reg._load("coin")
+
+        def canon(name, operand):
+            with _dm.step(D):
+                return from_lam(_ap(_A(name), operand))
+
+        for noun in ("Coin", "Side"):
+            pair = L.SEQ(L.CONS(_A(noun))(L.CONS(D)(L.NIL)))
+            assert list(canon("system:role_domain", pair)) == \
+                system.induce_domain(D, noun), noun
+        doms = [system.induce_domain(D, n) for n in ("Coin", "Side")]
+        got = canon("system:enum_product",
+                    to_lam(tuple(tuple(d) for d in doms)))
+        want = [tuple(c) for c in itertools.product(*doms)]
+        assert [tuple(r) for r in got] == want
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
