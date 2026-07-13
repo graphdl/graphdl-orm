@@ -203,3 +203,25 @@ def test_the_canon_gate_and_coverage_match_the_oracle():
         assert [r[1] for r in got] == ["b", "d", "c", "a", "e"]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_the_python_reference_twins_the_inline_induce():
+    # the whole verb, twice: the inline loop (the certified override) and
+    # the canon-reducing reference must answer identically, unconstrained
+    # and under to_explain (where only the candidate that IS the explained
+    # fact covers it, so the survivor sets differ from the plain run)
+    tmp = _fixture()
+    try:
+        reg = A.Registry(tmp, base_dir=A.default_base())
+        reg.compile("coin")
+        inline = reg.induce("coin", "Coin_has_Side")
+        ref = reg._induce_reference("coin", "Coin_has_Side")
+        assert ref == inline and len(inline) == 2
+        te = [{"ft": "Coin_has_Side", "fact": ["c1", "tails"]}]
+        inline_te = reg.induce("coin", "Coin_has_Side", to_explain=te)
+        ref_te = reg._induce_reference("coin", "Coin_has_Side",
+                                       to_explain=te)
+        assert ref_te == inline_te
+        assert [h["id"] for h in inline_te] == ["hyp-Coin_has_Side-1"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)

@@ -47,3 +47,4 @@ Operation 'cells' is overridable.
 Operation 'derive' is overridable.
 Operation 'nav' is overridable.
 Operation 'explain' is overridable.
+Operation 'induce' is overridable.

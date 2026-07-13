@@ -2437,6 +2437,116 @@ class Registry:
                 "fact_types": sorted(fts, key=lambda f: f["id"]),
                 "constraints": cons}
 
+    def _induce_reference(self, name, ft_id, to_explain=None, bound=None,
+                          cap=5000):
+        """The verb through the CANON: every judgment reduces the shared
+        DEFs (system:role_domain, enum_product, cand_gate, cand_covers,
+        cand_score, induce_judge); this host only loads, marshals operands
+        (candidate worlds via Store + run_rules, the validator via
+        validate_for, score rows normalized at the boundary), and formats.
+        The inline induce below is the certified fast override;
+        AREST_NO_OVERRIDE=induce (or *) selects this reference. One noted
+        boundary divergence: the delegate stringifies to_explain membership
+        (a wire accommodation), while the canonical reference is typed."""
+        from . import forml
+        from .lam import to_lam, from_lam
+        from .reduce import apply as _apx
+        from .lam import atom as _A
+        from . import defs as _dm
+        import pyarest.lam as L
+
+        D = self._load(name)
+
+        def canon(dname, operand):
+            with _dm.step(D):
+                return from_lam(_apx(_A(dname), operand))
+
+        def opseq(*xs):
+            l = L.NIL
+            for x in reversed(xs):
+                l = L.CONS(x)(l)
+            return L.SEQ(l)
+
+        fts = {f[0] for f in system._pop_rows(D, "factType") if f}
+        roles = sorted((r[2], r[3]) for r in system._pop_rows(D, "role")
+                       if len(r) >= 4 and r[1] == ft_id)
+        if ft_id not in fts or not roles:
+            return []
+        nouns = [n for (_p, n) in roles]
+        domains = [list(canon("system:role_domain", opseq(_A(n), D)))
+                   for n in nouns]
+        if any(not d for d in domains):
+            return []
+        combos = [tuple(c) for c in canon(
+            "system:enum_product",
+            to_lam(tuple(tuple(d) for d in domains)))][:cap]
+        part = system.rmap_partition(D)
+        val = forml.validate_for(ft_id, D, part)
+        existing = tuple(tuple(r) for r in system.ft_view(D, ft_id, part))
+        hook = f"Hypothesis_Candidate_has_hidden_{nouns[-1].replace(' ', '_')}"
+        hook_declared = hook in fts
+        pos_of = {n: p for (p, n) in reversed(roles)}
+        judged = []
+        for idx, cand in enumerate(combos):
+            if bound and any(pos_of.get(k) and cand[pos_of[k] - 1] != str(v)
+                             for k, v in bound.items()):
+                continue
+            gate = canon("system:cand_gate",
+                         opseq(to_lam(cand), to_lam(existing), val, D))
+            cover = "F"
+            score = 0
+            if gate == "T":
+                D2 = system.bulk_absorbed_install(
+                    D, part, part[ft_id], ft_id, [list(cand)]) \
+                    if part.get(ft_id, ft_id) != ft_id else \
+                    _apx(ast.Store(ft_id),
+                         _S(to_lam(system._rowsort(set(existing) | {cand})),
+                            D))
+                D3 = system.run_rules(D2, changed=[ft_id])
+                if to_explain:
+                    te = tuple((e["ft"], tuple(e["fact"])) for e in to_explain)
+                    cover = canon("system:cand_covers", opseq(to_lam(te), D3))
+                else:
+                    cover = "T"
+                if cover == "T" and hook_declared:
+                    hyp_id = f"hyp-{ft_id}-{idx}"
+                    D4 = _apx(ast.Store("Hypothesis_Candidate"),
+                              _S(to_lam(tuple(
+                                  tuple(r) for r in system._pop_rows(
+                                      D3, "Hypothesis_Candidate"))
+                                  + ((hyp_id,),)), D3))
+                    hrows = tuple(tuple(r) for r in system._pop_rows(D4, hook)) \
+                        + ((hyp_id,) + cand[1:],)
+                    D4 = _apx(ast.Store(hook), _S(to_lam(hrows), D4))
+                    D4 = system.run_rules(
+                        D4, changed=[hook, "Hypothesis_Candidate"])
+
+                    def _norm(v):
+                        try:
+                            return int(str(v))
+                        except ValueError:
+                            return 1
+                    rows = tuple(
+                        (r[0], _norm(r[1]))
+                        for r in system._pop_rows(
+                            D4, "Hypothesis_Candidate_has_Confidence_Score")
+                        if len(r) >= 2)
+                    score = canon("system:cand_score",
+                                  opseq(_A(hyp_id), to_lam(rows)))
+            judged.append((idx, cand, gate, cover, score))
+        ranked = canon("system:induce_judge",
+                       to_lam(tuple((i, c, g, v, s)
+                                    for (i, c, g, v, s) in judged)))
+        out = []
+        for row in ranked:
+            score, payload = row[0], row[1]
+            idx, cand = payload[0], payload[1]
+            out.append({"id": f"hyp-{ft_id}-{idx}",
+                        "confidence_score": score,
+                        "hidden": {"ft": ft_id, "fact": list(cand)},
+                        "explains": to_explain or []})
+        return out
+
     def induce(self, name, ft_id, to_explain=None, bound=None, cap=5000):
         """The abduction primitive (whitepaper §3 + Thm. 4; ported from the
         old engine's induce.rs, its semantics the oracle): enumerate candidate
@@ -2453,6 +2563,14 @@ class Registry:
         order stable on ties), and post-filter by `bound` role pins. Answers
         candidates as data; nothing persists (materialize the convincing one
         via apply)."""
+        import os as _os
+        _no = _os.environ.get("AREST_NO_OVERRIDE", "")
+        _killed = {p.strip() for p in _no.split(",") if p.strip()}
+        if "*" in _killed or "induce" in _killed:
+            # the registry convention: a killed override runs the reference,
+            # here the canon-reducing path this inline loop is certified
+            # against (test_induce_oracle's twin test)
+            return self._induce_reference(name, ft_id, to_explain, bound, cap)
         from . import forml
         from .lam import to_lam, from_lam
         from .reduce import apply as _apx
