@@ -149,3 +149,84 @@ def test_canon_named_overrides_have_their_defs():
         assert canon_name in defs, (
             f"override {host_name!r} names {canon_name!r} but shared/*.canon "
             "carries no such DEF — the meaning must land in canon first")
+
+
+# ---------------------------------------------------------------------------
+# THE VERB LAYER (the 2026-07-13 census, canon-first rebuild phase 1).
+# Every verb mcp_call_inner dispatches is one of exactly three things:
+#
+#   (1) CATALOG: a resolution.md operation. Its reference is the canon
+#       pipeline the verb reduces; a host binding is an override row.
+#   (2) SERVE: store addressing and inventory (the tenancy surface —
+#       a cell in one store may contain another entire store). These
+#       verbs move between stores and report on them; they carry no
+#       domain meaning to twin.
+#   (3) DELEGATED: meaning that still rides the Python reference host.
+#       This set is the standing drain queue, ordered by the rebuild
+#       plan: sql and explain first (phase 3b), the compile verb next,
+#       then the induction and tutor surfaces. A verb leaves this set
+#       by gaining a canon reference and a catalog row. The set may
+#       only shrink.
+#
+# A verb that fits none of these fails here, exactly as a DEF-layer op
+# with no canon story fails above.
+SERVE = {"context", "orient", "engine_version", "apps_list", "apps_current",
+         "apps_use", "apps_status", "apps_check", "apps_register",
+         "apps_create"}
+DELEGATED = {"sql", "explain", "compile", "propose", "induce", "ask",
+             "tutor_apply", "tutor_compile", "tutor_propose", "tutor_reset"}
+
+
+def _catalog():
+    src = _src("shared", "base", "resolution.md")
+    return set(re.findall(r"Operation '([^']+)' is overridable", src))
+
+
+def _fn_body(src, needle):
+    i = src.find(needle)
+    assert i >= 0, f"cannot locate {needle!r}"
+    depth = 0
+    opened = False
+    end = i
+    for off, ch in enumerate(src[i:], start=i):
+        if ch == "{":
+            depth += 1
+            opened = True
+        elif ch == "}":
+            depth -= 1
+            if opened and depth == 0:
+                end = off
+                break
+    return src[i:end]
+
+
+def _rust_verbs():
+    body = _fn_body(_src("rust", "src", "main.rs"), "fn mcp_call_inner(")
+    verbs = set()
+    for m in re.finditer(r"matches!\(tool,([^)]*)\)", body):
+        verbs |= set(re.findall(r'"([^"]+)"', m.group(1)))
+    k = body.find("match tool {")
+    depth = 0
+    for line in body[k:].splitlines():
+        if depth == 1 and "=>" in line and re.match(r'\s*"', line):
+            verbs |= set(re.findall(r'"([^"]+)"', line.split("=>")[0]))
+        depth += line.count("{") - line.count("}")
+    return verbs
+
+
+def test_no_verb_escapes_the_discipline():
+    stray = _rust_verbs() - (_catalog() | SERVE | DELEGATED)
+    assert not stray, (
+        f"mcp_call_inner dispatches verbs with no canon story: {sorted(stray)}"
+        " — give the verb a canon reference and a catalog row, or rule it"
+        " SERVE here with its reasoning")
+
+
+def test_delegated_verbs_are_a_drain_queue():
+    # A delegated verb that gains its canon reference moves to the catalog
+    # and must leave DELEGATED, so the two sets stay disjoint and the queue
+    # only shrinks.
+    overlap = DELEGATED & _catalog()
+    assert not overlap, (
+        f"verbs are both catalog and delegated: {sorted(overlap)} — remove"
+        " them from DELEGATED; the catalog row supersedes the queue entry")
