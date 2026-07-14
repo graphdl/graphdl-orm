@@ -14,3 +14,4 @@ source @ commit → disposition, gate evidence. Rejections are listed, never sil
 | engine/python/tromp.py @ 0fa14b7c | adopted → host_py/tromp.py; lazy imports relativized | it IS the G1 checker (tasks 20/22 lineage) |
 | engine/python/__init__.py @ 0fa14b7c | REPLACED: minimal seed (kernel + alias table + canon); the quarry init boots engine/compiler/protocol/tools — Day-3 material, not salvaged blind | SPEC 14.2: host code enters on H-shape only |
 | engine/tests/test_tromp.py @ 0fa14b7c | adopted → gates/g1_litmus.py; header swapped to host_py, assertions byte-identical | G1 green 2026-07-14, 17 passed in 5.82s |
+| (rebuild addition) system:registered manifest DEF in /arest.canon | authored, not salvaged — SPEC 7.2/8.2: the five boundary prims declared ⟨name, dom, cod, origin⟩; dom/cod transcribed from the quarry impls (engine.py lex/implode/slug/escape_html/strip_prefix) | G1: 18 passed; census 363/346/17; manifest names == boundary atoms |

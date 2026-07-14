@@ -27,10 +27,12 @@ SPEC.md + AREST.tex, root commit 7b48bd86.
 2.3 Enumerate the 17 boundary DEFs (362 total, 345 pure-closed at the quarry).
     Each becomes a declared Def-9 registered tuple in the canon's manifest or is
     rewritten pure (8.2). G1 = all 362 accounted.
-2.4 Salvage metamodel readings, scrubbed: prose-as-name out (10.2), every noun's
-    world assumption present or defaulted open (3.4).
 
 ## Day 3 — the Python μ-host
+
+3.0 (moved from Day 2) Salvage metamodel readings, scrubbed: prose-as-name out
+    (10.2), world assumptions defaulted open (3.4) — gated by the Day-3
+    compiler, not copied blind (14.2).
 
 3.1 host-py kernel: μ over the H1 forms, cells (H2). Salvage quarry kernel where
     litmus-clean.

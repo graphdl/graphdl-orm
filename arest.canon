@@ -7005,5 +7005,15 @@ DEF("monad:bind",
           S3(A("COMP"), A("cat"), S3(A("CONS"), N(1), S3(A("COMP"), N(2), N(2))))),
        S3(A("CONS"),
           S3(A("COMP"), N(2), N(1)),
-          S3(A("COMP"), A("apply"), S3(A("CONS"), N(2), S3(A("COMP"), N(1), N(1)))))))
+          S3(A("COMP"), A("apply"), S3(A("CONS"), N(2), S3(A("COMP"), N(1), N(1))))))),
+
+"Def. 9 / Cor. 6 manifest (SPEC 7.2, 8.2): the host primitives the canon reaches, DECLARED as name-dom-cod-origin rows; impl is each host runtime's, per Def. 9. The G1 litmus asserts its boundary atoms are exactly these names.",
+
+DEF("system:registered",
+    S6(A("CONS"),
+       S5(A("CONS"), K(A("implode")), K(A("separator-and-words")), K(A("text")), K(A("registered"))),
+       S5(A("CONS"), K(A("escape_html")), K(A("text")), K(A("html-text")), K(A("registered"))),
+       S5(A("CONS"), K(A("slug")), K(A("text")), K(A("identifier")), K(A("registered"))),
+       S5(A("CONS"), K(A("lex")), K(A("text")), K(A("token-records")), K(A("registered"))),
+       S5(A("CONS"), K(A("strip_prefix")), K(A("prefix-and-text")), K(A("text")), K(A("registered")))))
 )

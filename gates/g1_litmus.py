@@ -154,7 +154,8 @@ def test_every_canon_def_lifts_to_a_closed_pure_term():
     lift = CanonLift.load()
     rep = check_canon(lift)
 
-    assert rep.total == 362
+    # 362 at the quarry + system:registered, the Def-9 manifest (SPEC 7.2, 8.2)
+    assert rep.total == 363
     # no UNEXPECTED malformation: every DEF is either pure-closed or a known boundary DEF
     assert rep.malformed == [], f"unexpected malformations: {rep.malformed}"
 
@@ -164,9 +165,24 @@ def test_every_canon_def_lifts_to_a_closed_pure_term():
         assert well_formed(term), name
         assert is_closed(term), name
 
-    assert len(rep.pure_closed) == 345
+    assert len(rep.pure_closed) == 346
     assert len(rep.boundary) == 17
     assert len(rep.pure_closed) + len(rep.boundary) == rep.total
+
+
+def test_boundary_prims_are_declared_by_the_canon_manifest():
+    # SPEC 8.2: a boundary member without a Def-9 declaration is a defect. The
+    # manifest is itself a canon DEF; applied (membership IS application, Eq 1)
+    # it answers its rows, and the litmus boundary atoms must be EXACTLY its
+    # declared names, each row ⟨name, dom, cod, 'registered'⟩ (SPEC 7.2).
+    from host_py import kernel as _k, canon as _c
+    _c.load_all()
+    rows = _k.from_lam(_k.apply(_k.atom("system:registered"), _k.PHI))
+    assert len(rows) == 5
+    names = {r[0] for r in rows}
+    assert names == _HOST_PRIMS
+    for r in rows:
+        assert len(r) == 4 and r[3] == "registered", r
 
 
 def test_boundary_defs_are_exactly_the_registered_host_reachers():
