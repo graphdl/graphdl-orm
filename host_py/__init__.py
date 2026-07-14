@@ -14,3 +14,17 @@ for _n in ("lam", "defs", "delta", "reduce", "prims"):
     _sys.modules[__name__ + "." + _n] = kernel
 lam = defs = delta = reduce = prims = kernel
 from . import canon
+canon.load_all()                             # the canon boots before the engine:
+                                             # canonical names resolve everywhere
+from . import engine as _engine
+for _n in ("ast", "constraints", "system"):
+    _sys.modules[__name__ + "." + _n] = _engine
+ast = constraints = system = _engine
+from . import compiler as _compiler
+for _n in ("meta", "forml"):
+    _sys.modules[__name__ + "." + _n] = _compiler
+meta = forml = _compiler
+from . import tools as _tools
+for _n in ("optimize", "polyglot"):
+    _sys.modules[__name__ + "." + _n] = _tools
+optimize = polyglot = _tools
