@@ -196,8 +196,13 @@ def test_canon_store_sidecars_are_fresh():
 #       materialization is a sqlite artifact, and the host build is
 #       zero-dep by the 2026-07-09 decision recorded in Cargo.toml, so
 #       the delegate is sql's reference and any native leg is an
-#       opt-in cargo feature; the compile verb next, then the
-#       remaining induction surfaces (propose, ask) and the tutor
+#       opt-in cargo feature; compile drained 2026-07-13 on the
+#       strength of the ch. 06 pipeline canonization (the canon defs
+#       the native compile twins at byte parity, apps_compile_parity
+#       the standing pin); propose drained 2026-07-13 (its judgment,
+#       the sorted fact-type delta, is system:propose_report over the
+#       compile machinery's throwaway world). Remaining: ask (the
+#       filter algebra lands as canon DEFs next) and the tutor
 #       family. A verb leaves this set by gaining a canon reference
 #       and a catalog row. The set may only shrink.
 #
@@ -206,7 +211,7 @@ def test_canon_store_sidecars_are_fresh():
 SERVE = {"context", "orient", "engine_version", "apps_list", "apps_current",
          "apps_use", "apps_status", "apps_check", "apps_register",
          "apps_create"}
-DELEGATED = {"sql", "compile", "propose", "ask",
+DELEGATED = {"sql", "ask",
              "tutor_apply", "tutor_compile", "tutor_propose", "tutor_reset"}
 
 

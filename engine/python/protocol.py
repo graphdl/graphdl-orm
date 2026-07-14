@@ -2748,14 +2748,36 @@ class Registry:
     def propose(self, name, text):
         """The authoring dry-run: compile the candidate text ATOP the app's
         model on a throwaway store — classification, diagnostics, and the
-        would-be declarations — persisting nothing."""
+        would-be declarations — persisting nothing. The JUDGMENT (what the
+        text would declare: the fact-type delta, sorted) is canon
+        (system:propose_report = sort_asc over theta:setminus); the
+        throwaway world is the compile machinery's, an operand exactly as
+        induce's worlds are. AREST_NO_OVERRIDE=propose (or *) routes the
+        judgment through the canon reduction; the inline set arithmetic is
+        the certified override the twin test holds equal."""
         from . import forml
         D = self._load(name)
-        before = {r[0] for r in system._pop_rows(D, "factType") if r}
+        before = [r[0] for r in system._pop_rows(D, "factType") if r]
         D2, rep = forml.compile_model(text, D=D, context_from=D)
-        after = {r[0] for r in system._pop_rows(D2, "factType") if r}
+        after = [r[0] for r in system._pop_rows(D2, "factType") if r]
+        import os as _os
+        _no = _os.environ.get("AREST_NO_OVERRIDE", "")
+        _killed = {p.strip() for p in _no.split(",") if p.strip()}
+        if "*" in _killed or "propose" in _killed:
+            from .lam import to_lam, from_lam
+            from .reduce import apply as _apx
+            from .lam import atom as _A
+            from . import defs as _dm
+            import pyarest.lam as L
+            operand = L.SEQ(L.CONS(to_lam(tuple(after)))(
+                L.CONS(to_lam(tuple(before)))(L.NIL)))
+            with _dm.step(D):
+                would = list(from_lam(_apx(_A("system:propose_report"),
+                                           operand)))
+        else:
+            would = sorted(set(after) - set(before))
         return {"app": name,
-                "would_declare": sorted(after - before),
+                "would_declare": would,
                 "unclassified": rep.get("unparsed", []),
                 "prose": rep.get("prose", []),
                 "diagnostics": rep.get("rule_diagnostics", [])}

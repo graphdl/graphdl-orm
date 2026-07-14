@@ -48,3 +48,5 @@ Operation 'derive' is overridable.
 Operation 'nav' is overridable.
 Operation 'explain' is overridable.
 Operation 'induce' is overridable.
+Operation 'compile' is overridable.
+Operation 'propose' is overridable.

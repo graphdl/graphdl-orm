@@ -227,6 +227,27 @@ def test_the_python_reference_twins_the_inline_induce():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_the_canon_propose_report_twins_the_inline_judgment():
+    # propose's judgment (the sorted fact-type delta the text would
+    # declare) through the canon (sort_asc over theta:setminus) must equal
+    # the inline set arithmetic; the throwaway compile world is an operand
+    tmp = _fixture()
+    try:
+        reg = A.Registry(tmp, base_dir=A.default_base())
+        reg.compile("coin")
+        text = "Rim is a value type.\nCoin has Rim.\n"
+        inline = reg.propose("coin", text)
+        os.environ["AREST_NO_OVERRIDE"] = "propose"
+        try:
+            ref = reg.propose("coin", text)
+        finally:
+            del os.environ["AREST_NO_OVERRIDE"]
+        assert ref == inline
+        assert "Coin_has_Rim" in inline["would_declare"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_abduce_end_to_end_on_the_sherlock_forms():
     # slice (e): the sherlock reasoning forms verbatim — the hidden hook
     # declared, literal-pin scoring rules, and a single-role UC so the
