@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+target/
+node_modules/
+dist/
+*.db
+*.store.json
+*.events.jsonl
+*.aux
+*.log
+*.out
