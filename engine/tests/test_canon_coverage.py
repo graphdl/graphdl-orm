@@ -215,17 +215,26 @@ def test_canon_store_sidecars_are_fresh():
 #       resolves role positions with the missing-noun # sentinel,
 #       system:ask_row_ok judges a row against every spec, and
 #       system:ask_filter keeps rows through it; the inline str()
-#       comparison stays the wire-accommodation override). Remaining:
-#       the tutor family. A verb leaves this set by gaining a canon
-#       reference and a catalog row. The set may only shrink.
+#       comparison stays the wire-accommodation override); the tutor
+#       four reclassified SERVE 2026-07-13: each is a first-class verb
+#       SCOPED to the _tutor sandbox app (apply, compile, propose,
+#       whose meanings are already canon) or sandbox lifecycle
+#       (reset, the apps_create class), and scoping is addressing,
+#       never meaning. THE QUEUE IS EMPTY (Samuel's all-verbs-canon
+#       directive, discharged 2026-07-13): every dispatched verb is
+#       CATALOG (meaning in the canon), SERVE (addressing), or
+#       REGISTERED (the enumerable boundary, by design). A verb could
+#       only re-enter this set by shipping new meaning host-side,
+#       which the gate makes a loud choice.
 #
 # A verb that fits none of these fails here, exactly as a DEF-layer op
 # with no canon story fails above.
 SERVE = {"context", "orient", "engine_version", "apps_list", "apps_current",
          "apps_use", "apps_status", "apps_check", "apps_register",
-         "apps_create"}
-DELEGATED = {"sql",
-             "tutor_apply", "tutor_compile", "tutor_propose", "tutor_reset"}
+         "apps_create",
+         "tutor_apply", "tutor_compile", "tutor_propose", "tutor_reset"}
+REGISTERED = {"sql"}
+DELEGATED = set()
 
 
 def _catalog():
@@ -266,7 +275,7 @@ def _rust_verbs():
 
 
 def test_no_verb_escapes_the_discipline():
-    stray = _rust_verbs() - (_catalog() | SERVE | DELEGATED)
+    stray = _rust_verbs() - (_catalog() | SERVE | DELEGATED | REGISTERED)
     assert not stray, (
         f"mcp_call_inner dispatches verbs with no canon story: {sorted(stray)}"
         " — give the verb a canon reference and a catalog row, or rule it"
