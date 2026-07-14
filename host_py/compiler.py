@@ -959,6 +959,80 @@ _QUANT = re.compile(r"\b(some|that|each|no|an|a) ")
 _QUANT_MIN = re.compile(r"\b(some|that|each|no) ")
 
 
+def _inflections(w):
+    """The word's plausible de-inflections under the REGULAR English rules
+    only, as a candidate set (3sg -s/-es/-ies and participle -d/-ed/-ied with
+    consonant undoubling). Two orientations of one verb match when their
+    candidate sets intersect — no stemmer to get wrong; irregular verbs stay
+    unmatched and want the alternate reading declared."""
+    w = w.lower()
+    out = {w}
+    if w.endswith("ies") and len(w) > 3:
+        out.add(w[:-3] + "y")
+    if w.endswith("es") and len(w) > 2:
+        out.add(w[:-2])
+    if w.endswith("s") and len(w) > 1:
+        out.add(w[:-1])
+    if w.endswith("ied") and len(w) > 3:
+        out.add(w[:-3] + "y")
+    if w.endswith("ed") and len(w) > 2:
+        r = w[:-2]
+        out.add(r)
+        if len(r) > 1 and r[-1] == r[-2]:
+            out.add(r[:-1])
+    if w.endswith("d") and len(w) > 1:
+        out.add(w[:-1])
+    return out
+
+
+def _ft_nouns_verb(ftid, known):
+    """An ft id → (noun multiset, verb-phrase words): underscores to spaces,
+    then greedy longest-first matching of the KNOWN noun names (the
+    _type_span discipline at the id level); the leftover words, be/by
+    dropped, are the verb phrase."""
+    words = ftid.replace("_", " ").split()
+    # _Known IS the set of type names (a set subclass); iterate it directly
+    names = sorted(known, key=lambda n: -len(n.split()))
+    nouns, verb, i = [], [], 0
+    while i < len(words):
+        hit = None
+        for n in names:
+            nw = n.split()
+            if words[i:i + len(nw)] == nw:
+                hit = n
+                break
+        if hit:
+            nouns.append(hit)
+            i += len(hit.split())
+        else:
+            verb.append(words[i])
+            i += 1
+    verb = [w for w in verb if w.lower() not in ("is", "are", "was", "were", "by")]
+    return tuple(sorted(nouns)), tuple(verb)
+
+
+def _reading_synonym(ftid, known):
+    """AREST.tex §1, normative by example: a transition is triggered by
+    'Customer places Order' while the declaration reads 'Order is placed by
+    Customer' — one Verb, two orientations, the SAME fact type (the Verb
+    entity determines a reading's orientation). An undeclared reference
+    resolves to the UNIQUE declared fact type sharing its noun multiset and
+    verb identity under the regular inflections (_inflections); zero or many
+    candidates stay unresolved — declare the alternate reading instead."""
+    fts = getattr(known, "fts", None) or ()
+    nouns, verb = _ft_nouns_verb(ftid, known)
+    if not nouns or not verb:
+        return None
+    hits = []
+    for cand in fts:
+        cn, cv = _ft_nouns_verb(cand, known)
+        if cn != nouns or len(cv) != len(verb):
+            continue
+        if all(_inflections(a) & _inflections(b) for a, b in zip(verb, cv)):
+            hits.append(cand)
+    return hits[0] if len(hits) == 1 else None
+
+
 def _clause_ft(text, known):
     """A constraint clause (quantified reading text) → the fact-type id it references.
     Resolution prefers a DECLARED fact type under the MINIMAL quantifier strip
@@ -966,14 +1040,19 @@ def _clause_ft(text, known):
     manager' declares Employee_is_a_manager, and stripping the article resolved the
     clause to a cell that does not exist, a silently unenforced constraint). The full
     strip stays as the fallback, itself preferring a declared hit, so article-free
-    models keep their ids. The string boundary of set-comparison/subset clause
-    resolution (full RolePath unification is Stage 2)."""
+    models keep their ids. An id that is still undeclared takes the reading-synonym
+    pass (_reading_synonym — the paper's active↔passive trigger). The string boundary
+    of set-comparison/subset clause resolution (full RolePath unification is Stage 2)."""
     t = re.sub(r"\s+", " ", text.strip())
     fts = getattr(known, "fts", None) or ()
     ft_min, _ = _fact_type(_QUANT_MIN.sub("", t).strip(), known)
     if ft_min in fts:
         return ft_min
     ft_full, _facts = _fact_type(_QUANT.sub("", t).strip(), known)
+    if ft_full not in fts:
+        syn = _reading_synonym(ft_full, known)
+        if syn:
+            return syn
     return ft_full
 
 
