@@ -2677,13 +2677,53 @@ class Registry:
             rows = self.query(name, ft)
             filt = plan.get("filter") or {}
             if filt:
-                D = self._load(name)
-                pos_of = {r[3]: r[2] for r in system._pop_rows(D, "role")
-                          if len(r) >= 4 and r[1] == ft}
-                rows = [r for r in rows
-                        if all(k in pos_of and len(r) >= pos_of[k]
-                               and str(r[pos_of[k] - 1]) == str(v)
-                               for k, v in filt.items())]
+                import os as _os
+                _no = _os.environ.get("AREST_NO_OVERRIDE", "")
+                _killed = {p.strip() for p in _no.split(",") if p.strip()}
+                if "*" in _killed or "ask" in _killed:
+                    # the canon filter algebra: role positions resolve
+                    # through system:ask_pos (a missing noun answers the #
+                    # sentinel, which rejects every row) and the rows
+                    # filter through system:ask_filter. The canon is
+                    # TYPED; the inline path's str() comparison is the
+                    # wire accommodation, and the twin test pins the two
+                    # on string-valued fixtures.
+                    from .lam import to_lam, from_lam
+                    from .reduce import apply as _apx
+                    from .lam import atom as _A
+                    from . import defs as _dm
+                    import pyarest.lam as L
+
+                    D = self._load(name)
+
+                    def _canon(dname, operand):
+                        with _dm.step(D):
+                            return from_lam(_apx(_A(dname), operand))
+
+                    def _seq(*xs):
+                        l = L.NIL
+                        for x in reversed(xs):
+                            l = L.CONS(x)(l)
+                        return L.SEQ(l)
+
+                    specs = tuple(
+                        (_canon("system:ask_pos",
+                                _seq(_A(ft), _A(k), D)), v)
+                        for k, v in filt.items())
+                    kept = _canon(
+                        "system:ask_filter",
+                        _seq(to_lam(specs),
+                             to_lam(tuple(tuple(r) for r in rows))))
+                    rows = [tuple(r) for r in kept]
+                else:
+                    D = self._load(name)
+                    pos_of = {r[3]: r[2]
+                              for r in system._pop_rows(D, "role")
+                              if len(r) >= 4 and r[1] == ft}
+                    rows = [r for r in rows
+                            if all(k in pos_of and len(r) >= pos_of[k]
+                                   and str(r[pos_of[k] - 1]) == str(v)
+                                   for k, v in filt.items())]
             return {"app": name, "question": question, "fact_type": ft,
                     "filter": filt, "rows": rows}
         return {"app": name, "question": question, "needs_plan": True,

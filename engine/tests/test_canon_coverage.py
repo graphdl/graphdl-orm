@@ -210,17 +210,21 @@ def test_canon_store_sidecars_are_fresh():
 #       the native compile twins at byte parity, apps_compile_parity
 #       the standing pin); propose drained 2026-07-13 (its judgment,
 #       the sorted fact-type delta, is system:propose_report over the
-#       compile machinery's throwaway world). Remaining: ask (the
-#       filter algebra lands as canon DEFs next) and the tutor
-#       family. A verb leaves this set by gaining a canon reference
-#       and a catalog row. The set may only shrink.
+#       compile machinery's throwaway world); ask drained 2026-07-13
+#       (the plan query's filter algebra is canon: system:ask_pos
+#       resolves role positions with the missing-noun # sentinel,
+#       system:ask_row_ok judges a row against every spec, and
+#       system:ask_filter keeps rows through it; the inline str()
+#       comparison stays the wire-accommodation override). Remaining:
+#       the tutor family. A verb leaves this set by gaining a canon
+#       reference and a catalog row. The set may only shrink.
 #
 # A verb that fits none of these fails here, exactly as a DEF-layer op
 # with no canon story fails above.
 SERVE = {"context", "orient", "engine_version", "apps_list", "apps_current",
          "apps_use", "apps_status", "apps_check", "apps_register",
          "apps_create"}
-DELEGATED = {"sql", "ask",
+DELEGATED = {"sql",
              "tutor_apply", "tutor_compile", "tutor_propose", "tutor_reset"}
 
 

@@ -248,6 +248,38 @@ def test_the_canon_propose_report_twins_the_inline_judgment():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_the_canon_ask_filter_twins_the_inline_plan_query():
+    # ask with a plan: the canon filter algebra (position resolution with
+    # the missing-noun sentinel, per-row all-specs judgment) must answer
+    # exactly as the inline path on string-valued fixtures, including the
+    # missing-noun case that drops every row and the empty filter
+    tmp = _fixture()
+    try:
+        reg = A.Registry(tmp, base_dir=A.default_base())
+        reg.compile("coin")
+        cases = (
+            {"fact_type": "Coin_has_Side", "filter": {"Coin": "c1"}},
+            {"fact_type": "Coin_has_Side", "filter": {"Side": "heads"}},
+            {"fact_type": "Coin_has_Side",
+             "filter": {"Coin": "c1", "Side": "tails"}},
+            {"fact_type": "Coin_has_Side", "filter": {"Bogus": "x"}},
+            {"fact_type": "Coin_has_Side"},
+        )
+        for plan in cases:
+            inline = reg.ask("coin", "q", plan=plan)
+            os.environ["AREST_NO_OVERRIDE"] = "ask"
+            try:
+                ref = reg.ask("coin", "q", plan=plan)
+            finally:
+                del os.environ["AREST_NO_OVERRIDE"]
+            assert ref == inline, plan
+        hit = reg.ask("coin", "q", plan=cases[0])
+        assert hit["rows"] == [("c1", "heads")]
+        assert reg.ask("coin", "q", plan=cases[3])["rows"] == []
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_abduce_end_to_end_on_the_sherlock_forms():
     # slice (e): the sherlock reasoning forms verbatim — the hidden hook
     # declared, literal-pin scoring rules, and a single-role UC so the
