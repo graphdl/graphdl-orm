@@ -183,6 +183,15 @@ def test_canon_store_sidecars_are_fresh():
 #       a cell in one store may contain another entire store). These
 #       verbs move between stores and report on them; they carry no
 #       domain meaning to twin.
+#   (4) REGISTERED (Samuel, 2026-07-13): the enumerable boundary at the
+#       verb layer. An operation whose impl is supplied by the host
+#       runtime — an LLM shaping synthesize wording, an LLM-judge
+#       validate pass, sqlite materializing sql — registers through
+#       DEFS with origin=registered (paper Def. 10, Cor. 8) and is the
+#       ONE valid case to delegate without a shared canon: partial,
+#       external, enumerable by the boundary Filter, never widening
+#       the formal core. sql's delegated-by-design ruling is an
+#       instance of this class.
 #   (3) DELEGATED: meaning that still rides the Python reference host.
 #       This set is the standing drain queue, ordered by the rebuild
 #       plan: explain drained 2026-07-13 (catalog row + native walk
