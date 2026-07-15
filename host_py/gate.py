@@ -100,3 +100,171 @@ def alethic(violations):
     """The refusing subset (Def 6): the sweep's entries whose constraint is
     alethic — nonempty means the store does not satisfy its schema."""
     return [v for v in violations if v.get("alethic")]
+
+
+def compile_serving(text, context_from=None):
+    """Compile-for-serving (SPEC 11.1; the posture rule, 2026-07-14): a store
+    that will take WRITES is laid — status fact types materialized, the RMAP
+    layout as data (rmapColumns rides in the store), derivations settled.
+    compile-for-reading stays the raw own-table compile_model."""
+    from . import forml, system
+    D, rep = forml.compile_model(text, context_from=context_from)
+    D = system.status_facts(D)
+    D = system.layout_cells(D)
+    return settle(D), rep
+
+
+def _scoped_fts(D, touched):
+    """The §6.1 judgment scope: 'the recalculation a write forces is bounded
+    to the entity's cell and the role-player cells its constraints can reach,
+    a scope the schema fixes at compile time.' From the touched fact types,
+    take every constraint whose scope intersects them, then every fact type
+    those constraints reach — the exclusion family judges BOTH sides of a
+    write. The FULL sweep stays the compile/audit gate (G4)."""
+    from . import system
+    touched = set(touched)
+    judged = set(touched)
+    for c in system._pop_rows(D, "constraint"):
+        if len(c) < 3:
+            continue
+        scope = c[2:-1] if c[-1] in ("alethic", "deontic") else c[2:]
+        names = set()
+        for part in scope:
+            for t in (part if isinstance(part, tuple) else (part,)):
+                if isinstance(t, str):
+                    names.add(t)
+        if names & touched:
+            judged |= names
+    return judged
+
+
+def sweep_scoped(D, touched):
+    """The write gate's judgment (2.2 through the §6.1 bound): the absolute
+    sweep restricted to the fact types the step's cells reach. Same checkers,
+    same fail-closed posture, smaller universe."""
+    from . import system, forml, defs
+    from .compiler import M_MAP
+
+    judged = _scoped_fts(D, touched)
+    declared = {f[0] for f in system._pop_rows(D, "factType") if f}
+    partition = None
+    laid = any(isinstance(c, tuple) and len(c) == 3 and c[0] == "CELL"
+               and c[1] == "rmapColumns" for c in _fl_all(D))
+    if laid:
+        partition = system.rmap_partition(D)
+    out = []
+    for ft in sorted(judged & declared):
+        val = forml.validate_for(ft, D, partition)
+        pop = tuple(tuple(r) for r in system._pop_rows(D, ft))
+        if not pop and ft in M_MAP:
+            pop = tuple(tuple(r) for r in system._pop_rows(D, M_MAP[ft]))
+        pair = L.SEQ(L.CONS(to_lam(pop))(L.CONS(D)(L.NIL)))
+        try:
+            with defs.step(D):
+                ans = from_lam(_ap(val, pair))
+            _p, v, flag = ans
+        except Exception as e:
+            out.append({"fact_type": ft, "kinds": [],
+                        "offenders": [["<validate answered no triple>",
+                                       repr(e)[:120]]],
+                        "alethic": True})
+            continue
+        if v:
+            out.append({"fact_type": ft, "kinds": [],
+                        "offenders": [list(x) if isinstance(x, tuple) else [x]
+                                      for x in v],
+                        "alethic": flag == "T"})
+    return out
+
+
+def _fl_all(D):
+    from .lam import from_lam as _fl
+    return _fl(D)
+
+
+def _retract_row(D, ft, fact):
+    """2.5 (Decision D1): retraction removes one ASSERTED row from the fact
+    type's log cell — the log is the population the checkers read ("create
+    AND retract keep it current", the quarry's query discipline). A fully
+    derived (*) fact type refuses: its rows are consequences. The derived
+    heads clear and the fixed point recomputes from the shrunk base (correct
+    first; DRed incrementality later under 7.3). A laid store's absorbed
+    COLUMN refreshes at the next compile — the quarry's supersession
+    discipline: on commit the retraction is a log entry and the store
+    rebuilds through compile, so materialized views recompute from truth."""
+    from . import system, ast
+    from .reduce import apply as _apply
+    from .lam import atom as _A
+    modes = {r[0]: r[1] for r in system._pop_rows(D, "derivation") if len(r) >= 2}
+    if modes.get(ft) in ("*", "fully", "derived"):
+        return None, f"{ft} is fully derived: a consequence, not retractable (2.5)"
+    rows = [tuple(r) for r in system._pop_rows(D, ft)]
+    if tuple(fact) not in rows:
+        return None, f"no such asserted fact in {ft}"
+    kept = tuple(r for r in rows if r != tuple(fact))
+    cells = []
+    for c in _fl_all(D):
+        if isinstance(c, tuple) and len(c) == 3 and c[0] == "CELL" and c[1] == ft:
+            cells.append(("CELL", ft, kept))
+        else:
+            cells.append(c)
+    D2 = to_lam(tuple(cells))
+    # clear derived heads so the lfp recomputes from the asserted base
+    heads = {r[1] for r in system._pop_rows(D2, "ruleDerives") if len(r) >= 2}
+    if heads:
+        cells = []
+        for c in _fl_all(D2):
+            if (isinstance(c, tuple) and len(c) == 3 and c[0] == "CELL"
+                    and c[1] in heads):
+                cells.append(("CELL", c[1], ()))
+            else:
+                cells.append(c)
+        D2 = to_lam(tuple(cells))
+    return D2, None
+
+
+def step(D, ops, journal=None):
+    """One AST transition over a batch input (SPEC 2.1–2.5, Thm 1, §12).
+
+    ops: [("create"|"retract", fact_type, fact-tuple), …] — applied together,
+    judged together, committed or refused ATOMICALLY (2.4: the input names
+    finitely many assertions and retractions; every valid-to-valid move is
+    one step, so no sequencing wedge exists). resolve rides engine.create
+    (routing + the machine step, Prop 2) and _retract_row (2.5); derive
+    settles to the least fixed point (Def 5); the judgment is the one gate
+    over the §6.1 scope (sweep_scoped); an alethic violation answers the
+    ORIGINAL D (Def 5: 'otherwise leaving D unchanged'). A committed step's
+    ops append to the journal; a refused step appends nothing (12.1)."""
+    from . import system
+
+    D2 = D
+    touched = set()
+    for op, ft, fact in ops:
+        touched.add(ft)
+        if op == "create":
+            res = system.create(D2, ft, to_lam(tuple(fact)))
+            o = from_lam(_ap(L.atom(1), res))
+            if o == "ERROR":
+                return {"committed": False, "D": D,
+                        "violations": [{"fact_type": ft, "kinds": ["create"],
+                                        "offenders": [list(fact)],
+                                        "alethic": True}]}
+            D2 = _ap(L.atom(2), res)
+        elif op == "retract":
+            D2, err = _retract_row(D2, ft, fact)
+            if err:
+                return {"committed": False, "D": D,
+                        "violations": [{"fact_type": ft, "kinds": ["retract"],
+                                        "offenders": [[err]],
+                                        "alethic": True}]}
+        else:
+            raise ValueError(f"unknown op {op!r}")
+    D2 = settle(D2)
+    V = sweep_scoped(D2, touched)
+    bad = alethic(V)
+    if bad:
+        return {"committed": False, "violations": V, "D": D}
+    if journal is not None:
+        journal.append([list(o) if isinstance(o, tuple) else o for o in
+                        [[op, ft, list(fact)] for op, ft, fact in ops]])
+    return {"committed": True, "violations": V, "D": D2}
