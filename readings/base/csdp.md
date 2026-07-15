@@ -2,7 +2,7 @@
 
 ## Description
 
-Halpin's Conceptual Schema Design Procedure (7 steps) as an
+<!-- Halpin's Conceptual Schema Design Procedure (7 steps) as an
 EXECUTABLE state machine of the framework itself, not prose and not
 an app: every AREST universe of discourse carries the procedure that
 designs it (procedural-code-to-substrate — the engine drives and
@@ -11,7 +11,7 @@ SM does not afford). Each Schema Design is an entity whose status is
 the CSDP step it has reached; the legal transitions out of the
 current status are the ONLY HATEOAS affordances. Building an app is
 navigation of this machine — the links ARE the next valid CSDP
-steps.
+steps. -->
 
 <!--
 Steps per Halpin 2001: (1) elementary facts from examples (sec 3.3),
@@ -49,7 +49,7 @@ Schema Design(.name) is an entity type.
 ## Value Types
 
 Design Note is a value type.
-The data type of Design Note is text.
+Noun 'Design Note' has Conceptual Data Type 'text'.
 
 ## Fact Types
 

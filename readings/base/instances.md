@@ -87,7 +87,7 @@ Fact belongs to Domain. *
 Fact is completed.
 Fact is example.
 Fact cites Citation.
-  For each pair of Fact and Citation, that Fact cites that Citation at most once.
+  In each population of Fact cites Citation, each Fact, Citation combination occurs at most once.
 
 ### Event
 Event is of Event Type.
@@ -104,11 +104,11 @@ Event Type publishes to Stream.
   It is possible that more than one Event Type publishes to the same Stream.
 Event Type can be created by Verb.
   It is possible that some Event Type can be created by more than one Verb and that some Verb can create more than one Event Type.
-  For each combination of Event Type and Verb, that Event Type can be created by that Verb at most once.
+  In each population of Event Type can be created by Verb, each Event Type, Verb combination occurs at most once.
 
 ### Fact Type Citation
 Fact Type cites Citation.
-  For each pair of Fact Type and Citation, that Fact Type cites that Citation at most once.
+  In each population of Fact Type cites Citation, each Fact Type, Citation combination occurs at most once.
   It is possible that some Fact Type cites more than one Citation.
   It is possible that more than one Fact Type cites the same Citation.
 
@@ -248,7 +248,7 @@ Guard Run is for Guard.
   Each Guard Run is for exactly one Guard.
 Guard Run references Fact.
   It is possible that some Guard Run references more than one Fact and that some Fact is referenced by more than one Guard Run.
-  For each combination of Guard Run and Fact, that Guard Run references that Fact at most once.
+  In each population of Guard Run references Fact, each Guard Run, Fact combination occurs at most once.
 Guard Run has Result.
   Each Guard Run has at most one Result.
 

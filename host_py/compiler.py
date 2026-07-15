@@ -2619,10 +2619,37 @@ def compile_model(text, D=None, context_from=None):
     # machine-scope transition identity (Core.png surrogate; base-vs-app name reuse
     # must not merge one Transition across two machines) — per compile pass
     D2 = system.rekey_transitions(D2)
+    D2 = _default_noun_facts(D2, text)
     diags = [tuple(r) for r in system._pop_rows(D2, "ruleDiag")]
     return D2, {"total": len(statements(text)), "kinds": {},
                 "unparsed": rep["unclassified"], "prose": rep["prose"],
                 "rule_diagnostics": diags}
+
+
+def _default_noun_facts(D, text):
+    """SPEC 3.4 / Decision D2 (2026-07-14): every declared noun carries exactly
+    one world-assumption fact — the compiler defaults 'open' (Halpin's default)
+    and RECORDS the defaulted fact explicitly, so the metamodel's mandatory is
+    satisfied by construction and negation semantics are total. The object-type
+    row rides the same pass, entity vs value read off the declaration form.
+    Only MISSING rows are added: a declared assumption always wins."""
+    from . import ast
+    from .reduce import apply as _apply
+    from .lam import atom as _A
+    stmts = statements(text)
+    names = set(_known(stmts))
+    vals = set(_known_vals(stmts))
+    have_wa = {r[0] for r in system._pop_rows(D, "Noun_has_World_Assumption") if r}
+    have_ot = {r[0] for r in system._pop_rows(D, "Noun_has_Object_Type") if r}
+    for n in sorted(names):
+        if n not in have_wa:
+            D = _apply(_A(2), ast.run(to_lam((n, "open")), D,
+                                      cell_name="Noun_has_World_Assumption"))
+        if n not in have_ot:
+            kind = "Value Type" if n in vals else "Entity Type"
+            D = _apply(_A(2), ast.run(to_lam((n, kind)), D,
+                                      cell_name="Noun_has_Object_Type"))
+    return D
 
 
 def _compile_model_seed(text, D=None, context_from=None):

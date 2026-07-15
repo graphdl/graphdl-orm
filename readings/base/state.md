@@ -82,7 +82,7 @@ Status has effective Transition to Status on Event Type. *
 ### Guard
 Guard references Fact Type.
   It is possible that some Guard references more than one Fact Type and that for some Fact Type, more than one Guard references that Fact Type.
-  For each combination of Guard and Fact Type, that Guard references that Fact Type at most once.
+  In each population of Guard references Fact Type, each Guard, Fact Type combination occurs at most once.
 Guard guards Transition.
   Each Guard guards at most one Transition.
   It is possible that more than one Guard guards the same Transition.

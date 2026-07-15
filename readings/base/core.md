@@ -463,23 +463,23 @@ diagnostics via the standard violation surface.
 
 ### Layer 2: ring validity — same-noun spans
 
-A ring constraint (`IR`, `AS`, `AT`, `SY`, `IT`, `TR`, `AC`, `RF`)
+<!-- A ring constraint (`IR`, `AS`, `AT`, `SY`, `IT`, `TR`, `AC`, `RF`)
 must span roles whose Nouns are identical. A ring across mixed
 nouns is nonsensical — `No Customer is-subtype-of Address` has
 nothing to forbid. check.rs emits an Error-level diagnostic
 today; the deontic form is the same invariant spelled
-declaratively.
+declaratively. -->
 
 It is obligatory that each Ring Constraint spans two Roles and both Roles are played by the same Noun.
 
 ### Layer 3: ring completeness — declare the ring on a same-noun binary
 
-A binary Fact Type whose two Roles share the same Noun almost
+<!-- A binary Fact Type whose two Roles share the same Noun almost
 always wants an explicit ring constraint — without one, nothing
 prevents the self-reference cycle the schema is implicitly
 modelling. check.rs emits a Hint-level diagnostic that points
 authors at the missing `is acyclic.` / `is irreflexive.`
-annotation.
+annotation. -->
 
 It is obligatory that each binary Fact Type whose Roles are played by the same Noun has some Ring Constraint spanning it.
 
@@ -800,7 +800,7 @@ Constraint Type 'VC' has Name 'ValueComparison'.
 
 ### Conceptual Data Types (#279)
 
-NORMA's portable data-type catalog. Each leaf Conceptual Data Type is
+<!-- NORMA's portable data-type catalog. Each leaf Conceptual Data Type is
 classified into exactly one of eight Data Type Groups (text, numeric,
 temporal, logical, raw, other, unspecified, userDefined). The `is in`
 facts below are the single source of truth for both the leaf codes and
@@ -818,7 +818,7 @@ which text `length` reuses). Facets parameterize the projected DDL:
 `DECIMAL(precision, scale)`, `CHARACTER VARYING(length)`, etc. The
 `Facet` entity (with its own `Length` / `Digit Count` / `Binary
 Precision`) models per-instance facet rows for a future supertype /
-units pass and is independent of these absorbed Noun fields.
+units pass and is independent of these absorbed Noun fields. -->
 
 Data Type Group 'text' has Name 'Text'.
 Data Type Group 'numeric' has Name 'Numeric'.
