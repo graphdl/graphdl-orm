@@ -208,6 +208,14 @@ Guard guards Transition.
 
 
 
+# The has-initial reading, DECLARED and DERIVED (SPEC 10.2 / G4, 2026-07-14):
+# 'Each State Machine Definition has exactly one initial Status' below implied
+# this fact type without a declaration, and only a quarry Rust pass ever
+# populated it — meaning in a host is the drift class. The mirror derivation
+# is the same shape as the is-defined rule above.
+State Machine Definition has initial Status.
+* State Machine Definition has initial Status iff that Status is initial in that State Machine Definition.
+
 ## Constraints
 
 For each Noun, at most one State Machine Definition is for that Noun.

@@ -19,6 +19,15 @@ from .reduce import apply as _ap
 from . import lam as L
 
 
+def settle(D):
+    """derive_S = lfp(F_S, ·) (Def 5, Lem 1): the store with every derivation
+    at its least fixed point. The sweep judges P″, never the raw compile —
+    the first G4 run proved it: a parsed mirror rule that never fired left
+    the mandatory violated on the un-derived store."""
+    from . import system
+    return system.run_rules(D)
+
+
 def sweep(D):
     """V over the settled store: [{fact_type, kinds, offenders, alethic}] for
     every non-empty violation set; [] is a clean bill (G4). The constraint
@@ -44,8 +53,19 @@ def sweep(D):
         val = forml.validate_for(ft, D, partition)
         pop = tuple(tuple(r) for r in system._pop_rows(D, ft))
         pair = L.SEQ(L.CONS(to_lam(pop))(L.CONS(D)(L.NIL)))
-        with defs.step(D):
-            _p, v, flag = from_lam(_ap(val, pair))
+        try:
+            with defs.step(D):
+                ans = from_lam(_ap(val, pair))
+            _p, v, flag = ans
+        except Exception as e:
+            # FAIL CLOSED (Def 5): a validate object that cannot answer the
+            # ⟨P, V, flag⟩ triple is a defect, and an unjudgeable population
+            # refuses like an alethic violation — never a silent pass.
+            out.append({"fact_type": ft, "kinds": sorted(kinds.get(ft, ())),
+                        "offenders": [["<validate answered no triple>",
+                                       repr(e)[:120]]],
+                        "alethic": True})
+            continue
         if v:
             out.append({"fact_type": ft,
                         "kinds": sorted(kinds.get(ft, ())),

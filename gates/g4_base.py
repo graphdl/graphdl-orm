@@ -31,7 +31,7 @@ def test_base_compiles_whole():
 def test_base_satisfies_its_own_schema():
     from host_py import gate
     D, _ = _base_D()
-    bad = gate.alethic(gate.sweep(D))
+    bad = gate.alethic(gate.sweep(gate.settle(D)))
     assert bad == [], "\n".join(
         f"{v['fact_type']} {v['kinds']}: {v['offenders'][:5]}{'…' if len(v['offenders']) > 5 else ''}"
         for v in bad)

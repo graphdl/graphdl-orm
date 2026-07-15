@@ -861,13 +861,26 @@ Conceptual Data Type 'objectId' is in Data Type Group 'other'.
 Conceptual Data Type 'unspecified' is in Data Type Group 'unspecified'.
 Conceptual Data Type 'userDefined' is in Data Type Group 'userDefined'.
 
-JSON-Schema projection of the catalog (#279 P2a). Each leaf carries one
+### Formats (#279 P1)
+
+<!-- The legacy widget Formats, seeded as the Format-on-CDT comment above
+promises (it promised and never delivered — the quarry's Rust path or stale
+store masked the gap; G4 caught it 2026-07-14). 'enum' builds on 'text':
+an enum is text-valued, its domain riding Enum Values. -->
+
+Format 'text' is built on Conceptual Data Type 'text'.
+Format 'date' is built on Conceptual Data Type 'date'.
+Format 'boolean' is built on Conceptual Data Type 'boolean'.
+Format 'enum' is built on Conceptual Data Type 'text'.
+
+<!-- JSON-Schema projection of the catalog (#279 P2a). Each leaf carries one
 JSON Type (the `type` keyword the OpenAPI / JSON-Schema generator emits
 for a value-type property) and, for temporal / binary / uuid leaves, a
 JSON Format. These absorb `jsonType` / `jsonFormat` onto the Conceptual
 Data Type cell via RMAP, the same way `conceptualDataType` absorbs onto
 Noun. The generator's `JsonTypeMappingTable` reads them back; its boot
-fallback mirrors this block one-for-one.
+fallback mirrors this block one-for-one. (SPEC 10.2: this block was bare
+prose inside Instance Facts; commented 2026-07-14.) -->
 
 Conceptual Data Type 'text' has JSON Type 'string'.
 Conceptual Data Type 'fixedText' has JSON Type 'string'.
