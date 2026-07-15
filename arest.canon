@@ -433,6 +433,12 @@ DEF("constraints:scoped_exclusion_spec",
     S4(A("CONS"), K(A("COMP")), K(A("constraints:exclusion")),
        A("constraints:participation_spec"))),
 
+DEF("constraints:scoped_exclusion_projected_many",
+    S4(A("CONS"), K(A("COMP")), K(A("theta:flatten")),
+       S3(A("COMP"), A("apndl"),
+          S3(A("CONS"), S2(A("CONST"), A("CONS")),
+             S2(A("ALPHA"), A("constraints:scoped_exclusion_projected")))))),
+
 DEF("constraints:scoped_exclusive_or_spec",
     S4(A("CONS"), K(A("COMP")), K(A("constraints:exclusive_or")),
        S4(A("CONS"), K(A("CONS")),

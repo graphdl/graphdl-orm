@@ -154,8 +154,10 @@ def test_every_canon_def_lifts_to_a_closed_pure_term():
     lift = CanonLift.load()
     rep = check_canon(lift)
 
-    # 362 at the quarry + system:registered, the Def-9 manifest (SPEC 7.2, 8.2)
-    assert rep.total == 363
+    # 362 at the quarry + system:registered (the Def-9 manifest, SPEC 7.2/8.2)
+    # + constraints:scoped_exclusion_projected_many (the position-projected
+    # participation union — the G5 exclusion fix, 2026-07-14)
+    assert rep.total == 364
     # no UNEXPECTED malformation: every DEF is either pure-closed or a known boundary DEF
     assert rep.malformed == [], f"unexpected malformations: {rep.malformed}"
 
@@ -165,7 +167,7 @@ def test_every_canon_def_lifts_to_a_closed_pure_term():
         assert well_formed(term), name
         assert is_closed(term), name
 
-    assert len(rep.pure_closed) == 346
+    assert len(rep.pure_closed) == 347
     assert len(rep.boundary) == 17
     assert len(rep.pure_closed) + len(rep.boundary) == rep.total
 

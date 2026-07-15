@@ -1069,12 +1069,12 @@ _CS_PREFIX = {"disjunctive_mandatory": "ior_", "subset": "subset_",
               "equality": "eq_"}
 
 
-def _cs_call(kind, subj, clause_fts, raws, m):
+def _cs_call(kind, subj, clause_fts, raws, m, positions=None):
     """The set-comparison family through the crows path: cs_rows answers the A-row and
     the attach rows (canon); the cid minting ([:40] prefix policy, 'no take prim joins
     the kernel for cosmetics') and the per-attach builder operands are the boundary's.
     Nullary top-level builders spec operand () — the NAME is the object."""
-    a, o = _h_crows(_cook_cs(kind, subj, clause_fts, raws), None, m)
+    a, o = _h_crows(_cook_cs(kind, subj, clause_fts, raws, positions), None, m)
     return a, o
 
 
@@ -1096,7 +1096,7 @@ _CS_SPEC = {
 }
 
 
-def _cook_cs(kind, subj, clause_fts, raws):
+def _cook_cs(kind, subj, clause_fts, raws, positions=None):
     from .reduce import apply as _apply
     from .lam import atom as _A, from_lam as _fl
     rows = _fl(_apply(_A("system:cs_rows"),
@@ -1113,17 +1113,45 @@ def _cook_cs(kind, subj, clause_fts, raws):
         if builder == "scoped_equality_side":
             # the _a side checks against B, the _b side against A
             ft = arow[4] if cell.endswith("_a") else arow[3]
+        if (builder == "scoped_exclusion" and positions
+                and ft in clauses and len(positions) == len(clauses)):
+            # the PROJECTED participation (G5, 2026-07-14): each pair joins
+            # on the subject noun's own role position per clause —
+            # V at the target = ⋃_j π_{p_t}(P) ∩ π_{p_j}(↑other_j), the
+            # union built by the canon (scoped_exclusion_projected_many
+            # over ⟨other, ⟨p_t⟩, ⟨p_j⟩⟩ triples). Position-blind
+            # participation joined column 1 of every clause and let the
+            # forbidden write pass.
+            i = list(clauses).index(ft)
+            triples = tuple((other, (positions[i],), (positions[j],))
+                            for j, other in enumerate(clauses) if j != i)
+            ospecs.append((cell.replace(cid, minted, 1),
+                           "constraints:scoped_exclusion_projected_many",
+                           triples))
+            continue
         b, op = _CS_SPEC[builder](arow, clauses, ft)
         ospecs.append((cell.replace(cid, minted, 1), b, op))
     return ((), mid, tuple(ospecs))
 
 
 def _h_set_comparison(g, k, m):
+    """'For each <subj>, at most/exactly one of the following holds: …' —
+    the clauses resolve to fact types AND to the subject's ROLE POSITION in
+    each (the shared noun may sit at different positions per clause: Option
+    is role 1 in Option_is_eliminated, role 2 in Rebuild_uses_Option — the
+    G5 finding, 2026-07-14: position-blind participation joined column 1 of
+    both and the forbidden write passed). The positions ride to the cook."""
     subj, mode, body = g
-    pairs = [(c.strip(), _clause_ft(c, k))
-             for c in body.split(";") if c.strip()]
-    return _cs_call(mode, subj, [ft for _, ft in pairs],
-                    [t for t, _ in pairs], m)
+    pairs = []
+    for c in body.split(";"):
+        if not c.strip():
+            continue
+        ft, roles = _clause_ft_roles(c, k)
+        pos = roles.index(subj) + 1 if subj in roles else 1
+        pairs.append((c.strip(), ft, pos))
+    return _cs_call(mode, subj, [ft for _, ft, _ in pairs],
+                    [t for t, _, _ in pairs], m,
+                    positions=[p for _, _, p in pairs])
 
 def _h_disjunctive(g, k, m):
     body = g[-1]
@@ -2789,18 +2817,21 @@ def validate_for(fact_type, D, partition=None):
                 return C.scoped_equality_side(_vp(f[2]))
         if kind == "mandatory" and name == f[0] + "_e" and _absorbed(f[2]):
             return C.scoped_mandatory_facts(_vp(f[2]))
-        if kind in ("exclusion", "exclusive_or", "disjunctive_mandatory") and "@" in name:
+        if kind in ("exclusive_or", "disjunctive_mandatory") and "@" in name:
             clauses = tuple(f[3])
             if any(_absorbed(c) for c in clauses):
                 # pure-data clause specs (⟨'view',table,col⟩ per absorbed clause) for the
                 # spec-taking participation builder — host marshals, canon reads (task 16).
                 specs = {c: system.ftpop_spec(c, partition) for c in clauses if _absorbed(c)}
                 target = name.split("@", 1)[1]
-                if kind == "exclusion":
-                    return C.scoped_exclusion(clauses, target, specs)
                 if kind == "exclusive_or":
                     return C.scoped_exclusive_or(f[2], clauses, target, specs)
                 return C.scoped_inclusive_or(f[2], clauses, target, specs)
+        # exclusion is NOT rebuilt (G5, 2026-07-14): the stored @clause object
+        # is the position-PROJECTED union (scoped_exclusion_projected_many)
+        # reading sibling LOG cells, which create's append leg and retract's
+        # rewrite keep current on BOTH postures — a rebuild here would clobber
+        # the projections with the position-blind participation.
         return None
 
     spans = {}
