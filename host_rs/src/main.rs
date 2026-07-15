@@ -6739,7 +6739,8 @@ fn load_grammar_scratch(j: &J) -> Result<(GrammarScratch, String), String> {
             })?;
             let mut found: Option<std::path::PathBuf> = None;
             for dir in exe.ancestors().skip(1) {
-                let cand = dir.join("shared").join("forml2-grammar.store.json");
+                // the rebuild layout: the sidecar beside the canon at the root
+                let cand = dir.join("forml2-grammar.store.json");
                 if cand.is_file() {
                     found = Some(cand);
                     break;
@@ -6750,9 +6751,9 @@ fn load_grammar_scratch(j: &J) -> Result<(GrammarScratch, String), String> {
                 None => {
                     return Err(
                         "grammar store not resident and no grammar sidecar found: pass \
-                         grammar_sidecar or generate <root>/shared/forml2-grammar.store.json \
+                         grammar_sidecar or generate <root>/forml2-grammar.store.json \
                          from the Python engine (forml.grammar_D() serialized as \
-                         Registry._sidecar does — see the comment above load_grammar_scratch)"
+                         the sidecar shape — see the comment above load_grammar_scratch)"
                             .to_string(),
                     )
                 }
@@ -8818,33 +8819,37 @@ fn base_seed_paths(j: &J) -> Result<(std::path::PathBuf, std::path::PathBuf), St
         Some(_) => return Err("base_store must be a string path".to_string()),
         None => None,
     };
-    let shared: Option<std::path::PathBuf> = if explicit_dir.is_none() || explicit_store.is_none() {
+    // the rebuild layout (SPEC D7/PLAN): the repo ROOT is the marker — the
+    // grammar sidecar sits beside the canon at the root, the base readings
+    // under readings/base, the base store artifact at the root
+    let root: Option<std::path::PathBuf> = if explicit_dir.is_none() || explicit_store.is_none() {
         let exe = std::env::current_exe()
             .map_err(|e| format!("no executable path to walk for the base seed: {}", e))?;
         exe.ancestors()
             .skip(1)
-            .map(|dir| dir.join("shared"))
+            .map(|dir| dir.to_path_buf())
             .find(|cand| cand.join("forml2-grammar.store.json").is_file())
     } else {
         None
     };
     let base_dir = match explicit_dir {
         Some(d) => d,
-        None => shared
+        None => root
             .clone()
             .ok_or_else(|| {
                 "base readings dir not found by walking the executable's ancestors for \
-                 shared/forml2-grammar.store.json; pass base_dir"
+                 forml2-grammar.store.json at the repo root; pass base_dir"
                     .to_string()
             })?
+            .join("readings")
             .join("base"),
     };
     let store_path = match explicit_store {
         Some(s) => s,
-        None => shared
+        None => root
             .ok_or_else(|| {
                 "base store path not found by walking the executable's ancestors for \
-                 shared/forml2-grammar.store.json; pass base_store"
+                 forml2-grammar.store.json at the repo root; pass base_store"
                     .to_string()
             })?
             .join("base.store.json"),
