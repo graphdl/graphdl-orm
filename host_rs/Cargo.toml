@@ -1,0 +1,38 @@
+[package]
+name = "arest"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "arest"
+path = "src/main.rs"
+
+# the same single file is also the LIBRARY (the wasm/Worker path):
+# rlib for rust consumers, cdylib for wasm-bindgen
+[lib]
+name = "arest_core"
+path = "src/main.rs"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+# THE CRATE'S FIRST DEPENDENCY, deliberate and OPTIONAL (Samuel,
+# 2026-07-09: "I think we'd need bindgen for workers") — only the
+# worker feature pulls it; the host build stays zero-dep.
+wasm-bindgen = { version = "=0.2.117", optional = true }
+
+[profile.release]
+opt-level = 2
+# incremental was TRIED for release (2026-07-08) and REVERTED same day:
+# on this one-large-file crate the incremental engine THRASHED (a single
+# rustc unit ran 18+ min where the classic cold build takes ~8 total).
+# The build-tax answer is batching changes per rebuild and smoking on
+# the debug binary, not incremental codegen.
+
+[features]
+# the HOST feature carries everything a wasm32 build must not: process
+# spawning (the python delegate), the apps-dir filesystem, and the
+# stdio serve/mcp loops. Default on; wasm builds --no-default-features
+# and gets the pure core (reducer, native carrier, canon).
+default = ["host"]
+host = []
+worker = ["dep:wasm-bindgen"]
