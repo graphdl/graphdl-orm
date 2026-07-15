@@ -223,6 +223,52 @@ def _retract_row(D, ft, fact):
     return D2, None
 
 
+class Journal:
+    """§12: the durable event log. One line per COMMITTED step —
+    {"tx": n, "ops": [[op, ft, [fact…]], …]} in arrival order (transaction
+    time, 4.2); a refused step appends nothing (12.1). Derived facts never
+    journal — they are consequences (2.5)."""
+
+    def __init__(self, path):
+        import json, os
+        self.path = path
+        self.lines = []
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                self.lines = [json.loads(ln) for ln in f if ln.strip()]
+
+    @property
+    def tx(self):
+        return len(self.lines)
+
+    def append(self, ops):
+        import json
+        entry = {"tx": self.tx, "ops": ops}
+        self.lines.append(entry)
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False,
+                               separators=(",", ":")) + "\n")
+
+
+def replay(D, journal):
+    """12.2: fold the journal through the SAME gate. Each entry committed
+    against its predecessor state and the gate is deterministic, so replay
+    reproduces D exactly. An entry that fails replay signals corruption:
+    HALT with the report — never silently diverge, never silently resurrect
+    (the quarry's events journal resurrected a forbidden fact into every
+    rebuilt store, canon-first 181bc775)."""
+    for entry in (journal.lines if isinstance(journal, Journal) else journal):
+        ops = [(op, ft, tuple(fact)) for op, ft, fact in entry["ops"]]
+        res = step(D, ops)
+        if not res["committed"]:
+            raise RuntimeError(
+                f"journal replay halted at tx {entry.get('tx')}: a committed "
+                f"step no longer commits — corruption or drift. "
+                f"violations: {res['violations']!r}")
+        D = res["D"]
+    return D
+
+
 def step(D, ops, journal=None):
     """One AST transition over a batch input (SPEC 2.1–2.5, Thm 1, §12).
 

@@ -42,7 +42,9 @@ SPEC.md + AREST.tex, root commit 7b48bd86.
     RMAP cells (6.1), verbalize with nf idempotence (Prop 1). Salvaged behaviors
     enter only through G2.
 3.4 retract (2.5), batch steps (2.4), journal + replay (§12).
-3.5 G4 base self-validation; G7 acyclicity query on every ingest.
+3.5 G4 base self-validation. (G7, the Cor-2 acyclicity query on ingest,
+    moves to Day 5/6 with the rule-grammar work — the ingestion path and
+    rule read/derive machinery are touched together there.)
 
 ## Day 4 — the Rust μ-host
 

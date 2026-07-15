@@ -70,6 +70,38 @@ def test_a_lone_retract_that_orphans_the_rebuild_is_refused():
     assert res["D"] is committed["D"]
 
 
+def test_the_journal_replays_through_the_gate(tmp_path):
+    from host_py import gate, system
+    D, _ = _served()
+    path = str(tmp_path / "t.events.jsonl")
+    res = gate.step(D, [("create", "Rebuild_uses_Option",
+                         ("redo-2026-07", "greenfield-transcribe"))],
+                    journal=gate.Journal(path))
+    assert res["committed"]
+    # a fresh serving compile + replay reproduces the committed population
+    from_scratch, _ = gate.compile_serving(open(_APP, encoding="utf-8").read())
+    replayed = gate.replay(from_scratch, gate.Journal(path))
+    rows = {tuple(r) for r in system._pop_rows(replayed, "Rebuild_uses_Option")}
+    assert rows == {("redo-2026-07", "greenfield-transcribe")}
+
+
+def test_a_forbidden_journal_entry_halts_replay_loudly(tmp_path):
+    # the exact opposite of the old world, where the events journal
+    # resurrected a forbidden fact into every rebuilt store (181bc775):
+    # replay folds through THE GATE, and what cannot commit HALTS (12.2)
+    import json
+    import pytest
+    from host_py import gate
+    p = tmp_path / "bad.events.jsonl"
+    p.write_text(json.dumps(
+        {"tx": 0, "ops": [["create", "Rebuild_uses_Option",
+                           ["redo-2026-07", "strangler-in-place"]]]}) + "\n",
+        encoding="utf-8")
+    from_scratch, _ = gate.compile_serving(open(_APP, encoding="utf-8").read())
+    with pytest.raises(RuntimeError, match="halted at tx 0"):
+        gate.replay(from_scratch, gate.Journal(str(p)))
+
+
 def test_the_batch_swap_moves_valid_to_valid_in_one_step():
     from host_py import gate, system
     D, _ = _served()
